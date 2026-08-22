@@ -1,6 +1,6 @@
 import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+  type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import type {
   Artifact,
@@ -15,8 +15,8 @@ import { parseLocalFileTarget } from "../file-link";
 import {
   buildInteractiveSandboxDocument,
   buildSandboxDocument,
+  type HtmlPreviewTheme,
 } from "../html-preview";
-import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import {
@@ -26,11 +26,11 @@ import {
 } from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import { PanelResizer } from "./PanelResizer";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
 const SOURCE_PAGE_LINES = 500;
-const PANEL_WIDTH_KEY = "cc_remote_artifact_panel_width";
 const URL_ATTRIBUTES = new Set(["src", "href", "xlink:href", "poster", "action", "formaction"]);
 const UNSAFE_CSS = /(?:url\s*\(|@import|expression\s*\()/i;
 
@@ -70,7 +70,10 @@ function MarkdownPreviewCode({
   return <code className={className}>{children}</code>;
 }
 
-function HtmlArtifactPreview({ content }: { content: string }) {
+function HtmlArtifactPreview({ content, theme }: {
+  content: string;
+  theme?: HtmlPreviewTheme;
+}) {
   const [document, setDocument] = useState<string | null>(null);
   const [interactiveDocument, setInteractiveDocument] =
     useState<string | null>(null);
@@ -142,10 +145,12 @@ function HtmlArtifactPreview({ content }: { content: string }) {
         setDocument(buildSandboxDocument(
           parsed.body.innerHTML,
           parsed.head.innerHTML,
+          theme,
         ));
         setInteractiveDocument(buildInteractiveSandboxDocument(
           runnable.body.innerHTML,
           runnable.head.innerHTML,
+          theme,
         ));
         setInteractive(false);
         setError(null);
@@ -158,7 +163,7 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     };
     void prepare();
     return () => { cancelled = true; };
-  }, [content]);
+  }, [content, theme]);
 
   const loadInteractiveDocument = useCallback(() => {
     if (!interactiveDocument) return;
@@ -348,7 +353,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
-  onSaveMarkdown, onDirtyChange }: {
+  onSaveMarkdown, onDirtyChange, theme }: {
   artifact: Artifact;
   active: "diff" | "btw";
   hasBtw: boolean;
@@ -364,14 +369,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onSaveMarkdown?: (path: string, content: string, expectedSize: number,
     expectedMtimeNs: string, expectedRevision: string) => string | null;
   onDirtyChange?: (dirty: boolean) => void;
+  theme?: HtmlPreviewTheme;
 }) {
-  const panelRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
-  const resizeRef = useRef<{
-    pointerId: number;
-    startX: number;
-    startWidth: number;
-  } | null>(null);
   const artifactKey = `${artifact.sid || ""}:${artifact.file}:${artifact.requestId || ""}`;
   const [pageState, setPageState] = useState({ key: artifactKey, page: 0 });
   const [modeState, setModeState] = useState<{ key: string; mode: "preview" | "source" }>({
@@ -490,64 +490,6 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     saveDraft();
   };
 
-  const applyPanelWidth = useCallback((requestedWidth: number, persist = false) => {
-    const width = clampPanelWidth(requestedWidth, window.innerWidth);
-    document.documentElement.style.setProperty("--panel-w", `${width}px`);
-    if (persist) localStorage.setItem(PANEL_WIDTH_KEY, String(width));
-    return width;
-  }, []);
-
-  useEffect(() => {
-    if (!window.matchMedia("(min-width: 981px)").matches) return;
-    const saved = Number.parseFloat(localStorage.getItem(PANEL_WIDTH_KEY) || "");
-    if (Number.isFinite(saved)) applyPanelWidth(saved);
-    const fitPanel = () => {
-      if (!window.matchMedia("(min-width: 981px)").matches) return;
-      const current = panelRef.current?.getBoundingClientRect().width;
-      if (current) applyPanelWidth(current);
-    };
-    window.addEventListener("resize", fitPanel);
-    return () => {
-      window.removeEventListener("resize", fitPanel);
-      document.documentElement.classList.remove("panel-resizing");
-    };
-  }, [applyPanelWidth]);
-
-  const startResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!window.matchMedia("(min-width: 981px)").matches || !panelRef.current) return;
-    resizeRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startWidth: panelRef.current.getBoundingClientRect().width,
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    document.documentElement.classList.add("panel-resizing");
-    event.preventDefault();
-  };
-  const moveResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const resize = resizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    applyPanelWidth(resize.startWidth + resize.startX - event.clientX);
-  };
-  const finishResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const resize = resizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    resizeRef.current = null;
-    document.documentElement.classList.remove("panel-resizing");
-    const width = panelRef.current?.getBoundingClientRect().width;
-    if (width) applyPanelWidth(width, true);
-  };
-  const resizeWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    const width = panelRef.current?.getBoundingClientRect().width;
-    if (!width) return;
-    applyPanelWidth(width + (event.key === "ArrowLeft" ? 24 : -24), true);
-    event.preventDefault();
-  };
-
   const sendNextAsset = useCallback(() => {
     const current = requestedAssets.current;
     if (current.key !== artifactKey || current.active
@@ -624,13 +566,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     || (artifact.kind === "html" && mode === "preview");
 
   return (
-    <div className="artifact-panel" ref={panelRef} data-lock-horizontal-swipe="true"
+    <div className="artifact-panel" data-lock-horizontal-swipe="true"
       onKeyDown={handlePanelKeyDown}>
-      <button type="button" className="panel-resizer"
-        aria-label="调整文件面板宽度" title="左右拖动调整面板宽度"
-        onPointerDown={startResize} onPointerMove={moveResize}
-        onPointerUp={finishResize} onPointerCancel={finishResize}
-        onKeyDown={resizeWithKeyboard} />
+      <PanelResizer ariaLabel="调整文件面板宽度" />
       <div className="artifact-head">
         {hasBtw ? <PanelTabs active={active} artifactKind={artifact.kind} onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
@@ -725,7 +663,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         ) : artifact.kind === "html" ? (
           mode === "source"
             ? <SourceFile content={artifact.content || ""} artifactKey={artifactKey} />
-            : <HtmlArtifactPreview content={artifact.content || ""} />
+            : <HtmlArtifactPreview content={artifact.content || ""} theme={theme} />
         ) : artifact.kind === "image" ? (
           <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
             kind="image" title={title} />

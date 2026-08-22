@@ -9,6 +9,7 @@ import {
 } from "react";
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
+  StatusRateLimit,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
   EngineCapabilityItem, PermissionProfileInfo,
 } from "../protocol";
@@ -117,6 +118,7 @@ interface Props {
   contextReport: ContextReport | null;
   contextError?: string | null;
   statusReport?: StatusReport | null;
+  rateLimits?: StatusRateLimit[];
   statusError?: string | null;
   statusLoading?: boolean;
 }
@@ -954,20 +956,23 @@ export function Composer(p: Props) {
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
               >{p.fast == null ? "档位读取中" : p.fast ? "快速" : "标准"}</button>
             )}
-            {p.engine === "codex" && (
+            {(p.engine === "codex" || p.engine === "claude") && (
               <UsageMeter
+                engine={p.engine}
                 open={usageOpen}
                 report={p.statusReport ?? null}
-                error={p.statusError}
-                loading={p.statusLoading}
+                rateLimits={p.rateLimits}
+                error={p.engine === "codex" ? p.statusError : null}
+                loading={p.engine === "codex" && p.statusLoading}
                 onToggle={() => {
                   const opening = !usageOpen;
                   setCtxOpen(false);
                   setUsageOpen(opening);
-                  if (opening) p.onRefreshUsage?.();
+                  if (opening && p.engine === "codex") p.onRefreshUsage?.();
                 }}
-                onRefresh={() => p.onRefreshUsage?.()}
-                onOpenStatus={p.onStatus ? () => {
+                onRefresh={p.engine === "codex"
+                  ? () => p.onRefreshUsage?.() : undefined}
+                onOpenStatus={p.engine === "codex" && p.onStatus ? () => {
                   setUsageOpen(false);
                   p.onStatus?.();
                 } : undefined}

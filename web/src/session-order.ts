@@ -31,6 +31,23 @@ export function compareSessionsByActivity(a: SessionInfo, b: SessionInfo): numbe
   return a.session_id.localeCompare(b.session_id);
 }
 
+/** Select the session a surface should paint while its catalog refreshes.
+ * Exact user focus wins even for an archived row; otherwise use the newest
+ * visible session, matching the authoritative post-refresh focus policy. */
+export function selectSurfaceSession(
+  sessions: SessionInfo[], rememberedId?: string | null,
+): SessionInfo | null {
+  const remembered = rememberedId
+    ? sessions.find((session) => session.session_id === rememberedId)
+    : undefined;
+  return remembered
+    ?? [...sessions]
+      .filter((session) => session.tag !== "archived")
+      .sort(compareSessionsByActivity)[0]
+    ?? sessions[0]
+    ?? null;
+}
+
 export function bumpSessionActivity(
   sessions: SessionInfo[], sessionId: string, activityMs: number,
 ): SessionInfo[] {

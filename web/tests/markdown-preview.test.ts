@@ -537,6 +537,29 @@ $$`,
     "Codex App git directives need a native status instead of leaking wire text");
   assert.doesNotMatch(codexDirectiveMarkup, /::git-commit|private-project/,
     "directive attributes are local UI metadata and must not render as prose");
+  const codexVisualizationMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "visualize{\"path\":\"/Volumes/MuggleSSD/workspace/robot-dog/"
+      + ".visualizations/concept.html\",\"title\":\"双轮足结构草图\"}"
+      + "\n\n请确认结构方向。",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.match(codexVisualizationMarkup, /codex-visualization-card/,
+    "Codex visualize directives need a native artifact entry");
+  assert.match(codexVisualizationMarkup, /双轮足结构草图/);
+  assert.match(codexVisualizationMarkup, /HTML 可视化/);
+  assert.match(codexVisualizationMarkup, /请确认结构方向/);
+  assert.doesNotMatch(codexVisualizationMarkup, /visualize|\/Volumes\/MuggleSSD/,
+    "visualize wire text and private absolute paths must not leak into prose");
+  const invalidVisualizationMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "visualize{\"path\":\"https://example.com/concept.html\"}",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.doesNotMatch(invalidVisualizationMarkup, /codex-visualization-card/,
+    "network targets must not be promoted to authenticated local previews");
+  assert.match(invalidVisualizationMarkup, /visualize/,
+    "an invalid directive remains visible instead of silently discarding content");
   const fencedDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "```text\n::git-commit{cwd=\"/tmp/example\"}\n```",
     done: true,
@@ -1192,6 +1215,15 @@ $$`,
   assert.match(sandbox, /Content-Security-Policy/);
   assert.match(sandbox, /default-src &#39;none&#39;|default-src 'none'/);
   assert.match(sandbox, /<body><h1>safe<\/h1><\/body>/);
+  const darkVisualizationSandbox = buildSandboxDocument(
+    "<div style=\"color:var(--foreground)\">visual</div>", "", "dark");
+  assert.match(darkVisualizationSandbox, /data-theme="dark"/);
+  assert.match(darkVisualizationSandbox, /--foreground:#ecedf3/);
+  assert.match(darkVisualizationSandbox, /--viz-series-1:#8590ff/,
+    "Codex visualizations need their host palette inside the isolated iframe");
+  const lightVisualizationSandbox = buildSandboxDocument("visual", "", "light");
+  assert.match(lightVisualizationSandbox, /data-theme="light"/);
+  assert.match(lightVisualizationSandbox, /--background:#fff/);
 
   const artifactPanelSource = readFileSync(
     resolve(process.cwd(), "src/components/ArtifactPanel.tsx"), "utf8");

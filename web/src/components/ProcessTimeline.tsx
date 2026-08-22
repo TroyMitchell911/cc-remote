@@ -17,7 +17,10 @@ import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { ToolGroup } from "./ToolGroup";
-import { hasActiveProcess, processBlocks } from "../process-blocks";
+import {
+  hasActiveProcess,
+  presentableProcessBlocks,
+} from "../process-blocks";
 import {
   filePathsFromInput,
   presentFileOperation,
@@ -310,7 +313,7 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewImage, onPreviewHistoryImage, openOverride, onOpenChange,
-  onInteractionStart, onInteractionEnd }: {
+  onInteractionStart, onInteractionEnd, onOpenAgent }: {
   block: ProcessBlock;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
@@ -332,7 +335,27 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
+  if (block.processKind === "agent" && onOpenAgent) {
+    return (
+      <button type="button"
+        className={`process-activity process-agent-card process-${block.status}`}
+        onClick={() => onOpenAgent(block.item_id, block.title)}>
+        <span className="process-item-ic"><Icon name="spark" size={15} /></span>
+        <span className="process-agent-copy">
+          <span className="process-item-title">{block.title}</span>
+          {(block.progress || block.summary) && (
+            <span className="process-agent-summary">
+              {block.progress || block.summary}
+            </span>
+          )}
+        </span>
+        <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
+        <span className="process-item-chev"><Icon name="chev" size={14} /></span>
+      </button>
+    );
+  }
   const imageView = block.tool?.toLowerCase().replaceAll("_", "") === "viewimage";
   const imagePath = imageView
     ? filePathsFromInput(block.input)[0] ?? ""
@@ -440,7 +463,8 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
   onAuthorizeImage, onPreviewImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
-  itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd }: {
+  itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd,
+  onOpenAgent }: {
   block: Block;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
@@ -462,6 +486,7 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
   if (block.kind === "process") {
     const key = `process:${block.item_id}`;
@@ -477,7 +502,7 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
       openOverride={itemOpen?.(key)}
       onOpenChange={(open) => onItemOpenChange?.(key, open)}
       onInteractionStart={onInteractionStart}
-      onInteractionEnd={onInteractionEnd} />;
+      onInteractionEnd={onInteractionEnd} onOpenAgent={onOpenAgent} />;
   }
   const text = block as TextBlock;
   if (text.channel === "thinking") {
@@ -519,18 +544,6 @@ function groupTimelineRows(items: Block[]): TimelineRow[] {
     else rows.push({ kind: "tools", tools: [block] });
   }
   return rows;
-}
-
-function isCodexPresentationNoise(block: Block): boolean {
-  if (block.kind === "text" && block.channel === "thinking") return true;
-  if (block.kind !== "process") return false;
-  if (block.processKind === "reasoning") return true;
-  if (block.processKind !== "hook") return false;
-  // Successful/pending preToolUse hooks are implementation detail around each
-  // command. Rendering them between ToolBlocks splits one useful tool batch
-  // into a noisy Hook -> one tool -> Hook sequence. Keep actionable failures,
-  // but let ordinary hooks disappear so adjacent tools collapse together.
-  return !["failed", "declined", "cancelled", "interrupted"].includes(block.status);
 }
 
 const TERMINAL_PROCESS_STATUSES = new Set([
@@ -598,7 +611,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   onPreviewHistoryImage,
   externalPlanItemId,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
-  onInteractionStart, onInteractionEnd }: {
+  onInteractionStart, onInteractionEnd, onOpenAgent }: {
   blocks: Block[];
   done: boolean;
   /** Whether this process shell describes the turn's active live phase. */
@@ -640,16 +653,14 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
   const retainedPlanBlock = useRef<ProcessBlock | null>(null);
   // Codex does not expose its private chain of thought in official clients.
   // Keep actionable commentary, plans, hook failures and tools, but suppress
   // synthetic reasoning and successful hook plumbing so consecutive tool calls
   // collapse into one useful group.
-  const projectedItems = processBlocks(blocks).filter(
-    (block) => engine !== "codex" || !(
-    isCodexPresentationNoise(block)
-  ));
+  const projectedItems = presentableProcessBlocks(blocks, engine);
   const needsAuthoritativeDetail = deferredCount > 0;
   // Summary History may include bounded lifecycle/tool shells so the header can
   // report that work exists, but their inputs and outputs are intentionally
@@ -681,8 +692,11 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const processActive = active ?? (!done && (
     hasActiveProcess(projectedItems) || projectedItems.length > 0
   ));
+  const foregroundItems = done ? projectedItems.filter((block) => !(
+    block.kind === "process" && block.background === true
+  )) : projectedItems;
   const terminalComplete = done && !processActive
-    && !hasActiveProcess(projectedItems);
+    && !hasActiveProcess(foregroundItems);
   const processSettled = !processActive;
   const [uncontrolledOpen, setUncontrolledOpen] = useState(!terminalComplete);
   const open = openOverride ?? uncontrolledOpen;
@@ -736,7 +750,9 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const rows = open ? groupTimelineRows(timelineItems) : [];
   const toolCount = timelineItems.reduce(
     (count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
-  const countLabel = needsAuthoritativeDetail
+  const countLabel = visibleDetailError && timelineItems.length === 0
+    ? "加载失败"
+    : needsAuthoritativeDetail
     ? `${deferredCount} 项`
     : waitingForContent
       ? "等待响应"
@@ -745,17 +761,23 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     : engine === "codex" && toolCount === timelineItems.length
       ? `${toolCount} 个工具调用`
       : `${timelineItems.length} 项`;
-  const elapsed: number | null = terminalComplete
+  const rawElapsed: number | null = terminalComplete
     ? durationMs != null && durationMs > 0
       ? durationMs
-      : engine === "claude" && startTs != null && doneTs != null
-        ? Math.max(0, doneTs - startTs)
-        : durationMs === 0 && startTs != null && doneTs != null && doneTs > startTs
+      : startTs != null && doneTs != null
+        ? engine === "codex" && durationMs === 0
           ? 0
-          : null
+          : Math.max(0, doneTs - startTs)
+        : null
     : processActive
-      ? Math.max(0, now - (startTs ?? now))
+      ? startTs == null ? null : Math.max(0, now - startTs)
       : durationMs != null && durationMs > 0 ? durationMs : null;
+  // Rounded sub-second intervals render as "0s", which looks like a broken
+  // clock and can be resurrected from a pre-fix browser cache. Presence and
+  // timing are independent: keep the process label, omit only the unusable
+  // duration until at least one displayable second is available.
+  const elapsed = rawElapsed != null && rawElapsed >= 500
+    ? rawElapsed : null;
   const requestDetail = () => {
     setLocalDetailError(null);
     if (onLoadDetail?.() === false) {
@@ -915,6 +937,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
                 historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
                 onPreviewHistoryImage={onPreviewHistoryImage}
+                onOpenAgent={onOpenAgent}
                 itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
                 onInteractionStart={onInteractionStart}
                 onInteractionEnd={onInteractionEnd} />

@@ -49,6 +49,9 @@ from cc_remote.wrapper.codex_rpc import CodexRpcRejected
 from cc_remote.wrapper.codex_stream import (
     CodexAutomaticUserRecovery,
     CodexHistoryImageView,
+    CodexHistoryNativeWitness,
+    CodexHistoryProcessPageWitness,
+    CodexHistoryProcessWitness,
 )
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
@@ -59,6 +62,7 @@ from cc_remote.wrapper.history_store import (
 )
 from cc_remote.wrapper.stream import (
     StreamTranslator,
+    public_agent_run_id,
     transcript_compact_history_page,
     transcript_compact_snapshot,
     last_assistant_model,
@@ -68,6 +72,142 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_official_codex_summary_uses_only_positive_rollout_process_witness():
+    page = CodexHistoryPage(
+        events=(),
+        turns=(
+            {
+                "id": "direct", "prompt": "hello", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "processed", "prompt": "inspect", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+                "processStartedTs": 30_000,
+                "processDoneTs": 30_001,
+            },
+            {
+                "id": "omitted-full", "prompt": "inspect full", "blocks": [],
+                "done": True, "processDetailState": "none",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "exact", "prompt": "already hydrated", "blocks": [],
+                "done": True, "processDetailState": "present",
+                "detailReasons": ["process"], "detailEventCount": 2,
+                "detailLoaded": False,
+                "processStartedTs": 50_000,
+                "processDoneTs": 51_000,
+            },
+            {
+                "id": "untimed", "prompt": "hydrated without time", "blocks": [],
+                "done": True, "processDetailState": "present",
+                "detailReasons": ["process"], "detailEventCount": 2,
+                "detailLoaded": False,
+            },
+        ),
+        has_more=False,
+        oldest_id="direct",
+        newest_id="processed",
+    )
+    witness = CodexHistoryNativeWitness(
+        process_by_visible_id={
+            "processed": CodexHistoryProcessWitness(
+                started_ms=40_000,
+                done_ms=44_000,
+            ),
+            "omitted-full": CodexHistoryProcessWitness(
+                started_ms=45_000,
+                done_ms=47_000,
+            ),
+            "exact": CodexHistoryProcessWitness(
+                started_ms=60_000,
+                done_ms=70_000,
+            ),
+            "untimed": CodexHistoryProcessWitness(
+                started_ms=80_000,
+                done_ms=82_000,
+            ),
+        },
+    )
+
+    mm._apply_codex_process_witness(page, witness)
+
+    direct, processed, omitted_full, exact, untimed = page.turns
+    assert direct["processDetailState"] == "unknown"
+    assert direct["detailEventCount"] == 0
+    assert processed["processDetailState"] == "present"
+    assert processed["detailReasons"] == ["process"]
+    assert processed["detailEventCount"] == 1
+    assert processed["processStartedTs"] == 40_000
+    assert processed["processDoneTs"] == 44_000
+    assert omitted_full["processDetailState"] == "present"
+    assert omitted_full["detailReasons"] == ["process"]
+    assert omitted_full["detailEventCount"] == 1
+    assert omitted_full["processStartedTs"] == 45_000
+    assert omitted_full["processDoneTs"] == 47_000
+    assert exact["processStartedTs"] == 50_000
+    assert exact["processDoneTs"] == 51_000
+    assert untimed["processStartedTs"] == 80_000
+    assert untimed["processDoneTs"] == 82_000
+
+
+def test_official_codex_process_witness_joins_unrelated_visible_ids_by_segment():
+    page = CodexHistoryPage(
+        events=(),
+        turns=(
+            {
+                "id": "item-first", "prompt": "first", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "item-steer", "prompt": "continue", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+        ),
+        has_more=False,
+        oldest_id="item-first",
+        newest_id="item-steer",
+        native_turn_ids=("native-multi",),
+        native_segment_by_visible_id={
+            "item-first": ("native-multi", 0),
+            "item-steer": ("native-multi", 1),
+        },
+    )
+    witness = CodexHistoryNativeWitness(
+        # These are real rollout ids and deliberately cannot match item-*.
+        process_by_visible_id={
+            "msg-first": CodexHistoryProcessWitness(
+                started_ms=10_000, done_ms=11_000),
+            "msg-steer": CodexHistoryProcessWitness(
+                started_ms=20_000, done_ms=22_000),
+        },
+        process_by_native_segment={
+            ("native-multi", 0): CodexHistoryProcessWitness(
+                started_ms=10_000, done_ms=11_000),
+            ("native-multi", 1): CodexHistoryProcessWitness(
+                started_ms=20_000, done_ms=22_000),
+        },
+    )
+
+    mm._apply_codex_process_witness(page, witness)
+
+    assert [turn["processDetailState"] for turn in page.turns] == [
+        "present", "present",
+    ]
+    assert page.turns[0]["processStartedTs"] == 10_000
+    assert page.turns[1]["processStartedTs"] == 20_000
 
 
 def test_live_codex_terminal_is_available_to_stale_history_immediately(
@@ -1937,6 +2077,294 @@ def test_requested_codex_summary_passes_source_bound_client_aliases(
                 ("native-turn", 0): "browser-message",
             },
         })]
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_restores_process_beyond_recent_hydration(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "process-summary.jsonl"
+    rows = []
+    for index in range(4):
+        turn_id = f"native-{index}"
+        minute = index * 2
+        rows.extend((
+            {
+                "timestamp": f"2026-08-21T01:{minute:02d}:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            },
+            {
+                "timestamp": f"2026-08-21T01:{minute:02d}:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message", "turn_id": turn_id,
+                    "message": f"prompt {index}",
+                },
+            },
+        ))
+        if index != 3:
+            rows.extend((
+                {
+                    "timestamp": f"2026-08-21T01:{minute:02d}:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call", "id": f"call-{index}",
+                        "call_id": f"call-{index}", "name": "exec_command",
+                        "input": {},
+                    },
+                },
+                {
+                    "timestamp": f"2026-08-21T01:{minute:02d}:08Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-{index}", "output": "ok",
+                    },
+                },
+            ))
+        rows.append({
+            "timestamp": f"2026-08-21T01:{minute:02d}:10Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": turn_id},
+        })
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Official:
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=tuple({
+                    "id": f"native-{index}",
+                    "prompt": f"prompt {index}",
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                } for index in range(4)),
+                has_more=False,
+                oldest_id="native-0",
+                newest_id="native-3",
+                native_turn_ids=tuple(
+                    f"native-{index}" for index in reversed(range(4))
+                ),
+                native_segment_by_visible_id={
+                    f"native-{index}": (f"native-{index}", 0)
+                    for index in range(4)
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("process-summary", "process-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+
+        assert [turn.processDetailState for turn in history.turns] == [
+            "present", "present", "present", "unknown",
+        ]
+        assert history.turns[0].processStartedTs is not None
+        assert history.turns[0].processDoneTs is not None
+        assert (
+            history.turns[0].processDoneTs
+            - history.turns[0].processStartedTs
+        ) == 3000
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_never_scans_beyond_tail_budget(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "adaptive-process-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"adaptive-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    calls = []
+
+    def witness(_path, *, max_turns, max_scan_bytes, required_turn_ids=()):
+        calls.append((max_turns, max_scan_bytes, required_turn_ids))
+        assert max_scan_bytes is not None
+        return CodexHistoryNativeWitness(
+            turn_ids=("native-3", "native-2"),
+            process_by_visible_id={
+                "native-3": CodexHistoryProcessWitness(
+                    started_ms=10_000, done_ms=11_000),
+            },
+            offset_by_visible_id={
+                "native-3": 10,
+            },
+        )
+
+    monkeypatch.setattr(mm, "codex_history_native_witness", witness)
+
+    class Official:
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=tuple({
+                    "id": f"native-{index}",
+                    "prompt": f"prompt {index}",
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                } for index in range(4)),
+                has_more=False,
+                oldest_id="native-0",
+                newest_id="native-3",
+                native_turn_ids=(
+                    "native-3", "native-2", "native-1", "native-0"),
+                native_segment_by_visible_id={
+                    f"native-{index}": (f"native-{index}", 0)
+                    for index in range(4)
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("adaptive-summary", "adaptive-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        first = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+        second = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+
+        assert [turn.processDetailState for turn in first.turns] == [
+            "unknown", "unknown", "unknown", "present",
+        ]
+        assert [turn.processDetailState for turn in second.turns] == [
+            "unknown", "unknown", "unknown", "present",
+        ]
+        assert first.authoritative is True
+        assert second.authoritative is True
+        assert len(calls) == 1
+        assert calls[0][1] is not None
+        assert calls[0][2] == ()
+
+    asyncio.run(run())
+
+
+def test_requested_codex_older_process_pages_continue_from_cached_offset(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "offset-process-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"offset-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_history_native_witness",
+        lambda *_args, **_kwargs: CodexHistoryNativeWitness(
+            turn_ids=("native-new",),
+            offset_by_visible_id={"msg-new": 123},
+            offset_by_native_segment={("native-new", 0): 123},
+        ),
+    )
+    older_calls = []
+
+    def older_witness(
+        _path, *, before, before_offset, max_turns,
+    ):
+        older_calls.append((before, before_offset, max_turns))
+        return CodexHistoryProcessPageWitness(
+            process_by_visible_id={
+                "msg-old": CodexHistoryProcessWitness(
+                    started_ms=30_000, done_ms=31_000),
+            },
+            offset_by_visible_id={"msg-old": 45},
+            process_by_native_segment={
+                ("native-old", 0): CodexHistoryProcessWitness(
+                    started_ms=30_000, done_ms=31_000),
+            },
+            offset_by_native_segment={("native-old", 0): 45},
+        )
+
+    monkeypatch.setattr(
+        mm, "codex_history_process_witnesses", older_witness)
+
+    class Official:
+        async def summary_page(self, _sid, *, before, **_kwargs):
+            native_id = "native-new" if before is None else "native-old"
+            visible_id = "item-new" if before is None else "item-old"
+            return CodexHistoryPage(
+                events=(),
+                turns=({
+                    "id": visible_id,
+                    "prompt": native_id,
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                },),
+                has_more=before is None,
+                oldest_id=visible_id,
+                newest_id=visible_id,
+                native_turn_ids=(native_id,),
+                native_segment_by_visible_id={
+                    visible_id: (native_id, 0),
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("offset-summary", "offset-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._build_requested_history(
+            ctx.key, before=None, limit=1, cwd=ctx.cwd, detail="summary",
+        )
+        first = await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=2,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        second = await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=2,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=3,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert first.turns[0].processDetailState == "present"
+        assert second.turns[0].processDetailState == "present"
+        assert older_calls == [
+            ("item-new", 123, 2),
+            ("item-new", 123, 3),
+        ]
 
     asyncio.run(run())
 
@@ -6689,9 +7117,11 @@ def test_task_notification_history_is_structured_only_with_raw_origin_evidence(
     assert not any(
         isinstance(event, UserMsg) and "task-notification" in event.prompt
         for event in events)
-    process = next(
+    process = [
         event for event in events
-        if event.type == "process" and event.item_id == "agent:call-agent-1")
+        if event.type == "process"
+        and event.item_id == public_agent_run_id("call-agent-1")
+    ][-1]
     assert process.kind == "agent" and process.phase == "end"
     assert process.status == "succeeded"
     assert process.parent_id == "call-agent-1"

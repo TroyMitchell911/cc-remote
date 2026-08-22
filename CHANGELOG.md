@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Upgrade Claude Agent SDK to `0.2.142`; the wrapper remains pinned to this
+  exact verified patch and continues to launch the user's configured Claude
+  Code executable.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v37. Claude
+  subagent detail, detached background-process ownership, paged turn detail,
+  and sanitized Claude quota events now cross an explicit compatibility
+  boundary; ambiguous Codex steer owners can no longer revive an idle spark.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v36. Conversation
+  summaries now distinguish exact visible process, exact direct answers, and
+  opaque native detail; truncated content keeps its own disclosure, and Codex
+  process timing starts at the first visible process event instead of the user
+  message timestamp.
 - Add an official container deploy for the Relay: a multi-stage
   `deploy/Dockerfile` builds `web/dist` from source and installs the
   hash-locked wheels as a non-root `ccremote` user, with `docker-compose.yml`,

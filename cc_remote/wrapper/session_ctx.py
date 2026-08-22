@@ -137,6 +137,9 @@ class SessionContext:
     claude_item_turns: dict[str, str] = field(default_factory=dict)
     claude_item_titles: dict[str, str] = field(default_factory=dict)
     claude_item_meta: dict[str, tuple[str, str | None]] = field(default_factory=dict)
+    # Read-only projection of Claude-owned Agent runs. Kept resident across SDK
+    # reconnects; Work and broker-owned TUI sessions leave it unset.
+    claude_agents: Any = None
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.

@@ -132,7 +132,7 @@ def test_claude_work_passes_complete_policy_path_without_sdk_replacement(
     command = transport._build_command()
     settings_index = command.index("--settings")
 
-    # SDK 0.2.128 returns inline JSON here whenever options.sandbox is set,
+    # SDK 0.2.142 returns inline JSON here whenever options.sandbox is set,
     # replacing the policy file's complete sandbox object. Work must pass the
     # wrapper-owned file path verbatim instead.
     assert command[settings_index + 1] == str(policy)
@@ -263,7 +263,7 @@ def test_claude_preflight_inspects_effective_bundled_runtime(monkeypatch):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.128",
+            sdk_version="0.2.142",
             cli_version="2.1.220",
             cli_source="bundled",
             cli_path="/sdk/_bundled/claude",
@@ -281,7 +281,7 @@ def test_claude_preflight_inspects_configured_runtime(monkeypatch, tmp_path):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.128",
+            sdk_version="0.2.142",
             cli_version="2.1.220",
             cli_source="configured",
             cli_path=configured,

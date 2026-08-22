@@ -228,6 +228,24 @@ def _tool_meta(name: str, tool_input: dict[str, Any], *, server_tool: bool = Fal
     return "tool", _short_text(tool_input.get("description"), 900) or raw_name, None
 
 
+def _public_tool_input(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded public payload for one tool invocation.
+
+    Agent/Task ``prompt`` is delegated model context, not user-facing process
+    output.  Keep only the small presentation fields already used by the card;
+    an allowlist also fails closed when a future SDK adds new private fields.
+    """
+    if (name or "").lower() not in {"agent", "task"}:
+        value = _redact_sensitive_input(tool_input)
+        return value if isinstance(value, dict) else {}
+    public: dict[str, Any] = {}
+    for key in ("description", "subagent_type", "agent_type"):
+        value = _short_text(tool_input.get(key), 1000)
+        if value:
+            public[key] = value
+    return public
+
+
 def _tool_diff(name: str, tool_input: dict[str, Any], max_chars: int) -> tuple[str | None, bool]:
     """Build a bounded display diff only from the exact Edit/Write payload."""
     lower = (name or "").lower()
@@ -318,6 +336,17 @@ def _tool_diff(name: str, tool_input: dict[str, Any], max_chars: int) -> tuple[s
 
 def _safe_result_content(tool_name: str | None, content: Any) -> Any:
     """Keep MCP user-visible text while dropping opaque/private metadata."""
+    if (tool_name or "").lower() in {"agent", "task"}:
+        # Claude's Agent launch result contains an internal agent id, delegated
+        # prompt and temporary output-file path. None of those are part of the
+        # public cc-remote projection; the dedicated Agent detail endpoint owns
+        # the useful process and final text.
+        text = content if isinstance(content, str) else ""
+        return (
+            "协作代理已启动"
+            if "async agent launched" in text.lower()
+            else "协作代理已完成"
+        )
     if not (tool_name or "").lower().startswith("mcp__"):
         return content
     if isinstance(content, str) or content is None:
@@ -370,8 +399,16 @@ def _task_progress(usage: Any, last_tool_name: str | None = None) -> str | None:
 
 
 def _agent_process_id(tool_id: str) -> str:
-    """Stable process row paired with one Claude Agent/Task tool call."""
-    return _wire_id(f"agent:{tool_id}", "agent")
+    """Stable public run id paired with one Claude Agent/Task tool call."""
+    digest = hashlib.sha256(
+        f"claude-agent\0{tool_id}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+    return f"agent-{digest}"
+
+
+def public_agent_run_id(tool_id: str) -> str:
+    """Public helper shared by live routing and source-backed detail lookup."""
+    return _agent_process_id(_wire_id(tool_id, "tool"))
 
 
 class StreamTranslator:
@@ -493,7 +530,7 @@ class StreamTranslator:
             item_id=item_id, kind="agent", phase=phase, status=status,
             turn_id=self._remember_turn(item_id, tool_id), parent_id=tool_id,
             title=resolved_title, summary=summary, progress=progress,
-            duration_ms=duration_ms,
+            duration_ms=duration_ms, background=True,
         )
 
     def _emit_tool_use(self, events: list, block: ToolUseBlock | ServerToolUseBlock,
@@ -505,7 +542,8 @@ class StreamTranslator:
             return
         parent = _wire_id(parent_id, "tool") if parent_id else None
         redacted_input = _redact_sensitive_input(block.input)
-        safe_input = bounded_tool_input(redacted_input, self.tool_result_max)
+        public_input = _public_tool_input(block.name, block.input)
+        safe_input = bounded_tool_input(public_input, self.tool_result_max)
         category, title, server = _tool_meta(
             block.name, redacted_input, server_tool=server_tool)
         events.append(ToolUse(
@@ -555,7 +593,9 @@ class StreamTranslator:
 
     def _emit_tool_result(self, events: list, tool_use_id: Any, content: Any,
                           is_error: bool = False, summary: str | None = None,
-                          duration_ms: int | None = None) -> None:
+                          duration_ms: int | None = None,
+                          agent_terminal: bool | None = None,
+                          agent_status: str | None = None) -> None:
         self._ambiguous_final_mid = None
         tool_id = _wire_id(tool_use_id, "tool")
         # Fail closed for a result whose ToolUse was omitted/never observed. In
@@ -571,15 +611,26 @@ class StreamTranslator:
         diff_info = self._tool_diffs.pop(tool_id, None)
         diff = diff_info[0] if diff_info and not is_error else None
         truncated = bool(was_truncated or (diff_info and diff_info[1])) or None
+        is_agent = (self._tool_names.get(tool_id) or "").lower() in {
+            "agent", "task"}
+        result_status = (
+            "failed" if is_error else
+            agent_status if is_agent and agent_status else "succeeded"
+        )
         events.append(ToolResult(
             tool_use_id=tool_id, content=text, is_error=bool(is_error),
-            truncated=truncated, status="failed" if is_error else "succeeded",
+            truncated=truncated, status=result_status,
             summary=summary, diff=diff,
         ))
-        if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+        if is_agent and agent_terminal is not False:
             events.append(self._agent_tool_event(
                 tool_id, phase="end",
-                status="failed" if is_error else "succeeded",
+                status=("failed" if is_error else agent_status or "succeeded"),
+                summary=summary, duration_ms=duration_ms,
+            ))
+        elif is_agent:
+            events.append(self._agent_tool_event(
+                tool_id, phase="update", status=agent_status or "running",
                 summary=summary, duration_ms=duration_ms,
             ))
         self._finished_tool_items.add(tool_id)
@@ -780,10 +831,21 @@ class StreamTranslator:
             self._ambiguous_final_mid = None
         for block in content:
             if isinstance(block, ToolResultBlock):
+                raw_status = result_meta.get("status")
+                async_launched = bool(result_meta.get("isAsync")) or (
+                    isinstance(raw_status, str)
+                    and raw_status.lower() == "async_launched"
+                )
+                mapped_status = _task_status(
+                    raw_status if isinstance(raw_status, str) else None)
+                if async_launched:
+                    mapped_status = "running"
                 self._emit_tool_result(
                     events, block.tool_use_id, block.content,
                     bool(block.is_error), summary=summary,
-                    duration_ms=duration_ms)
+                    duration_ms=duration_ms,
+                    agent_terminal=not async_launched,
+                    agent_status=mapped_status if mapped_status != "unknown" else None)
             elif isinstance(block, ServerToolResultBlock):
                 self._emit_tool_result(events, block.tool_use_id, block.content)
         return events
@@ -897,6 +959,7 @@ class StreamTranslator:
                 item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
+                background=True if kind == "agent" else None,
             )]
         if isinstance(msg, TaskProgressMessage):
             return [ProcessEvent(
@@ -904,6 +967,7 @@ class StreamTranslator:
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
+                background=True if kind == "agent" else None,
             )]
         if isinstance(msg, TaskUpdatedMessage):
             status = _task_status(msg.status)
@@ -916,6 +980,7 @@ class StreamTranslator:
                 item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
+                background=True if kind == "agent" else None,
             )]
         if isinstance(msg, TaskNotificationMessage):
             status = _task_status(msg.status)
@@ -924,6 +989,7 @@ class StreamTranslator:
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
+                background=True if kind == "agent" else None,
             )]
         return []
 
@@ -2196,22 +2262,42 @@ def translate_history(
                         tool_id = _history_id(
                             b.get("tool_use_id"), "tool",
                             f"{message_index}-{block_index}-result")
+                        raw_result_content = b.get("content")
                         text, was_truncated = bounded_text(
                             _safe_result_content(
-                                history_tool_names.get(tool_id), b.get("content")),
+                                history_tool_names.get(tool_id), raw_result_content),
                             tool_result_max)
                         diff_info = history_tool_diffs.pop(tool_id, None)
                         is_error = bool(b.get("is_error"))
                         truncated = bool(
                             was_truncated or (diff_info and diff_info[1])) or None
+                        agent_result = (history_tool_names.get(tool_id) or "").lower() in {
+                            "agent", "task"}
+                        result_text = (
+                            raw_result_content
+                            if isinstance(raw_result_content, str) else ""
+                        )
+                        async_launched = agent_result and (
+                            "async agent launched" in result_text.lower()
+                        )
                         events.append(ToolResult(
                             tool_use_id=tool_id,
                             content=text,
                             is_error=is_error,
                             truncated=truncated,
-                            status="failed" if is_error else "succeeded",
+                            status=("failed" if is_error else
+                                    "running" if async_launched else "succeeded"),
                             diff=diff_info[0] if diff_info and not is_error else None,
                         ))
+                        if agent_result:
+                            events.append(ProcessEvent(
+                                item_id=_agent_process_id(tool_id), kind="agent",
+                                phase=("update" if async_launched else "end"),
+                                status=("failed" if is_error else
+                                        "running" if async_launched else "succeeded"),
+                                turn_id=current_turn_id, parent_id=tool_id,
+                                title="协作代理", background=True,
+                            ))
                     elif bt == "text":
                         txt = b.get("text", "")
                         if txt and not _is_meta_user_text(txt):
@@ -2322,6 +2408,8 @@ def translate_history(
                         f"{message_index}-{block_index}-use")
                     server_tool = bt == "server_tool_use"
                     redacted_input = _redact_sensitive_input(raw_input)
+                    public_input = _public_tool_input(
+                        b.get("name") or "", raw_input)
                     category, title, server = _tool_meta(
                         b.get("name") or "", redacted_input,
                         server_tool=server_tool)
@@ -2329,11 +2417,18 @@ def translate_history(
                         message_id=mid,
                         tool_use_id=tool_id,
                         tool=b.get("name") or "",
-                        input=bounded_tool_input(redacted_input, tool_result_max),
+                        input=bounded_tool_input(public_input, tool_result_max),
                         category=category, title=title, parent_id=parent,
                         server=server,
                     ))
                     history_tool_names[tool_id] = b.get("name") or ""
+                    if category == "agent":
+                        events.append(ProcessEvent(
+                            item_id=_agent_process_id(tool_id), kind="agent",
+                            phase="start", status="running",
+                            turn_id=current_turn_id, parent_id=tool_id,
+                            title=title, background=True,
+                        ))
                     diff, diff_truncated = _tool_diff(
                         b.get("name") or "", raw_input, tool_result_max)
                     if diff:
@@ -2366,21 +2461,41 @@ def translate_history(
                     tool_id = _history_id(
                         b.get("tool_use_id"), "tool",
                         f"{message_index}-{block_index}-assistant-result")
+                    raw_result_content = b.get("content")
                     text, was_truncated = bounded_text(
                         _safe_result_content(
-                            history_tool_names.get(tool_id), b.get("content")),
+                            history_tool_names.get(tool_id), raw_result_content),
                         tool_result_max)
                     result_type = (b.get("content") or {}).get("type", "") if isinstance(
                         b.get("content"), dict) else ""
                     is_error = bool(b.get("is_error")) or "error" in str(result_type).lower()
                     diff_info = history_tool_diffs.pop(tool_id, None)
+                    agent_result = (history_tool_names.get(tool_id) or "").lower() in {
+                        "agent", "task"}
+                    result_text = (
+                        raw_result_content
+                        if isinstance(raw_result_content, str) else ""
+                    )
+                    async_launched = agent_result and (
+                        "async agent launched" in result_text.lower()
+                    )
                     events.append(ToolResult(
                         tool_use_id=tool_id, content=text, is_error=is_error,
-                        status="failed" if is_error else "succeeded",
+                        status=("failed" if is_error else
+                                "running" if async_launched else "succeeded"),
                         truncated=bool(
                             was_truncated or (diff_info and diff_info[1])) or None,
                         diff=diff_info[0] if diff_info and not is_error else None,
                     ))
+                    if agent_result:
+                        events.append(ProcessEvent(
+                            item_id=_agent_process_id(tool_id), kind="agent",
+                            phase=("update" if async_launched else "end"),
+                            status=("failed" if is_error else
+                                    "running" if async_launched else "succeeded"),
+                            turn_id=current_turn_id, parent_id=tool_id,
+                            title="协作代理", background=True,
+                        ))
             if thinking_started:
                 events.append(AssistantMsgEnd(
                     message_id=thinking_mid, channel="thinking"))
@@ -2416,25 +2531,20 @@ def _parse_timestamp(value: Any) -> float | None:
 
 
 def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
-    """Recover bounded Claude subagent timelines omitted by SessionMessage.
+    """Recover only lightweight Claude Agent lifecycle cards.
 
-    Claude stores each subagent below ``<session>/subagents/agent-*.jsonl``.
-    The SDK's ``get_session_messages`` intentionally returns only the main chain,
-    so process history would otherwise disappear after reload. We correlate each
-    agentId through the main Agent/Task tool result, omit the private initial
-    subagent prompt, and reuse ``translate_history`` for the public assistant/tool
-    blocks. Uncorrelated files are skipped rather than creating phantom turns.
+    Full subagent conversations belong to ``GetAgentDetail`` and must never be
+    flattened back into the parent turn.  The main transcript is authoritative
+    for launch/notification state; EOF without a terminal is deliberately
+    ``unknown`` rather than a fabricated success.
     """
     main_path = transcript_path(session_id)
     if not main_path:
         return []
-    subagent_dir = os.path.join(os.path.splitext(main_path)[0], "subagents")
-    if not os.path.isdir(subagent_dir):
-        return []
 
-    tool_turns: dict[str, str] = {}
-    tool_titles: dict[str, str] = {}
+    records: dict[str, dict[str, Any]] = {}
     agent_tools: dict[str, str] = {}
+    order: list[str] = []
     current_turn: str | None = None
     try:
         with open(main_path, encoding="utf-8") as source:
@@ -2468,8 +2578,55 @@ def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
                             block.get("tool_use_id") for block in (content or [])
                             if isinstance(block, dict) and block.get("type") == "tool_result"
                         ), None) if isinstance(content, list) else None
-                        if agent_id and tool_id:
-                            agent_tools[str(agent_id)] = _wire_id(tool_id, "tool")
+                        if agent_id:
+                            agent_key = str(agent_id)
+                            known_tool = agent_tools.get(agent_key)
+                            candidate = _wire_id(tool_id, "tool") if tool_id else None
+                            if known_tool is None and candidate in records:
+                                known_tool = candidate
+                                agent_tools[agent_key] = candidate
+                            if known_tool is not None:
+                                record = records[known_tool]
+                                record["agent_id"] = agent_key
+                                title = _short_text(
+                                    result_meta.get("description"), 1000)
+                                if title:
+                                    record["title"] = title
+                                raw_status = result_meta.get("status")
+                                if (bool(result_meta.get("isAsync"))
+                                        or str(raw_status).lower()
+                                        == "async_launched"):
+                                    # The same agent can resume after an earlier
+                                    # notification. A later launch re-opens the
+                                    # same public run rather than creating a ghost.
+                                    record["async"] = True
+                                    record["terminal"] = None
+                    origin = row.get("origin")
+                    if (isinstance(origin, dict)
+                            and origin.get("kind") == "task-notification"
+                            and isinstance(content, str)):
+                        task_match = re.search(
+                            r"<task-id>([^<]{1,256})</task-id>", content)
+                        tool_match = re.search(
+                            r"<tool-use-id>([^<]{1,256})</tool-use-id>", content)
+                        status_match = re.search(
+                            r"<status>([^<]{1,64})</status>", content)
+                        summary_match = re.search(
+                            r"<summary>([\s\S]{0,65536}?)</summary>", content)
+                        agent_key = task_match.group(1) if task_match else None
+                        parent = (
+                            _wire_id(tool_match.group(1), "tool")
+                            if tool_match else agent_tools.get(agent_key or "")
+                        )
+                        if parent in records:
+                            record = records[parent]
+                            record["terminal"] = _task_status(
+                                status_match.group(1) if status_match else None)
+                            record["terminal_ts"] = _parse_timestamp(
+                                row.get("timestamp"))
+                            if summary_match:
+                                record["summary"] = _short_text(
+                                    summary_match.group(1), 64 * 1024)
                 elif role == "assistant" and isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -2478,149 +2635,66 @@ def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
                             continue
                         tool_id = _wire_id(
                             block.get("id"), "tool", f"{index}-agent")
-                        if current_turn:
-                            tool_turns[tool_id] = current_turn
                         tool_input = block.get("input") if isinstance(
                             block.get("input"), dict) else {}
-                        tool_titles[tool_id] = (
+                        if tool_id not in records:
+                            order.append(tool_id)
+                        records[tool_id] = {
+                            **records.get(tool_id, {}),
+                            "tool_id": tool_id,
+                            "turn": current_turn,
+                            "start_ts": _parse_timestamp(row.get("timestamp")),
+                            "async": records.get(tool_id, {}).get("async", False),
+                            "terminal": records.get(tool_id, {}).get("terminal"),
+                            "title": (
                             _short_text(tool_input.get("description"), 1000)
                             or _short_text(tool_input.get("subagent_type"), 1000)
-                            or "协作代理")
+                            or "协作代理"),
+                        }
     except (OSError, UnicodeError):
         return []
 
-    paths = sorted(glob.iglob(os.path.join(subagent_dir, "agent-*.jsonl")))
     events: list = []
-    total_bytes = 0
-    for file_index, path in enumerate(paths[:_MAX_SUBAGENT_FILES]):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
+    for tool_id in order[:_MAX_SUBAGENT_FILES]:
+        record = records[tool_id]
+        if not record.get("turn") or not record.get("async"):
             continue
-        total_bytes += size
-        if size > _MAX_SUBAGENT_TOTAL_BYTES or total_bytes > _MAX_SUBAGENT_TOTAL_BYTES:
-            break
-        raw_rows = []
-        agent_id = None
-        timestamps: dict[str, float] = {}
-        first_ts = last_ts = None
-        final_summary = None
-        try:
-            with open(path, encoding="utf-8") as source:
-                for row_index, line in enumerate(_bounded_jsonl_lines(source)):
-                    try:
-                        row = json.loads(line)
-                    except Exception:
-                        continue
-                    if not agent_id and row.get("agentId"):
-                        agent_id = str(row.get("agentId"))
-                    uid = _wire_id(
-                        row.get("uuid"), "msg", f"{file_index}-{row_index}")
-                    ts = _parse_timestamp(row.get("timestamp"))
-                    if ts is not None:
-                        timestamps[uid] = ts
-                        first_ts = ts if first_ts is None else min(first_ts, ts)
-                        last_ts = ts if last_ts is None else max(last_ts, ts)
-                    msg = row.get("message") if isinstance(
-                        row.get("message"), dict) else None
-                    if not msg:
-                        continue
-                    content = msg.get("content")
-                    role = msg.get("role") or row.get("type")
-                    # The private delegated prompt is already present in the
-                    # parent Agent tool input. Do not render it a second time.
-                    if role == "user" and not (
-                            isinstance(content, list) and any(
-                                isinstance(block, dict)
-                                and block.get("type") == "tool_result"
-                                for block in content)):
-                        continue
-                    if role == "assistant" and isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                candidate = _short_text(block.get("text"), 4096)
-                                if candidate:
-                                    final_summary = candidate
-                    raw_rows.append(SimpleNamespace(
-                        uuid=uid,
-                        type=role,
-                        message=msg,
-                        # Nest all internal tools under the agent process row.
-                        parent_tool_use_id=None,
-                    ))
-        except (OSError, UnicodeError):
-            continue
-        if not agent_id:
-            match = re.fullmatch(r"agent-([A-Za-z0-9._:@-]+)\.jsonl", os.path.basename(path))
-            agent_id = match.group(1) if match else None
-        parent = agent_tools.get(agent_id or "")
-        turn = tool_turns.get(parent or "")
-        if not parent or not turn:
-            continue
-        agent_item = _wire_id(f"agent:{agent_id}", "agent")
-        title = tool_titles.get(parent, "协作代理")
-        start = ProcessEvent(
-            item_id=agent_item, kind="agent", phase="start", status="running",
-            turn_id=turn, parent_id=parent, title=title,
+        status = record.get("terminal")
+        terminal = status in {"succeeded", "failed", "cancelled"}
+        event = ProcessEvent(
+            item_id=_agent_process_id(tool_id), kind="agent",
+            phase="end" if terminal else "snapshot",
+            status=status if terminal else "unknown",
+            turn_id=record["turn"], parent_id=tool_id,
+            title=record.get("title") or "协作代理",
+            summary=(record.get("summary") if terminal
+                     else "未收到结束信号"),
+            background=True,
         )
-        if first_ts is not None:
-            start.ts = first_ts
-        sequence = [start]
-        translated = translate_history(
-            raw_rows, tool_result_max, timestamps=timestamps)
-        for event in translated:
-            if isinstance(event, TurnEnd) or isinstance(event, UserMsg):
-                continue
-            if isinstance(event, (AssistantMsgStart, Delta, AssistantMsgEnd)):
-                if event.channel != "thinking":
-                    event.channel = "commentary"
-            if isinstance(event, ToolUse):
-                event.parent_id = agent_item
-            if isinstance(event, ProcessEvent):
-                event.turn_id = turn
-                event.parent_id = event.parent_id or agent_item
-            sequence.append(event)
-        end = ProcessEvent(
-            item_id=agent_item, kind="agent", phase="end", status="succeeded",
-            turn_id=turn, parent_id=parent, title=title, summary=final_summary,
-        )
-        if last_ts is not None:
-            end.ts = last_ts
-        sequence.append(end)
-        if len(events) + len(sequence) > _MAX_SUBAGENT_EVENTS:
-            break
-        events.extend(sequence)
+        start_ts = record.get("start_ts")
+        end_ts = record.get("terminal_ts")
+        if isinstance(start_ts, float) and isinstance(end_ts, float):
+            event.duration_ms = max(0, round((end_ts - start_ts) * 1000))
+        if isinstance(end_ts, float):
+            event.ts = end_ts
+        events.append(event)
     return events
 
 
 def merge_subagent_history(events: list, subagent_events: list) -> list:
-    """Insert each recovered agent timeline immediately below its Agent tool."""
+    """Insert recovered lifecycle refinements below their Agent tool call."""
     if not subagent_events:
         return events
-    groups: dict[str, list[list]] = {}
-    current: list | None = None
-    current_parent = None
+    groups: dict[str, list] = {}
     for event in subagent_events:
         if (isinstance(event, ProcessEvent) and event.kind == "agent"
-                and event.phase == "start"):
-            current = [event]
-            current_parent = event.parent_id
-            continue
-        if current is None:
-            continue
-        current.append(event)
-        if (isinstance(event, ProcessEvent) and event.kind == "agent"
-                and event.phase == "end"):
-            if current_parent:
-                groups.setdefault(current_parent, []).append(current)
-            current = None
-            current_parent = None
+                and event.parent_id):
+            groups.setdefault(event.parent_id, []).append(event)
     merged = []
     for event in events:
         merged.append(event)
         if isinstance(event, ToolUse):
-            for sequence in groups.pop(event.tool_use_id, []):
-                merged.extend(sequence)
+            merged.extend(groups.pop(event.tool_use_id, []))
     return merged
 
 

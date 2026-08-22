@@ -17,7 +17,9 @@ const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
 // v4 preserves a payload-free context-compaction identity shell. Older page
 // records can otherwise turn a repaired compact orphan into an unprovable
 // empty row after a hard refresh, so they must be rebuilt from History.
-const RECORD_VERSION = 4;
+// v5 stores v36's exact/unknown process-detail state. A v4 page can only infer
+// process presence from a generic deferred-event count and is unsafe to paint.
+const RECORD_VERSION = 5;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;
@@ -31,7 +33,7 @@ export interface HistoryPageCacheScope extends HistoryPageCacheSessionScope {
 }
 
 export interface HistoryPageCacheStoredRecord {
-  version: 1 | 2 | 3 | typeof RECORD_VERSION;
+  version: 1 | 2 | 3 | 4 | typeof RECORD_VERSION;
   key: string;
   scopeKey: string;
   sessionKey: string;
@@ -143,6 +145,8 @@ function sanitizeTurn(turn: Turn): Turn {
     // GetTurnDetail. Keeping their stripped shells produced dozens of
     // expandable "运行命令" rows with empty bodies after an IndexedDB paint.
     blocks: summaryBlocks,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
     // Summary pages keep canonical metadata only. Attachment bytes are fetched
     // lazily through GetHistoryImage when this row re-enters the viewport.
     images: undefined,

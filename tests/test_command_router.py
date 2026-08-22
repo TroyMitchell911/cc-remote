@@ -43,6 +43,7 @@ EXPECTED_COMMAND_HANDLERS = {
     "authorize_preview": "_handle_authorize_preview",
     "get_history": "_handle_get_history",
     "get_turn_detail": "_handle_get_turn_detail",
+    "get_agent_detail": "_handle_get_agent_detail",
     "get_history_image": "_handle_get_history_image",
     "get_models": "_handle_get_models",
     "get_engine_capabilities": "_handle_get_engine_capabilities",

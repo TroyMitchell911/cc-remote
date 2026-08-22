@@ -894,6 +894,22 @@ export class RelayWs {
     return this.send(frame);
   }
 
+  sendGetAgentDetail(
+    sessionId: string, runId: string, revision?: string | null,
+    detailRevision?: string | null, before?: string | null, limit = 192,
+    requestId = uuid(),
+  ): string | null {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_agent_detail",
+      session_id: sessionId, run_id: runId, request_id: requestId,
+      client_id: this.clientId, limit, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    if (detailRevision) frame.detail_revision = detailRevision;
+    if (before) frame.before = before;
+    return this.send(frame) ? requestId : null;
+  }
+
   sendGetHistoryImage(
     sessionId: string,
     turnId: string,

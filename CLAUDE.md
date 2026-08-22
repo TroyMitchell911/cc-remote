@@ -24,7 +24,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.128`**: message-type shapes and the
+- **SDK pinned to `claude-agent-sdk==0.2.142`**: message-type shapes and the
   interrupt/drain contract can shift between minor versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
   the major/minor at startup).
@@ -35,7 +35,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.128). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.142). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
@@ -66,7 +66,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v35 is declared by
+- **Protocol version gate**: current wire protocol v37 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all

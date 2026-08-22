@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v35
+**当前版本：v3.0.0** · Wire protocol v37
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -485,12 +485,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v35**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v37**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v35 relay 和
-> v35 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v37 relay 和
+> v37 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
 > 版本跨级升级，仍须执行 v34 引入的 Work SQLite 迁移保护：启动新 wrapper 前用
 > `deploy/work_registry_snapshot.py snapshot` 保存两个注册表。回滚时先停新版本、恢复
 > 该快照，再切回旧代码；不要在 wrapper 运行时只复制主 `.sqlite3` 文件而漏掉 WAL。
@@ -547,7 +547,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v35 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v37 wrapper。
 
 验证：
 

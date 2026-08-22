@@ -43,11 +43,10 @@ import {
 } from "./components/NewChatView";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { StatusSheet } from "./components/StatusSheet";
-import { UsageActivitySheet } from "./components/UsageActivitySheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
-import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
+import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
@@ -73,6 +72,7 @@ import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor, type Catalog } from "./data";
 import {
   normalizeSessionList,
+  scopedFocusForSessionList,
   shouldAcceptSessionList,
   updateScopedSessionLifecycle,
 } from "./session-list";
@@ -112,8 +112,8 @@ import { parseGitDiff } from "./diff";
 import { resolveSidebarSwipe } from "./responsive-layout";
 import {
   bumpSessionActivity,
-  compareSessionsByActivity,
   mergeSessionActivityState,
+  selectSurfaceSession,
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
@@ -224,7 +224,12 @@ import {
   readEngineSpaces,
   rememberEngineSpace,
 } from "./surface-preferences";
-import { exactActiveTurnId } from "./process-blocks";
+import {
+  activeTurnCandidateIds,
+  displayActiveTurnOwnerId,
+} from "./process-blocks";
+import type { AgentDetail } from "./protocol";
+import type { AgentDetailSelection } from "./components/AgentDetailController";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -237,6 +242,15 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
+const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
+  ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
+));
+const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").then(
+  ({ CapabilitiesSheet: Sheet }) => ({ default: Sheet }),
+));
+const AgentDetailController = lazy(() => import("./components/AgentDetailController").then(
+  ({ AgentDetailController: Controller }) => ({ default: Controller }),
 ));
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
@@ -280,11 +294,23 @@ export default function App() {
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
+  // A cold Work/Code or engine switch has no trustworthy row to paint until
+  // its scoped SessionList arrives. Keep that gap non-interactive: rendering a
+  // default `~` composer here can create a real session in the wrong cwd before
+  // the wrapper has had a chance to restore the remembered conversation.
+  const [restoringSurfaceScope, setRestoringSurfaceScope] =
+    useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
   // right slot is shared by diff + /btw; rightView picks which shows.
   const [rightView, setRightView] = useState<"diff" | "btw">("diff");
+  const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
+  const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
+  const setAgentDetailListener = useCallback(
+    (listener: ((message: AgentDetail) => void) | null) => {
+      agentDetailListenerRef.current = listener;
+    }, []);
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpeningByParentSid, setBtwOpeningByParentSid] = useState<Record<string, boolean>>({});
@@ -657,6 +683,7 @@ export default function App() {
     preferredSurfaceFocusRef.current = null;
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
+    setRestoringSurfaceScope(null);
     sessionActivityPendingRef.current.clear();
     skillCatalogsRef.current = {};
     skillCatalogRequestsRef.current?.reset();
@@ -788,6 +815,9 @@ export default function App() {
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  useEffect(() => {
+    setAgentPanel(null);
+  }, [activeScopeKey, focusedSid, focusedEngine, space, rt.historyRevision]);
   const focusedCodexProfileId = focusedEngine === "codex"
     ? focusedSession?.codex_profile_id
       ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
@@ -1494,32 +1524,52 @@ export default function App() {
     if (!preserveAuthority) {
       authoritativeSurfaceListsRef.current.delete(surfaceKey);
     }
+    const cachedSessions = sessionListsBySurfaceRef.current[surfaceKey] ?? [];
     dispatch({
       type: "restore_session_list",
-      sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
+      sessions: cachedSessions,
     });
     const remembered = lastFocusBySurfaceRef.current[focusScopeKey];
+    const immediate = preserveAuthority
+      ? null : selectSurfaceSession(cachedSessions, remembered);
     preferredSurfaceFocusRef.current = preserveAuthority
       ? null
       : remembered ? { key: focusScopeKey, sid: remembered } : null;
     didInitFocusRef.current = preserveAuthority;
-    wsRef.current?.setSurface(nextEngine, nextSpace);
-    wsRef.current?.setFocusedSid(null);
-    // Keep the previous surface's transcript out of view while its accepted
-    // list is restored. The focus effect below exits this temporary new page as
-    // soon as the remembered (or latest valid) session is available.
-    const current = stateRef.current;
-    dispatch({
-      type: "enter_new_chat",
-      cwd: "~",
-      cwdSource: "default",
-      codexProfileId: nextEngine === "codex"
-        ? current.codexProfileByScope[focusScopeKey]
-          ?? current.defaultCodexProfileId
-        : null,
-    });
+    const ws = wsRef.current;
+    ws?.setSurface(nextEngine, nextSpace);
+    if (immediate) {
+      // The cached list is scoped to this machine+engine+space. Paint its exact
+      // remembered row synchronously; the accepted list still validates it and
+      // clears/falls back if another client deleted it meanwhile.
+      dispatch({ type: "exit_new_chat" });
+      dispatch({ type: "focus_session", sid: immediate.session_id });
+      ws?.setFocusedSid(immediate.session_id, nextEngine, nextSpace);
+      requestHistory(
+        immediate.session_id, undefined, HISTORY_INITIAL_PAGE);
+      ws?.sendSwitchSession(immediate.session_id, nextEngine, nextSpace);
+      if (nextSpace === "work") {
+        ws?.sendGetWorkArtifacts(nextEngine, immediate.session_id);
+      }
+      setRestoringSurfaceScope(null);
+    } else {
+      // Do not expose a sendable home-directory draft while the target
+      // catalog is still unknown. The accepted list either restores a session
+      // or, only after confirming it is empty, creates the scoped default
+      // draft in the initial-focus effect below.
+      ws?.setFocusedSid(null);
+      dispatch({ type: "exit_new_chat" });
+      setRestoringSurfaceScope(focusScopeKey);
+    }
     setNewChatAutoFocus(false);
-  }, [clearForkFocusLease, engine, machineId, rememberSurfaceFocus, space]);
+  }, [
+    clearForkFocusLease,
+    engine,
+    machineId,
+    rememberSurfaceFocus,
+    requestHistory,
+    space,
+  ]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
@@ -1529,6 +1579,14 @@ export default function App() {
       || selected.space === "code"
       ? selected.space : spaceRef.current;
     const id = selected.session_id;
+    const focusScopeKey = sessionScopeKey(
+      machineId, selectedEngine, selectedSpace);
+    // The click is newer than any surface-restore intent already in flight.
+    // Claim the target synchronously because a SessionList can arrive before
+    // React commits the focus_session dispatch below.
+    didInitFocusRef.current = true;
+    preferredSurfaceFocusRef.current = null;
+    lastFocusBySurfaceRef.current[focusScopeKey] = id;
     if (forkFocusLeaseRef.current?.childSessionId !== id) {
       clearForkFocusLease(false);
     }
@@ -1539,6 +1597,7 @@ export default function App() {
     setWorkArtifactsOpen(false);
     dispatch({ type: "exit_new_chat" });
     dispatch({ type: "focus_session", sid: id });
+    setRestoringSurfaceScope(null);
     wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
     requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
     wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
@@ -1546,7 +1605,7 @@ export default function App() {
       wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
     }
     if (isMobile()) setSidebarOpen(false);
-  }, [clearForkFocusLease, requestHistory]);
+  }, [clearForkFocusLease, machineId, requestHistory]);
 
   useEffect(() => {
     const target = pendingNotificationTarget;
@@ -1600,6 +1659,7 @@ export default function App() {
             }
           : null;
         didInitFocusRef.current = false;
+        setRestoringSurfaceScope(null);
         setEngine(origin.engine);
         setSpace(origin.space);
         setMachineId(origin.machineId);
@@ -2809,9 +2869,19 @@ export default function App() {
               && !shouldAcceptSessionList(engineRef.current, spaceRef.current, msg)) return;
           if (msg.type === "session_list") {
             const currentSid = stateRef.current.focusedSid;
-            if (currentSid && !currentSid.startsWith("tmp-")
+            const listedSpace = msg.space ?? "code";
+            const listedScopeKey = sessionScopeKey(
+              machineId, msg.engine, listedSpace);
+            const scopedCurrentSid = scopedFocusForSessionList(
+              currentSid,
+              stateRef.current.sessions,
+              lastFocusBySurfaceRef.current[listedScopeKey],
+              msg.engine,
+              listedSpace,
+            );
+            if (scopedCurrentSid && !scopedCurrentSid.startsWith("tmp-")
                 && !normalizedListedSessions?.some(
-                  (session) => session.session_id === currentSid)) {
+                  (session) => session.session_id === scopedCurrentSid)) {
               didInitFocusRef.current = false;
               preferredSurfaceFocusRef.current = null;
             }
@@ -2825,6 +2895,12 @@ export default function App() {
               || (msg.type === "error"
                 && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
             );
+          if (msg.type === "agent_detail") {
+            agentDetailListenerRef.current?.(msg);
+            // Requester-scoped details never belong in the conversation
+            // reducer or another browser's side panel.
+            return;
+          }
           if (msg.type === "session_list" && normalizedListedSessions) {
             dispatch({ type: "event", event: {
               ...msg, sessions: normalizedListedSessions,
@@ -3008,6 +3084,8 @@ export default function App() {
         },
         onWrapperGenerationChanged: () => {
           if (!acceptsLifecycle()) return;
+          setAgentPanel(null);
+          agentDetailListenerRef.current = null;
           clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
@@ -3083,9 +3161,35 @@ export default function App() {
     const focusScopeKey = sessionScopeKey(
       machineId, engineRef.current, spaceRef.current);
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
+    // A directory chosen in New Chat is an explicit user destination. A
+    // reconnect/list refresh may validate the catalog, but it must not navigate
+    // away from that draft. Cold surface restoration clears the old surface's
+    // draft first, so it is deliberately excluded from this guard.
+    if (state.newChat?.cwdSource === "explicit"
+        && restoringSurfaceScope !== focusScopeKey) {
+      preferredSurfaceFocusRef.current = null;
+      didInitFocusRef.current = true;
+      return;
+    }
     if (state.sessions.length === 0) {
       preferredSurfaceFocusRef.current = null;
       didInitFocusRef.current = true;
+      const current = stateRef.current;
+      if (!current.newChat) {
+        const inheritedCwd = current.cwdByScope[focusScopeKey];
+        dispatch({
+          type: "enter_new_chat",
+          cwd: inheritedCwd || "~",
+          cwdSource: inheritedCwd ? "inherited" : "default",
+          codexProfileId: engineRef.current === "codex"
+            ? current.codexProfileByScope[focusScopeKey]
+              ?? current.defaultCodexProfileId
+            : null,
+        });
+      }
+      setRestoringSurfaceScope((scope) => (
+        scope === focusScopeKey ? null : scope
+      ));
       return;
     }
     const preferred = preferredSurfaceFocusRef.current?.key === focusScopeKey
@@ -3096,10 +3200,7 @@ export default function App() {
         ))
       : undefined;
     preferredSurfaceFocusRef.current = null;
-    const latest = preferred ?? [...state.sessions]
-      .filter((s) => s.tag !== "archived")
-      .sort(compareSessionsByActivity)[0]
-      ?? state.sessions[0];
+    const latest = preferred ?? selectSurfaceSession(state.sessions);
     didInitFocusRef.current = true;
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
@@ -3110,9 +3211,14 @@ export default function App() {
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
       wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
     }
+    setRestoringSurfaceScope((scope) => (
+      scope === focusScopeKey ? null : scope
+    ));
   }, [
     machineId,
     pendingNotificationTarget,
+    restoringSurfaceScope,
+    state.newChat,
     state.sessions,
     state.focusedSid,
     requestHistory,
@@ -3920,7 +4026,8 @@ export default function App() {
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
-    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing) {
+    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
+        || restoringSurfaceScope === activeScopeKey) {
       return false;
     }
     const { cwd, cwdSource, model, effort } = state.newChat;
@@ -4181,11 +4288,12 @@ export default function App() {
     targetSid: string | null,
     file: string,
     line?: number,
-  ) => {
-    if (!targetSid) return;
-    if (!confirmArtifactDiscard()) return;
+  ): boolean => {
+    if (!targetSid) return false;
+    if (!confirmArtifactDiscard()) return false;
     const requestId = uuid();
-    if (!wsRef.current?.sendGetFilePreview(file, requestId, targetSid)) return;
+    if (!wsRef.current?.sendGetFilePreview(
+      file, requestId, targetSid)) return false;
     setRightView("diff");
     dispatch({
       type: "open_file_loading",
@@ -4195,11 +4303,23 @@ export default function App() {
       kind: isMarkdownPath(file) ? "md" : "file",
       line,
     });
+    return true;
   };
   const previewFile = (file: string, line?: number) =>
     previewFileForSid(focusedSid, file, line);
   const previewBtwFile = (file: string, line?: number) =>
     previewFileForSid(activeBtwSid, file, line);
+
+  const openAgentDetail = (runId: string, title?: string) => {
+    if (!focusedSid || focusedEngine !== "claude" || space !== "code"
+        || !rt.historyRevision) return;
+    setAgentPanel({ sid: focusedSid, revision: rt.historyRevision,
+      runId, title: title || "协作代理" });
+  };
+  const previewAgentFile = (file: string, line?: number) => {
+    if (previewFileForSid(focusedSid, file, line)) setAgentPanel(null);
+  };
+
   const previewArtifactFile = (file: string, line?: number) =>
     previewFileForSid(state.artifact?.sid ?? focusedSid, file, line);
   const previewMarkdown = (file: string) => previewFile(file);
@@ -4425,6 +4545,7 @@ export default function App() {
       setBtwOpeningByParentSid({});
       setCompletionReceipts({});
       dispatch({ type: "reset" });
+      setRestoringSurfaceScope(null);
       setAuthed(false);
     } catch {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
@@ -4462,15 +4583,21 @@ export default function App() {
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
-  const activeTurnId = exactActiveTurnId(
+  const activeTurnCandidates = activeTurnCandidateIds(
     historyView.turns,
-    rt.liveOwner?.turnId,
+    displayActiveTurnOwnerId(
+      rt.liveOwner?.turnId, rt.acceptancePending),
     !historyView.browsing && !historyView.recovering
-      && (rt.state !== "idle" || rt.mirroredRunning),
+      && (rt.state !== "idle" || rt.mirroredRunning
+        || !!rt.acceptancePending),
   );
+  const activeTurnId = activeTurnCandidates.length === 1
+    ? activeTurnCandidates[0] : null;
+  const ambiguousActiveTurnIds = activeTurnCandidates.length > 1
+    ? activeTurnCandidates : [];
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening || agentPanel) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <SessionsSidebar
         open={sidebarOpen}
         engine={engine}
@@ -4496,8 +4623,8 @@ export default function App() {
           const selected = state.sessions.find((s) => s.session_id === id);
           if (selected) focusListedSession(selected);
         }}
-        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -4630,7 +4757,12 @@ export default function App() {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
           }} />
 
-        {state.newChat ? (
+        {restoringSurfaceScope === activeScopeKey ? (
+          <div className="empty" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span className="loading-tx">正在恢复会话</span>
+          </div>
+        ) : state.newChat ? (
           <NewChatView cwd={state.newChat.cwd}
             controlScopeKey={engine === "codex"
               ? `${activeScopeKey}\u0000${newChatCodexProfileId ?? "__default__"}`
@@ -4719,6 +4851,9 @@ export default function App() {
                 itemId: planProgress.block.item_id,
               } : null}
               activeTurnId={activeTurnId}
+              ambiguousActiveTurnIds={ambiguousActiveTurnIds}
+              onOpenAgent={focusedEngine === "claude" && space === "code"
+                ? openAgentDetail : undefined}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 
@@ -4886,6 +5021,7 @@ export default function App() {
           contextReport={rt.contextReport}
           contextError={rt.contextError}
           statusReport={rt.statusReport}
+          rateLimits={rt.rateLimits}
           statusError={rt.statusError}
           statusLoading={rt.statusRequestId !== null}
         />
@@ -4895,6 +5031,16 @@ export default function App() {
       </section>
       {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
       {(() => {
+        if (agentPanel) {
+          return <Suspense fallback={null}>
+            <AgentDetailController
+              key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
+              selection={agentPanel} ws={wsRef.current}
+              onListen={setAgentDetailListener}
+              onClose={() => setAgentPanel(null)}
+              onOpenFile={previewAgentFile} />
+          </Suspense>;
+        }
         const btwShowing = !!activeBtw || btwOpening;
         const view = rightView === "btw" && btwShowing ? "btw"
           : state.artifact ? "diff" : btwShowing ? "btw" : null;
@@ -4954,6 +5100,7 @@ export default function App() {
             </div>
           }>
             <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
+              theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
               onAuthorizePreview={authorizePreview}
@@ -5002,15 +5149,17 @@ export default function App() {
         onDismissNotice={(noticeId) => {
           if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
         }} />
-      <UsageActivitySheet
-        open={usageActivityOpen && engine === "codex"}
-        report={rt.statusReport}
-        error={rt.statusError}
-        loading={rt.statusRequestId !== null}
-        hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
-        onClose={() => setUsageActivityOpen(false)}
-        onRefresh={refreshStatus}
-      />
+      {usageActivityOpen && engine === "codex" && <Suspense fallback={null}>
+        <UsageActivitySheet
+          open
+          report={rt.statusReport}
+          error={rt.statusError}
+          loading={rt.statusRequestId !== null}
+          hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
+          onClose={() => setUsageActivityOpen(false)}
+          onRefresh={refreshStatus}
+        />
+      </Suspense>}
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
@@ -5042,6 +5191,7 @@ export default function App() {
         artifacts={currentWorkArtifacts}
         onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
         onClose={() => setWorkArtifactsOpen(false)} />
+      <Suspense fallback={null}>
       <CapabilitiesSheet open={capabilitiesOpen}
         engine={focusedEngine}
         activeKind={capabilitiesKind}
@@ -5121,6 +5271,7 @@ export default function App() {
           });
         }}
         onClose={() => setCapabilitiesOpen(false)} />
+      </Suspense>
       <DeviceSheet open={deviceSheetOpen}
         currentId={machineId}
         devices={remoteDevices}

@@ -39,7 +39,11 @@ import {
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
-import { exactActiveTurnId } from "../process-blocks";
+import {
+  activeTurnCandidateIds,
+  displayActiveTurnOwnerId,
+} from "../process-blocks";
+import { PanelResizer } from "./PanelResizer";
 
 interface Props {
   sid?: string;
@@ -99,11 +103,17 @@ export function BtwPanel(p: Props) {
   const input = draft.input;
   const turns = p.rt?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
-  const activeTurnId = exactActiveTurnId(
+  const activeTurnCandidates = activeTurnCandidateIds(
     turns,
-    p.rt?.liveOwner?.turnId,
-    runtimeState !== "idle" || p.rt?.mirroredRunning === true,
+    displayActiveTurnOwnerId(
+      p.rt?.liveOwner?.turnId,
+      p.rt?.acceptancePending,
+    ),
+    runtimeState !== "idle" || p.rt?.mirroredRunning === true
+      || !!p.rt?.acceptancePending,
   );
+  const activeTurnId = activeTurnCandidates.length === 1
+    ? activeTurnCandidates[0] : null;
   // The query outbox can be awaiting its first authoritative echo while the
   // last lifecycle frame still says idle. Treat that short acceptance window
   // as settling-busy so a second submit becomes pending/queued instead of
@@ -263,7 +273,8 @@ export function BtwPanel(p: Props) {
     || isSettlingStopDisabled(submitState, hasText);
 
   return (
-    <div className="btw-panel">
+    <div className="btw-panel" data-lock-horizontal-swipe="true">
+      <PanelResizer ariaLabel="调整 BTW 面板宽度" />
       <div className="btw-head">
         {p.hasArtifact
           ? <PanelTabs active={p.active} artifactKind={p.artifactKind}
@@ -297,7 +308,9 @@ export function BtwPanel(p: Props) {
                 onOpenFile={p.onOpenFile}
                 imageAssets={p.imageAssets}
                 onLoadImage={p.onLoadImage}
-                onAuthorizeImage={p.onAuthorizeImage} />}
+                onAuthorizeImage={p.onAuthorizeImage}
+                ambiguousActiveTurnIds={activeTurnCandidates.length > 1
+                  ? activeTurnCandidates : []} />}
       </div>
       <div className="btw-composer">
         {notice && <div className="btw-composer-notice">{notice}</div>}

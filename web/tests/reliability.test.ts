@@ -109,8 +109,6 @@ import {
 import {
   clientSlashesFor,
   commandsFor,
-  effortIsSelectable,
-  effortNameForDisplay,
   isKnownCodeOnlySlash,
   matchCommands,
   matchSkills,
@@ -121,29 +119,6 @@ import {
   permsFor,
   skillToken,
 } from "../src/data.ts";
-
-function testEffortPresentation(): void {
-  assert.equal(
-    effortNameForDisplay("model-default"),
-    "模型默认",
-    "an unresolved official model default must not remain in loading state",
-  );
-  assert.equal(
-    effortNameForDisplay(""),
-    null,
-    "an unseeded effort must retain the loading label instead of painting blank",
-  );
-  assert.equal(
-    effortNameForDisplay("xhigh"),
-    "xhigh",
-    "ordinary effort labels retain the raw CLI/config id contract",
-  );
-  assert.equal(effortIsSelectable("model-default"), false,
-    "the model-default display sentinel is never a selectable effort override");
-  assert.equal(effortIsSelectable("high"), true,
-    "ordinary effort ids remain selectable");
-}
-testEffortPresentation();
 import {
   createMobileViewportSync,
   type MobileViewportBindings,
@@ -232,11 +207,6 @@ import {
   composerDraftKey,
 } from "../src/composer-drafts.ts";
 import {
-  composePastePrompt,
-  makeComposerPaste,
-  MAX_PROMPT_CHARS,
-} from "../src/composer-pastes.ts";
-import {
   ENGINE_SPACES_KEY,
   LEGACY_SPACE_KEY,
   readEngineSpaces,
@@ -252,23 +222,6 @@ import {
 } from "../src/codex-profile-presentation.ts";
 
 const composerDrafts = new ComposerDraftStore();
-const pasteOne = makeComposerPaste("first pasted block", "paste-1");
-const pasteTwo = makeComposerPaste("second pasted block", "paste-2");
-assert.deepEqual(
-  composePastePrompt([pasteOne, pasteTwo], "follow-up"),
-  { ok: true, prompt: "first pasted block\n\nsecond pasted block\n\nfollow-up" },
-  "paste cards must remain ordered prefixes of the visible composer text",
-);
-assert.deepEqual(
-  composePastePrompt([], "x".repeat(MAX_PROMPT_CHARS)),
-  { ok: true, prompt: "x".repeat(MAX_PROMPT_CHARS) },
-  "the protocol's exact prompt limit remains sendable",
-);
-assert.deepEqual(
-  composePastePrompt([{ text: "x".repeat(MAX_PROMPT_CHARS) }], "tail"),
-  { ok: false, chars: MAX_PROMPT_CHARS + 6, maxChars: MAX_PROMPT_CHARS },
-  "paste separators and visible text must participate in the prompt bound",
-);
 const preferenceValues = new Map<string, string>([[LEGACY_SPACE_KEY, "work"]]);
 const preferenceStorage = {
   getItem: (key: string) => preferenceValues.get(key) ?? null,
@@ -1333,8 +1286,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 18/,
-  "legacy native-user projections must invalidate older cache rows");
+assert.match(cacheSource, /const CACHE_VER = 20/,
+  "v37 must invalidate browser rows containing parser-time process clocks");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -5819,6 +5772,21 @@ try {
         ...createRuntime(),
         state: "running" as const,
         syncReady: true,
+        controlGeneration: "history-running-g1",
+        historyGeneration: "history-running-g1",
+        historyRevision: "history-running-r1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 1,
+        historyNewestId: "history-running-original",
+        lastLiveSeq: 1,
+        lastLifecycleSeq: 1,
+        liveOwner: { turnId: "history-running-original", seq: 1 },
+        pendingLiveBinding: {
+          msgId: "history-running-original",
+          turnId: runningAliasNativeTurn,
+          seq: 1,
+          generation: "history-running-g1",
+        },
         turns: [{
           id: "history-running-original",
           forkPointId: runningAliasNativeTurn,
@@ -5843,11 +5811,12 @@ try {
       session_id: runningAliasSid,
       revision: "history-running-r1",
       generation: "history-running-g1",
-      build_seq: 1,
+      build_seq: 2,
       live_seq: 2,
       detail: "summary",
       has_more: true,
       in_progress: true,
+      newest_id: "history-running-native-steer",
       events: [],
       turns: [{
         id: "history-running-native-steer",
@@ -5877,6 +5846,16 @@ try {
       liveTaskId: runningAliasNativeTurn,
     }],
     "a running History alias moves native ownership across the steer fence",
+  );
+  assert.deepEqual(
+    runningAliasState.runtimes[runningAliasSid].liveOwner,
+    { turnId: "history-running-client-steer", seq: 2 },
+    "History-only steer acceptance moves the live display owner to the new segment",
+  );
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].pendingLiveBinding,
+    null,
+    "the same History watermark retires the predecessor binding it superseded",
   );
   runningAliasState = reduce(runningAliasState, {
     type: "event", event: event({
@@ -10692,6 +10671,8 @@ try {
   assert.match(btwPanelMarkup, />替换</);
   assert.match(btwPanelMarkup, />未发送</);
   assert.match(btwPanelMarkup, /aria-label="停止"/);
+  assert.match(btwPanelMarkup, /aria-label="调整 BTW 面板宽度"/);
+  assert.match(btwPanelMarkup, /data-lock-horizontal-swipe="true"/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
   state = reduce(state, { type: "event", event: event({
@@ -13923,19 +13904,19 @@ try {
   state = reduce(state, { type: "query_sent", sid: richSid, prompt: "实现功能",
     msg_id: "rich-turn", ts: 30_000 });
   const richEvents = [
-    event({ type: "assistant_msg_start", sid: richSid, message_id: "comment-1", channel: "commentary" }),
-    event({ type: "delta", sid: richSid, message_id: "comment-1", channel: "commentary", text: "先检查代码。" }),
-    event({ type: "assistant_msg_end", sid: richSid, message_id: "comment-1", channel: "commentary" }),
-    event({ type: "tool_use", sid: richSid, message_id: "comment-1", tool_use_id: "cmd-1",
+    event({ type: "assistant_msg_start", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary" }),
+    event({ type: "delta", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary", text: "先检查代码。" }),
+    event({ type: "assistant_msg_end", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary" }),
+    event({ type: "tool_use", sid: richSid, ts: 30, message_id: "comment-1", tool_use_id: "cmd-1",
       tool: "shell", category: "command", input: { command: "npm test" } }),
-    event({ type: "tool_delta", sid: richSid, tool_use_id: "cmd-1", stream: "output", delta: "ok\n" }),
-    event({ type: "tool_result", sid: richSid, tool_use_id: "cmd-1", content: "ok\n",
+    event({ type: "tool_delta", sid: richSid, ts: 31, tool_use_id: "cmd-1", stream: "output", delta: "ok\n" }),
+    event({ type: "tool_result", sid: richSid, ts: 31, tool_use_id: "cmd-1", content: "ok\n",
       is_error: false, status: "succeeded", exit_code: 0, duration_ms: 1250 }),
-    event({ type: "turn_plan", sid: richSid, item_id: "plan-1", turn_id: "turn-rich",
+    event({ type: "turn_plan", sid: richSid, ts: 31, item_id: "plan-1", turn_id: "turn-rich",
       explanation: "执行计划", plan: [{ step: "检查", status: "completed" }] }),
-    event({ type: "process", sid: richSid, item_id: "hook-1", kind: "hook", phase: "end",
+    event({ type: "process", sid: richSid, ts: 31, item_id: "hook-1", kind: "hook", phase: "end",
       status: "succeeded", turn_id: "turn-rich", title: "Hook 完成", duration_ms: 20 }),
-    event({ type: "turn_diff", sid: richSid, item_id: "diff-1", turn_id: "turn-rich",
+    event({ type: "turn_diff", sid: richSid, ts: 32, item_id: "diff-1", turn_id: "turn-rich",
       diff: "diff --git a/a b/a" }),
     event({ type: "assistant_msg_start", sid: richSid, message_id: "final-1", channel: "final" }),
     event({ type: "delta", sid: richSid, message_id: "final-1", channel: "final", text: "已经完成。" }),
@@ -14776,7 +14757,8 @@ try {
     sid: "summary-session",
     turns: [{
       id: "summary-turn", prompt: "inspect", done: true,
-      blocks: [], detailEventCount: 12, detailLoaded: false,
+      blocks: [], processDetailState: "present", detailReasons: ["process"],
+      detailEventCount: 12, detailLoaded: false,
     }],
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},
     onLoadDetail: () => {},
@@ -14791,17 +14773,24 @@ try {
     sid: "summary-session",
     turns: [{
       id: "summary-turn", prompt: "inspect", done: true,
-      blocks: [], detailEventCount: 12, detailLoaded: true,
+      blocks: [], processDetailState: "present", detailReasons: ["process"],
+      detailEventCount: 12, detailLoaded: true,
     }],
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},
     onLoadDetail: () => {},
   }));
   assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
+  assert.match(loadedDetailMarkup, /已处理/,
+    "a known process stays visible while its current detail page is replaced");
+  assert.match(loadedDetailMarkup, /加载失败/,
+    "a completed empty detail response must expose a retryable contradiction");
   const repairedDeferredDetail = mergeInitialHistory([{
     id: "native-summary-turn",
     clientMsgId: "browser-turn",
     prompt: "修复问题。",
     done: true,
+    processDetailState: "present",
+    detailReasons: ["process"],
     detailEventCount: 93,
     detailLoaded: false,
     blocks: [{
@@ -14851,7 +14840,8 @@ try {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(richMarkup, /已处理 3s/);
+  assert.match(richMarkup, /已处理 2s/,
+    "Codex timing stops at the final visible process snapshot");
   assert.match(richMarkup, /已经完成/);
   assert.doesNotMatch(richMarkup, /复制回复/,
     "reply copy keeps the original compact icon instead of adding a text action");
@@ -14891,8 +14881,9 @@ try {
     }],
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(cachedCodexDurationMarkup, /已处理 0s/,
-    "Claude cache compatibility must not reinterpret a valid Codex duration");
+  assert.match(cachedCodexDurationMarkup, />已处理</);
+  assert.doesNotMatch(cachedCodexDurationMarkup, /已处理 0s/,
+    "Codex process timing must not fall back to the user-message interval");
   const unknownCodexDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "unknown-codex-duration", engine: "codex",
     turns: [{
@@ -14918,7 +14909,8 @@ try {
       id: "thinking-live", prompt: "继续", done: false,
       blocks: [{ kind: "text", message_id: "thinking-text", channel: "thinking",
         text: "正在检查实现", done: false }],
-    }], engine: "claude", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "claude", activeTurnId: "thinking-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(thinkingMarkup, /class="turn-process open"/);
   assert.match(thinkingMarkup, /正在处理/);
@@ -14933,7 +14925,8 @@ try {
       id: "answer-live", prompt: "继续", done: false,
       blocks: [{ kind: "text", message_id: "answer-text", channel: "final",
         text: "正在回答", done: false }],
-    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "codex", activeTurnId: "answer-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(answerMarkup, /class="turn-working"/);
   assert.match(answerMarkup, /回答中/);
@@ -14950,7 +14943,8 @@ try {
         kind: "text", message_id: "answer-after-process",
         channel: "final", text: "正在总结", done: false,
       }],
-    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "codex", activeTurnId: "answering-after-process",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(answeringAfterProcessMarkup, /class="turn-process open"/,
     "the process disclosure stays open until the turn terminal boundary");
@@ -14976,7 +14970,8 @@ try {
           channel: "final", text: "阶段结论", done: false,
         }],
       }],
-      engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+      engine: "codex", activeTurnId: "commentary-while-answering",
+      onEdit: () => {}, onGetDiff: () => {},
     },
   ));
   assert.match(commentaryWhileAnsweringMarkup, /turn-process-state running/);
@@ -14991,7 +14986,8 @@ try {
     sid: richSid, turns: [{
       id: "zero-token-live", clientMsgId: "zero-token-prompt",
       prompt: "开始检查", done: false, blocks: [],
-  }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }], engine: "codex", activeTurnId: "zero-token-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(zeroTokenRunningMarkup, /class="turn-working"/);
   assert.match(zeroTokenRunningMarkup, /思考中/);
@@ -15862,7 +15858,7 @@ try {
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "end", status: "succeeded", turn_id: "turn-rich",
-    title: "后台代理完成",
+    title: "后台代理完成", background: true,
   }) });
   assert.equal(state.runtimes[richSid].turns.length, 2);
   assert.ok(state.runtimes[richSid].turns[0].blocks.some(
@@ -15871,13 +15867,12 @@ try {
   assert.ok(!state.runtimes[richSid].turns[1].blocks.some(
     (block: { kind: string; item_id?: string }) => block.item_id === "late-agent"));
 
-  // A late background update reopens only the process shell, not the completed
-  // answer turn. The user can keep reading the final answer while the activity
-  // header truthfully reports that work is still running.
+  // A late detached background update remains visible inside the completed
+  // turn without reopening its session-level working affordance.
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "update", status: "running", turn_id: "turn-rich",
-    title: "后台代理运行中", progress: "继续检查",
+    title: "后台代理运行中", progress: "继续检查", background: true,
   }) });
   const backgroundTurn = state.runtimes[richSid].turns[0];
   assert.equal(backgroundTurn.done, true);
@@ -15886,20 +15881,18 @@ try {
     sid: richSid, turns: [backgroundTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(backgroundMarkup, /正在处理/);
-  assert.match(backgroundMarkup, /继续检查/);
-  assert.match(backgroundMarkup, /class="turn-working"[\s\S]*处理中/,
-    "a live background process keeps its animated marker at the turn tail");
+  assert.doesNotMatch(backgroundMarkup, /class="turn-working"/,
+    "detached Agent work cannot reopen the completed turn's top-level spark");
   assert.match(
     backgroundMarkup,
-    /turn-process-state running"><svg/,
-    "the background process header stays static beside the tail animation",
+    /turn-process-state done"><svg/,
+    "the completed parent header stays settled while Agent detail remains live",
   );
-  assert.doesNotMatch(backgroundMarkup, /class="turn-done-mark"/);
+  assert.match(backgroundMarkup, /class="turn-done-mark"/);
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "end", status: "succeeded", turn_id: "turn-rich",
-    title: "后台代理完成",
+    title: "后台代理完成", background: true,
   }) });
   assert.equal(hasActiveProcess(state.runtimes[richSid].turns[0].blocks), false);
 
@@ -17467,6 +17460,11 @@ assert.match(appSource,
   "a remembered non-retired Goal or current Plan stays visible while its component chunk loads");
 assert.match(appSource, /externalPlanProgress=\{planProgress/,
   "the session strip must explicitly take ownership from the message row");
+assert.match(appSource,
+  /const previewAgentFile = [\s\S]{0,180}setAgentPanel\(null\)/,
+  "opening a file from Agent detail must switch the shared right slot");
+assert.match(appSource, /onOpenFile=\{previewAgentFile\}/,
+  "Agent file links must use the right-slot switching callback");
 assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
   "a transient Goal read failure must be retried in the same connection");
 assert.doesNotMatch(appSource,
@@ -17812,7 +17810,7 @@ assert.match(appSource,
   /<HeaderMenu[\s\S]*engine=\{engine\}[\s\S]*onOpenUsageActivity=\{openUsageActivity\}/,
   "the app must wire the selected engine and activity opener into the menu");
 assert.match(appSource,
-  /<UsageActivitySheet[\s\S]*open=\{usageActivityOpen && engine === "codex"\}/,
+  /usageActivityOpen && engine === "codex" && <Suspense[\s\S]{0,120}<UsageActivitySheet/,
   "the activity sheet must fail closed when the selected surface is Claude");
 assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
 assert.match(layoutCss,

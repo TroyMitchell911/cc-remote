@@ -41,6 +41,7 @@ from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     merge_subagent_history,
+    public_agent_run_id,
     translate_history,
     translate_subagent_history,
 )
@@ -515,7 +516,7 @@ def test_live_agent_tool_has_dedicated_realtime_lifecycle():
     tool = next(event for event in started if isinstance(event, ToolUse))
     agent = next(event for event in started if isinstance(event, ProcessEvent))
     assert tool.category == "agent"
-    assert agent.item_id == "agent:agent-tool"
+    assert agent.item_id == public_agent_run_id("agent-tool")
     assert agent.parent_id == "agent-tool"
     assert agent.kind == "agent" and agent.status == "running"
     assert agent.title == "审查后端并报告风险"
@@ -678,7 +679,7 @@ def test_history_does_not_promote_ambiguous_commentary_before_separate_tool_acti
     assert commentary.channel == "commentary"
 
 
-def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path, monkeypatch):
+def test_subagent_history_keeps_only_async_lifecycle_card(tmp_path, monkeypatch):
     sid = "88888888-8888-4888-8888-888888888888"
     main = tmp_path / f"{sid}.jsonl"
     rows = [
@@ -690,10 +691,20 @@ def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path
              "input": {"description": "Review backend"},
          }]}},
         {"type": "user", "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-         "toolUseResult": {"agentId": "agent-123", "status": "completed"},
+         "toolUseResult": {"agentId": "agent-123", "status": "async_launched",
+                           "isAsync": True},
          "message": {"role": "user", "content": [{
-             "type": "tool_result", "tool_use_id": "agent-tool", "content": "done",
+             "type": "tool_result", "tool_use_id": "agent-tool",
+             "content": "Async agent launched successfully.",
          }]}},
+        {"type": "user", "uuid": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+         "timestamp": "2026-07-13T01:00:03Z",
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": (
+             "<task-notification><task-id>agent-123</task-id>"
+             "<tool-use-id>agent-tool</tool-use-id><status>completed</status>"
+             "<summary>review complete</summary></task-notification>"
+         )}},
     ]
     main.write_text("".join(json.dumps(row) + "\n" for row in rows))
     subdir = tmp_path / sid / "subagents"
@@ -718,14 +729,15 @@ def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path
     monkeypatch.setattr(stream_module, "transcript_path", lambda _sid: str(main))
 
     recovered = translate_subagent_history(sid, 10_000)
-    assert isinstance(recovered[0], ProcessEvent) and recovered[0].phase == "start"
-    assert isinstance(recovered[-1], ProcessEvent) and recovered[-1].phase == "end"
+    assert len(recovered) == 1
+    assert isinstance(recovered[0], ProcessEvent)
+    assert recovered[0].phase == "end" and recovered[0].status == "succeeded"
     assert recovered[0].parent_id == "agent-tool"
-    assert [event.channel for event in recovered if isinstance(event, Delta)] == [
-        "thinking", "commentary"]
+    assert recovered[0].background is True
     wire = _wire_json(recovered)
     assert "PRIVATE DELEGATED PROMPT" not in wire
     assert "PRIVATE-SIGNATURE" not in wire
+    assert "agent-123" not in wire
 
     main_events = [
         UserMsg(msg_id="99999999-9999-4999-8999-999999999999", prompt="review it"),
@@ -742,6 +754,7 @@ def test_sdk_enables_hook_events_explicitly():
     options = SdkHandle(WrapperConfig())._options(None, "/tmp")
     assert options.include_partial_messages is True
     assert options.include_hook_events is True
+    assert options.max_buffer_size == 16 * 1024 * 1024
 
 
 def test_sdk_single_pump_forwards_post_result_background_events_immediately():
@@ -896,5 +909,41 @@ def test_sdk_pump_releases_turn_barrier_on_query_failure_and_disconnect():
         finally:
             if handle._message_pump_task is not None:
                 await handle._stop_message_pump()
+
+    asyncio.run(run())
+
+
+def test_sdk_pump_failure_requires_reconnect_before_another_query():
+    async def run():
+        class Query:
+            async def receive_messages(self):
+                if False:
+                    yield None
+                raise RuntimeError("reader failed")
+
+        class Client:
+            def __init__(self):
+                self._query = Query()
+
+            async def query(self, _prompt):
+                return None
+
+        handle = SdkHandle(SimpleNamespace(turn_reader_queue_cap=2))
+        handle.client = Client()
+        handle._start_message_pump()
+        assert handle._message_pump_task is not None
+        await handle._message_pump_task
+
+        assert handle.message_pump_failed is True
+        try:
+            await handle.query("must not send")
+        except RuntimeError as exc:
+            assert str(exc) == "Claude SDK message pump is not running"
+            assert isinstance(exc.__cause__, RuntimeError)
+            assert str(exc.__cause__) == "reader failed"
+        else:
+            raise AssertionError("query reused a failed Claude message pump")
+
+        await handle._stop_message_pump()
 
     asyncio.run(run())

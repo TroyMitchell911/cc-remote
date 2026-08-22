@@ -378,6 +378,8 @@ function detailPagingTurn(
       done: true,
       ts: Date.now(),
       doneTs: Date.now(),
+      processDetailState: "present",
+      detailReasons: ["process"],
       detailEventCount: 24,
       detailLoaded: false,
     };
@@ -408,6 +410,8 @@ function detailPagingTurn(
     done: true,
     ts: Date.now(),
     doneTs: Date.now(),
+    processDetailState: "present",
+    detailReasons: ["process"],
     detailEventCount: 24,
     detailLoaded: true,
     detailHasMore: page === "latest",
@@ -1883,6 +1887,8 @@ function HistoryConversationBrowserFixture() {
           onTextSelectionGuardChange={updateTextSelectionGuard}
           onEdit={() => {}}
           onGetDiff={() => {}}
+          activeTurnId={interactiveTimeline && sid.endsWith("-a")
+            ? "streaming" : null}
           externalPlanProgress={fixedPlanProgress ? {
             turnId: fixedPlanProgress.turnId,
             itemId: fixedPlanProgress.block.item_id,
@@ -2490,6 +2496,7 @@ function ArtifactPreviewFixture({ kind }: {
       content: `<!doctype html><html><head>
         <style>#head-style { color: rgb(12, 34, 56); }</style>
         </head><body><div id="head-style">head css retained</div>
+        <div id="visualization-theme" style="color:var(--foreground);background:var(--background);border:1px solid var(--border)">visualization theme</div>
         <script>
           document.body.dataset.scriptRan = "yes";
           try { parent.document.body.dataset.previewEscaped = "yes"; }
@@ -2542,6 +2549,7 @@ function ArtifactPreviewFixture({ kind }: {
     };
   return <main style={{ height: "100dvh" }}>
     <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
+      theme={kind === "html" ? "dark" : "light"}
       onTab={() => {}} onClose={() => {}} />
   </main>;
 }
@@ -2573,6 +2581,17 @@ function LocalFileLinkFixture() {
   </main>;
 }
 
+function CodexVisualizationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <output data-testid="visualization-opened-path">{opened}</output>
+    <MessageBlock
+      text={"visualize{\"path\":\"/tmp/private/concept.html\","
+        + "\"title\":\"结构原理草图\"}"}
+      done onOpenFile={(path) => setOpened(path)} />
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
@@ -2588,6 +2607,8 @@ createRoot(document.getElementById("root")!).render(
         theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
     : rootParams.has("local-file-link")
     ? <LocalFileLinkFixture />
+    : rootParams.has("codex-visualization")
+    ? <CodexVisualizationFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

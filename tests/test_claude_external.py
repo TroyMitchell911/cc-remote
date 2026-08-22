@@ -651,6 +651,30 @@ class _RejectAfterWriteSdk(_ClaudeRunSdk):
         raise RuntimeError("query rejected after a possible partial send")
 
 
+class _FailedMessagePumpSdk(_ClaudeRunSdk):
+    def __init__(self):
+        super().__init__()
+        self.message_pump_failed = False
+        self.fail_response = True
+
+    async def receive_response(self):
+        if self.fail_response:
+            self.message_pump_failed = True
+            raise RuntimeError("Claude SDK message pump stopped")
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sid",
+        )
+
+    async def force_reconnect(self, **kwargs):
+        await super().force_reconnect(**kwargs)
+        self.message_pump_failed = False
+
+
 def test_claude_init_upstream_model_never_overwrites_selected_alias():
     class GatewaySdk(_ClaudeRunSdk):
         model = "claude-mythos-5[1m]"
@@ -1119,6 +1143,20 @@ def test_claude_growth_classifier_rejects_partial_jsonl():
     assert classify_claude_growth(
         b'{"type":"assistant","entrypoint":"sdk-py"'
     ) == ("unknown", ())
+
+
+def test_claude_growth_classifier_treats_atis_latch_as_neutral_metadata():
+    assistant_id = "11111111-1111-4111-8111-111111111111"
+    origin, owned = classify_claude_growth(
+        (
+            '{"type":"assistant","entrypoint":"sdk-py",'
+            f'"uuid":"{assistant_id}"}}\n'
+            '{"type":"atis-latch","atis":"","sessionId":"sid"}\n'
+        ).encode()
+    )
+
+    assert origin == "sdk"
+    assert owned == (assistant_id,)
 
 
 def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
@@ -1609,6 +1647,54 @@ def test_failed_claude_query_never_rebaselines_an_ambiguous_append(
         assert path.stat().st_size > 0
         assert await machine._prime_claude_ownership("sid") is False
         assert ctx.needs_reload is True
+
+    asyncio.run(go())
+
+
+def test_failed_claude_message_pump_forces_resume_before_next_query(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-pump-failed"
+        sdk = _FailedMessagePumpSdk()
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner,
+            raising=False,
+        )
+
+        await machine._run_turn(ctx, "first")
+
+        assert ctx.needs_reload is False
+        assert sdk.reconnects == 0
+        assert any(
+            getattr(event, "code", None) == "cc_crash"
+            and event.msg_id == "msg-pump-failed"
+            for event in transport.sent
+        )
+
+        sdk.fail_response = False
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-after-recovery"
+        await machine._run_turn(ctx, "second")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "message pump failure",
+            "preserve_model": True,
+        }]
+        assert sdk.queries == 2
+        assert sdk.message_pump_failed is False
+        assert ctx.needs_reload is False
+        assert ctx.state == "idle"
 
     asyncio.run(go())
 

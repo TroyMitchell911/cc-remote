@@ -22,7 +22,7 @@ import { ProcessTimeline } from "./ProcessTimeline";
 import {
   finalTextBlocks,
   hasActiveProcess,
-  processBlocks,
+  presentableProcessBlocks,
 } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import { collectTurnFileChanges } from "../file-changes";
@@ -290,7 +290,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   externalPlanProgress,
+  onOpenAgent,
   activeTurnId = null,
+  ambiguousActiveTurnIds = [],
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -338,6 +340,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string, imageId: string, variant: HistoryImageVariant,
   ) => boolean;
   onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
   externalPlanProgress?: {
     turnId: string;
     itemId: string;
@@ -345,6 +348,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   /** Exact displayed row owned by the still-running native task. Runtime-only:
    * never infer this from array position, final text, or historical activity. */
   activeTurnId?: string | null;
+  /** More than one displayed row exactly aliases the active native owner.
+   * Empty for idle/browse/missing-owner states, which must stay fail-closed. */
+  ambiguousActiveTurnIds?: readonly string[];
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
@@ -2368,6 +2374,37 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           + index * (HISTORY_VIRTUAL_ESTIMATE_PX + HISTORY_TURN_GAP_PX),
       };
     });
+  // A shared native Codex task can make two steer segments match the same
+  // history alias. App passes those exact active candidates separately so an
+  // idle, browsed, missing, or stale owner can never revive an arbitrary row.
+  const ambiguousActiveTurnIdSet = new Set(ambiguousActiveTurnIds);
+  const fallbackWorkingTurnId = activeTurnId == null
+      && ambiguousActiveTurnIdSet.size > 1
+    ? [...turns].reverse().find((turn) => {
+        if (!ambiguousActiveTurnIdSet.has(turn.id)) return false;
+        if (turn.done && (turn.interrupted || turn.error)) return false;
+        const archived = mergeDetailWithLiveTail(
+          turn.detailProjection?.blocks ?? [],
+          turn.liveSpillBlocks ?? [],
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const timeline = mergeDetailWithLiveTail(
+          archived,
+          turn.blocks,
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const processItems = presentableProcessBlocks(timeline, engine);
+        const foreground = turn.done
+          ? processItems.filter((block) => !(
+              block.kind === "process" && block.background === true
+            ))
+          : processItems;
+        return !turn.done || hasActiveProcess(foreground)
+          || foreground.some((block) => !block.done);
+      })?.id ?? null
+    : null;
   const activityRequest = historyRequestRef.current;
   const visibleHistoryPageActivity = historyPageActivity && (
     activityRequest?.activityKey === historyPageActivity.key
@@ -2466,34 +2503,72 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               t.done && !t.detailRestorePending
                 && !t.detailRestoreIncomplete,
             );
-            const activeProcess = hasActiveProcess(timelineBlocks);
-            const processItems = processBlocks(timelineBlocks);
+            const processItems = presentableProcessBlocks(
+              timelineBlocks, engine);
+            const foregroundProcessItems = t.done
+              ? processItems.filter((block) => !(
+                  block.kind === "process" && block.background === true
+                ))
+              : processItems;
+            const activeProcess = hasActiveProcess(foregroundProcessItems);
             const activeTimeline = activeProcess
-              || processItems.some((block) => !block.done);
+              || foregroundProcessItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
             const enclosingTaskActive = activeTurnId === t.id;
+            const processDetailState = processItems.length > 0
+              ? "present"
+              : t.processDetailState
+                ?? ((t.detailEventCount ?? 0) > 0 ? "unknown" : "none");
+            const hasDeferredContent = t.detailReasons?.some(
+              (reason) => reason !== "process") ?? false;
             // A failed/interrupted enclosing terminal is authoritative. A
             // successful answer may still own genuine background agent work,
             // but a stale child flag must never animate beside "已打断".
             const terminalProblem = t.done && (!!t.interrupted || !!t.error);
             const working = !terminalProblem && (
               enclosingTaskActive || !t.done || activeTimeline);
+            // A source can positively report process presence while an
+            // incomplete detail response contains only the final answer. Do
+            // not turn that contradiction into an endless loading row: keep
+            // the disclosure and expose a retryable error instead.
+            const missingLoadedProcess = t.done && !!t.detailLoaded
+              && !t.detailLoading
+              && !t.detailHasMore && !t.detailHasNewer
+              && processItems.length === 0
+              && processDetailState === "present";
+            const processDetailError = t.detailError
+              ?? (missingLoadedProcess
+                ? "详细过程未完整返回，请重试" : undefined);
             const hasProcessTimeline = processItems.length > 0
-              || (!!t.detailEventCount && !t.detailLoaded)
-              || !!t.detailError;
+              || processDetailState === "present";
             const activePhase = !working
               ? "complete"
               : hasProcessTimeline
-                  && (enclosingTaskActive
-                    || activeTimeline || finalBlocks.length === 0)
+                  && (activeTimeline
+                    || (enclosingTaskActive
+                      && (finalBlocks.length === 0 || t.done)))
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
             const showProcessTimeline = hasProcessTimeline;
+            const showStandaloneDetail = t.done && !t.detailLoaded
+              && (hasDeferredContent || processDetailState === "unknown");
+            const standaloneDetailLabel = hasDeferredContent
+              ? "查看完整内容" : "查看本轮详情";
             // Keep the live affordance at the physical tail of the turn. The
             // process disclosure can be far above the viewport once a long
             // tool stream grows, so it must not be the only place which tells
             // the reader that the turn is still active.
-            const showWorking = working;
+            // A steered Codex task can span several visible narrative rows.
+            // Once the runtime has an exact owner, only that row may render
+            // the session-level working affordance. Older rows can still keep
+            // their own background/process lifecycle inside the disclosure,
+            // but a delayed child update must not create a second top-level
+            // spark beside the current steer row.
+            const showWorking = working && (
+              enclosingTaskActive
+              || (ambiguousActiveTurnIdSet.has(t.id)
+                && fallbackWorkingTurnId === t.id)
+            );
             // Compact can close a display segment before the enclosing native
             // task reaches its terminal boundary. Completion time, copy and
             // fork belong to that real boundary, never to the segment bit.
@@ -2514,6 +2589,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 ? externalPlanProgress.itemId : null;
             const detailRetryBefore = t.detailRetryBefore;
             const detailRetryDirection = t.detailRetryDirection;
+            const deferredProcessCount = (!t.detailLoaded || !!t.detailLoading)
+                && processDetailState === "present"
+              ? processItems.length === 0
+                ? Math.max(1, t.detailEventCount ?? 0)
+                : t.detailEventCount ?? 0
+              : 0;
             const historyImagesReady = !!t.imageRefs?.length
               && t.imageRefs.every((image) => (
                 historyImageAssets?.[historyImageAssetKey(
@@ -2608,10 +2689,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             {showProcessTimeline && (
               <ProcessTimeline blocks={timelineBlocks} done={t.done}
                 active={activePhase === "process"} engine={engine}
-                durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
-                deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
+                durationMs={engine === "codex" ? undefined : t.durationMs}
+                startTs={engine === "codex" ? t.processStartedTs : t.ts}
+                doneTs={engine === "codex" ? t.processDoneTs : t.doneTs}
+                deferredCount={deferredProcessCount}
                 detailLoading={t.detailLoading}
-                detailError={t.detailError}
+                detailError={processDetailError}
                 externalPlanItemId={externalPlanItemId}
                 onLoadDetail={onLoadDetail
                   ? () => requestProcessDetail(
@@ -2650,6 +2733,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                   imageId,
                   alt: "查看过的图片",
                 })}
+                onOpenAgent={onOpenAgent}
                 onInteractionStart={beginProcessInteraction}
                 onInteractionEnd={endProcessInteraction}
                 openOverride={
@@ -2701,6 +2785,31 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 )}
               </>
             )}
+              {(showStandaloneDetail
+                  || (!!t.detailError && !showProcessTimeline)) && (
+                <div className="turn-detail-entry">
+                  <button type="button" className="turn-detail-entry-btn"
+                    disabled={!onLoadDetail || !!t.detailLoading}
+                    aria-busy={!!t.detailLoading}
+                    onClick={() => requestProcessDetail(
+                      t.id,
+                      detailRetryDirection ? detailRetryBefore : undefined,
+                      detailRetryDirection ?? "initial",
+                      true,
+                    )}>
+                    {t.detailLoading
+                      ? <span className="process-spin" aria-hidden="true" />
+                      : <Icon name="chev" size={14} />}
+                    <span>{t.detailLoading
+                      ? "正在加载详情…" : standaloneDetailLabel}</span>
+                  </button>
+                  {t.detailError && (
+                    <span className="turn-detail-entry-error">
+                      {t.detailError}
+                    </span>
+                  )}
+                </div>
+              )}
               {showWorking && (
                 <div className="turn-working" role="status" aria-live="polite">
                   <ClaudeWorking size={24} />

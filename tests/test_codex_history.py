@@ -19,6 +19,7 @@ from cc_remote.wrapper.codex_rpc import (
 )
 from cc_remote.wrapper.codex_stream import (
     codex_history_native_witness,
+    codex_history_process_witnesses,
     codex_history_image_views,
     codex_rollout_task_bindings,
     codex_history_turn_user,
@@ -64,7 +65,7 @@ def _turn(
     *,
     status: str = "completed",
     items_view: str = "summary",
-    started_at: int = 100,
+    started_at: int | None = 100,
     completed_at: int | None = 102,
     duration_ms: int | None = 2000,
     error: dict | None = None,
@@ -359,7 +360,9 @@ def test_summary_page_is_chronological_and_preserves_native_identity():
         assert page.has_more is True
         assert page.native_turn_ids == ("native-new", "native-old")
         assert page.turns[0]["blocks"][-1]["text"] == "old answer"
-        assert page.turns[0]["detailEventCount"] >= 1
+        assert page.turns[0]["detailEventCount"] == 0
+        assert page.turns[0]["processDetailState"] == "unknown"
+        assert page.turns[0]["detailReasons"] == []
 
     asyncio.run(run())
 
@@ -437,6 +440,263 @@ def test_native_history_witness_ignores_abnormal_payloads_and_dedupes_steers(
     assert bounded.turn_ids == ("native-new",)
     assert bounded.scanned_to_start is True
     assert bounded.has_more_turns is True
+
+
+def test_native_history_witness_recovers_public_process_without_direct_reply(
+    tmp_path,
+):
+    path = tmp_path / "process-witness.jsonl"
+
+    def row(timestamp, row_type, payload):
+        return {
+            "timestamp": timestamp,
+            "type": row_type,
+            "payload": payload,
+        }
+
+    rows = [
+        row("2026-08-21T01:00:00Z", "event_msg", {
+            "type": "task_started", "turn_id": "native-direct",
+        }),
+        row("2026-08-21T01:00:01Z", "response_item", {
+            "type": "message", "role": "user", "id": "user-direct",
+        }),
+        row("2026-08-21T01:00:01Z", "event_msg", {
+            "type": "user_message", "turn_id": "native-direct",
+            "message": "hello",
+        }),
+        row("2026-08-21T01:00:02Z", "response_item", {
+            "type": "reasoning", "id": "private-reasoning",
+        }),
+        row("2026-08-21T01:00:03Z", "event_msg", {
+            "type": "agent_message", "phase": "final_answer",
+            "message": "hi",
+        }),
+        row("2026-08-21T01:00:04Z", "event_msg", {
+            "type": "task_complete", "turn_id": "native-direct",
+        }),
+        row("2026-08-21T01:01:00Z", "event_msg", {
+            "type": "task_started", "turn_id": "native-process",
+        }),
+        row("2026-08-21T01:01:01Z", "response_item", {
+            "type": "message", "role": "user", "id": "user-process",
+        }),
+        row("2026-08-21T01:01:01Z", "event_msg", {
+            "type": "user_message", "turn_id": "native-process",
+            "message": "inspect",
+        }),
+        row("2026-08-21T01:01:05Z", "response_item", {
+            "type": "custom_tool_call", "id": "call-1",
+            "call_id": "call-1", "name": "exec_command", "input": {},
+        }),
+        row("2026-08-21T01:01:08Z", "response_item", {
+            "type": "custom_tool_call_output", "call_id": "call-1",
+            "output": "ok",
+        }),
+        row("2026-08-21T01:01:09Z", "event_msg", {
+            "type": "agent_message", "phase": "final_answer",
+            "message": "done",
+        }),
+        row("2026-08-21T01:01:10Z", "event_msg", {
+            "type": "task_complete", "turn_id": "native-process",
+        }),
+    ]
+    path.write_bytes(b"".join(
+        json.dumps(value).encode() + b"\n" for value in rows
+    ))
+
+    witness = codex_history_native_witness(
+        str(path), max_turns=4, max_scan_bytes=4 * 1024 * 1024)
+
+    assert witness.turn_ids == ("native-process", "native-direct")
+    assert "user-direct" not in witness.process_by_visible_id
+    process = witness.process_by_visible_id["user-process"]
+    assert process.started_ms == 1_787_274_065_000
+    assert process.done_ms == 1_787_274_068_000
+
+
+def test_native_process_witness_numbers_steer_segments_chronologically(
+    tmp_path,
+):
+    path = tmp_path / "steer-process-witness.jsonl"
+
+    def row(timestamp, row_type, payload):
+        return {
+            "timestamp": timestamp,
+            "type": row_type,
+            "payload": payload,
+        }
+
+    rows = [
+        row("2026-08-21T01:10:00Z", "event_msg", {
+            "type": "task_started", "turn_id": "native-multi",
+        }),
+        row("2026-08-21T01:10:01Z", "response_item", {
+            "type": "message", "role": "user", "id": "rollout-first",
+        }),
+        row("2026-08-21T01:10:01Z", "event_msg", {
+            "type": "user_message", "turn_id": "native-multi",
+            "message": "first",
+        }),
+        row("2026-08-21T01:10:02Z", "response_item", {
+            "type": "custom_tool_call", "id": "call-first",
+            "call_id": "call-first", "name": "exec_command", "input": {},
+        }),
+        row("2026-08-21T01:10:03Z", "response_item", {
+            "type": "custom_tool_call_output", "call_id": "call-first",
+            "output": "first",
+        }),
+        row("2026-08-21T01:10:04Z", "response_item", {
+            "type": "message", "role": "user", "id": "rollout-steer",
+        }),
+        row("2026-08-21T01:10:04Z", "event_msg", {
+            "type": "user_message", "turn_id": "native-multi",
+            "message": "continue",
+        }),
+        row("2026-08-21T01:10:05Z", "response_item", {
+            "type": "custom_tool_call", "id": "call-steer",
+            "call_id": "call-steer", "name": "exec_command", "input": {},
+        }),
+        row("2026-08-21T01:10:06Z", "response_item", {
+            "type": "custom_tool_call_output", "call_id": "call-steer",
+            "output": "steer",
+        }),
+        row("2026-08-21T01:10:07Z", "event_msg", {
+            "type": "task_complete", "turn_id": "native-multi",
+        }),
+    ]
+    path.write_bytes(b"".join(
+        json.dumps(value).encode() + b"\n" for value in rows
+    ))
+
+    witness = codex_history_native_witness(
+        str(path), max_turns=2, max_scan_bytes=4 * 1024 * 1024)
+
+    assert set(witness.process_by_native_segment) == {
+        ("native-multi", 0), ("native-multi", 1),
+    }
+    first = witness.process_by_native_segment[("native-multi", 0)]
+    steer = witness.process_by_native_segment[("native-multi", 1)]
+    assert (first.started_ms, first.done_ms) == (
+        1_787_274_602_000, 1_787_274_603_000)
+    assert (steer.started_ms, steer.done_ms) == (
+        1_787_274_605_000, 1_787_274_606_000)
+    assert witness.offset_by_native_segment[("native-multi", 0)] \
+        < witness.offset_by_native_segment[("native-multi", 1)]
+
+
+def test_older_history_process_witness_starts_after_browser_cursor(tmp_path):
+    path = tmp_path / "older-process-witness.jsonl"
+    rows = []
+    for index in range(6):
+        turn_id = f"native-{index}"
+        rows.extend((
+            {
+                "timestamp": f"2026-08-21T02:{index:02d}:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            },
+            {
+                "timestamp": f"2026-08-21T02:{index:02d}:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message", "turn_id": turn_id,
+                    "message": f"prompt {index}",
+                },
+            },
+            {
+                "timestamp": f"2026-08-21T02:{index:02d}:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call", "id": f"call-{index}",
+                    "call_id": f"call-{index}", "name": "exec_command",
+                    "input": {},
+                },
+            },
+            {
+                "timestamp": f"2026-08-21T02:{index:02d}:03Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": turn_id},
+            },
+        ))
+    path.write_bytes(b"".join(
+        json.dumps(value).encode() + b"\n" for value in rows
+    ))
+
+    witnesses = codex_history_process_witnesses(
+        str(path), before="native-4", max_turns=2,
+    )
+
+    assert set(witnesses.process_by_visible_id) == {"native-3", "native-2"}
+    assert set(witnesses.offset_by_visible_id) == {"native-3", "native-2"}
+
+    next_page = codex_history_process_witnesses(
+        str(path),
+        before="native-2",
+        before_offset=witnesses.offset_by_visible_id["native-2"],
+        max_turns=2,
+    )
+    assert set(next_page.process_by_visible_id) == {"native-1", "native-0"}
+
+
+def test_required_native_witness_extends_past_initial_tail_budget(tmp_path):
+    path = tmp_path / "adaptive-process-witness.jsonl"
+    rows = []
+    expected = []
+    for index in range(5):
+        turn_id = f"native-{index}"
+        expected.append(turn_id)
+        rows.extend((
+            {
+                "timestamp": f"2026-08-21T03:{index:02d}:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            },
+            {
+                "timestamp": f"2026-08-21T03:{index:02d}:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message", "turn_id": turn_id,
+                    "message": f"prompt {index}",
+                },
+            },
+            {
+                "timestamp": f"2026-08-21T03:{index:02d}:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call", "id": f"call-{index}",
+                    "call_id": f"call-{index}", "name": "exec_command",
+                    "input": {},
+                },
+            },
+            {
+                "timestamp": f"2026-08-21T03:{index:02d}:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count", "padding": "x" * 400_000,
+                },
+            },
+            {
+                "timestamp": f"2026-08-21T03:{index:02d}:04Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": turn_id},
+            },
+        ))
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    bounded = codex_history_native_witness(
+        str(path), max_turns=6, max_scan_bytes=1024 * 1024)
+    assert len(bounded.turn_ids) < len(expected)
+
+    adaptive = codex_history_native_witness(
+        str(path),
+        max_turns=6,
+        max_scan_bytes=None,
+        required_turn_ids=tuple(reversed(expected)),
+    )
+    assert adaptive.turn_ids == tuple(reversed(expected))
+    assert set(adaptive.process_by_visible_id) == set(expected)
+    assert set(adaptive.offset_by_visible_id) == set(expected)
 
 
 def test_summary_page_recovers_goal_prompt_for_assistant_only_native_turn():
@@ -637,6 +897,67 @@ def test_summary_supports_assistant_only_and_multiple_steer_segments():
         assert "forkPointId" not in first
         assert steer["forkPointId"] == "native-multi"
         assert steer["clientMsgId"] == "client-steer"
+        assert page.native_segment_by_visible_id == {
+            "native-auto": ("native-auto", 0),
+            "user-first": ("native-multi", 0),
+            "user-steer": ("native-multi", 1),
+        }
+
+    asyncio.run(run())
+
+
+def test_rollout_detail_fallback_covers_every_visible_steer_segment():
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [
+                _turn(
+                    "native-newest",
+                    [_user("user-newest", "newest"),
+                     _agent("answer-newest", "done")],
+                ),
+                _turn(
+                    "native-middle",
+                    [_user("user-middle", "middle"),
+                     _agent("answer-middle", "done")],
+                ),
+                _turn(
+                    "native-steered",
+                    [
+                        _user("user-first", "first"),
+                        _agent("answer-first", "first answer"),
+                        _user("user-steer", "continue"),
+                        _agent("answer-steer", "final answer"),
+                    ],
+                ),
+                _turn(
+                    "native-oldest",
+                    [_user("user-oldest", "oldest"),
+                     _agent("answer-oldest", "done")],
+                ),
+            ],
+            "nextCursor": None,
+        }
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-visible-limit", before=None, limit=4)
+
+        assert [turn["id"] for turn in page.turns] == [
+            "user-oldest",
+            "user-first",
+            "user-steer",
+            "user-middle",
+            "user-newest",
+        ]
+        # Rollout pagination counts visible user segments, while the official
+        # API limit counts native turns. The oldest visible row must therefore
+        # retain a fallback window wide enough to include all five rows.
+        fallback = history.rollout_fallback(
+            "thread-visible-limit", "user-oldest")
+        assert fallback.limit == 5
+        assert fallback.native_turn_id == "native-oldest"
 
     asyncio.run(run())
 
@@ -1055,6 +1376,110 @@ def test_newest_completed_turn_hydration_restores_cold_steer_segments():
             "first", "continue"]
         assert page.turns[-1]["done"] is True
         assert page.turns[-1]["durationMs"] == 9000
+        assert all(
+            turn["processDetailState"] == "none"
+            for turn in page.turns
+        )
+        assert all(turn["detailReasons"] == [] for turn in page.turns)
+
+    asyncio.run(run())
+
+
+def test_recent_full_process_does_not_invent_zero_second_interval():
+    items = [
+        _user("user-process", "inspect"),
+        {
+            "type": "commandExecution",
+            "id": "command-process",
+            "command": "pwd",
+            "commandActions": [],
+            "cwd": "/repo",
+            "status": "completed",
+            "aggregatedOutput": "/repo\n",
+            "exitCode": 0,
+            "durationMs": 12,
+        },
+        _agent("answer-process", "done"),
+    ]
+    responses = [
+        {
+            "data": [_turn("native-process", [items[0], items[-1]])],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-process", items, items_view="full",
+            )],
+            "nextCursor": None,
+        },
+    ]
+
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return responses.pop(0)
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-process", before=None, limit=1, hydrate_recent=1,
+        )
+
+        turn = page.turns[0]
+        assert turn["processDetailState"] == "present"
+        assert "processStartedTs" not in turn
+        assert "processDoneTs" not in turn
+
+    asyncio.run(run())
+
+
+def test_official_turn_without_timestamps_does_not_use_history_read_time():
+    items = [
+        _user("user-untimed", "inspect"),
+        {
+            "type": "commandExecution",
+            "id": "command-untimed",
+            "command": "pwd",
+            "commandActions": [],
+            "cwd": "/repo",
+            "status": "completed",
+            "aggregatedOutput": "/repo\n",
+            "exitCode": 0,
+            "durationMs": 12,
+        },
+        _agent("answer-untimed", "done"),
+    ]
+
+    responses = [{
+        "data": [_turn(
+            "native-untimed", [items[0], items[-1]],
+            started_at=None, completed_at=None,
+        )],
+        "nextCursor": None,
+    }, {
+        "data": [_turn(
+            "native-untimed", items, items_view="full",
+            started_at=None, completed_at=None,
+        )],
+        "nextCursor": None,
+    }]
+
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return responses.pop(0)
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-untimed", before=None, limit=1, hydrate_recent=1,
+        )
+
+        assert all("ts" not in event for event in page.events)
+        turn = page.turns[0]
+        assert "ts" not in turn
+        assert "doneTs" not in turn
+        assert turn["processDetailState"] == "present"
+        assert "processStartedTs" not in turn
+        assert "processDoneTs" not in turn
 
     asyncio.run(run())
 

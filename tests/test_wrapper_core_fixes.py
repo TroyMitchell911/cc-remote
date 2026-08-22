@@ -22,7 +22,8 @@ from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.codex_sessions import codex_session_settings
 from cc_remote.wrapper.codex_stream import (
-    codex_history_window, codex_native_rollback_turns,
+    codex_history_native_witness, codex_history_window,
+    codex_native_rollback_turns,
     codex_translate_history,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
@@ -1847,6 +1848,14 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
                 "message": internal,
             }
         )},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "id": "switch-call",
+            "call_id": "switch-call", "name": "exec_command", "input": {},
+        }},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "switch-call",
+            "output": "ok",
+        }},
         {"type": "event_msg", "payload": {
             "type": "agent_message", "turn_id": "turn-new",
             "message": "task A complete",
@@ -1894,6 +1903,14 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
     start, end, has_more, forced, forced_offset = codex_history_window(
         str(rollout), before="turn-b", limit=1)
     assert (has_more, forced, forced_offset) == (False, None, None)
+    witness = codex_history_native_witness(
+        str(rollout),
+        max_turns=4,
+        max_scan_bytes=None,
+        required_turn_ids=("turn-old", "turn-new"),
+    )
+    assert witness.turn_ids == ("turn-b", "turn-old")
+    assert set(witness.process_by_visible_id) == {"turn-old"}
     previous_page, _ = codex_translate_history(
         str(rollout), 10_000, start_offset=start, end_offset=end)
     assert [

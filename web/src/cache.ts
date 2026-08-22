@@ -50,7 +50,13 @@ const SCHEMA = 1;
 // seeded after (instead of before) its proven replay suffix. Those rows can
 // contain a canonical History owner plus a second prompt-less live layer; the
 // cache is rebuildable, so one clean reload is safer than shape-based guessing.
-const CACHE_VER = 18;
+// v19 persists exact process presence independently from deferred detail size.
+// Older rows can resurrect an empty "已处理" shell or hide a known process
+// after a detail page is replaced, so they must be rebuilt from v36 History.
+// v20 discards v19 Codex process clocks which may contain parser-time defaults.
+// SQLite projection migrations cannot invalidate a browser's IndexedDB copy,
+// and a hard refresh deliberately preserves that local cache.
+const CACHE_VER = 20;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -237,6 +243,8 @@ function projectTurnForCache(turn: Turn): Turn {
     error: clipCacheString(turn.error, 32 * 1024) ?? undefined,
     progress: clipCacheString(turn.progress, 8 * 1024) ?? undefined,
     blocks,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
     // Keep a small optimistic attachment set for a flicker-free first paint.
     // Larger bodies stay in the transcript image store and are refilled through
     // History image references instead of evicting the whole turn.

@@ -110,6 +110,18 @@ test("HTML preview retains head CSS and runs scripts only after explicit consent
     "color",
     "rgb(12, 34, 56)",
   );
+  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+    "color",
+    "rgb(236, 237, 243)",
+  );
+  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+    "background-color",
+    "rgb(13, 14, 21)",
+  );
+  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+    "border-top-color",
+    "rgb(49, 50, 63)",
+  );
   await expect(staticFrame.locator("body")).not.toHaveAttribute(
     "data-script-ran",
     "yes",
@@ -139,6 +151,20 @@ test("HTML preview retains head CSS and runs scripts only after explicit consent
   await expect(warmInteractiveFrame.locator("body")).toHaveAttribute(
     "data-script-ran",
     "yes",
+  );
+});
+
+test("Codex visualize output opens its local HTML through the preview callback", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?codex-visualization=1");
+  const card = page.getByRole("button", { name: /结构原理草图/ });
+  await expect(card).toBeVisible();
+  await expect(card).toContainText("HTML 可视化");
+  await expect(page.locator("main")).not.toContainText("/tmp/private");
+  await card.click();
+  await expect(page.getByTestId("visualization-opened-path")).toHaveText(
+    "/tmp/private/concept.html",
   );
 });
 
@@ -1789,7 +1815,7 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
         savedAt: Date.now(),
       }, lateSeedV17Sid);
       tx.objectStore("sessions").put({
-        v: 18,
+        v: 20,
         turns: [{
           id: "active-before-steer",
           prompt: "first prompt",

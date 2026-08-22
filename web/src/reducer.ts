@@ -327,6 +327,10 @@ export interface SessionRuntime {
     revision: number;
   } | null;
   statusReport: StatusReport | null;
+  // Engine-neutral quota projection. Codex seeds it from StatusReport and
+  // sparse app-server events; Claude can populate it from SDK events without
+  // fabricating a Codex-only status snapshot.
+  rateLimits: StatusRateLimit[];
   statusRequestId: string | null;
   statusError: string | null;
   notices: Notice[];
@@ -438,7 +442,7 @@ export function createRuntime(): SessionRuntime {
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
     goalId: null, goalDismissed: false, completion: null,
-    statusReport: null, statusRequestId: null, statusError: null,
+    statusReport: null, rateLimits: [], statusRequestId: null, statusError: null,
     notices: [], sendMode: "steer",
     queue: [], pendingSend: null, failedDeferred: [],
     acceptancePending: null,
@@ -684,9 +688,10 @@ function reconcileBoundCompactionOrphan(
   runtime: SessionRuntime,
   turns: Turn[],
   msgIds: readonly (string | null | undefined)[],
-  nativeTurnId: string | null | undefined,
+  nativeTurnId: string | readonly string[] | null | undefined,
 ): Turn[] {
-  if (!nativeTurnId) return turns;
+  if (!nativeTurnId || (Array.isArray(nativeTurnId)
+      && nativeTurnId.length === 0)) return turns;
   const aliases = msgIds.filter((value): value is string => !!value);
   const reconciliation = reconcileBoundCompactionOrphanDetailed(
     turns, aliases, nativeTurnId);
@@ -1050,7 +1055,8 @@ function bindAuthoritativeActiveHistoryHead(
   const logicalOwners = turns.filter((turn) =>
     turnHasIdentityAlias(turn, msgId));
   if (logicalOwners.length > 1) return undefined;
-  if (findTurnByEngineId([head], nativeTurnId) !== head) {
+  if (head.historyTurnId !== nativeTurnId
+      && findTurnByEngineId([head], nativeTurnId) !== head) {
     if (!historyStreamId
         || !continuationTurnIds?.includes(nativeTurnId)
         || !continuationTurnIds.includes(historyStreamId)) return undefined;
@@ -1424,6 +1430,10 @@ function limitTurnBlocks(turn: Turn): void {
       turn.detailEventCount ?? 0,
       retained.length + (turn.liveSpilledBlockCount ?? 0),
     );
+    if (spilled.some(isStateVisibleProcessBlock)) {
+      turn.processDetailState = "present";
+      ensureTurnDetailReason(turn, "process");
+    }
     turn.detailLoaded = false;
     if ((firstSpill || continuedLiveSpillRefreshDue(turn))
         && turn.detailLoading !== true) {
@@ -1788,6 +1798,53 @@ function markTurnAsLive(
 
 const MAX_LIVE_DETAIL_TURN_IDS = 128;
 
+function isStateVisibleProcessBlock(block: Block): boolean {
+  if (block.kind === "tool") return true;
+  if (block.kind === "text") {
+    return block.channel === "commentary" && block.text.length > 0;
+  }
+  if (block.processKind === "reasoning") return false;
+  if (block.processKind !== "hook") return true;
+  return ["failed", "declined", "cancelled", "interrupted"].includes(
+    block.status,
+  );
+}
+
+function ensureTurnDetailReason(
+  turn: Turn,
+  reason: NonNullable<Turn["detailReasons"]>[number],
+): void {
+  if (turn.detailReasons?.includes(reason)) return;
+  turn.detailReasons = [...(turn.detailReasons ?? []), reason];
+}
+
+function markVisibleProcessStarted(
+  turn: Turn,
+  stamp: number | undefined,
+): void {
+  turn.processDetailState = "present";
+  ensureTurnDetailReason(turn, "process");
+  if (stamp != null) {
+    turn.processStartedTs = turn.processStartedTs == null
+      ? stamp : Math.min(turn.processStartedTs, stamp);
+  }
+  // A later visible item reopens the process interval. It settles only after
+  // every currently visible item reaches a terminal state.
+  turn.processDoneTs = undefined;
+}
+
+function settleVisibleProcessIfComplete(
+  turn: Turn,
+  stamp: number | undefined,
+): void {
+  if (turn.processDetailState !== "present"
+      || turn.processStartedTs == null || turn.processDoneTs != null
+      || stamp == null) return;
+  const visible = mutableTurnBlocks(turn).filter(isStateVisibleProcessBlock);
+  if (visible.length === 0 || visible.some((block) => !block.done)) return;
+  turn.processDoneTs = Math.max(turn.processStartedTs, stamp);
+}
+
 function markTurnDetailAsLive(
   runtime: SessionRuntime, turnId: string, liveEvent: boolean,
 ): void {
@@ -1916,8 +1973,10 @@ const RATE_RESET_JITTER_SECONDS = 60;
 function mergeRateWindow(
   current: StatusRateWindow | null | undefined,
   update: StatusRateWindow | null | undefined,
+  replace = false,
 ): StatusRateWindow | null | undefined {
   if (!update) return current;
+  if (replace) return { ...update };
   const currentDuration = current?.window_duration_mins;
   const updateDuration = update.window_duration_mins;
   if (currentDuration != null && updateDuration != null
@@ -1953,11 +2012,10 @@ function mergeRateWindow(
   return next;
 }
 
-function mergeRateLimitUpdate(
-  report: StatusReport | null, update: RateLimitUpdate,
-): StatusReport | null {
-  if (!report) return null;
-  const limits = report.rate_limits.map((limit) => ({ ...limit }));
+function mergeRateLimitCollection(
+  source: readonly StatusRateLimit[], update: RateLimitUpdate,
+): StatusRateLimit[] {
+  const limits = source.map((limit) => ({ ...limit }));
   let index = update.limit_id
     ? limits.findIndex((limit) => limit.limit_id === update.limit_id)
     : limits.length === 1 ? 0 : -1;
@@ -1967,16 +2025,26 @@ function mergeRateLimitUpdate(
   }
   const current = limits[index];
   const next: StatusRateLimit = { ...current };
+  const clearsReachedLimit = !!current.rate_limit_reached_type
+    && update.reached_type === "";
   if (update.limit_id != null) next.limit_id = update.limit_id;
   if (update.name != null) next.limit_name = update.name;
   if (update.plan_type != null) next.plan_type = update.plan_type;
   if (update.reached_type != null) {
     next.rate_limit_reached_type = update.reached_type;
   }
-  next.primary = mergeRateWindow(current.primary, update.primary);
-  next.secondary = mergeRateWindow(current.secondary, update.secondary);
+  next.primary = mergeRateWindow(
+    current.primary, update.primary, clearsReachedLimit);
+  next.secondary = mergeRateWindow(
+    current.secondary, update.secondary, clearsReachedLimit);
   limits[index] = next;
-  return { ...report, rate_limits: limits.slice(-16) };
+  return limits.slice(-16);
+}
+
+function mergeRateLimitUpdate(
+  report: StatusReport | null, limits: StatusRateLimit[],
+): StatusReport | null {
+  return report ? { ...report, rate_limits: limits } : null;
 }
 
 export function reduce(state: AppState, action: Action): AppState {
@@ -3291,8 +3359,22 @@ function reduceEvent(
           && state.cwdByScope[ownership.scopeKey] !== focusedSession.cwd
         ? { ...state.cwdByScope, [ownership.scopeKey]: focusedSession.cwd }
         : state.cwdByScope;
-      const replacementNewChat = focusedMissing
-        ? {
+      // A New Chat cwd is user-owned draft state. In particular, the sidebar
+      // intentionally leaves the former focusedSid in memory while the draft
+      // is open; a later authoritative list may report that old focus missing.
+      // That must not replace an explicitly selected directory with `~`.
+      let replacementNewChat = state.newChat;
+      if (replacementNewChat && e.engine === "codex"
+          && selectedCodexProfileId
+          && replacementNewChat.codexProfileId !== selectedCodexProfileId) {
+        replacementNewChat = {
+          ...replacementNewChat,
+          codexProfileId: selectedCodexProfileId,
+          model: null,
+          effort: null,
+        };
+      } else if (focusedMissing && !replacementNewChat) {
+        replacementNewChat = {
           cwd: (ownership
             ? state.cwdByScope[ownership.scopeKey] : "") || "~",
           cwdSource: (ownership
@@ -3301,16 +3383,8 @@ function reduceEvent(
           model: null,
           effort: null,
           codexProfileId: selectedCodexProfileId,
-        }
-        : state.newChat && e.engine === "codex" && selectedCodexProfileId
-          && state.newChat.codexProfileId !== selectedCodexProfileId
-          ? {
-            ...state.newChat,
-            codexProfileId: selectedCodexProfileId,
-            model: null,
-            effort: null,
-          }
-          : state.newChat;
+        };
+      }
       let runtimes = state.runtimes;
       for (const session of sessions) {
         if (session.completion_revision == null
@@ -3433,11 +3507,11 @@ function reduceEvent(
         return state;
       }
       const preControlBase = state.runtimes[sid] ?? createRuntime();
-      if (!e.before && preControlBase.pendingHistoryGeneration
+      if (preControlBase.pendingHistoryGeneration
           && e.generation !== preControlBase.pendingHistoryGeneration) {
         return state;
       }
-      if (!e.before && e.authoritative !== false
+      if (e.authoritative !== false
           && isHistoryRecoveryPending(state.historyRecovery, sid)
           && !historyMatchesRecovery(state.historyRecovery, e)) {
         return state;
@@ -3446,12 +3520,12 @@ function reduceEvent(
         ? preControlBase.historyGeneration === e.generation
         : preControlBase.historyGeneration == null
           && preControlBase.historyRevision === e.revision;
-      const staleHistoryBuild = !e.before && e.build_seq != null
+      const staleHistoryBuild = e.build_seq != null
         && sameBuildGeneration
         && e.build_seq < preControlBase.historyBuildSeq;
       const runtimeRecoveryPending =
         isRuntimeHistoryRecoveryPending(preControlBase);
-      if (!e.before && e.authoritative !== false && runtimeRecoveryPending) {
+      if (e.authoritative !== false && runtimeRecoveryPending) {
         if (!historyMatchesRuntimeRecovery(preControlBase, e)) return state;
         if (historyNeedsConfirmationRequest(preControlBase, e)) {
           let next = patch(state, sid, (rt) => {
@@ -3472,7 +3546,7 @@ function reduceEvent(
         }
         if (!historyConfirmsRuntimeRecovery(preControlBase, e)) return state;
       }
-      if (!e.before && e.authoritative !== false
+      if (e.authoritative !== false
           && isHistoryRecoveryPending(state.historyRecovery, sid)
           && state.historyRecovery!.candidateBuildSeq != null
           && !historyConfirmsRecovery(state.historyRecovery, e)) {
@@ -3493,7 +3567,7 @@ function reduceEvent(
           switchControlGeneration(rt, e.generation);
         }, true);
       }
-      if (!e.before && e.terminal_fences !== undefined
+      if (e.terminal_fences !== undefined
           && (!preControlBase.pendingHistoryRevision
             || e.revision === preControlBase.pendingHistoryRevision)
           && (!staleHistoryBuild
@@ -3545,10 +3619,15 @@ function reduceEvent(
           ts: turn.ts ?? undefined,
           doneTs: turn.doneTs ?? undefined,
           durationMs: turn.durationMs ?? undefined,
+          processDetailState: turn.processDetailState ?? undefined,
+          detailReasons: turn.detailReasons
+            ? [...turn.detailReasons] : undefined,
+          processStartedTs: turn.processStartedTs ?? undefined,
+          processDoneTs: turn.processDoneTs ?? undefined,
         }));
       }
       if (e.authoritative === false) {
-        const provisional = !e.error && !e.before && built.turns.length > 0;
+        const provisional = !e.error && built.turns.length > 0;
         const pendingRecovery = isHistoryRecoveryPending(
           state.historyRecovery, sid);
         const coldPreview = provisional
@@ -3591,16 +3670,11 @@ function reduceEvent(
         }
         return next;
       }
-      // A pre-rollback first page and an older pagination response can arrive
-      // after the replayable marker. Only the marker's exact revision may cross
-      // the destructive boundary; pagination is valid only for the revision
-      // whose first page is already installed.
-      if (!e.before && base.pendingHistoryRevision
+      // A pre-rollback first page can arrive after the replayable marker. Only
+      // the marker's exact revision may cross the destructive boundary; older
+      // pagination was already routed out through the display-only path above.
+      if (base.pendingHistoryRevision
           && e.revision !== base.pendingHistoryRevision) return state;
-      if (e.before && (base.historyInvalidated
-          || !base.historyRevision || e.revision !== base.historyRevision)) {
-        return state;
-      }
       const pendingAcceptanceTurn = base.acceptancePending
         ? base.turns.find((turn) =>
             turnHasIdentityAlias(turn, base.acceptancePending))
@@ -3650,12 +3724,19 @@ function reduceEvent(
             }
           : turn);
       }
-      const racedLiveEvent = !e.before && e.live_seq != null
+      const racedLiveEvent = e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const runningGeneration = preControlBase.controlGeneration
+        ?? preControlBase.historyGeneration;
+      const currentRunningHistory = e.in_progress === true
+        && e.live_seq != null
+        && base.lastLiveSeq <= e.live_seq
+        && base.lastLifecycleSeq <= e.live_seq
+        && (runningGeneration == null || e.generation === runningGeneration);
       const preserveProjectionOpenPlans = racedLiveEvent
         || e.in_progress === true
         || (e.in_progress == null && base.state !== "idle");
-      const settledHistory = !e.before && !racedLiveEvent
+      const settledHistory = !racedLiveEvent
         && e.in_progress === false;
       const settledCodexHistory = settledHistory && state.sessions.some(
         (session) => session.session_id === sid && session.engine === "codex");
@@ -3665,8 +3746,7 @@ function reduceEvent(
         && !acceptanceConfirmed;
       const acceptanceRuntime = { ...base };
       if (acceptanceConfirmed) clearAcceptance(acceptanceRuntime);
-      const preserveStableHeadHistory = !e.before
-        && base.turns.length > 0
+      const preserveStableHeadHistory = base.turns.length > 0
         && (base.hasLoadedOlderHistory || e.has_more === true)
         && !base.historyInvalidated
         && base.historyRevision === e.revision
@@ -3674,6 +3754,7 @@ function reduceEvent(
           ? base.historyGeneration === e.generation
           : base.historyGeneration == null);
       let turns: Turn[];
+      let pendingBound: Turn[] = [];
       if (e.before) {
         // pagination (load older): PREPEND the older turns ahead of what we have,
         // deduped by id — keeps the current view and in-flight turn intact.
@@ -3688,6 +3769,23 @@ function reduceEvent(
           base.turns, base.hydratedCacheTurnIds);
         const newestUnfinished = [...unfinished].reverse().find(
           (turn) => turnHasUnfinishedWork(turn));
+        const pendingBinding = base.pendingLiveBinding;
+        const binding = pendingBinding
+          && e.in_progress
+          && e.live_seq != null
+          && !e.external
+          && e.generation
+          && pendingBinding.generation === e.generation
+          && e.live_seq >= pendingBinding.seq
+          ? pendingBinding : null;
+        pendingBound = binding
+          ? unfinished.filter((turn) =>
+              !turn.done
+              && turnHasIdentityAlias(turn, binding.msgId)
+              && (!turnHasBoundEngineId(turn)
+                || findTurnByEngineId([turn], binding.turnId))
+              && (turn.prompt || turn.images?.[0] || turn.files?.[0]))
+          : [];
         const liveTail = preserveStableHeadHistory
           // A bounded newest page is a moving head window, not the whole
           // conversation. Keep rows already painted from live traffic or from
@@ -3705,12 +3803,16 @@ function reduceEvent(
           // Current authoritative History validates real replay tails by turn
           // identity; unmatched fragments must not survive at the newest edge.
           // Keep an optimistic query which has not yet received its UserMsg
-          // echo so a History read cannot erase an in-flight send. Likewise,
-          // an explicitly running snapshot may precede the transcript flush;
-          // only its newest unfinished row can be the active unflushed tail.
+          // echo so a History read cannot erase an in-flight send. Once
+          // TurnBinding clears that acceptance flag, pendingBound preserves
+          // only its unique same-generation user row while running History
+          // still lags behind compaction. Likewise, an explicitly running
+          // snapshot may precede the transcript flush; only its newest
+          // unfinished row can be the active unflushed tail.
           ? unfinished.filter((turn) =>
               turn.id === base.acceptancePending
               || historyContainsTurn(built.turns, turn)
+              || (turn === pendingBound[0] && !pendingBound[1])
               || (e.in_progress === true && turn === newestUnfinished))
           : unfinished;
         turns = mergeInitialHistory(
@@ -3815,19 +3917,61 @@ function reduceEvent(
           base.turns.filter((turn) => observedIds.has(turn.id)),
         );
       }
+      // Codex can compact between accepting a browser query and flushing that
+      // query back into the bounded History page. Live replay then contains an
+      // exact bound user row plus a promptless compaction continuation row.
+      // The wrapper-provided continuation set is the only proof that those two
+      // native ids belong to one task; never infer this from row order or time.
+      let provenanceRuntime = base;
+      let compactBridgeOwner: SessionRuntime["liveOwner"] = null;
+      const compactBinding = base.pendingLiveBinding;
+      const compactIds = e.compaction_continuation_turn_ids;
+      if (currentRunningHistory && !e.external && !base.external
+          && compactBinding
+          && compactBinding.generation === (e.generation
+            ?? base.controlGeneration ?? base.historyGeneration)
+          && e.live_seq! >= compactBinding.seq
+          && compactIds?.includes(compactBinding.turnId)
+          && pendingBound.length === 1) {
+        const bridge = { ...base, turns };
+        const repaired = reconcileBoundCompactionOrphan(
+          bridge, turns, [compactBinding.msgId], compactIds);
+        if (repaired.length < turns.length) {
+          const owner = repaired.find((turn) =>
+            turnHasIdentityAlias(turn, compactBinding.msgId))!;
+          bridge.turns = repaired;
+          bridge.liveOwner = {
+            turnId: owner.id,
+            seq: e.live_seq!,
+          };
+          turns = repaired;
+          provenanceRuntime = bridge;
+          compactBridgeOwner = bridge.liveOwner;
+        }
+      }
       let boundHistoryOwner: SessionRuntime["liveOwner"] = null;
-      const currentRunningHistory = !e.before
-        && e.in_progress === true
-        && e.live_seq != null
-        && base.lastLiveSeq <= e.live_seq
-        && base.lastLifecycleSeq <= e.live_seq
-        && (base.historyGeneration == null
-          || e.generation === base.historyGeneration);
       if (currentRunningHistory && e.live_seq != null) {
         turns = reopenAuthoritativeActiveHistoryHead(
-          base, turns, e.newest_id, e.live_seq,
+          provenanceRuntime, turns, e.newest_id, e.live_seq,
           e.compaction_continuation_turn_ids);
-        const binding = base.pendingLiveBinding;
+        // A current History head can be the only surviving acceptance proof
+        // after reconnect. Feed that exact native/client pair through the same
+        // strict binding path as a live TurnBinding; the helper still requires
+        // one unfinished authoritative head and rejects alias ambiguity.
+        const binding = acceptanceConfirmed && base.acceptancePending
+            && acceptedNativeTurnId
+            && !e.external && !base.external
+            && e.generation != null
+            && e.generation === (preControlBase.pendingHistoryGeneration
+              ?? preControlBase.controlGeneration
+              ?? preControlBase.historyGeneration)
+          ? {
+              msgId: base.acceptancePending,
+              turnId: acceptedNativeTurnId,
+              seq: e.live_seq,
+              generation: e.generation,
+            }
+          : base.pendingLiveBinding;
         const responseGeneration = e.generation
           ?? base.controlGeneration ?? base.historyGeneration;
         if (binding && binding.generation === responseGeneration
@@ -3835,7 +3979,7 @@ function reduceEvent(
           const bindingRuntime = {
             ...base,
             state: "running" as const,
-            liveOwner: base.liveOwner ? { ...base.liveOwner } : null,
+            liveOwner: null,
           };
           bindAuthoritativeActiveHistoryHead(
             bindingRuntime,
@@ -3924,7 +4068,9 @@ function reduceEvent(
       const preserveStablePagination = preserveStableHeadHistory && (
         base.hasLoadedOlderHistory || (!!base.hasMore && !!base.oldestId)
       );
-      const acceptsControlState = !e.before;
+      // Older pages returned at the top of this case and never reach runtime
+      // authority reconciliation; every remaining frame is a newest page.
+      const acceptsControlState = true;
       const acceptsOwnershipState = acceptsControlState && !racedLiveEvent
         && !base.hasRevisionedControl;
       const confirmsWrapperRunning = acceptsControlState
@@ -3940,16 +4086,20 @@ function reduceEvent(
         : base.historyGeneration;
       const nextOrderingGeneration = base.controlGeneration
         ?? nextHistoryGeneration;
-      let pendingLiveBinding = base.pendingLiveBinding;
+      // Once History has established the accepted head as an explicit owner,
+      // an older predecessor binding must not reopen that row on the next tool.
+      let pendingLiveBinding = boundHistoryOwner
+        ? null : base.pendingLiveBinding;
       // An exact idle History page is also a lifecycle boundary when the
       // browser missed State(idle). Do not carry task A's owner into a later
       // task B which can become running before its binding reaches this client.
       let liveOwner = settledHistory
         ? null
         : boundHistoryOwner
+          ?? compactBridgeOwner
           ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
       const liveDetailTurnIds = remapTurnProvenanceIds(
-        base.liveDetailTurnIds, base.turns, turns);
+        provenanceRuntime.liveDetailTurnIds, provenanceRuntime.turns, turns);
       if (pendingLiveBinding
           && pendingLiveBinding.generation !== nextOrderingGeneration) {
         pendingLiveBinding = null;
@@ -4126,6 +4276,8 @@ function reduceEvent(
       const target = base.turns.find((turn) => turn.id === e.turn_id
         || canonicalTurnId(turn) === e.turn_id);
       if (!target || e.events.length === 0) {
+        const exactEmptyInitial = !!target && e.events.length === 0
+          && e.before == null && !e.has_more && !e.has_newer;
         return patch(state, sid, (rt) => {
           rt.turns = rt.turns.map((turn) => (
             turn.id === e.turn_id || canonicalTurnId(turn) === e.turn_id)
@@ -4136,6 +4288,21 @@ function reduceEvent(
                 detailError: undefined,
                 detailRetryBefore: undefined,
                 detailRetryDirection: undefined,
+                // An empty complete read can refine an opaque summary to an
+                // exact direct reply. It cannot revoke positive evidence from
+                // a previous page/live event in this revision: doing so makes
+                // the collapsed process disappear until the next History
+                // refresh restores it.
+                ...(exactEmptyInitial
+                    && turn.processDetailState !== "present" ? {
+                  processDetailState: "none" as const,
+                  detailReasons: turn.detailReasons?.filter(
+                    (reason) => reason !== "process"),
+                  detailEventCount: 0,
+                  detailLoaded: true,
+                  processStartedTs: undefined,
+                  processDoneTs: undefined,
+                } : {}),
               }
             : turn);
         });
@@ -4209,6 +4376,10 @@ function reduceEvent(
         });
       });
     }
+    case "agent_detail":
+      // Agent detail is a requester-correlated side panel projection. App owns
+      // it separately so it can never mutate the parent conversation runtime.
+      return state;
     case "dir_list":
       return {
         ...state,
@@ -4712,6 +4883,7 @@ function reduceEvent(
         // snapshot overwrite the newer request's loading state or result.
         if (rt.statusRequestId && e.request_id !== rt.statusRequestId) return;
         rt.statusReport = e;
+        rt.rateLimits = e.rate_limits.map((limit) => ({ ...limit }));
         rt.statusRequestId = null;
         rt.statusError = null;
       });
@@ -4721,7 +4893,8 @@ function reduceEvent(
       });
     case "rate_limit_update":
       return patch(state, e.sid, (rt) => {
-        rt.statusReport = mergeRateLimitUpdate(rt.statusReport, e);
+        rt.rateLimits = mergeRateLimitCollection(rt.rateLimits, e);
+        rt.statusReport = mergeRateLimitUpdate(rt.statusReport, rt.rateLimits);
       });
     case "replay_start": {
       const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
@@ -4959,6 +5132,10 @@ function reduceEvent(
           (query) => !query.msg_id || !acceptedIds.has(query.msg_id));
         if (rt.acceptancePending
             && acceptedIds.has(rt.acceptancePending)) {
+          // Claude's native TurnBinding follows this exact user echo later.
+          if (boundCompletedTurns && e.seq != null) {
+            rt.liveOwner = { turnId: rt.acceptancePending, seq: e.seq };
+          }
           clearAcceptance(rt);
         }
         markTurnAsLive(rt, e.msg_id, boundCompletedTurns, e.seq);
@@ -5168,6 +5345,9 @@ function reduceEvent(
         if (block.channel !== "final" && e.text.length > 0) {
           markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         }
+        if (block.channel === "commentary" && e.text.length > 0) {
+          markVisibleProcessStarted(t, eventTimestampMs(e.ts));
+        }
         if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
       });
@@ -5198,6 +5378,7 @@ function reduceEvent(
             server: e.server, done: false });
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
+        markVisibleProcessStarted(t, eventTimestampMs(e.ts));
         rt.turns = turns;
       });
     case "tool_delta":
@@ -5209,6 +5390,7 @@ function reduceEvent(
           if (!block) continue;
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
+          markVisibleProcessStarted(t, eventTimestampMs(e.ts));
           if (e.stream === "progress" || e.stream === "summary") {
             block.progress = appendField(
               block.progress, e.delta, MAX_LIVE_PROGRESS_CHARS);
@@ -5240,6 +5422,8 @@ function reduceEvent(
             if ("diff" in e) b.diff = e.diff ?? undefined;
             b.done = true;
             t.progress = undefined;
+            markVisibleProcessStarted(t, eventTimestampMs(e.ts));
+            settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
             if (boundCompletedTurns) limitTurnBlocks(t);
             break;
           }
@@ -5256,6 +5440,9 @@ function reduceEvent(
             markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
             b.done = true;
+            if (b.channel === "commentary" && b.text.length > 0) {
+              settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
+            }
             break;
           }
         }
@@ -5286,7 +5473,10 @@ function reduceEvent(
           owner = openTurn(
             turns, e.turn_id || e.item_id, eventTimestampMs(e.ts));
         }
-        markTurnAsLive(rt, owner.id, boundCompletedTurns, e.seq);
+        const detachedBackground = e.background === true && owner.done;
+        if (!detachedBackground) {
+          markTurnAsLive(rt, owner.id, boundCompletedTurns, e.seq);
+        }
         markTurnDetailAsLive(rt, owner.id, boundCompletedTurns);
         if (!block) {
           block = { kind: "process", item_id: e.item_id, processKind: e.kind,
@@ -5313,6 +5503,7 @@ function reduceEvent(
         if (e.exit_code != null) block.exit_code = e.exit_code;
         if (e.duration_ms != null) block.duration_ms = e.duration_ms;
         if (e.truncated != null) block.truncated = e.truncated;
+        if (e.background != null) block.background = e.background;
         if (e.append_to && e.delta) {
           if (e.append_to === "summary") {
             block.summary = appendField(
@@ -5331,7 +5522,13 @@ function reduceEvent(
           }
         }
         block.done = e.phase === "end" || terminalProcessStatus(e.status);
-        owner.progress = undefined;
+        if (isStateVisibleProcessBlock(block)) {
+          markVisibleProcessStarted(owner, eventTimestampMs(e.ts));
+          if (block.done) {
+            settleVisibleProcessIfComplete(owner, eventTimestampMs(e.ts));
+          }
+        }
+        if (!detachedBackground) owner.progress = undefined;
         if (boundCompletedTurns) limitTurnBlocks(owner);
         rt.turns = turns;
         applyPendingCodexTerminalFences(rt);
@@ -5361,6 +5558,11 @@ function reduceEvent(
         block.status = e.plan.length > 0 && e.plan.every((entry) => entry.status === "completed")
           ? "succeeded" : "running";
         block.done = block.status === "succeeded";
+        markVisibleProcessStarted(t, eventTimestampMs(e.ts));
+        if (block.done) {
+          settleVisibleProcessIfComplete(
+            t, eventTimestampMs(e.ts) ?? t.doneTs);
+        }
         t.progress = undefined;
         if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
@@ -5387,6 +5589,14 @@ function reduceEvent(
         }
         block.diff = e.diff;
         block.truncated = e.truncated;
+        // TurnDiff is a complete snapshot, not an open stream. A later
+        // snapshot may update it, but this event itself has a terminal
+        // boundary and must not keep the process clock running until TurnEnd.
+        block.phase = "snapshot";
+        block.status = "succeeded";
+        block.done = true;
+        markVisibleProcessStarted(t, eventTimestampMs(e.ts));
+        settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
         t.progress = undefined;
         if (boundCompletedTurns) limitTurnBlocks(t);
         rt.turns = turns;
@@ -5543,6 +5753,8 @@ function reduceEvent(
             e.result.is_error,
             e.result.subtype === "steered",
           );
+          settleVisibleProcessIfComplete(
+            t, eventTimestampMs(e.ts) ?? t.doneTs);
           if (t.liveBlocksSpilled) {
             // Refresh the newest source-backed page at the terminal boundary.
             // If a running snapshot is already in flight, keep this pending

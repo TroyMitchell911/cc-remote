@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
 
 from cc_remote.protocol import TurnEnd, TurnResult, UserMsg
@@ -22,7 +22,10 @@ from cc_remote.wrapper.codex_rpc import (
     CodexRpcResponseTooLarge,
     codex_rpc,
 )
-from cc_remote.wrapper.codex_stream import CodexStreamTranslator
+from cc_remote.wrapper.codex_stream import (
+    CodexStreamTranslator,
+    MIN_PROCESS_DURATION_MS,
+)
 from cc_remote.wrapper.history_store import materialize_history_turns
 
 
@@ -86,6 +89,12 @@ class CodexHistoryPage:
     # stay wrapper-private and let the caller validate projection completeness
     # without guessing from visible steer-segment ids.
     native_turn_ids: tuple[str, ...] = ()
+    # Official user item ids and rollout user ids are intentionally unrelated.
+    # Join positive rollout evidence through the native task plus chronological
+    # steer index instead of guessing that either visible id is shared.
+    native_segment_by_visible_id: dict[
+        str, tuple[str, int]
+    ] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -287,7 +296,24 @@ def _translate_segment(
     started_ts = float(started) if isinstance(started, int) else None
     completed_ts = float(completed) if isinstance(completed, int) else None
     translator = CodexStreamTranslator(tool_result_max)
-    events = []
+    events: list[dict[str, Any]] = []
+
+    def serialized(event, timestamp: float | None) -> dict[str, Any]:
+        """Keep parser time out of persisted-history evidence.
+
+        Every protocol model receives a wall-clock ``ts`` by default for live
+        transport.  Official history can omit both turn timestamps, though;
+        serializing that default would make the time at which the browser read
+        history look like the time at which the model worked.  Only an
+        app-server timestamp is authoritative here.
+        """
+        event.sid = thread_id
+        if timestamp is not None:
+            event.ts = timestamp
+        payload = event.model_dump(mode="json")
+        if timestamp is None:
+            payload.pop("ts", None)
+        return payload
 
     if not any(item.get("type") == "userMessage" for item in segment):
         # Automatic continuation turns have no user item. Anchor them to the
@@ -299,15 +325,12 @@ def _translate_segment(
             prompt="",
             sid=thread_id,
         )
-        if started_ts is not None:
-            anchor.ts = started_ts
-        events.append(anchor)
+        events.append(serialized(anchor, started_ts))
 
     for item in segment:
         if item.get("type") == "userMessage":
             event = _user_message(item, ts=started_ts)
-            event.sid = thread_id
-            events.append(event)
+            events.append(serialized(event, started_ts))
             continue
         if (
             item.get("type") == "agentMessage"
@@ -328,11 +351,7 @@ def _translate_segment(
                 "item": item,
             },
         })
-        for event in translated:
-            event.sid = thread_id
-            if started_ts is not None:
-                event.ts = started_ts
-        events.extend(translated)
+        events.extend(serialized(event, started_ts) for event in translated)
 
     final_segment = segment_index == segment_count - 1
     status = turn["status"]
@@ -353,11 +372,7 @@ def _translate_segment(
                 },
             },
         })
-        for event in translated:
-            event.sid = thread_id
-            if completed_ts is not None:
-                event.ts = completed_ts
-        events.extend(translated)
+        events.extend(serialized(event, completed_ts) for event in translated)
     elif not final_segment:
         terminal = TurnEnd(
             result=TurnResult(
@@ -367,11 +382,9 @@ def _translate_segment(
             ),
             sid=thread_id,
         )
-        if started_ts is not None:
-            terminal.ts = started_ts
-        events.append(terminal)
+        events.append(serialized(terminal, started_ts))
 
-    return [event.model_dump(mode="json") for event in events]
+    return events
 
 
 def _translate_turn(
@@ -722,7 +735,7 @@ class CodexOfficialHistory:
         visible_seen: set[str] = set()
         projected_rows: list[dict[str, Any]] = []
         chronological_segments: list[
-            tuple[list[dict[str, Any]], _TurnLocator]
+            tuple[list[dict[str, Any]], _TurnLocator, bool]
         ] = []
         if self._recover_users is not None:
             missing_automatic: list[str] = []
@@ -948,6 +961,7 @@ class CodexOfficialHistory:
                         request_before=before,
                         request_limit=limit,
                     ),
+                    turn.get("itemsView") == "full",
                 ))
 
         if active_turn_ids and before is None and not (
@@ -961,7 +975,7 @@ class CodexOfficialHistory:
         # The official page is descending by native turn. Preserve the order of
         # steer segments inside each native turn while reversing native turns.
         grouped: list[list[
-            tuple[list[dict[str, Any]], _TurnLocator]
+            tuple[list[dict[str, Any]], _TurnLocator, bool]
         ]] = []
         offset = 0
         for projected_turn in projected_rows:
@@ -973,10 +987,29 @@ class CodexOfficialHistory:
             for native_group in reversed(grouped)
             for segment in native_group
         ]
+        # Official pagination counts native turns, whereas the rollout
+        # compatibility reader counts visible user segments. One native turn
+        # may contain several steer segments, so replaying the native request
+        # limit can trim the oldest visible row out of its own detail fallback.
+        # Preserve the exact source page but widen its visible-row budget to the
+        # number this official page actually materialized.
+        rollout_fallback_limit = max(limit, len(ordered))
+        if rollout_fallback_limit != limit:
+            ordered = [
+                (
+                    segment_events,
+                    replace(
+                        locator,
+                        request_limit=rollout_fallback_limit,
+                    ),
+                    process_detail_exact,
+                )
+                for segment_events, locator, process_detail_exact in ordered
+            ]
 
         native_aliases = client_message_ids or {}
         segment_aliases = segment_client_message_ids or {}
-        for segment_events, locator in ordered:
+        for segment_events, locator, _process_detail_exact in ordered:
             user = next((
                 event for event in segment_events
                 if event.get("type") == "user_msg"
@@ -998,7 +1031,7 @@ class CodexOfficialHistory:
 
         events = tuple(
             event
-            for segment_events, _locator in ordered
+            for segment_events, _locator, _process_detail_exact in ordered
             for event in segment_events
         )
         turns = materialize_history_turns(
@@ -1008,19 +1041,39 @@ class CodexOfficialHistory:
         if len(turns) != len(ordered):
             raise CodexHistoryInvalidResponse(
                 "Codex page segment count changed during projection")
-        for turn, (segment_events, locator) in zip(turns, ordered):
+        for turn, (
+            segment_events,
+            locator,
+            process_detail_exact,
+        ) in zip(turns, ordered):
             visible_id = turn["id"]
             if (
                 locator.native_turn_id in active_turn_ids
                 and locator.segment_index == locator.segment_count - 1
             ):
                 turn["forkPointId"] = locator.native_turn_id
-            # ``itemsView=summary`` is explicit authoritative evidence that a
-            # full projection exists even when its process-item count is not
-            # exposed. Keep the detail affordance available without loading the
-            # heavyweight item list on first paint.
-            turn["detailEventCount"] = max(
-                1, int(turn.get("detailEventCount") or 0))
+            # A native summary proves that more item data can be requested, but
+            # it does not prove that the hidden payload contains a process the
+            # UI is allowed to show. Keep that uncertainty distinct from both
+            # exact direct answers and exact process-bearing full projections.
+            if (
+                not process_detail_exact
+                and turn.get("processDetailState") == "none"
+            ):
+                turn["processDetailState"] = "unknown"
+            process_started = turn.get("processStartedTs")
+            process_done = turn.get("processDoneTs")
+            if (
+                isinstance(process_started, int)
+                and isinstance(process_done, int)
+                and process_done - process_started < MIN_PROCESS_DURATION_MS
+            ):
+                # Full native items inherit the turn-level second timestamp,
+                # so parsing several real process items can otherwise invent a
+                # misleading 0s interval. Presence remains exact; timing waits
+                # for a source-backed witness with distinct event timestamps.
+                turn.pop("processStartedTs", None)
+                turn.pop("processDoneTs", None)
             self._remember(
                 self._locators, (thread_id, visible_id), locator)
             previous_summary = self._summary_events.get(
@@ -1032,6 +1085,14 @@ class CodexOfficialHistory:
                 (thread_id, visible_id),
                 tuple(segment_events),
             )
+
+        native_segment_by_visible_id = {
+            turn["id"]: (
+                locator.native_turn_id,
+                locator.segment_index,
+            )
+            for turn, (_events, locator, _exact) in zip(turns, ordered)
+        }
 
         oldest_id = turns[0]["id"] if turns else None
         newest_id = turns[-1]["id"] if turns else None
@@ -1054,6 +1115,7 @@ class CodexOfficialHistory:
                 _wire_id(turn["id"], "turn")
                 for turn in validated_rows
             ),
+            native_segment_by_visible_id=native_segment_by_visible_id,
         )
 
     def _locator(self, thread_id: str, visible_turn_id: str) -> _TurnLocator:

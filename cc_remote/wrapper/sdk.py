@@ -49,6 +49,7 @@ log = logger("cc_remote.wrapper.sdk")
 
 CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
 CLAUDE_DEFAULT_EFFORT = "max"
+CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024
 _CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
 
 # Work keeps the file primitives needed for documents and other deliverables,
@@ -199,6 +200,15 @@ class SdkHandle:
         return ClaudeAgentOptions(
             tools=list(CLAUDE_WORK_TOOLS) if self.work_mode else None,
             include_partial_messages=True,        # StreamEvent with content_block_delta
+            # Claude's Read result can carry image bytes as base64 in one NDJSON
+            # record. The SDK defaults to 1 MiB, below cc-remote's bounded
+            # attachment/image envelope, so an otherwise valid tool result can
+            # kill the sole stdout reader while the Claude child keeps running.
+            # This is an on-demand line limit, not a per-session preallocation.
+            max_buffer_size=CLAUDE_MAX_BUFFER_SIZE,
+            # Code exposes Claude-owned subagent output as a read-only process
+            # projection. Work deliberately has no Agent tool or agent surface.
+            forward_subagent_text=not self.work_mode,
             # Claude's public rewind_files() needs both checkpoint creation and
             # replayed UserMessage UUIDs.  The latter are also the stable UI
             # anchors used to choose a code-only rewind point.
@@ -230,7 +240,7 @@ class SdkHandle:
             setting_sources=[] if self.work_mode else None,
             skills=[] if self.work_mode else None,
             # The wrapper-owned Work settings file already contains the complete
-            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.128
+            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.142
             # replaces (rather than deep-merges) that object when `sandbox=` is
             # also supplied, silently dropping filesystem policy and inlining
             # provider credentials in argv. Pass only the policy path instead.
@@ -728,6 +738,15 @@ class SdkHandle:
                     return
         finally:
             self._turn_consumer_active = False
+
+    @property
+    def message_pump_failed(self) -> bool:
+        """Whether this client must be reconnected before another query."""
+        task = self._message_pump_task
+        return (
+            self._message_pump_error is not None
+            or (task is not None and task.done())
+        )
 
     def release_background_messages(self) -> None:
         """Release notifications ordered after the processed ResultMessage."""

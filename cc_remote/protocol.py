@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 35
+PROTOCOL_VERSION = 37
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -777,6 +777,10 @@ class ProcessEvent(_Base):
     exit_code: Optional[int] = None
     duration_ms: Optional[int] = Field(default=None, ge=0)
     truncated: Optional[bool] = None
+    # Claude Agent work may outlive the parent ResultMessage. It remains visible
+    # in that turn's collaboration card, but must not re-open the session-wide
+    # running indicator after the parent turn has authoritatively completed.
+    background: Optional[bool] = None
 
 
 class TurnPlan(_Base):
@@ -1776,12 +1780,12 @@ class Notice(_Base):
 
 
 class RateLimitUpdate(_Base):
-    """Sparse-safe, sanitized rolling Codex rate-limit state.
+    """Sparse-safe, sanitized rolling engine rate-limit state.
 
-    The app-server's credits, individual spend control and future unknown
-    fields are intentionally absent.  Names differ slightly from StatusReport
-    so the live event remains concise; the Web reducer projects them into the
-    existing StatusRateLimit view model.
+    Codex app-server credits/spend controls and Claude SDK raw/account fields
+    are intentionally absent. Names differ slightly from StatusReport so the
+    live event remains concise; the Web reducer projects both engines into the
+    shared StatusRateLimit view model.
     """
     type: Literal["rate_limit_update"] = "rate_limit_update"
     limit_id: Optional[str] = Field(default=None, max_length=128)
@@ -1974,6 +1978,17 @@ class ConversationTurn(BaseModel):
     ts: Optional[int] = Field(default=None, ge=0)
     doneTs: Optional[int] = Field(default=None, ge=0)
     durationMs: Optional[int] = Field(default=None, ge=0)
+    # Detail size and process visibility are deliberately separate. A deferred
+    # payload may contain only a truncated prompt/final answer (or an image),
+    # while an official Codex summary may not reveal whether process items
+    # exist at all. The browser must never turn either case into a fake
+    # "processed" row.
+    processDetailState: Literal["none", "present", "unknown"] = "none"
+    detailReasons: list[Literal[
+        "process", "prompt_truncated", "answer_truncated", "image_deferred",
+    ]] = Field(default_factory=list, max_length=4)
+    processStartedTs: Optional[int] = Field(default=None, ge=0)
+    processDoneTs: Optional[int] = Field(default=None, ge=0)
     detailEventCount: int = Field(default=0, ge=0)
     detailLoaded: bool = False
 
@@ -2025,7 +2040,7 @@ class History(_Base):
     # sampled/changed-during-read preview while an exact refresh runs in background.
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = Field(default_factory=list)
     turns: list[ConversationTurn] = []
     detail: Literal["summary", "full"] = "full"
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
@@ -2086,7 +2101,49 @@ class TurnDetail(_Base):
     revision: WireId
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    has_more: bool = False
+    oldest_cursor: Optional[WireId] = None
+    has_newer: bool = False
+    newer_cursor: Optional[WireId] = None
+    before: Optional[WireId] = None
+
+
+class GetAgentDetail(_Command):
+    """client -> wrapper: fetch one Claude subagent's public process projection."""
+    type: Literal["get_agent_detail"] = "get_agent_detail"
+    session_id: WireId
+    run_id: WireId
+    request_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+    detail_revision: Optional[WireId] = None
+    before: Optional[WireId] = None
+    limit: int = Field(default=192, ge=1, le=256)
+
+
+class AgentDetail(_Base):
+    """wrapper -> browser: one read-only page from a Claude subagent run.
+
+    ``run_id`` is a stable public hash of the spawning Agent tool call. Raw
+    Claude agent ids, delegated prompts and output-file paths never cross this
+    boundary. Live batches are unbuffered hints; a normal response is always a
+    source-backed or resident authoritative snapshot.
+    """
+    type: Literal["agent_detail"] = "agent_detail"
+    session_id: WireId
+    run_id: WireId
+    request_id: Optional[WireId] = None
+    revision: WireId
+    detail_revision: WireId
+    authoritative: bool = True
+    live: bool = False
+    title: str = Field(default="协作代理", min_length=1, max_length=1024)
+    parent_run_id: Optional[WireId] = None
+    status: ProcessStatus = "unknown"
+    error: Optional[str] = Field(default=None, max_length=4096)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    through_seq: int = Field(default=0, ge=0)
     has_more: bool = False
     oldest_cursor: Optional[WireId] = None
     has_newer: bool = False
@@ -2279,8 +2336,8 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2340,6 +2397,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "authorize_preview": AuthorizePreview,
     "get_history": GetHistory,
     "get_turn_detail": GetTurnDetail,
+    "get_agent_detail": GetAgentDetail,
     "get_history_image": GetHistoryImage,
     "get_models": GetModels,
     "models": Models,
@@ -2402,6 +2460,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "work_artifacts": WorkArtifacts,
     "history": History,
     "turn_detail": TurnDetail,
+    "agent_detail": AgentDetail,
     "history_image": HistoryImage,
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,

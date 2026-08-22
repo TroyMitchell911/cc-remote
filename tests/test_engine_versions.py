@@ -12,9 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_claude_sdk_policy_is_exact():
-    assert claude_runtime.validate_sdk_version("0.2.128") == "0.2.128"
-    with pytest.raises(RuntimeError, match="not the verified 0.2.128"):
-        claude_runtime.validate_sdk_version("0.2.127")
+    assert claude_runtime.validate_sdk_version("0.2.142") == "0.2.142"
+    with pytest.raises(RuntimeError, match="not the verified 0.2.142"):
+        claude_runtime.validate_sdk_version("0.2.141")
 
 
 def test_verified_claude_sdk_matches_dependency_pin():

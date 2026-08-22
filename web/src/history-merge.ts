@@ -50,6 +50,104 @@ function isFinalTextBlock(
   return block.kind === "text" && block.channel === "final";
 }
 
+type ProcessDetailState = NonNullable<Turn["processDetailState"]>;
+type TurnDetailReason = NonNullable<Turn["detailReasons"]>[number];
+
+function isPresentableProcessBlock(block: Block): boolean {
+  if (block.kind === "tool") return true;
+  if (block.kind === "text") {
+    return block.channel === "commentary" && block.text.length > 0;
+  }
+  if (block.processKind === "reasoning") return false;
+  if (block.processKind !== "hook") return true;
+  return ["failed", "declined", "cancelled", "interrupted"].includes(
+    block.status,
+  );
+}
+
+function statedProcessDetailState(turn: Turn): ProcessDetailState {
+  if (turn.processDetailState) return turn.processDetailState;
+  return (turn.detailEventCount ?? 0) > 0 ? "unknown" : "none";
+}
+
+function hasDeferredTurnDetail(turn: Turn): boolean {
+  return statedProcessDetailState(turn) !== "none"
+    || (turn.detailReasons?.length ?? 0) > 0
+    || (turn.detailEventCount ?? 0) > 0;
+}
+
+/** Merge only same-revision process evidence. A concrete browser/detail
+ * projection refines an opaque native summary, while an opaque refresh can
+ * never erase an exact conclusion already learned for that revision. */
+function mergedProcessDetailState(
+  history: Turn,
+  live: Turn,
+  blocks: readonly Block[],
+): ProcessDetailState {
+  if (blocks.some(isPresentableProcessBlock)) return "present";
+  const historyState = statedProcessDetailState(history);
+  const liveState = statedProcessDetailState(live);
+  // Visible process is immutable within one history revision. A later opaque
+  // or final-only page may replace the currently retained block window, but it
+  // cannot prove that a process observed on another page never existed.
+  if (historyState === "present" || liveState === "present") return "present";
+  if (historyState !== "unknown") return historyState;
+  if (liveState !== "unknown") return liveState;
+  return "unknown";
+}
+
+function mergedDetailReasons(
+  history: Turn,
+  live: Turn,
+  processState: ProcessDetailState,
+): TurnDetailReason[] {
+  const reasons = new Set<TurnDetailReason>([
+    ...(history.detailReasons ?? []),
+    ...(live.detailReasons ?? []),
+  ]);
+  if (processState === "present") reasons.add("process");
+  else if (processState === "none") reasons.delete("process");
+  return [...reasons];
+}
+
+function earliestTimestamp(
+  first: number | undefined,
+  second: number | undefined,
+): number | undefined {
+  if (first == null) return second;
+  if (second == null) return first;
+  return Math.min(first, second);
+}
+
+function latestTimestamp(
+  first: number | undefined,
+  second: number | undefined,
+): number | undefined {
+  if (first == null) return second;
+  if (second == null) return first;
+  return Math.max(first, second);
+}
+
+function trustworthyProcessStartedTs(turn: Turn): number | undefined {
+  const started = turn.processStartedTs;
+  const done = turn.processDoneTs;
+  if (started == null) return undefined;
+  // Older projections assigned every hydrated native item the same parser
+  // timestamp. Do not let that invalid zero interval combine with a newer
+  // source witness and manufacture a duration stretching to refresh time.
+  if (done != null && done - started < 500) return undefined;
+  return started;
+}
+
+function trustworthyProcessDoneTs(turn: Turn): number | undefined {
+  const started = turn.processStartedTs;
+  const done = turn.processDoneTs;
+  if (started == null || done == null || done - started < 500) {
+    return undefined;
+  }
+  return done;
+}
+
 function processBlockMatches(
   history: Block[],
   live: Block[],
@@ -523,7 +621,7 @@ function installCachedDetailRestore(
 ): Turn {
   if (!summary.done || !cached.done || summary.detailLoaded
       || summary.detailProjection
-      || (summary.detailEventCount ?? 0) <= 0) return summary;
+      || statedProcessDetailState(summary) === "none") return summary;
   const source = cached.detailProjection?.blocks ?? cached.blocks;
   // A session-wide running bit is not turn ownership. The next task may have
   // started before its UserMsg/TurnBinding while a same-revision cache row from
@@ -537,8 +635,23 @@ function installCachedDetailRestore(
     .map((block) => cloneSettledCachedDetailBlock(
       block, summary, preserveOpenPlans));
   if (blocks.length === 0) return summary;
+  const processDetailState = mergedProcessDetailState(
+    summary, cached, blocks);
   return {
     ...summary,
+    processDetailState,
+    detailReasons: mergedDetailReasons(
+      summary, cached, processDetailState),
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(summary),
+          trustworthyProcessStartedTs(cached))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(summary),
+          trustworthyProcessDoneTs(cached))
+      : undefined,
     detailLoaded: false,
     detailLoading: false,
     detailError: undefined,
@@ -633,8 +746,23 @@ export function restoreObservedLiveTurnDetails(
         && (block.kind !== "text" || block.text.length > 0))
       .map(cloneDetailBlock);
     if (blocks.length === 0) continue;
+    const processDetailState = mergedProcessDetailState(
+      summary, observed, blocks);
     restored[summaryIndex] = {
       ...summary,
+      processDetailState,
+      detailReasons: mergedDetailReasons(
+        summary, observed, processDetailState),
+      processStartedTs: processDetailState === "present"
+        ? earliestTimestamp(
+            trustworthyProcessStartedTs(summary),
+            trustworthyProcessStartedTs(observed))
+        : undefined,
+      processDoneTs: processDetailState === "present"
+        ? latestTimestamp(
+            trustworthyProcessDoneTs(summary),
+            trustworthyProcessDoneTs(observed))
+        : undefined,
       detailLoaded: false,
       detailLoading: false,
       detailError: undefined,
@@ -768,6 +896,10 @@ function mergeTurn(
     completedTextAuthority,
     settledCanonicalText,
   );
+  const processDetailState = mergedProcessDetailState(
+    history, live, blocks);
+  const detailReasons = mergedDetailReasons(
+    history, live, processDetailState);
   // A Plan is durable session-level progress and ChatView may lift it into the
   // composer-adjacent progress strip.  It therefore cannot prove that this
   // turn's heavyweight process projection is still resident: treating a lone
@@ -828,6 +960,18 @@ function mergeTurn(
     durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
       ? live.durationMs
       : history.durationMs ?? live.durationMs,
+    processDetailState,
+    detailReasons,
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(history),
+          trustworthyProcessStartedTs(live))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(history),
+          trustworthyProcessDoneTs(live))
+      : undefined,
     // Detail is a monotonic, revision-bound local projection. A later summary
     // may legitimately contain no heavyweight blocks; it must not erase pages
     // which the user already expanded in this same revision.
@@ -842,7 +986,7 @@ function mergeTurn(
     // turn timeline.
     detailLoaded: !!(detailProjection
       || (live.detailLoaded || history.detailLoaded)
-        && (hasLoadedDetailPayload || !history.detailEventCount)),
+        && (hasLoadedDetailPayload || !hasDeferredTurnDetail(history))),
     detailLoading: live.detailLoading ?? history.detailLoading,
     detailError: live.detailError ?? history.detailError,
     detailHasMore: detailProjection
@@ -1031,6 +1175,22 @@ export function installAuthoritativeTurnDetailPage(
     ? detailProjection.newerCursor : page.newerCursor ?? null;
   const restoreIncomplete =
     summary.detailRestoreIncomplete === true && hasMore;
+  const processBlocks = detailProjection?.blocks ?? detailWithoutFinals;
+  let processDetailState = mergedProcessDetailState(
+    summary, detail, processBlocks);
+  // A bounded page containing only the final answer is not an exact
+  // process-free conclusion while adjacent source pages remain unread. Keep
+  // the honest unknown state mounted so automatic/manual pagination cannot
+  // make its detail affordance blink out between responses.
+  if (processDetailState === "none"
+      && statedProcessDetailState(summary) === "unknown"
+      && (hasMore || hasNewer)) {
+    processDetailState = "unknown";
+  }
+  const incompleteUnknownProcess = processDetailState === "unknown"
+    && (hasMore || hasNewer);
+  const retryDirection = hasMore ? "older" : hasNewer ? "newer" : undefined;
+  const retryBefore = hasMore ? oldestCursor : hasNewer ? newerCursor : null;
   return {
     ...summary,
     prompt: detail.prompt || summary.prompt,
@@ -1046,15 +1206,29 @@ export function installAuthoritativeTurnDetailPage(
     done: summary.done,
     doneTs: summary.doneTs,
     durationMs: summary.durationMs,
+    processDetailState,
+    detailReasons: mergedDetailReasons(
+      summary, detail, processDetailState),
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(summary),
+          trustworthyProcessStartedTs(detail))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(summary),
+          trustworthyProcessDoneTs(detail))
+      : undefined,
     interrupted: summary.interrupted,
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: !restoreIncomplete,
+    detailLoaded: !restoreIncomplete && !incompleteUnknownProcess,
     detailLoading: false,
     detailError: undefined,
-    detailRetryBefore: undefined,
-    detailRetryDirection: undefined,
+    detailRetryBefore: incompleteUnknownProcess ? retryBefore : undefined,
+    detailRetryDirection: incompleteUnknownProcess
+      ? retryDirection : undefined,
     detailProjection,
     detailHasMore: hasMore,
     detailOldestCursor: oldestCursor,

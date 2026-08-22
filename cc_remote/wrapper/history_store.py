@@ -32,8 +32,12 @@ from cc_remote.protocol import ConversationTurn
 # v17 also discards Codex pages whose legacy rollout user rows were materialized
 # without the adjacent native app-server item id used by the live stream. v18
 # rebuilds page projections once: older summary pages could be truncated against
-# source-complete event size before lightweight turns were materialized.
-_SCHEMA_VERSION = 18
+# source-complete event size before lightweight turns were materialized. v19
+# rebuilds summaries with exact/unknown process-detail metadata; raw details,
+# image assets, and compact ancestry remain source-valid. v20 adds the Claude
+# Agent detail cache. v21 discards Codex pages/details that may contain parser-
+# time timestamps created when official turns omitted startedAt/completedAt.
+_SCHEMA_VERSION = 21
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -45,9 +49,44 @@ _SUMMARY_LIVE_FIELD_MAX_CHARS = 4 * 1024
 _SUMMARY_LIVE_BLOCK_MAX = 24
 _SUMMARY_BLOCK_MAX = 32
 _VOLATILE_EVENT_FIELDS = frozenset({"ts", "seq", "to", "route_id"})
+_SUMMARY_PAGE_PAYLOAD_SQL = """
+json_set(
+    payload_json,
+    '$.events',
+    COALESCE(
+        (
+            SELECT json_group_array(json(event.value))
+            FROM json_each(payload_json, '$.events') AS event
+            WHERE json_extract(event.value, '$.type') IN ('model', 'effort')
+        ),
+        json('[]')
+    )
+)
+""".strip()
 _COMPACT_SOURCE_LIMIT = 16
 _SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _GENERIC_HISTORY_TURN_FAILURE = "该轮未正常结束"
+
+
+def _summary_projection_fallback(
+    error: sqlite3.OperationalError,
+) -> str | None:
+    """Classify only JSON projection failures that a raw read can recover."""
+    message = str(error).casefold()
+    if (
+        ("no such function" in message or "no such table" in message)
+        and any(
+            name in message
+            for name in ("json_set", "json_each", "json_group_array")
+        )
+    ):
+        return "unsupported"
+    if (
+        "malformed json" in message
+        or "json cannot hold blob" in message
+    ):
+        return "payload"
+    return None
 _PROVIDER_AUTH_TURN_FAILURE = (
     "模型服务认证已失效或当前账号无权限，"
     "请检查当前服务的凭据或账号权限后重试。"
@@ -476,7 +515,11 @@ def materialize_history_turns(
         texts: dict[str, list[str]] = {}
         text_order: list[str] = []
         text_done: set[str] = set()
+        text_first_ms: dict[str, int] = {}
+        text_last_ms: dict[str, int] = {}
+        text_done_ms: dict[str, int] = {}
         detail_items: set[str] = set()
+        process_evidence: dict[str, dict[str, Any]] = {}
         live_blocks: list[dict[str, Any]] = []
         live_texts: dict[str, dict[str, Any]] = {}
         live_tools: dict[str, dict[str, Any]] = {}
@@ -505,6 +548,36 @@ def materialize_history_turns(
             elif channel != "unknown":
                 block["channel"] = channel
             return block
+
+        def touch_process(
+            item_id: str,
+            event: dict[str, Any],
+            *,
+            visible: bool = True,
+            terminal: bool = False,
+        ) -> None:
+            row = process_evidence.setdefault(item_id, {
+                "visible": False,
+                "terminal": False,
+                "first_ms": None,
+                "last_ms": None,
+                "terminal_ms": None,
+            })
+            row["visible"] = bool(row["visible"] or visible)
+            row["terminal"] = bool(row["terminal"] or terminal)
+            # Hidden reasoning/success-hook plumbing cannot start the public
+            # process clock. If a hook later becomes actionable, its first
+            # visible failure event establishes the timestamp instead.
+            if not row["visible"]:
+                return
+            stamp = _event_ms(event.get("ts"))
+            if stamp is None:
+                return
+            if row["first_ms"] is None:
+                row["first_ms"] = stamp
+            row["last_ms"] = stamp
+            if terminal:
+                row["terminal_ms"] = stamp
 
         for event in group:
             event_type = event.get("type")
@@ -535,6 +608,10 @@ def materialize_history_turns(
                         texts[message_id] = []
                         text_order.append(message_id)
                     add_live_text(message_id, channels[message_id])
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
             elif event_type == "delta":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str) and isinstance(event.get("text"), str):
@@ -547,6 +624,10 @@ def materialize_history_turns(
                     block = add_live_text(message_id, channels[message_id])
                     if block is not None:
                         block["text"] += event["text"]
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
             elif event_type == "assistant_msg_end":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
@@ -554,6 +635,11 @@ def materialize_history_turns(
                     block = live_texts.get(message_id)
                     if block is not None:
                         block["done"] = True
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
+                        text_done_ms[message_id] = stamp
             elif event_type == "turn_binding":
                 if isinstance(event.get("turn_id"), str):
                     fork_point = event["turn_id"]
@@ -607,6 +693,10 @@ def materialize_history_turns(
                         }
                         live_tools[tool_id] = block
                         live_blocks.append(block)
+            if event_type == "tool_use":
+                tool_id = event.get("tool_use_id")
+                if isinstance(tool_id, str):
+                    touch_process(f"tool:{tool_id}", event)
             elif include_live_detail and event_type == "tool_result":
                 tool_id = event.get("tool_use_id")
                 block = live_tools.get(tool_id) if isinstance(tool_id, str) else None
@@ -625,6 +715,14 @@ def materialize_history_turns(
                         result["truncated"] = bool(event["truncated"])
                     block["result"] = result
                     block["done"] = True
+            if event_type == "tool_result":
+                tool_id = event.get("tool_use_id")
+                if (
+                    isinstance(tool_id, str)
+                    and f"tool:{tool_id}" in process_evidence
+                ):
+                    touch_process(
+                        f"tool:{tool_id}", event, terminal=True)
             elif (include_live_detail and event_type == "process"
                   and event.get("kind") != "reasoning"):
                 item_id = event.get("item_id")
@@ -706,6 +804,50 @@ def materialize_history_turns(
                     else:
                         block.clear()
                         block.update(replacement)
+            if event_type == "process":
+                item_id = event.get("item_id")
+                kind = event.get("kind")
+                status = event.get("status")
+                phase = event.get("phase")
+                if isinstance(item_id, str):
+                    actionable_hook = kind == "hook" and status in {
+                        "failed", "declined", "cancelled", "interrupted",
+                    }
+                    visible = kind != "reasoning" and (
+                        kind != "hook" or actionable_hook)
+                    touch_process(
+                        f"process:{item_id}",
+                        event,
+                        visible=visible,
+                        terminal=(
+                            phase == "end"
+                            or status in {
+                                "succeeded", "failed", "declined",
+                                "cancelled", "interrupted",
+                            }
+                        ),
+                    )
+            elif event_type == "turn_plan":
+                item_id = event.get("item_id")
+                if isinstance(item_id, str):
+                    raw_plan = event.get("plan")
+                    terminal = bool(
+                        isinstance(raw_plan, list)
+                        and raw_plan
+                        and all(
+                            isinstance(entry, dict)
+                            and entry.get("status") == "completed"
+                            for entry in raw_plan
+                        )
+                    )
+                    touch_process(
+                        f"plan:{item_id}", event, terminal=terminal)
+            elif event_type == "turn_diff":
+                item_id = event.get("item_id")
+                if isinstance(item_id, str):
+                    # A diff snapshot is complete at the event boundary.
+                    touch_process(
+                        f"diff:{item_id}", event, terminal=True)
             if event_type in {"tool_use", "process", "turn_plan", "turn_diff"}:
                 detail_id = event.get("tool_use_id") or event.get("item_id")
                 if isinstance(detail_id, str):
@@ -724,6 +866,14 @@ def materialize_history_turns(
         for message_id in text_order:
             if message_id not in final_id_set and any(texts.get(message_id, ())):
                 detail_items.add(message_id)
+                if channels.get(message_id) == "commentary":
+                    process_evidence[f"text:{message_id}"] = {
+                        "visible": True,
+                        "terminal": message_id in text_done,
+                        "first_ms": text_first_ms.get(message_id),
+                        "last_ms": text_last_ms.get(message_id),
+                        "terminal_ms": text_done_ms.get(message_id),
+                    }
         # Codex reconstructs summary-only process/text envelopes while parsing
         # a rollout. For an assistant-only continuation those synthetic rows
         # can carry the parse time because there is no UserMsg to provide the
@@ -834,11 +984,47 @@ def materialize_history_turns(
                     "done": done,
                     "channel": "final",
                 })
+        visible_process = [
+            row for row in process_evidence.values()
+            if row.get("visible")
+        ]
+        process_started_ms = None
+        if visible_process and all(
+                isinstance(row.get("first_ms"), int)
+                for row in visible_process):
+            process_started_ms = min(
+                int(row["first_ms"]) for row in visible_process)
+        process_done_ms = None
+        if process_started_ms is not None and visible_process:
+            if all(
+                    row.get("terminal")
+                    and isinstance(row.get("terminal_ms"), int)
+                    for row in visible_process):
+                process_done_ms = max(
+                    int(row["terminal_ms"]) for row in visible_process)
+            elif done and done_ms is not None:
+                # TurnEnd is the final trustworthy fence for any process item
+                # whose producer omitted its own terminal timestamp.
+                process_done_ms = done_ms
+            if process_done_ms is not None:
+                process_done_ms = max(process_started_ms, process_done_ms)
+        detail_reasons = []
+        if visible_process:
+            detail_reasons.append("process")
+        if prompt_truncated:
+            detail_reasons.append("prompt_truncated")
+        if summary_truncated:
+            detail_reasons.append("answer_truncated")
+        if deferred_image_count:
+            detail_reasons.append("image_deferred")
         turn: dict[str, Any] = {
             "id": turn_id,
             "prompt": prompt,
             "blocks": blocks,
             "done": done,
+            "processDetailState": (
+                "present" if visible_process else "none"),
+            "detailReasons": detail_reasons,
             "detailEventCount": (
                 len(detail_items)
                 + int(prompt_truncated)
@@ -856,6 +1042,8 @@ def materialize_history_turns(
             "ts": started_ms,
             "doneTs": done_ms,
             "durationMs": duration_ms,
+            "processStartedTs": process_started_ms,
+            "processDoneTs": process_done_ms,
             "error": error,
         }
         turn.update({key: value for key, value in optional.items() if value is not None})
@@ -883,6 +1071,7 @@ class HistoryIndexStore:
         self.path = Path(state_dir) / "history-index.sqlite3"
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max(1024, int(max_bytes))
+        self._summary_json_sql_available: bool | None = None
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -896,6 +1085,34 @@ class HistoryIndexStore:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
+
+    def _select_page_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        summary_only: bool,
+        projected_sql: str,
+        raw_sql: str,
+        parameters: tuple[Any, ...],
+    ) -> sqlite3.Row | None:
+        """Read one page without turning unrelated SQLite faults into retries."""
+        if not summary_only or self._summary_json_sql_available is False:
+            return connection.execute(raw_sql, parameters).fetchone()
+        try:
+            row = connection.execute(
+                projected_sql, parameters,
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            fallback = _summary_projection_fallback(exc)
+            if fallback is None:
+                raise
+            if fallback == "unsupported":
+                # A custom SQLite build without JSON1 would otherwise throw on
+                # every summary read before doing the same full-payload query.
+                self._summary_json_sql_available = False
+            return connection.execute(raw_sql, parameters).fetchone()
+        self._summary_json_sql_available = True
+        return row
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
@@ -926,11 +1143,22 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current == 17:
-                # Page payloads are rebuildable and may contain the old
-                # pre-summary size truncation. Source-complete turn details and
-                # image assets are independently fingerprinted and remain valid.
+            elif current in (17, 18):
+                # Page payloads are rebuildable and may contain either the old
+                # pre-summary size truncation or no v36 process-detail state.
+                # v21 additionally invalidates Codex details whose official
+                # events may contain parser-time timestamps. Claude details and
+                # all source-bound image assets remain valid.
                 connection.execute("DELETE FROM history_pages")
+                connection.execute(
+                    "DELETE FROM history_turn_details WHERE engine='codex'")
+            elif current in (19, 20):
+                # v20 adds an independent source-bound Claude Agent detail LRU.
+                # v21 rebuilds only timestamp-bearing Codex projections; Claude
+                # history, images and Agent details remain byte-for-byte valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the
@@ -942,6 +1170,7 @@ class HistoryIndexStore:
                 connection.execute("DROP TABLE IF EXISTS history_pages")
                 connection.execute("DROP TABLE IF EXISTS history_turn_details")
                 connection.execute("DROP TABLE IF EXISTS history_image_assets")
+                connection.execute("DROP TABLE IF EXISTS history_agent_details")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_sources")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_records")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_queue")
@@ -999,6 +1228,29 @@ class HistoryIndexStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_turn_details_lru "
                 "ON history_turn_details(accessed_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS history_agent_details (
+                    session_id TEXT NOT NULL,
+                    source_token TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    payload_json BLOB NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, source_token, run_id)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_agent_details_lookup "
+                "ON history_agent_details(session_id, source_path, run_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_agent_details_lru "
+                "ON history_agent_details(accessed_at)"
             )
             connection.execute(
                 """
@@ -1385,17 +1637,31 @@ class HistoryIndexStore:
         *,
         before: str | None,
         limit: int,
+        summary_only: bool = False,
     ) -> MaterializedHistoryPage | None:
+        parameters = (
+            session_id, engine, source.token,
+            self._cursor(before), int(limit),
+        )
+        raw_sql = """
+            SELECT payload_json FROM history_pages
+            WHERE session_id=? AND engine=? AND source_token=?
+              AND before_cursor=? AND page_limit=?
+        """
         now = time.time()
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json FROM history_pages
-                WHERE session_id=? AND engine=? AND source_token=?
-                  AND before_cursor=? AND page_limit=?
+            row = self._select_page_row(
+                connection,
+                summary_only=summary_only,
+                projected_sql=f"""
+                    SELECT {_SUMMARY_PAGE_PAYLOAD_SQL} AS payload_json
+                    FROM history_pages
+                    WHERE session_id=? AND engine=? AND source_token=?
+                      AND before_cursor=? AND page_limit=?
                 """,
-                (session_id, engine, source.token, self._cursor(before), int(limit)),
-            ).fetchone()
+                raw_sql=raw_sql,
+                parameters=parameters,
+            )
             if row is None:
                 return None
             connection.execute(
@@ -1408,7 +1674,12 @@ class HistoryIndexStore:
                  self._cursor(before), int(limit)),
             )
         try:
-            payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            raw_payload = row["payload_json"]
+            payload = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else bytes(raw_payload).decode("utf-8")
+            )
             if not isinstance(payload, dict):
                 return None
             return MaterializedHistoryPage.from_payload(payload)
@@ -1424,6 +1695,7 @@ class HistoryIndexStore:
         *,
         before: str | None,
         limit: int,
+        summary_only: bool = False,
     ) -> MaterializedHistoryPage | None:
         """Return a cached page whose source is a verified file prefix.
 
@@ -1431,21 +1703,38 @@ class HistoryIndexStore:
         snapshot. Device/inode/size checks plus both sampled ends of the old
         source reject truncation, replacement and in-place rewrites.
         """
+        parameters = (
+            session_id, engine, source.path, source.device,
+            source.inode, source.size, self._cursor(before), int(limit),
+        )
+        raw_sql = """
+            SELECT payload_json, source_size, source_head_sha256,
+                   source_tail_sha256
+            FROM history_pages
+            WHERE session_id=? AND engine=? AND source_path=?
+              AND source_device=? AND source_inode=?
+              AND source_size<? AND before_cursor=? AND page_limit=?
+            ORDER BY source_size DESC, created_at DESC
+            LIMIT 1
+        """
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json, source_size, source_head_sha256,
-                       source_tail_sha256
-                FROM history_pages
-                WHERE session_id=? AND engine=? AND source_path=?
-                  AND source_device=? AND source_inode=?
-                  AND source_size<? AND before_cursor=? AND page_limit=?
-                ORDER BY source_size DESC, created_at DESC
-                LIMIT 1
+            row = self._select_page_row(
+                connection,
+                summary_only=summary_only,
+                projected_sql=f"""
+                    SELECT {_SUMMARY_PAGE_PAYLOAD_SQL} AS payload_json,
+                           source_size, source_head_sha256,
+                           source_tail_sha256
+                    FROM history_pages
+                    WHERE session_id=? AND engine=? AND source_path=?
+                      AND source_device=? AND source_inode=?
+                      AND source_size<? AND before_cursor=? AND page_limit=?
+                    ORDER BY source_size DESC, created_at DESC
+                    LIMIT 1
                 """,
-                (session_id, engine, source.path, source.device, source.inode,
-                 source.size, self._cursor(before), int(limit)),
-            ).fetchone()
+                raw_sql=raw_sql,
+                parameters=parameters,
+            )
         if row is None:
             return None
         old_size = int(row["source_size"])
@@ -1467,7 +1756,12 @@ class HistoryIndexStore:
                 != row["source_tail_sha256"]):
             return None
         try:
-            payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            raw_payload = row["payload_json"]
+            payload = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else bytes(raw_payload).decode("utf-8")
+            )
             if not isinstance(payload, dict):
                 return None
             return MaterializedHistoryPage.from_payload(payload)
@@ -1721,6 +2015,86 @@ class HistoryIndexStore:
                     return tuple(group)
         return None
 
+    def put_agent_detail(
+        self,
+        session_id: str,
+        source: HistorySourceFingerprint,
+        run_id: str,
+        events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> None:
+        payload = json.dumps(
+            events, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > self.max_bytes:
+            return
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO history_agent_details (
+                    session_id, source_token, source_path, run_id,
+                    payload_json, payload_bytes, created_at, accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, source_token, run_id) DO UPDATE SET
+                    source_path=excluded.source_path,
+                    payload_json=excluded.payload_json,
+                    payload_bytes=excluded.payload_bytes,
+                    created_at=excluded.created_at,
+                    accessed_at=excluded.accessed_at
+                """,
+                (session_id, source.token, source.path, run_id,
+                 payload, len(payload), now, now),
+            )
+            connection.execute(
+                """
+                DELETE FROM history_agent_details
+                WHERE session_id=? AND run_id=? AND source_path=?
+                  AND source_token<>?
+                """,
+                (session_id, run_id, source.path, source.token),
+            )
+            self._prune_agent_details(connection)
+
+    def get_agent_detail(
+        self,
+        session_id: str,
+        source: HistorySourceFingerprint,
+        run_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM history_agent_details
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (session_id, source.token, run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                payload = None
+            if not (isinstance(payload, list)
+                    and all(isinstance(event, dict) for event in payload)):
+                connection.execute(
+                    """
+                    DELETE FROM history_agent_details
+                    WHERE session_id=? AND source_token=? AND run_id=?
+                    """,
+                    (session_id, source.token, run_id),
+                )
+                return None
+            connection.execute(
+                """
+                UPDATE history_agent_details SET accessed_at=?
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (now, session_id, source.token, run_id),
+            )
+            return tuple(payload)
+
     def get_image_asset(
         self,
         session_id: str,
@@ -1890,6 +2264,33 @@ class HistoryIndexStore:
             entries -= 1
             total_bytes -= int(victim["payload_bytes"])
 
+    def _prune_agent_details(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(payload_bytes), 0) AS bytes "
+            "FROM history_agent_details"
+        ).fetchone()
+        entries = int(row["entries"])
+        total_bytes = int(row["bytes"])
+        max_entries = self.max_entries * 4
+        while entries > max_entries or total_bytes > self.max_bytes:
+            victim = connection.execute(
+                """
+                SELECT session_id, source_token, run_id, payload_bytes
+                FROM history_agent_details ORDER BY accessed_at ASC LIMIT 1
+                """
+            ).fetchone()
+            if victim is None:
+                break
+            connection.execute(
+                """
+                DELETE FROM history_agent_details
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (victim["session_id"], victim["source_token"], victim["run_id"]),
+            )
+            entries -= 1
+            total_bytes -= int(victim["payload_bytes"])
+
     def invalidate_session(self, session_id: str) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -1900,6 +2301,10 @@ class HistoryIndexStore:
             )
             connection.execute(
                 "DELETE FROM history_image_assets WHERE session_id=?",
+                (session_id,),
+            )
+            connection.execute(
+                "DELETE FROM history_agent_details WHERE session_id=?",
                 (session_id,),
             )
 

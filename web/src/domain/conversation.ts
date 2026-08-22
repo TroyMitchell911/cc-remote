@@ -77,6 +77,9 @@ export interface ProcessBlock {
   exit_code?: number | null;
   duration_ms?: number | null;
   truncated?: boolean | null;
+  /** Background Claude Agent work stays visible in its card without reopening
+   * the enclosing session after the parent ResultMessage. */
+  background?: boolean | null;
   explanation?: string | null;
   plan?: PlanEntry[];
   done: boolean;
@@ -138,6 +141,16 @@ export interface Turn {
   ts?: number;
   doneTs?: number;
   durationMs?: number;
+  /** Exact visible-process evidence, or `unknown` when a bounded native
+   * summary proves only that more detail exists. */
+  processDetailState?: "none" | "present" | "unknown";
+  detailReasons?: Array<
+    "process" | "prompt_truncated" | "answer_truncated" | "image_deferred"
+  >;
+  /** First/last trustworthy visible-process event, never the user-message
+   * timestamp. These drive the process timer without inheriting prompt wait. */
+  processStartedTs?: number;
+  processDoneTs?: number;
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;

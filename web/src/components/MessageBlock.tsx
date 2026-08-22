@@ -35,9 +35,47 @@ const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
 
 type MessagePart =
   | { kind: "markdown"; text: string }
-  | { kind: "directive"; name: string; label: string };
+  | { kind: "directive"; name: string; label: string }
+  | { kind: "visualization"; path: string; title: string };
 
-function splitCodexDirectives(text: string): MessagePart[] {
+const CODEX_VISUALIZATION_PREFIX = "visualize";
+const CODEX_VISUALIZATION_SUFFIX = "";
+const MAX_VISUALIZATION_PATH_CHARS = 4096;
+const MAX_VISUALIZATION_TITLE_CHARS = 240;
+
+function parseCodexVisualization(line: string): MessagePart | null {
+  const value = line.trim();
+  if (!value.startsWith(CODEX_VISUALIZATION_PREFIX)
+      || !value.endsWith(CODEX_VISUALIZATION_SUFFIX)) return null;
+  const encoded = value.slice(
+    CODEX_VISUALIZATION_PREFIX.length,
+    -CODEX_VISUALIZATION_SUFFIX.length,
+  );
+  let payload: unknown;
+  try {
+    payload = JSON.parse(encoded);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.path !== "string"
+      || record.path.length > MAX_VISUALIZATION_PATH_CHARS) return null;
+  const target = parseLocalFileTarget(record.path);
+  if (!target || !/\.html?$/i.test(target.path)) return null;
+  const filename = target.path.replace(/\\/g, "/").split("/").pop()
+    ?.replace(/\.html?$/i, "") || "可视化";
+  const suppliedTitle = typeof record.title === "string"
+    ? record.title.trim().slice(0, MAX_VISUALIZATION_TITLE_CHARS)
+    : "";
+  return {
+    kind: "visualization",
+    path: target.path,
+    title: suppliedTitle || filename,
+  };
+}
+
+function splitCodexRichContent(text: string): MessagePart[] {
   const parts: MessagePart[] = [];
   let markdown = "";
   let fence: "`" | "~" | null = null;
@@ -52,6 +90,12 @@ function splitCodexDirectives(text: string): MessagePart[] {
     const suffix = index < lines.length - 1 ? "\n" : "";
     const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
     if (!fence) {
+      const visualization = parseCodexVisualization(line);
+      if (visualization) {
+        flushMarkdown();
+        parts.push(visualization);
+        return;
+      }
       const directive = line.match(
         /^::(git-stage|git-commit|git-create-branch|git-push|git-create-pr|created-thread)\{[^\n]*\}\s*$/,
       );
@@ -75,6 +119,28 @@ function splitCodexDirectives(text: string): MessagePart[] {
   });
   flushMarkdown();
   return parts;
+}
+
+function CodexVisualizationCard({ path, title, onOpenFile }: {
+  path: string;
+  title: string;
+  onOpenFile?: (path: string, line?: number) => void;
+}) {
+  const available = !!onOpenFile;
+  return <button type="button" className="codex-visualization-card"
+    disabled={!available} data-visualization="html"
+    title={available ? "在 Remote 中打开可视化" : "当前无法读取可视化文件"}
+    onClick={() => onOpenFile?.(path)}>
+    <span className="codex-visualization-icon"><Icon name="read" size={17} /></span>
+    <span className="codex-visualization-copy">
+      <strong>{title}</strong>
+      <span>HTML 可视化</span>
+    </span>
+    <span className="codex-visualization-open">
+      {available ? "打开" : "不可用"}
+      <Icon name="chevron-right" size={15} />
+    </span>
+  </button>;
 }
 
 function nodeText(node: ReactNode): string {
@@ -574,7 +640,7 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   ]);
   const math = useMarkdownMathPlugins(shown, true);
   const parts = useMemo(
-    () => splitCodexDirectives(math.normalizedSource),
+    () => splitCodexRichContent(math.normalizedSource),
     [math.normalizedSource],
   );
 
@@ -582,17 +648,21 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   return (
     <MessageMarkdownContext.Provider value={markdownContext}>
       <div className="prose">
-        {parts.map((part, index) => part.kind === "markdown"
-          ? <ReactMarkdown key={`markdown-${index}`}
+        {parts.map((part, index) => {
+          if (part.kind === "markdown") return <ReactMarkdown key={`markdown-${index}`}
               remarkPlugins={
                 math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
               rehypePlugins={math.plugins?.rehypePlugins}
-              components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
-          : <div key={`directive-${index}`} className="codex-directive-status"
+              components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>;
+          if (part.kind === "visualization") return <CodexVisualizationCard
+            key={`visualization-${index}`} path={part.path} title={part.title}
+            onOpenFile={onOpenFile} />;
+          return <div key={`directive-${index}`} className="codex-directive-status"
               data-directive={part.name}>
               <Icon name="verify" size={14} />
               <span>{part.label}</span>
-            </div>)}
+            </div>;
+        })}
         {!done && <span className="cursor" />}
       </div>
     </MessageMarkdownContext.Provider>

@@ -25,7 +25,8 @@ try {
   const { UsageMeter } = await harness.ssrLoadModule(
     "/src/components/UsageMeter.tsx");
   const {
-    accountQuotaWindows, quotaTone, quotaWindowLabel, remainingPercent,
+    accountQuotaWindows, activeRateLimits, quotaTone, quotaWindowLabel,
+    quotaWindowsForLimits, remainingPercent,
   } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
@@ -167,6 +168,21 @@ try {
   assert.equal(merged?.rate_limit_reached_type, "rate_limit_reached");
   assert.equal(Object.hasOwn(merged ?? {}, "credits"), false);
   assert.equal(Object.hasOwn(merged ?? {}, "individualLimit"), false);
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_update",
+    limit_id: "codex",
+    name: null,
+    plan_type: null,
+    reached_type: "",
+    primary: { used_percent: 10, resets_at: null, window_duration_mins: 300 },
+    secondary: null,
+  }) });
+  merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  assert.equal(merged?.rate_limit_reached_type, "");
+  assert.equal(merged?.primary?.used_percent, 10,
+    "an explicit allowed transition replaces exhausted usage without reset proof");
+  assert.equal(merged?.primary?.resets_at, null,
+    "an explicit allowed transition clears the exhausted period's old reset");
 
   // A delayed status response must not replace the newest in-flight read.
   state = reduce(state, {
@@ -180,12 +196,12 @@ try {
   } as StatusReport;
   state = reduce(state, { type: "event", event: staleStatus });
   assert.equal(state.runtimes[sid].statusRequestId, "status-new");
-  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 10,
     "stale status response must not replace the installed report");
   const uncorrelatedStatus = { ...staleStatus, request_id: undefined } as StatusReport;
   state = reduce(state, { type: "event", event: uncorrelatedStatus });
   assert.equal(state.runtimes[sid].statusRequestId, "status-new");
-  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 10,
     "uncorrelated status response must not replace an in-flight request");
   const currentStatus = {
     ...report, request_id: "status-new",
@@ -197,6 +213,49 @@ try {
   assert.equal(state.runtimes[sid].statusRequestId, null);
   assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 0,
     "the matching status response installs and completes the request");
+
+  const claudeSid = "claude-rate-session";
+  let claudeState = {
+    ...initialState,
+    focusedSid: claudeSid,
+    runtimes: { [claudeSid]: createRuntime() },
+  };
+  for (const update of [{
+    limit_id: "claude", name: "Claude", primary: {
+      used_percent: 35, resets_at: 1_800_000_000,
+      window_duration_mins: 300,
+    },
+  }, {
+    limit_id: "claude", name: "Claude", secondary: {
+      used_percent: 70, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    },
+  }, {
+    limit_id: "claude-seven-day-opus", name: "Opus", primary: {
+      used_percent: 80, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    },
+  }]) {
+    claudeState = reduce(claudeState, { type: "event", event: event({
+      type: "rate_limit_update", sid: claudeSid,
+      plan_type: null, reached_type: null,
+      primary: null, secondary: null, ...update,
+    }) });
+  }
+  assert.equal(claudeState.runtimes[claudeSid].statusReport, null,
+    "Claude quota must not fabricate a Codex StatusReport");
+  assert.equal(claudeState.runtimes[claudeSid].rateLimits.length, 2);
+  const claudeQuotas = quotaWindowsForLimits(
+    claudeState.runtimes[claudeSid].rateLimits, "claude",
+  );
+  assert.equal(remainingPercent(claudeQuotas.fiveHour), 65);
+  assert.equal(remainingPercent(claudeQuotas.weekly), 30);
+  assert.equal(activeRateLimits([{
+    limit_id: "claude", primary: {
+      used_percent: 99, resets_at: 999, window_duration_mins: 300,
+    },
+  }], 1_000).length, 0,
+  "elapsed SDK windows must disappear without waiting for another event");
 
   const officialDiagnostic = event({
     type: "notice", notice_id: "codex-notice-private-diagnostic",
@@ -444,6 +503,24 @@ try {
   assert.doesNotMatch(usageMarkup, /used_percent|rate_limit_reached/i);
   assert.match(usageMarkup, /aria-haspopup="true"/);
   assert.doesNotMatch(usageMarkup, /role="dialog"/);
+  const claudeUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    engine: "claude",
+    open: true,
+    report: null,
+    rateLimits: claudeState.runtimes[claudeSid].rateLimits,
+    error: null,
+    loading: false,
+    onToggle: () => {},
+  }));
+  assert.match(claudeUsageMarkup, /5 小时额度/);
+  assert.match(claudeUsageMarkup, /每周额度/);
+  assert.match(claudeUsageMarkup, /Opus 专项周额度/);
+  assert.match(claudeUsageMarkup, /剩余 65%/);
+  assert.match(claudeUsageMarkup, /剩余 30%/);
+  assert.match(claudeUsageMarkup, /剩余 20%/);
+  assert.match(claudeUsageMarkup, /原生额度事件自动同步/);
+  assert.doesNotMatch(claudeUsageMarkup, />刷新<|完整状态/,
+    "Claude SDK has no supported pull/status API, so the popover is push-only");
   const compactUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
     open: false,
     report: quotaReport,

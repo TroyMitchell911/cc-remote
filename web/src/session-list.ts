@@ -71,6 +71,26 @@ export function shouldAcceptSessionList(
   return event.engine === activeEngine && (event.space ?? "code") === activeSpace;
 }
 
+/** Resolve the focus identity that one accepted catalog is allowed to
+ * validate. During a surface switch React may still expose the previous
+ * surface's focused row; that stale row must never invalidate the explicit
+ * bookmark already claimed for the incoming engine/space. */
+export function scopedFocusForSessionList(
+  currentSid: string | null,
+  currentSessions: readonly SessionInfo[],
+  rememberedSid: string | null | undefined,
+  engine: Engine,
+  space: Space,
+): string | null {
+  const current = currentSid
+    ? currentSessions.find((session) => session.session_id === currentSid)
+    : undefined;
+  const currentMatches = !!current
+    && (current.engine ?? "claude") === engine
+    && (current.space ?? "code") === space;
+  return currentMatches ? currentSid : rememberedSid ?? null;
+}
+
 export function updateScopedSessionLifecycle(
   catalog: Readonly<Record<string, SessionInfo[]>>,
   engine: Engine,

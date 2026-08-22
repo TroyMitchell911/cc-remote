@@ -16,7 +16,7 @@ import subprocess
 import claude_agent_sdk
 
 
-VERIFIED_SDK_VERSION = "0.2.128"
+VERIFIED_SDK_VERSION = "0.2.142"
 _CLI_VERSION_TIMEOUT = 3.0
 _VERSION_RE = re.compile(r"(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)")
 

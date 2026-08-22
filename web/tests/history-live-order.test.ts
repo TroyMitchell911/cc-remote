@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
-import type { ServerEvent } from "../src/protocol.ts";
+import type { History, ServerEvent } from "../src/protocol.ts";
 import {
   mergeInitialHistory,
   restoreCachedTurnDetails,
@@ -13,16 +13,40 @@ import type { Block, Turn } from "../src/reducer.ts";
 import { reconcileProvenCompactionOrphans } from
   "../src/compaction-orphans.ts";
 import {
+  composePastePrompt,
   composerPastePreview,
   countTextLines,
+  makeComposerPaste,
   MAX_PROMPT_CHARS,
   PASTE_PREVIEW_CHARS,
 } from "../src/composer-pastes.ts";
-import { exactActiveTurnId } from "../src/process-blocks.ts";
+import {
+  activeTurnCandidateIds,
+  displayActiveTurnOwnerId,
+  exactActiveTurnId,
+} from "../src/process-blocks.ts";
 
 const blockIdentity = (block: Block): string => block.kind === "text"
   ? block.message_id
   : block.kind === "tool" ? block.tool_use_id : block.item_id;
+
+const pasteOne = makeComposerPaste("first pasted block", "paste-1");
+const pasteTwo = makeComposerPaste("second pasted block", "paste-2");
+assert.deepEqual(
+  composePastePrompt([pasteOne, pasteTwo], "follow-up"),
+  { ok: true, prompt: "first pasted block\n\nsecond pasted block\n\nfollow-up" },
+  "paste cards must remain ordered prefixes of the visible composer text",
+);
+assert.deepEqual(
+  composePastePrompt([], "x".repeat(MAX_PROMPT_CHARS)),
+  { ok: true, prompt: "x".repeat(MAX_PROMPT_CHARS) },
+  "the protocol's exact prompt limit remains sendable",
+);
+assert.deepEqual(
+  composePastePrompt([{ text: "x".repeat(MAX_PROMPT_CHARS) }], "tail"),
+  { ok: false, chars: MAX_PROMPT_CHARS + 6, maxChars: MAX_PROMPT_CHARS },
+  "paste separators and visible text must participate in the prompt bound",
+);
 
 const maximumPaste = `first line\n${"x".repeat(MAX_PROMPT_CHARS - 20)}\nlast`;
 assert.equal(countTextLines(maximumPaste), 3,
@@ -48,6 +72,26 @@ assert.equal(exactActiveTurnId([{
   id: "stale-owner",
 }], "stale-owner", false), null,
 "an idle lifecycle never revives a stale runtime owner");
+assert.deepEqual(activeTurnCandidateIds([{
+  id: "collision-a", historyTurnId: "shared-owner",
+}, {
+  id: "collision-b", historyTurnId: "shared-owner",
+}], "shared-owner", true), ["collision-a", "collision-b"],
+"only exact aliases of a genuinely active owner become fallback candidates");
+assert.deepEqual(activeTurnCandidateIds([{
+  id: "stale-owner", historyTurnId: "shared-owner",
+}], "shared-owner", false), [],
+"idle lifecycle state exposes no ambiguous fallback candidates");
+assert.equal(
+  displayActiveTurnOwnerId("completed-previous-turn", "new-optimistic-turn"),
+  "new-optimistic-turn",
+  "a freshly submitted prompt owns the spark before native binding arrives",
+);
+assert.equal(
+  displayActiveTurnOwnerId("still-running-native-turn", null),
+  "still-running-native-turn",
+  "native ownership remains authoritative when no submit is pending",
+);
 
 const settledCachedProcess = restoreCachedTurnDetails([{
   id: "settled-cache-summary", prompt: "done already", done: true,
@@ -528,6 +572,257 @@ try {
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: 22, ts: 10, ...body,
   } as ServerEvent);
+
+  const compactGapGeneration = "compact-gap-generation";
+  const compactGapMessage = "compact-gap-browser-message";
+  const compactGapNativeTurn = "compact-gap-native-turn";
+  const compactGapContinuation = "compact-gap-continuation";
+  const compactGapPrompt = "当前机身的重量是多少？";
+  const compactGapRuntime = () => {
+    const sid = "compact-gap-pre-history";
+    let prepared = {
+      ...initialState,
+      focusedSid: sid,
+      runtimes: { [sid]: createRuntime() },
+    };
+    prepared = reduce(prepared, { type: "event", event: event({
+      type: "replay_start", sid, from_seq: 100, to_seq: 104,
+      truncated: true, rebuild: false, generation: compactGapGeneration,
+    }) });
+    prepared = reduce(prepared, {
+      type: "query_sent", sid, msg_id: compactGapMessage,
+      prompt: compactGapPrompt, ts: 10_000,
+    });
+    for (const frame of [
+      event({ type: "state", sid, seq: 101, state: "running" }),
+      event({ type: "turn_binding", sid, seq: 102,
+        msg_id: compactGapMessage, turn_id: compactGapNativeTurn }),
+      event({ type: "replay_end", sid, to_seq: 102, truncated: true }),
+    ]) {
+      prepared = reduce(prepared, { type: "event", event: frame });
+    }
+    const runtime = prepared.runtimes[sid];
+    const question = runtime.turns.find(
+      (turn: Turn) => turn.id === compactGapMessage)!;
+    assert.equal(runtime.acceptancePending, null,
+      "TurnBinding clears transport acceptance before History materializes");
+    assert.equal(runtime.pendingLiveBinding?.msgId, compactGapMessage);
+    return {
+      ...runtime,
+      turns: [{ ...question, blocks: [] }, {
+        id: compactGapContinuation,
+        prompt: "",
+        done: false,
+        ts: 71_000,
+        blocks: [{
+          kind: "process" as const,
+          item_id: "compact-gap-marker",
+          processKind: "compaction" as const,
+          phase: "end" as const,
+          status: "succeeded" as const,
+          turn_id: compactGapContinuation,
+          title: "压缩上下文",
+          done: true,
+        }],
+      }],
+    };
+  };
+  const laggingCompactHistory = (
+    sid: string, buildSeq: number, inProgress = true, external = false,
+    liveSeq = 103,
+  ): History => event({
+    type: "history", sid, session_id: sid,
+    revision: "compact-gap-revision", generation: compactGapGeneration,
+    build_seq: buildSeq, live_seq: liveSeq, authoritative: true,
+    in_progress: inProgress, external,
+    has_more: true, oldest_id: "older-history-turn",
+    newest_id: "older-history-turn", detail: "summary", events: [],
+    compaction_continuation_turn_ids: [
+      compactGapNativeTurn, compactGapContinuation,
+    ],
+    turns: [{
+      id: "older-history-turn", prompt: "上一轮问题",
+      blocks: [], done: true, detailEventCount: 0,
+      detailLoaded: false, ts: 5_000, doneTs: 6_000,
+    }],
+  }) as History;
+  const applyLaggingCompactHistory = (
+    sid: string,
+    runtime: ReturnType<typeof createRuntime>,
+    inProgress = true,
+    external = false,
+    liveSeq = 103,
+  ) => {
+    let candidate = {
+      ...initialState,
+      focusedSid: sid,
+      sessions: [{ session_id: sid, engine: "codex" as const,
+        space: "code" as const }],
+      runtimes: { [sid]: runtime },
+    };
+    for (const buildSeq of [1, 2]) {
+      candidate = reduce(candidate, { type: "event",
+        event: laggingCompactHistory(
+          sid, buildSeq, inProgress, external, liveSeq),
+      });
+    }
+    return candidate;
+  };
+  const hasCompactGapQuestion = (
+    runtime: ReturnType<typeof createRuntime>,
+  ) => runtime.turns.some((turn: Turn) => turn.id === compactGapMessage);
+
+  const compactGapSid = "compact-gap-keeps-bound-question";
+  let compactGapState = applyLaggingCompactHistory(
+    compactGapSid, compactGapRuntime());
+  let compactGap = compactGapState.runtimes[compactGapSid];
+  assert.equal(hasCompactGapQuestion(compactGap), true,
+    "a running lagging History keeps the exact bound question visible");
+  assert.equal(compactGap.turns.filter((turn: Turn) =>
+    turn.id === compactGapMessage).length, 1);
+  assert.equal(compactGap.turns.some((turn: Turn) => turn.blocks.some(
+    (block: Block) => block.kind === "process"
+      && block.processKind === "compaction")), true,
+  "retaining the question does not hide the compaction disclosure");
+  const compactGapOwners = compactGap.turns.filter((turn: Turn) =>
+    turn.id === compactGapMessage
+    || turn.blocks.some((block: Block) => block.kind === "process"
+      && block.processKind === "compaction"));
+  assert.equal(compactGapOwners.length, 1,
+    "a proven compact continuation is one active user turn, not two rows");
+  assert.equal(compactGap.liveOwner?.turnId, compactGapMessage,
+    "the surviving user row remains the exact live narrative owner");
+  assert.equal(compactGap.pendingLiveBinding?.msgId, compactGapMessage,
+    "a lagging page keeps the exact bridge for later canonical History");
+
+  let continuedCompactGapState = compactGapState;
+  for (const frame of [
+    event({ type: "assistant_msg_start", sid: compactGapSid, seq: 104,
+      message_id: "compact-gap-commentary", channel: "commentary" }),
+    event({ type: "delta", sid: compactGapSid, seq: 105,
+      message_id: "compact-gap-commentary", channel: "commentary",
+      text: "继续检查" }),
+    event({ type: "tool_use", sid: compactGapSid, seq: 106,
+      message_id: "compact-gap-assistant", tool_use_id: "compact-gap-tool",
+      tool: "Read", input: { file_path: "/tmp/example" } }),
+  ]) {
+    continuedCompactGapState = reduce(continuedCompactGapState, {
+      type: "event", event: frame,
+    });
+  }
+  const continuedCompactGap =
+    continuedCompactGapState.runtimes[compactGapSid];
+  const continuedOwner = continuedCompactGap.turns.find((turn: Turn) =>
+    turn.id === compactGapMessage)!;
+  assert.ok(continuedOwner.blocks.some((block: Block) =>
+    block.kind === "text" && block.message_id === "compact-gap-commentary"));
+  assert.ok(continuedOwner.blocks.some((block: Block) =>
+    block.kind === "tool" && block.tool_use_id === "compact-gap-tool"));
+  assert.equal(continuedCompactGap.turns.filter((turn: Turn) => !turn.prompt
+    && turn.blocks.some((block: Block) => block.kind === "process"
+      && block.processKind === "compaction")).length, 0,
+  "later narrative cannot resurrect a promptless compact duplicate");
+
+  compactGapState = reduce(compactGapState, { type: "event", event: event({
+    ...laggingCompactHistory(compactGapSid, 3),
+    live_seq: 104,
+    newest_id: "compact-gap-history-message",
+    turns: [{
+      id: "older-history-turn", prompt: "上一轮问题",
+      blocks: [], done: true, detailEventCount: 0,
+      detailLoaded: false, ts: 5_000, doneTs: 6_000,
+    }, {
+      id: "compact-gap-history-message",
+      clientMsgId: compactGapMessage,
+      forkPointId: compactGapNativeTurn,
+      prompt: compactGapPrompt,
+      blocks: [], done: false, detailEventCount: 0,
+      detailLoaded: false, ts: 10_000,
+    }],
+  }) as History });
+  compactGap = compactGapState.runtimes[compactGapSid];
+  assert.equal(compactGap.turns.filter((turn: Turn) =>
+    turn.prompt === compactGapPrompt).length, 1,
+  "canonical History consumes the retained optimistic identity once");
+  assert.equal(compactGap.pendingLiveBinding, null,
+    "an exact canonical liveOwner hand-off consumes the bridge binding");
+
+  const zeroSeqBinding = compactGapRuntime();
+  zeroSeqBinding.pendingLiveBinding = {
+    ...zeroSeqBinding.pendingLiveBinding!, seq: 0,
+  };
+  zeroSeqBinding.lastLiveSeq = 0;
+  zeroSeqBinding.lastLifecycleSeq = 0;
+  assert.equal(hasCompactGapQuestion(applyLaggingCompactHistory(
+    "compact-gap-zero-seq", zeroSeqBinding, true, false, 0).runtimes[
+      "compact-gap-zero-seq"]), true,
+  "the wrapper reconnect owner seed at sequence zero remains valid");
+
+  const staleBinding = compactGapRuntime();
+  staleBinding.pendingLiveBinding = {
+    ...staleBinding.pendingLiveBinding!,
+    generation: "older-wrapper-generation",
+  };
+  assert.equal(hasCompactGapQuestion(applyLaggingCompactHistory(
+    "compact-gap-stale-binding", staleBinding).runtimes[
+      "compact-gap-stale-binding"]), false,
+  "a stale-generation binding cannot retain an optimistic question");
+
+  const conflictingNative = compactGapRuntime();
+  conflictingNative.turns = conflictingNative.turns.map((turn: Turn) =>
+    turn.id === compactGapMessage
+      ? { ...turn, forkPointId: "different-native-turn" } : turn);
+  assert.equal(hasCompactGapQuestion(applyLaggingCompactHistory(
+    "compact-gap-conflicting-native", conflictingNative).runtimes[
+      "compact-gap-conflicting-native"]), false,
+  "a matching msgId cannot override an explicitly conflicting native owner");
+
+  const switchedGeneration = compactGapRuntime();
+  switchedGeneration.historyGeneration = "previous-history-generation";
+  const switchedGenerationGap = applyLaggingCompactHistory(
+    "compact-gap-new-control-generation", switchedGeneration).runtimes[
+      "compact-gap-new-control-generation"];
+  assert.equal(hasCompactGapQuestion(switchedGenerationGap), true,
+  "current control generation supersedes an old installed History generation");
+  assert.equal(switchedGenerationGap.turns.filter((turn: Turn) =>
+    turn.id === compactGapMessage
+    || turn.blocks.some((block: Block) => block.kind === "process"
+      && block.processKind === "compaction")).length, 1,
+  "the current control generation can restore its compact continuation owner");
+  assert.equal(switchedGenerationGap.liveOwner?.turnId, compactGapMessage);
+
+  const idleGap = applyLaggingCompactHistory(
+    "compact-gap-idle", compactGapRuntime(), false).runtimes[
+      "compact-gap-idle"];
+  assert.equal(hasCompactGapQuestion(idleGap), false,
+    "authoritative idle History removes a question absent from its source");
+  assert.equal(idleGap.pendingLiveBinding, null);
+
+  const completedGap = compactGapRuntime();
+  completedGap.turns = completedGap.turns.map((turn: Turn) =>
+    turn.id === compactGapMessage ? { ...turn, done: true } : turn);
+  assert.equal(hasCompactGapQuestion(applyLaggingCompactHistory(
+    "compact-gap-completed", completedGap).runtimes[
+      "compact-gap-completed"]), false,
+  "a completed owner cannot be reopened by the running History bridge");
+
+  assert.equal(hasCompactGapQuestion(applyLaggingCompactHistory(
+    "compact-gap-external", compactGapRuntime(), true, true).runtimes[
+      "compact-gap-external"]), false,
+  "external ownership cannot inherit a browser-only pending binding");
+
+  const rollbackGapSid = "compact-gap-real-rollback";
+  const rollbackGap = reduce({ ...initialState, focusedSid: rollbackGapSid,
+    runtimes: { [rollbackGapSid]: compactGapRuntime() },
+  }, { type: "event", event: event({
+    type: "history_invalidated", sid: rollbackGapSid,
+    session_id: rollbackGapSid, revision: "compact-gap-after-rollback",
+    reason: "rollback",
+  }) }).runtimes[rollbackGapSid];
+  assert.deepEqual(rollbackGap.turns, [],
+    "a real source rollback remains destructive");
+  assert.equal(rollbackGap.pendingLiveBinding, null);
+
   const sid = "history-live-block-order";
   let state = {
     ...initialState,
@@ -539,6 +834,33 @@ try {
     }],
     runtimes: { [sid]: createRuntime() },
   };
+
+  const sparkSid = "new-submit-spark-owner";
+  const settledRuntime = createRuntime();
+  settledRuntime.state = "idle";
+  settledRuntime.turns = [{
+    id: "settled-previous-turn", prompt: "old", blocks: [], done: true,
+  }];
+  settledRuntime.liveOwner = { turnId: "settled-previous-turn", seq: 20 };
+  const submittedSparkState = reduce({
+    ...initialState,
+    focusedSid: sparkSid,
+    runtimes: { [sparkSid]: settledRuntime },
+  }, {
+    type: "query_sent", sid: sparkSid, prompt: "new", msg_id: "new-turn",
+    ts: 21_000,
+  });
+  const submittedSparkRuntime = submittedSparkState.runtimes[sparkSid];
+  assert.deepEqual(activeTurnCandidateIds(
+    submittedSparkRuntime.turns,
+    displayActiveTurnOwnerId(
+      submittedSparkRuntime.liveOwner?.turnId,
+      submittedSparkRuntime.acceptancePending,
+    ),
+    submittedSparkRuntime.state !== "idle"
+      || !!submittedSparkRuntime.acceptancePending,
+  ), ["new-turn"],
+  "query_sent moves the spark directly to the optimistic tail row");
 
   for (const liveEvent of [
     event({ type: "state", sid, state: "running", seq: 1 }),
@@ -761,6 +1083,51 @@ try {
     2,
     "the real terminal adds one completion time beside the prompt time",
   );
+
+  const staleChildTurn: Turn = {
+    id: "steer-predecessor", prompt: "start", done: true,
+    historyTurnId: "shared-native-task",
+    blocks: [{
+      kind: "process", item_id: "late-predecessor-child",
+      processKind: "agent", phase: "update", status: "running",
+      title: "旧分段后台任务", done: false,
+    }],
+  };
+  const currentSteerTurn: Turn = {
+    id: "current-steer", clientMsgId: "current-steer",
+    historyTurnId: "shared-native-task", prompt: "继续", done: false,
+    blocks: [],
+  };
+  const singleOwnerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [staleChildTurn, currentSteerTurn], engine: "codex",
+    activeTurnId: currentSteerTurn.id,
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.equal(
+    singleOwnerMarkup.match(/class="turn-working"/g)?.length ?? 0,
+    1,
+    "one native task may render only one session-level working spark after steer",
+  );
+  assert.match(singleOwnerMarkup, /旧分段后台任务/,
+    "suppressing the duplicate spark keeps the predecessor process visible");
+  const ambiguousOwnerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [staleChildTurn, currentSteerTurn], engine: "codex",
+    activeTurnId: null,
+    ambiguousActiveTurnIds: [staleChildTurn.id, currentSteerTurn.id],
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.equal(
+    ambiguousOwnerMarkup.match(/class="turn-working"/g)?.length ?? 0,
+    1,
+    "an ambiguous shared native owner still renders at most one top-level spark",
+  );
+  const idleAmbiguousRowsMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [staleChildTurn, currentSteerTurn], engine: "codex",
+    activeTurnId: null,
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.doesNotMatch(idleAmbiguousRowsMarkup, /class="turn-working"/,
+    "idle or missing-owner state cannot revive a cached open row");
 
   const currentRunningState = reduce({
     ...initialState,

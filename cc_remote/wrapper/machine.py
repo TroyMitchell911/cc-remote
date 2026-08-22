@@ -55,7 +55,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from contextlib import AsyncExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from uuid import uuid4
 from typing import Literal, Optional
@@ -68,6 +68,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import (
     HookEventMessage, ResultMessage, TaskNotificationMessage,
     TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
+    RateLimitEvent,
 )
 
 from cc_remote.attachments import (
@@ -106,7 +107,8 @@ from cc_remote.protocol import (
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
-    ConversationTurn, CodexTerminalFence, History, TurnDetail, HistoryImage,
+    ConversationTurn, CodexTerminalFence, History, TurnDetail, AgentDetail,
+    HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
     State, TakeoverState, SessionControl,
@@ -146,6 +148,10 @@ from cc_remote.wrapper.claude_controls import (
 from cc_remote.wrapper.claude_client_messages import (
     ClaudeClientMessageStore,
     ClaudeClientMessageStoreError,
+)
+from cc_remote.wrapper.claude_rate_limits import (
+    ClaudeRateLimitStore,
+    ClaudeRateLimitStoreError,
 )
 from cc_remote.wrapper.codex_controls import (
     CODEX_WEB_SEARCH_MODES,
@@ -198,6 +204,13 @@ from cc_remote.wrapper.history_store import (
     history_source_extends,
     materialize_history_turns,
 )
+from cc_remote.wrapper.claude_agents import (
+    AgentSourceTooLarge,
+    AgentRoute,
+    ClaudeAgentRegistry,
+    resolve_source_agent,
+    translate_source_agent,
+)
 from cc_remote.wrapper.stream import (
     StreamTranslator, extract_session_id, extract_model,
     replayed_user_message_id,
@@ -224,15 +237,18 @@ from cc_remote.wrapper.codex_client_messages import (
 )
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
-    CodexHistoryImageView, CodexHistoryNativeWitness, CodexLiveUserMessage,
+    CodexHistoryImageView, CodexHistoryNativeWitness,
+    CodexHistoryProcessPageWitness, CodexLiveUserMessage,
     CodexStreamTranslator,
+    MIN_PROCESS_DURATION_MS,
     coalesce_codex_live_notifications,
     codex_live_user_message,
     codex_rollout_task_bindings,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_turn_users,
-    codex_history_native_witness, codex_history_window,
+    codex_history_native_witness, codex_history_process_witnesses,
+    codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
 )
@@ -1256,6 +1272,19 @@ class _CodexGoalRecoveryMiss:
     stable: bool
 
 
+@dataclass
+class _CodexProcessWitnessCache:
+    """Append-safe offsets and positive process proof for official pages."""
+
+    source: HistorySourceFingerprint
+    head_native_turn_ids: tuple[str, ...] = ()
+    head: CodexHistoryNativeWitness | None = None
+    offsets: dict[str, int] = dataclass_field(default_factory=dict)
+    pages: OrderedDict[
+        tuple[str, int], CodexHistoryProcessPageWitness
+    ] = dataclass_field(default_factory=OrderedDict)
+
+
 @dataclass(frozen=True)
 class _CodexDeleteRejection:
     error: Error
@@ -1295,7 +1324,11 @@ def _codex_official_projection_outcome(
             turn_id not in official_set for turn_id in rollout
         ):
             return "mismatch"
-        return "match" if witness.scanned_to_start else "inconclusive"
+        # A byte-bounded witness may stop inside one very large older turn.
+        # With no positive contradiction it is not an authority over the
+        # official app-server page, and must not turn a stable page into a
+        # permanent provisional/retry loop.
+        return "match" if witness.scanned_to_start else "not-applicable"
     if not shared_indices:
         return "inconclusive"
 
@@ -1317,6 +1350,82 @@ def _codex_official_projection_outcome(
     if shared_official != shared_rollout:
         return "mismatch"
     return "match"
+
+
+def _apply_codex_process_witness(
+    page: CodexHistoryPage,
+    witness: CodexHistoryNativeWitness,
+) -> None:
+    """Overlay source-bound public-process proof onto opaque native summaries.
+
+    The official ``itemsView=summary`` response intentionally omits tools and
+    commentary. Positive rollout evidence can therefore refine either an
+    opaque ``unknown`` or a structurally valid ``full`` row whose app-server
+    projection omitted tools. Absence is never used to claim a direct reply
+    because a bounded scan may have skipped a large record or started mid-turn.
+    """
+    for turn in page.turns:
+        current_started = turn.get("processStartedTs")
+        current_done = turn.get("processDoneTs")
+        current_timing_is_exact = (
+            isinstance(current_started, int)
+            and isinstance(current_done, int)
+            and current_done - current_started >= MIN_PROCESS_DURATION_MS
+        )
+        if (
+            turn.get("processDetailState") == "present"
+            and current_timing_is_exact
+        ):
+            continue
+        visible_id = turn.get("id")
+        process = (
+            witness.process_by_visible_id.get(visible_id)
+            if isinstance(visible_id, str) else None
+        )
+        if process is None and isinstance(visible_id, str):
+            native_segment = page.native_segment_by_visible_id.get(visible_id)
+            if native_segment is not None:
+                process = witness.process_by_native_segment.get(
+                    native_segment)
+        if process is None:
+            continue
+        turn["processDetailState"] = "present"
+        reasons = list(turn.get("detailReasons") or [])
+        if "process" not in reasons:
+            reasons.append("process")
+        turn["detailReasons"] = reasons
+        turn["detailEventCount"] = max(
+            1, int(turn.get("detailEventCount") or 0))
+        started_ms = process.started_ms
+        done_ms = process.done_ms
+        if (
+            isinstance(started_ms, int)
+            and isinstance(done_ms, int)
+            and done_ms - started_ms >= MIN_PROCESS_DURATION_MS
+        ):
+            turn["processStartedTs"] = started_ms
+            turn["processDoneTs"] = done_ms
+        else:
+            # One persisted process record proves the disclosure exists but
+            # cannot prove a useful interval. Never replace that distinction
+            # with the parser-time ``0s`` produced by a hydrated native turn.
+            turn.pop("processStartedTs", None)
+            turn.pop("processDoneTs", None)
+
+
+def _codex_visible_process_offsets(
+    page: CodexHistoryPage,
+    *,
+    visible: dict[str, int],
+    native_segments: dict[tuple[str, int], int],
+) -> dict[str, int]:
+    """Bridge rollout offsets onto official browser-visible turn ids."""
+    offsets = dict(visible)
+    for visible_id, native_segment in page.native_segment_by_visible_id.items():
+        offset = native_segments.get(native_segment)
+        if offset is not None:
+            offsets[visible_id] = offset
+    return offsets
 
 
 class _CodexHistoryProfiles:
@@ -1497,7 +1606,8 @@ class WrapperMachine:
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
-        "list_sessions", "get_history", "get_turn_detail", "get_history_image",
+        "list_sessions", "get_history", "get_turn_detail", "get_agent_detail",
+        "get_history_image",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
         "get_preview_asset", "get_goal", "dismiss_goal",
@@ -1522,7 +1632,8 @@ class WrapperMachine:
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
-        "get_history", "get_turn_detail", "get_history_image", "switch_session",
+        "get_history", "get_turn_detail", "get_agent_detail",
+        "get_history_image", "switch_session",
         "rename_session", "archive_session", "pin_session",
         "delete_work_session", "delete_session", "rollback_session",
         "compact_session", "start_review",
@@ -1630,6 +1741,17 @@ class WrapperMachine:
         # but never discover or adopt it in the customer path by default.
         self._claude_broker_enabled = bool(getattr(
             cfg, "experimental_claude_broker", False))
+        self._claude_rate_limit_lock = asyncio.Lock()
+        self._claude_rate_limit_emit_lock = asyncio.Lock()
+        try:
+            self._claude_rate_limits: ClaudeRateLimitStore | None = (
+                ClaudeRateLimitStore(cfg.state_dir)
+            )
+        except ClaudeRateLimitStoreError:
+            # Quota is optional presentation state. A damaged cache must never
+            # prevent Claude sessions from starting or receiving model output.
+            self._claude_rate_limits = None
+            log.exception("Claude rate-limit cache unavailable")
         # A History token changes for every wrapper process and every local
         # destructive conversation mutation.  Browsers persist this token with
         # IndexedDB turns, so a fresh wrapper can never merge a pre-crash cache
@@ -1641,6 +1763,12 @@ class WrapperMachine:
         # includes the Codex profile, so identical native UUIDs in two accounts
         # can never share fallback state.
         self._codex_rollout_history_revisions: dict[str, str] = {}
+        # Official summary pages omit process items. Keep append-safe rollout
+        # offsets so older-page disclosure recovery continues from the prior
+        # page instead of rescanning a multi-gigabyte file from its tail.
+        self._codex_process_witness_caches: OrderedDict[
+            str, _CodexProcessWitnessCache
+        ] = OrderedDict()
         # SessionContext objects are evicted and recreated while this wrapper
         # generation stays alive. Keep each sid's control revision outside the
         # resident context so a rebuilt Snapshot cannot move backwards and be
@@ -2637,6 +2765,7 @@ class WrapperMachine:
     def _invalidate_codex_history(self, sid: str) -> None:
         """Invalidate only Codex-native supplements for one routed thread id."""
         self._codex_rollout_history_revisions.pop(sid, None)
+        self._codex_process_witness_caches.pop(sid, None)
         for key in tuple(self._codex_history_image_views):
             if key[0] == sid:
                 self._codex_history_image_views.pop(key, None)
@@ -2659,6 +2788,21 @@ class WrapperMachine:
         for key in tuple(self._codex_goal_recovery_misses):
             if key[0] == sid:
                 self._codex_goal_recovery_misses.pop(key, None)
+
+    def _codex_process_witness_cache(
+        self,
+        sid: str,
+        source: HistorySourceFingerprint,
+    ) -> _CodexProcessWitnessCache:
+        cache = self._codex_process_witness_caches.get(sid)
+        if cache is None or not history_source_extends(cache.source, source):
+            cache = _CodexProcessWitnessCache(source=source)
+            self._codex_process_witness_caches[sid] = cache
+        else:
+            self._codex_process_witness_caches.move_to_end(sid)
+        while len(self._codex_process_witness_caches) > 64:
+            self._codex_process_witness_caches.popitem(last=False)
+        return cache
 
     def _codex_rollout_history_active(self, sid: str) -> bool:
         return self._codex_rollout_history_revisions.get(
@@ -4368,6 +4512,10 @@ class WrapperMachine:
         self, ctx: SessionContext, sdk: SdkHandle,
     ) -> None:
         """Install the complete per-session Claude bridge on one SDK handle."""
+        if ctx.space == "code" and ctx.claude_agents is None:
+            ctx.claude_agents = ClaudeAgentRegistry(self.cfg.tool_result_max)
+        elif ctx.space != "code":
+            ctx.claude_agents = None
         sdk.ask_server = make_ask_server(
             lambda q, o: self._on_mcp_ask(ctx, q, o),
             lambda m: self._on_set_mode(ctx, m),
@@ -5510,7 +5658,7 @@ class WrapperMachine:
                 if cmd.type == "list_sessions":
                     self._start_session_list_command(cmd)
                     continue
-                if cmd.type in {"get_history", "get_turn_detail"}:
+                if cmd.type in {"get_history", "get_turn_detail", "get_agent_detail"}:
                     self._start_history_command(cmd)
                     continue
                 if cmd.type == "get_models":
@@ -8020,6 +8168,7 @@ class WrapperMachine:
             focused_id = self._ctx_wire_sid(focused) or focused.key
             if focused_id:
                 cursors[focused_id] = legacy_cursor
+        claude_rate_limits = await self._claude_rate_limit_snapshot()
         for old_key in list(cursors):
             alias = self._session_aliases.get(old_key)
             if alias is None:
@@ -8193,6 +8342,17 @@ class WrapperMachine:
                             to=cmd.client_id,
                             route_id=getattr(cmd, "route_id", None),
                         ))
+                    if ctx.engine == "claude" and not ctx.btw:
+                        for rate_limit in claude_rate_limits:
+                            await self.transport.send(rate_limit.model_copy(
+                                deep=True,
+                                update={
+                                    "to": cmd.client_id,
+                                    "sid": sid,
+                                    "route_id": getattr(
+                                        cmd, "route_id", None),
+                                },
+                            ))
                     if (ctx.engine != "codex"
                             or self._codex_model_effort_authority(ctx)
                             == settings_authority):
@@ -9887,6 +10047,7 @@ class WrapperMachine:
                     source_fingerprint,
                     before=before,
                     limit=int(limit) if isinstance(limit, int) else 0,
+                    summary_only=detail == "summary",
                 )
                 if (indexed_page is None and allow_stale
                         and before is None):
@@ -9897,6 +10058,7 @@ class WrapperMachine:
                         source_fingerprint,
                         before=None,
                         limit=int(limit) if isinstance(limit, int) else 0,
+                        summary_only=detail == "summary",
                     )
                     stale_indexed_page = indexed_page is not None
             except OSError:
@@ -10568,9 +10730,27 @@ class WrapperMachine:
                 # Preserve identity/lifecycle and leave the source-complete
                 # detail expandable; only the large inline preview is omitted.
                 compact_turn = dict(detail_source_turns[-1])
-                compact_turn["prompt"] = str(
-                    compact_turn.get("prompt") or "")[:32 * 1024]
+                original_prompt = str(compact_turn.get("prompt") or "")
+                original_blocks = list(compact_turn.get("blocks") or [])
+                compact_turn["prompt"] = original_prompt[:32 * 1024]
                 compact_turn["blocks"] = []
+                detail_reasons = list(compact_turn.get("detailReasons") or [])
+                if (
+                    len(compact_turn["prompt"]) < len(original_prompt)
+                    and "prompt_truncated" not in detail_reasons
+                ):
+                    detail_reasons.append("prompt_truncated")
+                if (
+                    any(
+                        block.get("kind") == "text"
+                        and block.get("channel") == "final"
+                        and block.get("text")
+                        for block in original_blocks
+                    )
+                    and "answer_truncated" not in detail_reasons
+                ):
+                    detail_reasons.append("answer_truncated")
+                compact_turn["detailReasons"] = detail_reasons
                 compact_turn["detailEventCount"] = max(
                     1, int(compact_turn.get("detailEventCount") or 0))
                 compact_turn["detailLoaded"] = False
@@ -11174,30 +11354,152 @@ class WrapperMachine:
                 raise OSError(
                     "Codex rollout identity changed during History read")
 
+        if before is not None and source_path and source_before is not None:
+            process_cache = self._codex_process_witness_cache(
+                sid, source_before)
+            process_page_turns = max(
+                limit or 4,
+                len(page.native_turn_ids),
+            )
+            process_page_key = (before, process_page_turns)
+            process_page = process_cache.pages.get(process_page_key)
+            try:
+                if process_page is None:
+                    process_page = await asyncio.to_thread(
+                        codex_history_process_witnesses,
+                        source_path,
+                        before=before,
+                        before_offset=process_cache.offsets.get(before),
+                        max_turns=process_page_turns,
+                    )
+                source_after = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, source_path)
+            except OSError:
+                process_page = None
+            else:
+                if (
+                    (
+                        source_after == source_before
+                        or history_source_extends(
+                            source_before, source_after)
+                    )
+                    and self._history_revision(sid) == revision
+                    and process_page is not None
+                ):
+                    process_cache.source = source_after
+                    process_cache.offsets.update(
+                        _codex_visible_process_offsets(
+                            page,
+                            visible=process_page.offset_by_visible_id,
+                            native_segments=(
+                                process_page.offset_by_native_segment),
+                        )
+                    )
+                    process_cache.pages[process_page_key] = process_page
+                    process_cache.pages.move_to_end(process_page_key)
+                    while len(process_cache.pages) > 256:
+                        process_cache.pages.popitem(last=False)
+                    _apply_codex_process_witness(
+                        page,
+                        CodexHistoryNativeWitness(
+                            process_by_visible_id=(
+                                process_page.process_by_visible_id),
+                            process_by_native_segment=(
+                                process_page.process_by_native_segment),
+                        ),
+                    )
+
         projection_outcome = "not-applicable"
         if before is None and source_path:
             if source_capture_failed or source_before is None:
                 projection_outcome = "inconclusive"
             else:
                 try:
-                    witness = await asyncio.to_thread(
-                        codex_history_native_witness,
-                        source_path,
-                        max_turns=max(
-                            (limit or 4) + 1,
-                            len(page.native_turn_ids) + 1,
-                        ),
-                        max_scan_bytes=(
-                            self.cfg.codex_history_window_max_bytes),
+                    process_cache = self._codex_process_witness_cache(
+                        sid, source_before)
+                    head_ids = tuple(page.native_turn_ids)
+                    exact_cached_head = (
+                        process_cache.source == source_before
+                        and process_cache.head_native_turn_ids == head_ids
+                        and process_cache.head is not None
                     )
+                    if exact_cached_head:
+                        witness = process_cache.head
+                        process_witness = witness
+                    else:
+                        witness = await asyncio.to_thread(
+                            codex_history_native_witness,
+                            source_path,
+                            max_turns=max(
+                                (limit or 4) + 1,
+                                len(page.native_turn_ids) + 1,
+                            ),
+                            max_scan_bytes=(
+                                self.cfg.codex_history_window_max_bytes),
+                        )
+                        cached_head = (
+                            process_cache.head
+                            if process_cache.head_native_turn_ids == head_ids
+                            else None
+                        )
+                        if cached_head is not None:
+                            process_witness = CodexHistoryNativeWitness(
+                                turn_ids=witness.turn_ids,
+                                scanned_to_start=witness.scanned_to_start,
+                                has_more_turns=witness.has_more_turns,
+                                process_by_visible_id={
+                                    **cached_head.process_by_visible_id,
+                                    **witness.process_by_visible_id,
+                                },
+                                offset_by_visible_id={
+                                    **cached_head.offset_by_visible_id,
+                                    **witness.offset_by_visible_id,
+                                },
+                                process_by_native_segment={
+                                    **cached_head.process_by_native_segment,
+                                    **witness.process_by_native_segment,
+                                },
+                                offset_by_native_segment={
+                                    **cached_head.offset_by_native_segment,
+                                    **witness.offset_by_native_segment,
+                                },
+                            )
+                        else:
+                            process_witness = witness
                     source_after = await asyncio.to_thread(
                         HistorySourceFingerprint.capture, source_path)
                 except OSError:
                     projection_outcome = "inconclusive"
                 else:
+                    same_revision = self._history_revision(sid) == revision
+                    source_compatible = bool(
+                        source_after == source_before
+                        or history_source_extends(
+                            source_before, source_after)
+                    )
+                    if same_revision and source_compatible:
+                        # Positive process evidence in an immutable prefix
+                        # remains valid while the live rollout appends. Page
+                        # completeness still requires the exact frozen source
+                        # below, so this refinement cannot make a moving page
+                        # authoritative.
+                        _apply_codex_process_witness(page, process_witness)
+                        process_cache.source = source_after
+                        process_cache.head_native_turn_ids = head_ids
+                        process_cache.head = process_witness
+                        process_cache.offsets.update(
+                            _codex_visible_process_offsets(
+                                page,
+                                visible=(
+                                    process_witness.offset_by_visible_id),
+                                native_segments=(
+                                    process_witness
+                                    .offset_by_native_segment),
+                            )
+                        )
                     if (
                         source_after != source_before
-                        or self._history_revision(sid) != revision
+                        or not same_revision
                     ):
                         projection_outcome = "inconclusive"
                     else:
@@ -12041,6 +12343,228 @@ class WrapperMachine:
             return await send(error="详细过程分页位置已失效，请重新展开该轮")
         return await send(
             page,
+            has_more=has_more,
+            oldest_cursor=oldest,
+            has_newer=has_newer,
+            newer_cursor=newer,
+        )
+
+    async def _handle_get_agent_detail(self, cmd) -> AgentDetail:
+        """Return one read-only Claude Agent process page without resuming it."""
+        started_at = time.perf_counter()
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        revision = self._history_revision(sid)
+        client_id = getattr(cmd, "client_id", None)
+
+        async def send(
+            events: list[dict] | None = None,
+            *,
+            title: str = "协作代理",
+            parent_run_id: str | None = None,
+            status: str = "unknown",
+            detail_revision: str = "unavailable",
+            through_seq: int = 0,
+            error: str | None = None,
+            has_more: bool = False,
+            oldest_cursor: str | None = None,
+            has_newer: bool = False,
+            newer_cursor: str | None = None,
+        ) -> AgentDetail:
+            detail = AgentDetail(
+                session_id=sid,
+                run_id=cmd.run_id,
+                request_id=cmd.request_id,
+                revision=revision,
+                detail_revision=detail_revision,
+                authoritative=error is None,
+                title=title,
+                parent_run_id=parent_run_id,
+                status=status,
+                error=error,
+                events=events or [],
+                through_seq=through_seq,
+                has_more=has_more,
+                oldest_cursor=oldest_cursor,
+                has_newer=has_newer,
+                newer_cursor=newer_cursor,
+                before=getattr(cmd, "before", None),
+                sid=sid,
+                to=client_id,
+            )
+            await self.transport.send(detail)
+            log.info(
+                "Claude Agent detail sent",
+                session_id=sid,
+                run_id=cmd.run_id,
+                events=len(detail.events),
+                authoritative=detail.authoritative,
+                client_id=client_id,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return detail
+
+        requested_revision = getattr(cmd, "revision", None)
+        if requested_revision and requested_revision != revision:
+            return await send(error="会话历史已更新，请重新打开协作代理")
+
+        self._watch_session(sid)
+        watch = self._watch.get(sid) or {}
+        ctx = self._ctx_by_sid(sid)
+        if ((ctx is not None and ctx.engine != "claude")
+                or (ctx is None and watch.get("engine") == "codex")):
+            return await send(error="当前会话不支持协作代理详情")
+        if ctx is not None and ctx.space != "code":
+            return await send(error="Work 不提供协作代理详情")
+        if ctx is None:
+            work_record = await asyncio.to_thread(
+                self._work.for_engine("claude").get_by_session, sid)
+            if work_record is not None:
+                return await send(error="Work 不提供协作代理详情")
+
+        registry = ctx.claude_agents if ctx is not None else None
+        run = registry.snapshot(cmd.run_id) if registry is not None else None
+        if run is not None:
+            detail_revision = self._resident_agent_detail_revision(run)
+            requested_detail = getattr(cmd, "detail_revision", None)
+            if requested_detail and requested_detail != detail_revision:
+                return await send(
+                    title=run.title,
+                    parent_run_id=run.parent_run_id,
+                    status=run.status,
+                    detail_revision=detail_revision,
+                    through_seq=run.through_seq,
+                    error="协作代理详情已更新，请重新打开",
+                )
+            if client_id:
+                run.subscribe(client_id)
+            try:
+                page, has_more, oldest, has_newer, newer = _turn_detail_page(
+                    run.events,
+                    before=getattr(cmd, "before", None),
+                    limit=getattr(cmd, "limit", 192),
+                    max_bytes=min(
+                        8 * 1024 * 1024,
+                        max(512 * 1024, self.cfg.ws_max_size_bytes // 2),
+                    ),
+                )
+            except ValueError:
+                return await send(
+                    title=run.title,
+                    parent_run_id=run.parent_run_id,
+                    status=run.status,
+                    detail_revision=detail_revision,
+                    through_seq=run.through_seq,
+                    error="协作代理分页位置已失效，请重新打开",
+                )
+            return await send(
+                page,
+                title=run.title,
+                parent_run_id=run.parent_run_id,
+                status=run.status,
+                detail_revision=detail_revision,
+                through_seq=run.through_seq,
+                has_more=has_more,
+                oldest_cursor=oldest,
+                has_newer=has_newer,
+                newer_cursor=newer,
+            )
+
+        try:
+            location = await asyncio.to_thread(
+                resolve_source_agent, sid, cmd.run_id,
+                ctx.cwd if ctx is not None else None)
+        except Exception as exc:
+            log.warning(
+                "Claude Agent identity read failed",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            return await send(error="协作代理详情暂时不可用，请稍后重试")
+        if location is None:
+            return await send(error="未找到这个协作代理")
+
+        source = None
+        rows = None
+        if location.source_path:
+            try:
+                source = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, location.source_path)
+                if self._history_index is not None:
+                    rows = await asyncio.to_thread(
+                        self._history_index.get_agent_detail,
+                        sid, source, cmd.run_id)
+            except OSError:
+                source = None
+        detail_revision = (
+            source.token if source is not None
+            else f"source-{hashlib.sha256(cmd.run_id.encode()).hexdigest()[:24]}"
+        )
+        requested_detail = getattr(cmd, "detail_revision", None)
+        if requested_detail and requested_detail != detail_revision:
+            return await send(
+                title=location.title,
+                parent_run_id=location.parent_run_id,
+                status=location.status,
+                detail_revision=detail_revision,
+                error="协作代理详情已更新，请重新打开",
+            )
+        if rows is None:
+            try:
+                detail = await asyncio.to_thread(
+                    translate_source_agent,
+                    sid, location, ctx.cwd if ctx is not None else None,
+                    self.cfg.tool_result_max,
+                )
+            except AgentSourceTooLarge:
+                return await send(
+                    title=location.title,
+                    parent_run_id=location.parent_run_id,
+                    status=location.status,
+                    detail_revision=detail_revision,
+                    error="协作代理记录过大，暂时无法安全读取完整过程",
+                )
+            except Exception as exc:
+                log.warning(
+                    "Claude Agent detail translation failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                return await send(
+                    title=location.title,
+                    parent_run_id=location.parent_run_id,
+                    status=location.status,
+                    detail_revision=detail_revision,
+                    error="协作代理详情暂时不可用，请稍后重试",
+                )
+            rows = detail.events
+            if source is not None and self._history_index is not None:
+                await asyncio.to_thread(
+                    self._history_index.put_agent_detail,
+                    sid, source, cmd.run_id, rows)
+        try:
+            page, has_more, oldest, has_newer, newer = _turn_detail_page(
+                rows,
+                before=getattr(cmd, "before", None),
+                limit=getattr(cmd, "limit", 192),
+                max_bytes=min(
+                    8 * 1024 * 1024,
+                    max(512 * 1024, self.cfg.ws_max_size_bytes // 2),
+                ),
+            )
+        except ValueError:
+            return await send(
+                title=location.title,
+                parent_run_id=location.parent_run_id,
+                status=location.status,
+                detail_revision=detail_revision,
+                error="协作代理分页位置已失效，请重新打开",
+            )
+        return await send(
+            page,
+            title=location.title,
+            parent_run_id=location.parent_run_id,
+            status=location.status,
+            detail_revision=detail_revision,
             has_more=has_more,
             oldest_cursor=oldest,
             has_newer=has_newer,
@@ -15013,6 +15537,62 @@ class WrapperMachine:
             return
         await self._emit(ctx, event)
 
+    async def _claude_rate_limit_snapshot(
+        self,
+    ) -> tuple[RateLimitUpdate, ...]:
+        store = self._claude_rate_limits
+        if store is None:
+            return ()
+        async with self._claude_rate_limit_lock:
+            try:
+                return await asyncio.to_thread(store.snapshot)
+            except ClaudeRateLimitStoreError:
+                log.warning("Claude rate-limit snapshot unavailable")
+                return ()
+
+    async def _seed_claude_rate_limits(
+        self, ctx: SessionContext,
+    ) -> tuple[RateLimitUpdate, ...]:
+        """Publish cached, unexpired account windows to one new runtime."""
+        if ctx.engine != "claude" or ctx.btw:
+            return ()
+        events = await self._claude_rate_limit_snapshot()
+        for event in events:
+            await self._emit(ctx, event.model_copy(deep=True))
+        return events
+
+    async def _observe_claude_rate_limit_message(
+        self, message,
+    ) -> bool:
+        """Consume one SDK quota event without turning it into transcript UI."""
+        if not isinstance(message, RateLimitEvent):
+            return False
+        store = self._claude_rate_limits
+        if store is None:
+            return True
+        async with self._claude_rate_limit_lock:
+            try:
+                update = await asyncio.to_thread(
+                    store.observe, message.rate_limit_info)
+            except ClaudeRateLimitStoreError:
+                log.warning("Claude rate-limit update could not be cached")
+                return True
+            if update is None:
+                return True
+        # Claude currently has one machine-level authentication boundary. Seed
+        # every resident normal session so a tab switch is immediate;
+        # cold/evicted sessions receive the same cache on focus/Hello. Keep
+        # transport backpressure outside the disk-cache lock while preserving
+        # provider event order with a dedicated publisher lock.
+        targets = tuple(
+            ctx for ctx in self.sessions.values()
+            if ctx.engine == "claude" and not ctx.btw
+        )
+        async with self._claude_rate_limit_emit_lock:
+            for target in targets:
+                await self._emit(target, update.model_copy(deep=True))
+        return True
+
     async def _on_claude_background_message(
         self, ctx: SessionContext, message, turn_id: str | None,
     ) -> None:
@@ -15023,6 +15603,8 @@ class WrapperMachine:
         sufficient because stable item -> origin-turn/title/kind maps live on
         the SessionContext and are shared across all translator instances.
         """
+        if await self._observe_claude_rate_limit_message(message):
+            return
         thread_id = self._ctx_wire_sid(ctx)
         if not thread_id:
             return
@@ -15030,6 +15612,11 @@ class WrapperMachine:
             message, thread_id)
         if goal_changed and ctx.goal_visible:
             await self._emit(ctx, GoalState(goal=goal))
+        registry = ctx.claude_agents
+        route = registry.route(message) if registry is not None else AgentRoute("main")
+        await self._publish_claude_agent_route(ctx, route)
+        if route.target == "detail":
+            return
         if not isinstance(message, (
             HookEventMessage, TaskStartedMessage, TaskProgressMessage,
             TaskUpdatedMessage, TaskNotificationMessage,
@@ -15044,6 +15631,46 @@ class WrapperMachine:
         )
         for event in translator.feed(message):
             await self._emit(ctx, event)
+
+    def _resident_agent_detail_revision(self, run) -> str:
+        return (
+            f"live-{self.instance_id[:24]}-{run.run_id[:48]}-"
+            f"{run.revision_epoch}"
+        )
+
+    async def _publish_claude_agent_route(
+        self, ctx: SessionContext, route: AgentRoute,
+    ) -> None:
+        """Send unbuffered Agent detail hints only to interested browsers."""
+        registry = ctx.claude_agents
+        sid = self._ctx_wire_sid(ctx)
+        if registry is None or not sid:
+            return
+        touched = tuple(dict.fromkeys((
+            *((route.run_id,) if route.run_id else ()),
+            *route.touched_run_ids,
+        )))
+        for run_id in touched:
+            run = registry.snapshot(run_id)
+            if run is None or not run.subscribers:
+                continue
+            events = list(route.events) if route.run_id == run_id else []
+            for client_id in tuple(run.subscribers):
+                await self.transport.send(AgentDetail(
+                    session_id=sid,
+                    run_id=run.run_id,
+                    revision=self._history_revision(sid),
+                    detail_revision=self._resident_agent_detail_revision(run),
+                    authoritative=False,
+                    live=True,
+                    title=run.title,
+                    parent_run_id=run.parent_run_id,
+                    status=run.status,
+                    events=events,
+                    through_seq=run.through_seq,
+                    sid=sid,
+                    to=client_id,
+                ))
 
     async def _on_codex_turn_lifecycle(
         self, ctx: SessionContext, phase: str, turn_id: str,
@@ -19860,6 +20487,8 @@ class WrapperMachine:
                 effort_event = Effort(effort=effort)
                 await self._emit(ctx, effort_event)
                 cached_responses.append(effort_event)
+            rate_limit_events = await self._seed_claude_rate_limits(ctx)
+            cached_responses.extend(rate_limit_events)
         # Seed the chips on entering a Codex session from the authoritative
         # thread-local settings restored in _spawn. Without the Model frame the composer falls back
         # to the engine's first model, so a luna session came up labelled "Sol".
@@ -20217,6 +20846,9 @@ class WrapperMachine:
             effort_event = Effort(effort=initial_effort)
             await self._emit(ctx, effort_event)
             cached_responses.append(effort_event)
+        if ctx.engine == "claude":
+            rate_limit_events = await self._seed_claude_rate_limits(ctx)
+            cached_responses.extend(rate_limit_events)
         permission_mode = _session_permission_mode(ctx)
         ctx.announced_perm = permission_mode
         permission_event = Perm(mode=permission_mode)
@@ -27398,6 +28030,20 @@ class WrapperMachine:
                     # during reconnect can set it again without being overwritten.
                     ctx.needs_reload = False
                     await reconnect_claude("external transcript change")
+            # A failed sole SDK reader cannot be reused even though its Claude
+            # child may have kept writing the transcript. External transcript
+            # authority above takes precedence when both conditions are present;
+            # otherwise resume now before accepting another prompt. Never replay
+            # the failed prompt automatically because it may already have run.
+            if (
+                not is_codex
+                and getattr(ctx.sdk, "message_pump_failed", False)
+            ):
+                log.warning(
+                    "recovering failed Claude SDK message pump before query",
+                    sid=ctx.session_id,
+                )
+                await reconnect_claude("message pump failure")
             # apply a pending effort change: --effort is spawn-time, so respawn the
             # cc subprocess (resume preserves context) before issuing this turn. Only
             # fires when the level actually changed since the live client was spawned;
@@ -27742,6 +28388,11 @@ class WrapperMachine:
                         await ctx.codex_steer_gate.wait()
                         await self._apply_codex_steer_user_identity(ctx, msg)
                     continue
+                if (
+                    not is_codex
+                    and await self._observe_claude_rate_limit_message(msg)
+                ):
+                    continue
                 if notice_active or ctx.claude_progress_notice_active:
                     # Any raw engine frame is fresh activity, even when the
                     # translator intentionally skips it. Clear a stale
@@ -27848,6 +28499,15 @@ class WrapperMachine:
                     msg, ctx.session_id or ctx.key)
                 if goal_changed and ctx.goal_visible:
                     await self._emit(ctx, GoalState(goal=goal))
+
+                registry = ctx.claude_agents
+                route = (
+                    registry.route(msg)
+                    if registry is not None else AgentRoute("main")
+                )
+                await self._publish_claude_agent_route(ctx, route)
+                if route.target == "detail":
+                    continue
 
                 native_user_id = replayed_user_message_id(msg)
                 if native_user_id is not None:
