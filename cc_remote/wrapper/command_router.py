@@ -22,6 +22,7 @@ COMMAND_HANDLER_NAMES = MappingProxyType({
     "takeover": "_handle_takeover",
     "set_model": "_handle_set_model",
     "set_effort": "_handle_set_effort",
+    "set_auto_compact": "_handle_set_auto_compact",
     "set_service_tier": "_handle_set_service_tier",
     "set_collaboration_mode": "_handle_set_collaboration_mode",
     "open_btw": "_handle_open_btw",

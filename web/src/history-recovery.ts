@@ -33,6 +33,9 @@ export interface HistoryRuntimeState {
 export interface HistoryRecoveryProjection {
   sid: string;
   turns: Turn[] | null;
+  /** Exact browser-owned row which may keep rendering live activity while the
+   * old readable projection is frozen. Never infer this from row order. */
+  activeOwnerId: string | null;
   hasMore: boolean;
   oldestId: string | null;
   viewRevision: string | null;
@@ -55,6 +58,7 @@ export function beginHistoryRecovery(
   runtime: HistoryRuntimeState,
   generation?: string | null,
   candidateBuildSeq: number | null = null,
+  activeOwnerId?: string | null,
 ): HistoryRecoveryProjection {
   const retained = current?.sid === sid && current.turns !== null
     ? current
@@ -64,6 +68,8 @@ export function beginHistoryRecovery(
     // Move the already-bounded array into display-only state. The runtime gets
     // a fresh empty array before any replay frame can mutate it.
     turns: retained?.turns ?? runtime.turns,
+    activeOwnerId: activeOwnerId !== undefined
+      ? activeOwnerId : retained?.activeOwnerId ?? null,
     hasMore: retained?.hasMore ?? !!runtime.hasMore,
     oldestId: retained?.oldestId ?? runtime.oldestId ?? null,
     viewRevision: retained?.viewRevision
@@ -215,6 +221,7 @@ export function historyConfirmsRecovery(
 
 export interface DisplayHistoryProjection {
   turns: Turn[];
+  activeOwnerId: string | null;
   hasMore: boolean;
   /** The visible cursor belongs to the currently verified wrapper projection. */
   pagingReady: boolean;
@@ -241,6 +248,7 @@ export function displayHistoryProjection(
   if (sid && retainedBrowse?.sid === sid) {
     return {
       turns: retainedBrowse.turns,
+      activeOwnerId: null,
       // Preserve the truthful affordance while making its stale cursor
       // inoperable. A same-revision/generation first page reactivates it.
       hasMore: retainedBrowse.hasOlder,
@@ -261,6 +269,7 @@ export function displayHistoryProjection(
   if (sid && isHistoryRecoveryPending(recovery, sid)) {
     return {
       turns: recovery!.turns!,
+      activeOwnerId: recovery!.activeOwnerId,
       // The retained cursor belongs to the old generation. Keep the old rows
       // readable, but never issue pagination/detail reads from display-only
       // state while the authoritative projection is rebuilding.
@@ -285,6 +294,7 @@ export function displayHistoryProjection(
         || browse.generation === runtime.historyGeneration)) {
     return {
       turns: browse.turns,
+      activeOwnerId: null,
       hasMore: browse.hasOlder,
       pagingReady: true,
       oldestId: browse.olderCursor,
@@ -304,6 +314,7 @@ export function displayHistoryProjection(
     ? recovery : null;
   return {
     turns: runtime.turns,
+    activeOwnerId: null,
     hasMore: !!runtime.hasMore,
     pagingReady: !runtime.historyInvalidated,
     oldestId: runtime.oldestId ?? null,

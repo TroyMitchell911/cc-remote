@@ -16,7 +16,7 @@ import type {
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
   PreviewAuthorizationOperation, CodexProfileInfo,
-  CodexTerminalFence,
+  CodexTerminalFence, AutoCompact, AutoCompactMode,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -204,6 +204,7 @@ export interface SessionRuntime {
   mirroredRunning: boolean;
   model: string;
   effort: string;
+  autoCompact: AutoCompact | null;
   perm: string;
   permissionProfile: string | null;
   permissionProfiles: PermissionProfileInfo[] | null;
@@ -291,6 +292,11 @@ export interface SessionRuntime {
   // query freezes this together with revision/build/live watermarks so a later
   // materialized page can prove acceptance even when its UserMsg id is native.
   historyNewestId: string | null;
+  // Whether the current revision/generation has supplied an authoritative
+  // newest page. Together with `loading` this distinguishes unknown/loading/
+  // ready without treating the default `hasMore=false` as proof that a cold
+  // session is already at the beginning of history.
+  historyHeadKnown: boolean;
   // true while we've switched to a session but its history hasn't arrived yet
   // (no cache hit + waiting on the wrapper's cold spawn/replay) — drives a spinner.
   loading?: boolean;
@@ -371,6 +377,8 @@ export interface AppState {
     cwdSource: "default" | "inherited" | "explicit";
     model: string | null;
     effort: string | null;
+    autoCompactMode: AutoCompactMode;
+    autoCompactThresholdTokens: number | null;
     codexProfileId: string | null;
   } | null;
   // Public labels/errors only; CODEX_HOME never crosses the wire. Selection is
@@ -419,7 +427,7 @@ export function createRuntime(): SessionRuntime {
     // has not heard them yet, so keep them unknown instead of briefly claiming a
     // model, effort, or permission policy that may not match the native CLI.
     turns: [], state: "idle", mirroredRunning: false,
-    model: "", effort: "", perm: "",
+    model: "", effort: "", autoCompact: null, perm: "",
     permissionProfile: null, permissionProfiles: null, webSearch: null,
     collaborationMode: "default",
     fast: null,
@@ -439,6 +447,7 @@ export function createRuntime(): SessionRuntime {
     hydratedCacheTurnIds: [],
     liveDetailTurnIds: [],
     historyNewestId: null,
+    historyHeadKnown: false,
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
     goalId: null, goalDismissed: false, completion: null,
@@ -502,16 +511,17 @@ export type Action =
   | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; error?: string | null; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
   | { type: "history_detail_cancelled"; context: HistoryDetailRequestContext }
   | { type: "return_to_latest"; sid: string }
-  | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null }
+  | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null; historyAtStart?: boolean }
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; codexProfileId?: string | null }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; autoCompactMode?: AutoCompactMode; autoCompactThresholdTokens?: number | null; codexProfileId?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
   | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
+  | { type: "set_new_chat_auto_compact"; mode: AutoCompactMode; thresholdTokens: number | null }
   | { type: "set_new_chat_selection"; model: string | null; effort: string | null }
   | { type: "exit_new_chat" };
 
@@ -1462,12 +1472,15 @@ function finishOpenBlocks(
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
   preserveOpenPlans = false,
+  preserveBackground = false,
 ): void {
   finishOpenBlockList(
-    mutableTurnBlocks(turn), status, isError, preserveOpenPlans);
+    mutableTurnBlocks(turn), status, isError,
+    preserveOpenPlans, preserveBackground);
   if (turn.detailProjection) {
     finishOpenBlockList(
-      turn.detailProjection.blocks, status, isError, preserveOpenPlans);
+      turn.detailProjection.blocks, status, isError,
+      preserveOpenPlans, preserveBackground);
   }
 }
 
@@ -1475,12 +1488,14 @@ function finishOpenBlocks(
 function finishCompletedTurnChildren(
   turn: Turn,
   preserveOpenPlans = false,
+  preserveBackground = false,
 ): void {
   if (!turn.done) return;
   const status = turn.interrupted
     ? "interrupted" : turn.error ? "failed" : "succeeded";
   finishOpenBlocks(
-    turn, status, status !== "succeeded", preserveOpenPlans);
+    turn, status, status !== "succeeded",
+    preserveOpenPlans, preserveBackground);
 }
 
 /** Close only one newly-installed detail projection. A completed turn may have
@@ -1504,12 +1519,14 @@ function finishOpenBlockList(
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
   preserveOpenPlans = false,
+  preserveBackground = false,
 ): void {
   for (const block of blocks) {
     if (block.kind === "text") {
       block.done = true;
     } else if (block.kind === "process" && !block.done) {
-      if (preserveOpenPlans && block.processKind === "plan") continue;
+      if ((preserveOpenPlans && block.processKind === "plan")
+          || (preserveBackground && block.background === true)) continue;
       block.done = true;
       if (!terminalProcessStatus(block.status)) block.status = status;
     } else if (block.kind === "tool" && !block.done) {
@@ -1710,6 +1727,43 @@ function turnHasUnfinishedWork(turn: Turn): boolean {
 function unfinishedLiveTail(turns: Turn[], hydratedCacheTurnIds: string[]): Turn[] {
   const cached = new Set(hydratedCacheTurnIds);
   return turns.filter((turn) => !cached.has(turn.id) && turnHasUnfinishedWork(turn));
+}
+
+/** Preserve the one browser-owned row which a later replay gap cannot rebuild.
+ *
+ * A truncated suffix is authoritative for neither completed history nor the
+ * user boundary which may already have fallen out of the ring. The browser's
+ * still-pending Query id, or the wrapper's same-generation TurnBinding, is an
+ * exact connection-local proof for that one unfinished row. Carrying anything
+ * else across the destructive recovery boundary would resurrect rolled-back
+ * cache rows or conflate separate steer segments which share a native task. */
+function recoverableSubmittedTurn(
+  runtime: SessionRuntime,
+  generation: string | null | undefined,
+): Turn | undefined {
+  const currentGeneration = runtimeOrderingGeneration(runtime);
+  if (generation && currentGeneration && generation !== currentGeneration) {
+    return undefined;
+  }
+  let ownerId = runtime.acceptancePending;
+  if (!ownerId) {
+    const binding = runtime.pendingLiveBinding;
+    const expectedGeneration = generation ?? currentGeneration;
+    if (!binding || runtime.state === "idle"
+        || binding.generation !== expectedGeneration
+        || binding.generation !== currentGeneration) {
+      return undefined;
+    }
+    ownerId = binding.msgId;
+  }
+  const owners = runtime.turns.filter((turn) =>
+    !turn.done && turnHasIdentityAlias(turn, ownerId));
+  if (owners.length !== 1) return undefined;
+  const owner = owners[0];
+  if (!owner.prompt && !owner.images?.length && !owner.files?.length) {
+    return undefined;
+  }
+  return cloneTurns([owner])[0];
 }
 
 /** Reopen only the exact newest row named by a current authoritative History.
@@ -1917,6 +1971,11 @@ function switchControlGeneration(
   if (runtime.historyGeneration !== null
       && generation !== runtime.historyGeneration) {
     runtime.liveDetailTurnIds = [];
+    runtime.historyHeadKnown = false;
+    // An empty projection from the previous wrapper is no longer proof that
+    // this session is genuinely empty. Keep non-empty cached history painted,
+    // but make an empty runtime wait for the new generation's History page.
+    if (runtime.turns.length === 0) runtime.loading = true;
   }
   if (generation === runtime.controlGeneration) return;
   clearSessionControl(runtime);
@@ -2442,8 +2501,13 @@ export function reduce(state: AppState, action: Action): AppState {
       const sid = action.sid;
       const rt = state.runtimes[sid] ?? createRuntime();
       // if we have no turns yet, mark loading so the UI shows a spinner (not the
-      // empty "send a message" prompt) until cache-hydrate or the wrapper replay lands.
-      const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
+      // empty "send a message" prompt) until cache-hydrate or the wrapper replay
+      // lands. An authoritative empty head is already a complete projection and
+      // must not flash the same loader on every focus round-trip.
+      const runtimes = { ...state.runtimes, [sid]: {
+        ...rt,
+        loading: rt.turns.length === 0 && !rt.historyHeadKnown,
+      } };
       return {
         ...state, focusedSid: sid, runtimes, artifact: null,
         historyRecovery: state.historyRecovery?.sid === sid
@@ -2787,10 +2851,31 @@ export function reduce(state: AppState, action: Action): AppState {
           ? action.control : null;
         const cacheGeneration =
           action.generation ?? control?.generation ?? null;
+        const runtimeGeneration = runtimeOrderingGeneration(rt);
+        const hasCachedProjection = action.revision != null
+          || action.turns.length > 0
+          || control != null
+          || action.historyAtStart === true;
+        const cacheGenerationMatches = runtimeGeneration == null
+          || (cacheGeneration != null
+            && cacheGeneration === runtimeGeneration);
+        // IndexedDB is paint-only. Once a live Snapshot/History has established
+        // this runtime's wrapper generation, an older (or unscoped) cache row
+        // must not roll control/history ordering back to its saved generation.
+        // The empty 6s fallback has no cached projection and still clears the
+        // loader when both IndexedDB and the wrapper remain silent.
+        if (hasCachedProjection && !cacheGenerationMatches) return;
         if (rt.turns.length === 0) {
           switchControlGeneration(
             rt, cacheGeneration);
           if (control) applySessionControl(rt, control);
+          if (action.turns.length || action.historyAtStart === true) {
+            rt.historyHeadKnown = action.historyAtStart === true;
+            rt.hasMore = false;
+            rt.oldestId = null;
+            rt.historyRevision = action.revision;
+            rt.historyGeneration = cacheGeneration;
+          }
           if (action.turns.length) {
             replaceWithBoundedTurns(rt, cloneTurns(action.turns).map((turn) => (
               // Cache paint has no current lifecycle authority. Keep a Plan
@@ -2801,8 +2886,6 @@ export function reduce(state: AppState, action: Action): AppState {
                 ? { ...turn, forkPointId: turn.codexTurnId }
                 : turn
             )));
-            rt.historyRevision = action.revision;
-            rt.historyGeneration = cacheGeneration;
             rt.hydratedCacheTurnIds = action.turns.map((turn) => turn.id);
           }
         } else if (rt.turns.length > 0
@@ -2869,6 +2952,11 @@ export function reduce(state: AppState, action: Action): AppState {
           cwdSource: action.cwdSource ?? "default",
           model: action.model ?? null,
           effort: action.effort ?? null,
+          autoCompactMode: action.autoCompactMode ?? "inherit",
+          autoCompactThresholdTokens:
+            action.autoCompactMode === "custom"
+              ? action.autoCompactThresholdTokens ?? null
+              : null,
           codexProfileId: action.codexProfileId ?? null,
         },
       };
@@ -2909,6 +2997,13 @@ export function reduce(state: AppState, action: Action): AppState {
       return state.newChat ? { ...state, newChat: { ...state.newChat, model: action.model } } : state;
     case "set_new_chat_effort":
       return state.newChat ? { ...state, newChat: { ...state.newChat, effort: action.effort } } : state;
+    case "set_new_chat_auto_compact":
+      return state.newChat ? { ...state, newChat: {
+        ...state.newChat,
+        autoCompactMode: action.mode,
+        autoCompactThresholdTokens:
+          action.mode === "custom" ? action.thresholdTokens : null,
+      } } : state;
     case "set_new_chat_selection":
       return state.newChat ? { ...state, newChat: {
         ...state.newChat,
@@ -2973,15 +3068,16 @@ function reduceEvent(
       // id-capture is handled by session_rekey — keeping it out of here is what
       // stops a background session's id-capture from stealing the user's view.
       const newF = e.session_id;
-      // switch confirmed by the wrapper → stop the loading spinner. Essential for
-      // a RESIDENT session with no replay (e.g. one that only ran /theme and has
-      // no history) — otherwise it'd spin until the 6s fallback.
+      // A focus acknowledgement confirms routing, not transcript completeness.
+      // Keep a genuinely unknown empty head loading until cache/History arrives;
+      // a previously confirmed empty session remains immediately paintable.
       const base = state.runtimes[newF] ?? createRuntime();
       const runtimes = {
         ...state.runtimes,
         [newF]: {
           ...base,
-          loading: base.historyInvalidated ? true : false,
+          loading: base.historyInvalidated
+            || (base.turns.length === 0 && !base.historyHeadKnown),
           syncReady: true,
         },
       };
@@ -3075,6 +3171,10 @@ function reduceEvent(
                 && source.controlGeneration !== mergeTarget.controlGeneration
             ? source.control
             : newestSessionControl(mergeTarget.control, source.control);
+          const mergedHistoryRuntime = source.historyRevision == null
+            ? mergeTarget : source;
+          const mergedHistoryInvalidated =
+            mergeTarget.historyInvalidated || source.historyInvalidated;
           const lifecycleRuntime =
             source.lastLifecycleSeq > mergeTarget.lastLifecycleSeq
               ? source
@@ -3116,8 +3216,9 @@ function reduceEvent(
             state: lifecycleRuntime.state,
             mirroredRunning: lifecycleRuntime.mirroredRunning,
             syncReady: mergeTarget.syncReady || source.syncReady,
-            historyInvalidated:
-              mergeTarget.historyInvalidated || source.historyInvalidated,
+            loading: mergedHistoryInvalidated
+              ? true : mergedHistoryRuntime.loading,
+            historyInvalidated: mergedHistoryInvalidated,
             historyRevision:
               source.historyRevision ?? mergeTarget.historyRevision,
             pendingHistoryRevision:
@@ -3164,6 +3265,8 @@ function reduceEvent(
               : mergeTarget.pendingHistoryCandidateBuildSeq,
             historyNewestId: source.historyRevision == null
               ? mergeTarget.historyNewestId : source.historyNewestId,
+            historyHeadKnown: mergedHistoryInvalidated
+              ? false : mergedHistoryRuntime.historyHeadKnown,
             lastLiveSeq: Math.max(
               source.lastLiveSeq, mergeTarget.lastLiveSeq),
             lastLifecycleSeq: Math.max(
@@ -3382,6 +3485,8 @@ function reduceEvent(
               ? "inherited" : "default") as "inherited" | "default",
           model: null,
           effort: null,
+          autoCompactMode: "inherit",
+          autoCompactThresholdTokens: null,
           codexProfileId: selectedCodexProfileId,
         };
       }
@@ -3453,6 +3558,7 @@ function reduceEvent(
         rt.historyInvalidated = true;
         rt.pendingHistoryRevision = e.revision;
         rt.historyNewestId = null;
+        rt.historyHeadKnown = false;
         // Keep the accepted generation until replacement arrives: a slow
         // pre-rollback build from that same generation must remain rejectable.
         rt.historyBuildSeq = 0;
@@ -3738,8 +3844,17 @@ function reduceEvent(
         || (e.in_progress == null && base.state !== "idle");
       const settledHistory = !racedLiveEvent
         && e.in_progress === false;
-      const settledCodexHistory = settledHistory && state.sessions.some(
-        (session) => session.session_id === sid && session.engine === "codex");
+      const isCodexHistory = ownership?.engine === "codex"
+        || state.sessions.some((session) =>
+          session.session_id === sid && session.engine === "codex");
+      const isClaudeHistory = ownership?.engine === "claude"
+        || state.sessions.some((session) =>
+          session.session_id === sid && session.engine === "claude");
+      const settledCodexHistory = settledHistory && isCodexHistory;
+      // Never infer Claude merely because Codex ownership has not arrived yet.
+      // Session lists and first History can race on reconnect; an unknown
+      // engine must retain its projection until explicit ownership exists.
+      const settledClaudeHistory = settledHistory && isClaudeHistory;
       const resolveUnknownSteerFromIdle = settledHistory
         && base.acceptanceKind === "steer_unknown"
         && !!base.acceptancePending
@@ -3879,7 +3994,7 @@ function reduceEvent(
           // (or a newer live frame which raced this page) may keep it open. An
           // exact idle page must settle stale cache/detail Plan state too.
           finishCompletedTurnChildren(
-            merged, preserveProjectionOpenPlans);
+            merged, preserveProjectionOpenPlans, isClaudeHistory);
           return merged;
         });
         const cachedScopeMatches = e.generation != null
@@ -4051,6 +4166,14 @@ function reduceEvent(
         // an old item/started replay animate the session again.
         turns = cloneTurns(turns);
         turns.forEach((turn) => finishCompletedTurnChildren(turn));
+      } else if (settledClaudeHistory) {
+        // ResultMessage closes Claude's foreground turn, but a following
+        // same-revision summary can restore live-observed detail after that
+        // terminal. Settle only ordinary foreground children here; explicitly
+        // detached Agent work remains live in its collaboration card.
+        turns = cloneTurns(turns);
+        turns.forEach((turn) =>
+          finishCompletedTurnChildren(turn, false, true));
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -4200,6 +4323,8 @@ function reduceEvent(
                   ? (e.newest_id ?? null)
                   : base.historyNewestId)
               : base.historyNewestId,
+            historyHeadKnown: acceptsControlState
+              ? true : base.historyHeadKnown,
             hasLoadedOlderHistory: e.before
               ? true
               : preserveStableHeadHistory
@@ -4782,6 +4907,8 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
     case "effort":
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
+    case "auto_compact":
+      return patch(state, e.sid, (rt) => { rt.autoCompact = e; });
     case "fast":
       return patch(state, e.sid, (rt) => { rt.fast = e.on; });
     case "collaboration_mode":
@@ -4898,6 +5025,13 @@ function reduceEvent(
       });
     case "replay_start": {
       const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
+      const replaySid = e.sid ?? state.focusedSid;
+      const submittedTurn = needsAuthoritativeHistory && !e.rebuild
+        ? recoverableSubmittedTurn(
+            state.runtimes[replaySid ?? ""] ?? createRuntime(),
+            e.generation,
+          )
+        : undefined;
       let historyRecovery = state.historyRecovery;
       if (needsAuthoritativeHistory && state.focusedSid === e.sid
           && !state.newChat && e.sid) {
@@ -4906,7 +5040,23 @@ function reduceEvent(
           e.sid,
           state.runtimes[e.sid] ?? createRuntime(),
           e.generation,
+          null,
+          submittedTurn?.id ?? null,
         );
+        if (submittedTurn && historyRecovery.turns) {
+          // A prior recovery projection may predate this Query. Reconcile the
+          // exact browser id into that frozen readable copy as well as the live
+          // runtime, otherwise switching away/back exposes either no question
+          // or both its optimistic and canonical rows while History catches up.
+          historyRecovery = {
+            ...historyRecovery,
+            turns: mergeInitialHistory(
+              historyRecovery.turns,
+              [submittedTurn],
+              { preserveLiveTailOpen: true },
+            ),
+          };
+        }
       }
       const next = patch(state, e.sid, (rt) => {
         switchControlGeneration(rt, e.generation);
@@ -4916,10 +5066,26 @@ function reduceEvent(
         // rebuild clears turns then refills — keep loading=true so the gap shows a
         // spinner rather than briefly flashing the empty "send a message" prompt.
         if (needsAuthoritativeHistory) {
-          rt.turns = [];
+          // Canonical rows still rebuild from source, but a same-generation
+          // replay suffix cannot recreate a submitted user boundary which has
+          // already fallen out of the ring. Keep its exact local/bound owner in
+          // the live runtime so subsequent deltas and History share one row.
+          rt.turns = submittedTurn ? [submittedTurn] : [];
+          if (submittedTurn && rt.pendingLiveBinding
+              && turnHasIdentityAlias(
+                submittedTurn, rt.pendingLiveBinding.msgId)) {
+            rt.liveOwner = {
+              turnId: submittedTurn.id,
+              seq: Math.max(
+                rt.liveOwner?.seq ?? 0,
+                rt.pendingLiveBinding.seq,
+              ),
+            };
+          }
           rt.pendingQuestion = null;
           rt.hasMore = false;
           rt.oldestId = null;
+          rt.historyHeadKnown = false;
           rt.historyInvalidated = true;
           rt.pendingHistoryGeneration = e.generation ?? null;
           rt.pendingHistoryCandidateBuildSeq = null;

@@ -100,6 +100,49 @@ def test_claude_control_state_survives_sdk_reconnect_and_failed_set(
     asyncio.run(go())
 
 
+def test_claude_sdk_passes_bounded_autocompact_as_a_spawn_option(monkeypatch):
+    class ContextClient(_FakeClaudeClient):
+        async def get_context_usage(self):
+            return {
+                "model": self.options.model or "claude-mythos-5",
+                "autoCompactThreshold": 250_000,
+                "rawMaxTokens": 1_000_000,
+            }
+
+    async def go():
+        ContextClient.created = []
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ContextClient)
+        handle = SdkHandle(WrapperConfig())
+        handle.set_auto_compact("custom", 250_000)
+
+        await handle.connect(cwd="/tmp")
+
+        first = ContextClient.created[-1]
+        assert first.options.extra_args["autocompact"] == "250000"
+        assert handle.applied_auto_compact_mode == "custom"
+        assert handle.applied_auto_compact_threshold_tokens == 250_000
+        assert handle.effective_auto_compact_threshold_tokens == 250_000
+        assert handle.raw_context_max_tokens == 1_000_000
+
+        handle.set_auto_compact("auto")
+        assert handle.applied_auto_compact_mode == "custom"
+        await handle.force_reconnect(
+            None, "/tmp", reason="apply autocompact")
+        assert ContextClient.created[-1].options.extra_args[
+            "autocompact"] == "auto"
+        assert handle.applied_auto_compact_mode == "auto"
+
+        handle.set_auto_compact("inherit")
+        await handle.force_reconnect(
+            None, "/tmp", reason="inherit autocompact")
+        assert "autocompact" not in (
+            ContextClient.created[-1].options.extra_args or {})
+        assert handle.applied_auto_compact_mode == "inherit"
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
 def test_claude_model_probe_failure_does_not_fail_connect(monkeypatch):
     class ProbeUnavailable(_FakeClaudeClient):
         async def _send_control_request(self, request, timeout):
@@ -742,11 +785,12 @@ def test_switching_to_resident_claude_reseeds_its_actual_permission():
 
         assert [event.type for event in result] == [
             "session_focus", "session_control", "completion_state", "perm",
-            "model", "effort", "state"]
+            "model", "effort", "auto_compact", "state"]
         assert result[3].mode == "default"
         assert result[4].model == "claude-sonnet-5"
         assert result[5].effort == "high"
-        assert result[6].state == "idle"
+        assert result[6].mode == "inherit"
+        assert result[7].state == "idle"
 
     asyncio.run(go())
 
@@ -843,6 +887,7 @@ def test_open_btw_emits_its_permission_frame():
 
         async def spawn(_parent, owner_client_id=None):
             assert owner_client_id == "client-1"
+            fork.owner_client_id = owner_client_id
             return fork
 
         machine._spawn_btw = spawn
@@ -853,7 +898,7 @@ def test_open_btw_emits_its_permission_frame():
         ))
 
         assert [event.type for event in result] == [
-            "btw_opened", "snapshot", "perm"]
+            "btw_opened", "snapshot", "auto_compact", "perm"]
         perm = result[-1]
         assert perm.mode == "plan"
         assert perm.sid == "btw-1" and perm.to == "client-1"

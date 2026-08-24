@@ -33,6 +33,7 @@ from claude_agent_sdk.types import (
 from cc_remote.protocol import ProcessEvent, ToolUse, TurnEnd, UserMsg
 from cc_remote.wrapper.stream import (
     StreamTranslator,
+    _is_agent_task_type,
     _short_text,
     _task_status,
     _wire_id,
@@ -270,7 +271,11 @@ class ClaudeAgentRegistry:
             run_id = self.run_by_agent.get(task_id)
             if run_id:
                 return self.runs.get(run_id)
-        if tool_id:
+        # A local background Bash task also carries tool_use_id. Never create a
+        # clickable Agent run from correlation alone: require the explicit SDK
+        # task type when the preceding Agent ToolUse was not observed.
+        if (tool_id and isinstance(message, TaskStartedMessage)
+                and _is_agent_task_type(message.task_type)):
             return self._ensure_run(tool_id)
         return None
 
@@ -407,18 +412,25 @@ class SourceAgentLocation:
 
 
 def _notification_event(content: str) -> ProcessEvent | None:
+    task = re.search(r"<task-id>([^<]{1,256})</task-id>", content)
     tool = re.search(r"<tool-use-id>([^<]{1,256})</tool-use-id>", content)
     status = re.search(r"<status>([^<]{1,64})</status>", content)
     summary = re.search(r"<summary>([\s\S]{0,65536}?)</summary>", content)
-    if not tool:
+    if not task:
         return None
-    tool_id = _wire_id(tool.group(1), "tool")
+    task_id = _wire_id(task.group(1), "task")
+    tool_id = _wire_id(tool.group(1), "tool") if tool else None
     mapped = _task_status(status.group(1) if status else None)
     terminal = mapped in {"succeeded", "failed", "cancelled"}
     return ProcessEvent(
-        item_id=public_agent_run_id(tool_id), kind="agent",
+        # A task notification's tool-use-id is correlation, not Agent proof.
+        # translate_history has the preceding ToolUse name and promotes this
+        # event only when that parent is actually Agent/Task. In particular,
+        # Bash(run_in_background=true) must remain an ordinary background task
+        # even when it runs inside a real Agent transcript.
+        item_id=task_id, kind="task",
         phase="end" if terminal else "update",
-        status=mapped, parent_id=tool_id, title="协作代理",
+        status=mapped, parent_id=tool_id, title="后台任务",
         summary=_short_text(summary.group(1), 64 * 1024) if summary else None,
         background=True,
     )

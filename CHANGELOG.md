@@ -7,10 +7,13 @@
 - Upgrade Claude Agent SDK to `0.2.142`; the wrapper remains pinned to this
   exact verified patch and continues to launch the user's configured Claude
   Code executable.
-- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v37. Claude
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v38. Claude
   subagent detail, detached background-process ownership, paged turn detail,
-  and sanitized Claude quota events now cross an explicit compatibility
-  boundary; ambiguous Codex steer owners can no longer revive an idle spark.
+  sanitized Claude quota events, and per-session automatic-compaction controls
+  now cross an explicit compatibility boundary. Code, Work, BTW, new sessions,
+  and forks can inherit Claude's setting, use automatic mode, or select a
+  bounded `100K–1M` token threshold; busy changes wait for a proven terminal
+  boundary. Ambiguous Codex steer owners can no longer revive an idle spark.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v36. Conversation
   summaries now distinguish exact visible process, exact direct answers, and
   opaque native detail; truncated content keeps its own disclosure, and Codex

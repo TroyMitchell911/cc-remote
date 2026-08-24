@@ -605,6 +605,34 @@ function cloneSettledCachedDetailBlock(
   return cloned;
 }
 
+/** Repair the one pre-v36 cache shape which treated every task correlation as
+ * a clickable Agent. A real Agent process is parented by an Agent/Task tool;
+ * an explicitly observed non-Agent parent is therefore safe to demote. When
+ * the parent shell was evicted, retain the block unchanged and let canonical
+ * TurnDetail replace it instead of guessing. */
+function repairCachedAgentClassification(blocks: readonly Block[]): Block[] {
+  const parentTools = new Map<string, ToolBlock>();
+  for (const block of blocks) {
+    if (block.kind === "tool") parentTools.set(block.tool_use_id, block);
+  }
+  return blocks.map((block) => {
+    if (block.kind !== "process" || block.processKind !== "agent"
+        || !block.parent_id) return block;
+    const parent = parentTools.get(block.parent_id);
+    if (!parent) return block;
+    const tool = parent.tool.toLowerCase();
+    if (parent.category === "agent" || tool === "agent" || tool === "task") {
+      return block;
+    }
+    return {
+      ...block,
+      processKind: "task",
+      title: block.title === "协作代理" ? "后台任务" : block.title,
+      background: true,
+    };
+  });
+}
+
 /** Paint only heavyweight blocks from a same-revision/generation browser
  * cache over an authoritative summary row.
  *
@@ -631,9 +659,10 @@ function installCachedDetailRestore(
     || (authority === "running" && !!activeOwnerId
       && exactTurnAliases(summary).has(activeOwnerId)
       && exactTurnAliases(cached).has(activeOwnerId));
-  const blocks = source.filter((block) => !isFinalTextBlock(block))
-    .map((block) => cloneSettledCachedDetailBlock(
-      block, summary, preserveOpenPlans));
+  const blocks = repairCachedAgentClassification(
+    source.filter((block) => !isFinalTextBlock(block)),
+  ).map((block) => cloneSettledCachedDetailBlock(
+    block, summary, preserveOpenPlans));
   if (blocks.length === 0) return summary;
   const processDetailState = mergedProcessDetailState(
     summary, cached, blocks);

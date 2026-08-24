@@ -65,6 +65,12 @@ _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
 _SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
 _INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
 _SYNTHETIC_API_ERROR_PREFIX = "API Error:"
+_CLAUDE_AGENT_TASK_TYPES = frozenset({
+    # Current Claude Code / Agent SDK task types.
+    "local_agent", "local_workflow", "in_process_teammate",
+    # Older/alternate runtimes retained for source compatibility.
+    "agent", "subagent",
+})
 _DIFF_LINE_BREAK = re.compile(
     r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
@@ -84,6 +90,11 @@ def _short_text(value: Any, limit: int = 1024) -> str | None:
     text, _ = bounded_text(value, limit)
     text = " ".join(text.split())
     return text or None
+
+
+def _is_agent_task_type(value: Any) -> bool:
+    return isinstance(value, str) \
+        and value.lower() in _CLAUDE_AGENT_TASK_TYPES
 
 
 def replayed_user_message_id(message: Any) -> str | None:
@@ -936,10 +947,28 @@ class StreamTranslator:
             task_id, ("task", None))
         parent = (_wire_id(parent_raw, "tool") if parent_raw
                   else remembered_parent)
-        kind = ("agent" if parent
-                else remembered_kind if remembered_kind in {"agent", "task"}
-                else "task")
-        item_id = _agent_process_id(parent) if parent else task_id
+        task_type = (
+            (msg.task_type or "").lower()
+            if isinstance(msg, TaskStartedMessage) else ""
+        )
+        parent_kind = (
+            self.item_meta.get(_agent_process_id(parent), (None, None))[0]
+            if parent else None
+        )
+        parent_tool = (self._tool_names.get(parent) or "").lower() \
+            if parent else ""
+        # A tool_use_id is only correlation. Bash(run_in_background=true)
+        # carries its Bash tool id in the exact same field as an Agent task.
+        # Promote only explicit Agent task types or a parent already proven to
+        # be an Agent/Task tool; otherwise keep the background job ordinary.
+        kind = "agent" if (
+            _is_agent_task_type(task_type)
+            or remembered_kind == "agent"
+            or parent_kind == "agent"
+            or parent_tool in {"agent", "task"}
+        ) else "task"
+        item_id = _agent_process_id(parent) \
+            if kind == "agent" and parent else task_id
         turn = self._remember_turn(item_id, parent)
         title = (getattr(msg, "description", None)
                  or self.item_titles.get(item_id)
@@ -950,16 +979,11 @@ class StreamTranslator:
         self.item_meta[task_id] = (kind, parent)
         self.item_meta[item_id] = (kind, parent)
         if isinstance(msg, TaskStartedMessage):
-            if ((msg.task_type or "").lower() in {"agent", "subagent"}
-                    or parent):
-                kind = "agent"
-            self.item_meta[task_id] = (kind, parent)
-            self.item_meta[item_id] = (kind, parent)
             return [ProcessEvent(
                 item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
-                background=True if kind == "agent" else None,
+                background=True,
             )]
         if isinstance(msg, TaskProgressMessage):
             return [ProcessEvent(
@@ -967,7 +991,7 @@ class StreamTranslator:
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
-                background=True if kind == "agent" else None,
+                background=True,
             )]
         if isinstance(msg, TaskUpdatedMessage):
             status = _task_status(msg.status)
@@ -980,7 +1004,7 @@ class StreamTranslator:
                 item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
-                background=True if kind == "agent" else None,
+                background=True,
             )]
         if isinstance(msg, TaskNotificationMessage):
             status = _task_status(msg.status)
@@ -989,7 +1013,7 @@ class StreamTranslator:
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
-                background=True if kind == "agent" else None,
+                background=True,
             )]
         return []
 
@@ -2033,16 +2057,20 @@ def _internal_user_event_from_row(
         if value and value.isdigit():
             usage[tag] = int(value)
     status = _task_status(raw_status)
-    item_id = _agent_process_id(tool_id) if tool_id else task_id
     return ProcessEvent(
-        item_id=item_id,
-        kind="agent" if tool_id else "task",
+        # tool-use-id is correlation, not proof of an Agent. translate_history
+        # has the preceding ToolUse name and promotes this exact event only when
+        # its parent is an Agent/Task tool.
+        item_id=task_id,
+        kind="task",
         phase="end",
         status=status,
         parent_id=tool_id,
-        title=summary or ("协作代理" if tool_id else "后台任务"),
+        title="后台任务",
+        summary=summary,
         progress=_task_progress(usage),
         duration_ms=usage.get("duration_ms"),
+        background=True,
     )
 
 
@@ -2222,6 +2250,14 @@ def translate_history(
                 internal_event = (internal_user_events or {}).get(source_uid)
                 if internal_event is not None:
                     event = internal_event.model_copy(deep=True)
+                    parent_name = (
+                        history_tool_names.get(event.parent_id or "") or ""
+                    ).lower()
+                    if parent_name in {"agent", "task"} and event.parent_id:
+                        event.item_id = _agent_process_id(event.parent_id)
+                        event.kind = "agent"
+                        event.title = event.summary or "协作代理"
+                        event.background = True
                     event.turn_id = event.turn_id or current_turn_id
                     t = _ts(source_uid)
                     if t is not None:

@@ -8,7 +8,8 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
+  AutoCompactMode, DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent,
+  SessionControl, Space,
 } from "./protocol.ts";
 import {
   compareSessionControl,
@@ -19,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   sessionControlTargetsSid,
 } from "./protocol.ts";
+import { validAutoCompactThreshold } from "./auto-compact.ts";
 import {
   CommandOutbox,
   QueryAcceptanceLatch,
@@ -741,6 +743,42 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
+  sendSetAutoCompact(
+    mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+      ...this.sidObj(),
+    });
+  }
+
+  sendSetAutoCompactTo(
+    sid: string, mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      sid,
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+    });
+  }
+
   sendSetServiceTier(service_tier: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj() });
   }
@@ -1221,10 +1259,19 @@ export class RelayWs {
                  webSearch?: "cached" | "live",
                  serviceTier?: "default" | "fast",
                  space: Space = "code", projectId?: string | null,
-                 codexProfileId?: string | null): boolean {
+                 codexProfileId?: string | null,
+                 autoCompact?: {
+                   mode: AutoCompactMode;
+                   thresholdTokens?: number | null;
+                 }): boolean {
+    const targetEngine = engine ?? "claude";
+    if (targetEngine === "claude" && autoCompact?.mode === "custom"
+        && !validAutoCompactThreshold(autoCompact.thresholdTokens)) {
+      return false;
+    }
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
-    this.newSessionEngine = engine ?? "claude";
+    this.newSessionEngine = targetEngine;
     this.newSessionSpace = space;
     const ownership = this.ownershipSnapshot(
       this.newSessionEngine,
@@ -1244,6 +1291,12 @@ export class RelayWs {
     if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
+    if (targetEngine === "claude" && autoCompact) {
+      obj.auto_compact_mode = autoCompact.mode;
+      if (autoCompact.mode === "custom") {
+        obj.auto_compact_threshold_tokens = autoCompact.thresholdTokens;
+      }
+    }
     if (engine === "codex" && collaborationMode) {
       obj.collaboration_mode = collaborationMode;
     }

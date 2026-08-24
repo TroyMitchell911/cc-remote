@@ -168,6 +168,10 @@ class _ControlResidentSdk(_ResidentSdk):
         self.effort = "low"
         self.applied_effort = "low"
         self.permission_mode = "default"
+        self.auto_compact_mode = "inherit"
+        self.auto_compact_threshold_tokens = None
+        self.applied_auto_compact_mode = "inherit"
+        self.applied_auto_compact_threshold_tokens = None
         self.models = []
         self.efforts = []
         self.permissions = []
@@ -213,6 +217,10 @@ class _RestoredSdk:
         self.model = None
         self.effort = "max"
         self.applied_effort = None
+        self.auto_compact_mode = "inherit"
+        self.auto_compact_threshold_tokens = None
+        self.applied_auto_compact_mode = None
+        self.applied_auto_compact_threshold_tokens = None
         self.connected = []
         self.disconnected = 0
         self.__class__.instances.append(self)
@@ -222,6 +230,13 @@ class _RestoredSdk:
     ):
         self.connected.append((resume_id, cwd, fork, model_override))
         self.applied_effort = self.effort
+        self.applied_auto_compact_mode = self.auto_compact_mode
+        self.applied_auto_compact_threshold_tokens = (
+            self.auto_compact_threshold_tokens)
+
+    def set_auto_compact(self, mode, threshold_tokens=None):
+        self.auto_compact_mode = mode
+        self.auto_compact_threshold_tokens = threshold_tokens
 
     async def disconnect(self):
         self.disconnected += 1
@@ -281,6 +296,8 @@ def test_broker_adoption_keeps_tui_permission_instead_of_sdk_chip(
         resident.permission_mode = "acceptEdits"
         resident.model = "stale-sdk-model"
         resident.effort = "low"
+        resident.auto_compact_mode = "auto"
+        resident.auto_compact_threshold_tokens = None
         ctx = _mk_ctx(SESSION_ID, SESSION_ID)
         ctx.cwd = str(tmp_path)
         ctx.engine = "claude"
@@ -293,6 +310,10 @@ def test_broker_adoption_keeps_tui_permission_instead_of_sdk_chip(
         replacement.permission_mode = "default"
         replacement.model = "broker-model"
         replacement.effort = "high"
+        replacement.auto_compact_mode = "custom"
+        replacement.auto_compact_threshold_tokens = 250_000
+        replacement.applied_auto_compact_mode = "custom"
+        replacement.applied_auto_compact_threshold_tokens = 250_000
 
         async def discover(_client, session_id):
             assert session_id == SESSION_ID
@@ -309,6 +330,8 @@ def test_broker_adoption_keeps_tui_permission_instead_of_sdk_chip(
         assert replacement.permission_mode == "default"
         assert replacement.model == "broker-model"
         assert replacement.effort == "high"
+        assert replacement.auto_compact_mode == "custom"
+        assert replacement.auto_compact_threshold_tokens == 250_000
         assert ctx.announced_perm == "default"
         assert ctx.announced_model == "broker-model"
         assert ctx.announced_effort == "high"
@@ -433,6 +456,7 @@ def test_sdk_controls_persist_for_next_broker_resume(monkeypatch, tmp_path):
             "model": "claude-fable-5",
             "effort": "max",
             "permission_mode": "plan",
+            "auto_compact": "inherit",
         })
 
     asyncio.run(go())
@@ -971,6 +995,10 @@ def test_exited_broker_restores_sdk_in_place_without_switch_session(
         old.permission_mode = "acceptEdits"
         old.model = "claude-selected"
         old.effort = "high"
+        old.auto_compact_mode = "custom"
+        old.auto_compact_threshold_tokens = 250_000
+        old.applied_auto_compact_mode = "custom"
+        old.applied_auto_compact_threshold_tokens = 250_000
 
         async def stale_status():
             raise BrokerClientError("session_exited", "old TUI exited")
@@ -987,6 +1015,13 @@ def test_exited_broker_restores_sdk_in_place_without_switch_session(
         stale_ctx.announced_model = "claude-selected"
         stale_ctx.announced_effort = "high"
         machine.sessions[SESSION_ID] = stale_ctx
+        persisted = []
+
+        class ControlStore:
+            def update(self, session_id, **controls):
+                persisted.append((session_id, controls))
+
+        machine._claude_controls = ControlStore()
 
         class Client:
             async def status(self, session_id):
@@ -1008,6 +1043,10 @@ def test_exited_broker_restores_sdk_in_place_without_switch_session(
         assert stale_ctx.sdk.model == "claude-selected"
         assert stale_ctx.sdk.effort == "high"
         assert stale_ctx.sdk.applied_effort == "high"
+        assert stale_ctx.sdk.auto_compact_mode == "custom"
+        assert stale_ctx.sdk.auto_compact_threshold_tokens == 250_000
+        assert stale_ctx.sdk.applied_auto_compact_mode == "custom"
+        assert stale_ctx.sdk.applied_auto_compact_threshold_tokens == 250_000
         assert stale_ctx.sdk.ask_server is not None
         assert callable(stale_ctx.sdk.permission_callback)
         assert callable(stale_ctx.sdk.background_message_callback)
@@ -1019,6 +1058,13 @@ def test_exited_broker_restores_sdk_in_place_without_switch_session(
                     if event.type == "session_control"]
         assert controls and controls[-1].control_mode == "remote"
         assert controls[-1].write_state == "writable"
+        assert persisted == [(SESSION_ID, {
+            "model": "claude-selected",
+            "effort": "high",
+            "permission_mode": "acceptEdits",
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 250_000,
+        })]
 
     asyncio.run(go())
 

@@ -73,6 +73,28 @@ def test_same_unresolved_identity_aliases_to_canonical_marker(tmp_path):
     assert later["marker"] == claude_fork_marker("request-later")
 
 
+def test_begin_rejects_invalid_controls_without_mutating_the_journal(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+
+    with pytest.raises(
+        ClaudeForkJournalError,
+        match="invalid Claude fork autocompact threshold",
+    ):
+        journal.begin(
+            "request-invalid",
+            "parent",
+            "message-1",
+            "/repo",
+            {
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 99_999,
+            },
+        )
+
+    assert journal.entries == {}
+    assert not journal.path.exists()
+
+
 def test_get_canonical_follows_alias_and_returns_an_independent_copy(tmp_path):
     journal = ClaudeForkJournal(tmp_path)
     assert journal.get_canonical("missing-request") is None

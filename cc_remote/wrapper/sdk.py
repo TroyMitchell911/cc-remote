@@ -35,6 +35,10 @@ from cc_remote.wrapper.claude_rewind import (
     validate_rewind_target,
 )
 from cc_remote.wrapper.claude_runtime import inspect_claude_runtime
+from cc_remote.wrapper.claude_controls import (
+    claude_auto_compact_cli_value,
+    valid_claude_auto_compact,
+)
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
@@ -100,6 +104,15 @@ class SdkHandle:
         # box (matches the client's default chip); the user can lower it per session.
         self.effort: str | None = CLAUDE_DEFAULT_EFFORT
         self.applied_effort: str | None = None
+        # Automatic compaction is also a spawn-time CLI option. Keep desired and
+        # applied values separate so a busy turn can drain to ResultMessage before
+        # the wrapper reconnects this exact session with the new threshold.
+        self.auto_compact_mode = "inherit"
+        self.auto_compact_threshold_tokens: int | None = None
+        self.applied_auto_compact_mode: str | None = None
+        self.applied_auto_compact_threshold_tokens: int | None = None
+        self.effective_auto_compact_threshold_tokens: int | None = None
+        self.raw_context_max_tokens: int | None = None
         # Authoritative selected Claude alias for this session.  The transcript
         # may expose a proxy's upstream model (for example glm-5.2), so recover
         # this from the SDK control plane and preserve it across reconnects.
@@ -137,6 +150,11 @@ class SdkHandle:
         # UI immediately without racing the next receive_response() consumer.
         self.background_message_callback: Callable[
             [Any, str | None], Awaitable[None]] | None = None
+        # Machine owns the connection-local task ledger because lifecycle
+        # messages must be observed in delivery order. Disconnect nevertheless
+        # invalidates that whole generation, so give it one synchronous reset
+        # hook rather than leaving stale task ids on the resident context.
+        self.lifecycle_reset_callback: Callable[[], None] | None = None
         # Machine sets this immediately before query(). It is copied onto every
         # post-Result background envelope so even a parentless Stop hook or a
         # newly-announced task remains attached to the turn that spawned it.
@@ -187,6 +205,14 @@ class SdkHandle:
             "Modes: default, acceptEdits, plan, auto, bypassPermissions."
         )
         extra_args = {"replay-user-messages": None}
+        auto_compact = claude_auto_compact_cli_value(
+            self.auto_compact_mode,
+            self.auto_compact_threshold_tokens,
+        )
+        if auto_compact is not None:
+            # SDK 0.2.142 has no typed option yet, but intentionally forwards
+            # bounded extra_args to the pinned Claude Code runtime.
+            extra_args["autocompact"] = auto_compact
         if self.work_mode:
             # Safe mode suppresses user-installed agents/plugins/MCP and other
             # customizations while retaining ordinary OAuth/provider auth.  Do
@@ -297,6 +323,26 @@ class SdkHandle:
             model = usage.get("model") if isinstance(usage, dict) else None
             if isinstance(model, str) and 0 < len(model.strip()) <= 256:
                 self.model = model.strip()
+            auto_threshold = (
+                usage.get("autoCompactThreshold")
+                if isinstance(usage, dict) else None
+            )
+            self.effective_auto_compact_threshold_tokens = (
+                auto_threshold
+                if isinstance(auto_threshold, int)
+                and not isinstance(auto_threshold, bool)
+                and auto_threshold >= 0 else None
+            )
+            raw_max = (
+                usage.get("rawMaxTokens")
+                if isinstance(usage, dict) else None
+            )
+            self.raw_context_max_tokens = (
+                raw_max
+                if isinstance(raw_max, int)
+                and not isinstance(raw_max, bool)
+                and raw_max >= 0 else None
+            )
             if (self.work_mode and not resume_id
                     and self.work_context_baseline_tokens is None):
                 total_tokens = (
@@ -318,9 +364,14 @@ class SdkHandle:
         if resume_id and not fork:
             await self.refresh_goal(resume_id)
         self.applied_effort = self.effort  # the live subprocess now reflects this effort
+        self.applied_auto_compact_mode = self.auto_compact_mode
+        self.applied_auto_compact_threshold_tokens = (
+            self.auto_compact_threshold_tokens)
         self._start_message_pump()
         log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
                  effort=self.effort, permission_mode=self.permission_mode,
+                 auto_compact=self.auto_compact_mode,
+                 auto_compact_threshold=self.auto_compact_threshold_tokens,
                  sdk_version=SDK_VERSION)
 
     async def query(self, prompt) -> None:
@@ -370,10 +421,37 @@ class SdkHandle:
             self.permission_mode = mode
         log.info("permission mode set", mode=mode)
 
+    def set_auto_compact(
+        self, mode: str, threshold_tokens: int | None = None,
+    ) -> None:
+        """Record a validated desired threshold; reconnect is machine-owned."""
+        checked_mode, checked_threshold = valid_claude_auto_compact(
+            mode, threshold_tokens)
+        if checked_mode != mode or checked_threshold != threshold_tokens:
+            raise ValueError("invalid Claude autocompact configuration")
+        self.auto_compact_mode = checked_mode
+        self.auto_compact_threshold_tokens = checked_threshold
+
     async def get_context_usage(self) -> dict:
         """Return the cc session's context window usage (matches CLI /context)."""
         assert self.client is not None
-        return await self.client.get_context_usage()
+        usage = await self.client.get_context_usage()
+        if isinstance(usage, dict):
+            threshold = usage.get("autoCompactThreshold")
+            self.effective_auto_compact_threshold_tokens = (
+                threshold
+                if isinstance(threshold, int)
+                and not isinstance(threshold, bool)
+                and threshold >= 0 else None
+            )
+            raw_max = usage.get("rawMaxTokens")
+            self.raw_context_max_tokens = (
+                raw_max
+                if isinstance(raw_max, int)
+                and not isinstance(raw_max, bool)
+                and raw_max >= 0 else None
+            )
+        return usage
 
     async def rewind_files(self, user_message_id: str) -> None:
         """Restore SDK-checkpointed files to a UserMessage UUID."""
@@ -779,17 +857,29 @@ class SdkHandle:
         self._turn_origin_id = None
 
     async def disconnect(self) -> None:
-        if self.client is not None:
-            try:
+        try:
+            if self.client is not None:
                 await self._stop_message_pump()
                 await self.client.disconnect()
-            finally:
-                self.client = None
-                self._conversation_rewind_capability = None
+        finally:
+            self.client = None
+            self._conversation_rewind_capability = None
+            callback = self.lifecycle_reset_callback
+            if callback is not None:
+                try:
+                    callback()
+                except Exception as exc:
+                    # A lifecycle reset must never mask the real disconnect
+                    # result or prevent a force_reconnect recovery.
+                    log.warning(
+                        "Claude lifecycle reset callback failed",
+                        error_type=type(exc).__name__,
+                    )
 
     async def force_reconnect(self, resume_id: str | None, cwd: str | None = None,
                               reason: str = "drain timeout",
-                              preserve_model: bool = True) -> None:
+                              preserve_model: bool = True,
+                              fork: bool = False) -> None:
         """Tear down and reconnect with resume. Used after a drain timeout, and to
         apply a spawn-time option change (e.g. effort) to a live session."""
         async with self._permission_reconnect_lock:
@@ -805,4 +895,4 @@ class SdkHandle:
                 self.model = None
             await self.connect(
                 resume_id=resume_id, cwd=cwd,
-                model_override=model_override)
+                model_override=model_override, fork=fork)

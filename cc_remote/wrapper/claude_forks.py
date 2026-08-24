@@ -29,6 +29,10 @@ from claude_agent_sdk import list_sessions
 from claude_agent_sdk._internal.session_mutations import (
     _find_session_file_with_dir,
 )
+from cc_remote.protocol import (
+    MAX_AUTO_COMPACT_TOKENS,
+    MIN_AUTO_COMPACT_TOKENS,
+)
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -134,7 +138,42 @@ class ClaudeForkJournal:
         return entries
 
     @staticmethod
-    def _validate_entry(request_id: Any, entry: Any) -> None:
+    def _validate_controls(controls: Any) -> None:
+        if not isinstance(controls, dict) or set(controls) - {
+            "model", "effort", "permission_mode",
+            "auto_compact_mode", "auto_compact_threshold_tokens",
+        }:
+            raise ValueError("invalid Claude fork controls")
+        model = controls.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not model or len(model) > 256
+        ):
+            raise ValueError("invalid Claude fork model")
+        effort = controls.get("effort")
+        if effort is not None and effort not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError("invalid Claude fork effort")
+        permission = controls.get("permission_mode")
+        if permission is not None and permission not in {
+            "default", "acceptEdits", "plan", "auto", "bypassPermissions",
+        }:
+            raise ValueError("invalid Claude fork permission mode")
+        auto_mode = controls.get("auto_compact_mode", "inherit")
+        if auto_mode not in {"inherit", "auto", "custom"}:
+            raise ValueError("invalid Claude fork autocompact mode")
+        auto_threshold = controls.get("auto_compact_threshold_tokens")
+        if auto_mode == "custom":
+            if (not isinstance(auto_threshold, int)
+                    or isinstance(auto_threshold, bool)
+                    or not MIN_AUTO_COMPACT_TOKENS <= auto_threshold
+                    <= MAX_AUTO_COMPACT_TOKENS):
+                raise ValueError("invalid Claude fork autocompact threshold")
+        elif auto_threshold is not None:
+            raise ValueError("unexpected Claude fork autocompact threshold")
+
+    @classmethod
+    def _validate_entry(cls, request_id: Any, entry: Any) -> None:
         request_id = _safe_id(request_id, "fork request id")
         if not isinstance(entry, dict):
             raise ValueError("invalid Claude fork journal entry")
@@ -180,26 +219,7 @@ class ClaudeForkJournal:
                 or not math.isfinite(created_at)
                 or created_at < 0):
             raise ValueError("invalid Claude fork timestamp")
-        controls = entry.get("controls", {})
-        if not isinstance(controls, dict) or set(controls) - {
-            "model", "effort", "permission_mode",
-        }:
-            raise ValueError("invalid Claude fork controls")
-        model = controls.get("model")
-        if model is not None and (
-            not isinstance(model, str) or not model or len(model) > 256
-        ):
-            raise ValueError("invalid Claude fork model")
-        effort = controls.get("effort")
-        if effort is not None and effort not in {
-            "low", "medium", "high", "xhigh", "max",
-        }:
-            raise ValueError("invalid Claude fork effort")
-        permission = controls.get("permission_mode")
-        if permission is not None and permission not in {
-            "default", "acceptEdits", "plan", "auto", "bypassPermissions",
-        }:
-            raise ValueError("invalid Claude fork permission mode")
+        cls._validate_controls(entry.get("controls", {}))
 
     @staticmethod
     def _validate_aliases(
@@ -239,7 +259,7 @@ class ClaudeForkJournal:
         parent_session_id: str,
         cutoff_message_id: str,
         cwd: str,
-        controls: Optional[dict[str, str]] = None,
+        controls: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         request_id = _safe_id(request_id, "fork request id")
         parent_session_id = _safe_id(parent_session_id, "parent session id")
@@ -251,6 +271,14 @@ class ClaudeForkJournal:
             "cwd": cwd,
         }
         control_snapshot = dict(controls or {})
+        # Validate before touching the durable journal.  Direct callers are not
+        # required to construct their snapshot through ClaudeControlStore, and
+        # persisting a malformed intent would make the whole journal unreadable
+        # after the next wrapper restart.
+        try:
+            self._validate_controls(control_snapshot)
+        except ValueError as exc:
+            raise ClaudeForkJournalError(str(exc)) from exc
         with self._lock:
             existing = self.entries.get(request_id)
             if existing is not None:

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
   createHistoryBrowse,
   markBrowseDetail,
@@ -834,6 +835,14 @@ const dirty = markBrowseLatestDirty(detailed, {
   expectedScopeKey: scopeKey,
 });
 assert.equal(dirty.latestDirty, true);
+assert.equal(cachedLatestRequiresLiveRuntime(dirty, { isLatest: true }), true);
+assert.equal(cachedLatestRequiresLiveRuntime(dirty, { isLatest: false }), false);
+assert.equal(cachedLatestRequiresLiveRuntime(detailed, { isLatest: true }), false);
+assert.equal(cachedLatestRequiresLiveRuntime(
+  { ...dirty, newerPageKey: `latest:${dirty.viewId}` },
+  null,
+  `latest:${dirty.viewId}`,
+), true, "a dirty latest link survives an IndexedDB write/read race");
 assert.equal(markBrowseLatestDirty(dirty, {
   expectedScopeKey: scopeKey,
 }), dirty);

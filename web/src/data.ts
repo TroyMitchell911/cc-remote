@@ -43,6 +43,7 @@ export const COMMANDS: Command[] = [
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
+  { slash: "autocompact", name: "自动压缩", ds: "/autocompact [数字]；不填打开设置", ic: "simplify" },
 ];
 
 // Work is a separate product surface, not a differently styled Code session.
@@ -64,6 +65,7 @@ export const WORK_COMMANDS: Command[] = [
   { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
   { slash: "preview", name: "预览 Artifacts", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "context", name: "上下文用量", ds: "查看本次工作的 token 占用", ic: "cpu" },
+  { slash: "autocompact", name: "自动压缩", ds: "/autocompact [数字]；不填打开设置", ic: "simplify" },
   { slash: "clear", name: "新工作", ds: "开始一项独立的新工作", ic: "close" },
 ];
 
@@ -321,7 +323,7 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // /rewind stays reserved locally while its UI is hidden so manually typing it
 // cannot fall through to Claude's interactive-only slash layer.
 const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "autocompact", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
 
 // Codex engine command palette. Native app-server controls are handled locally
 // and never expanded into natural-language lookalikes. /context is the focused
@@ -361,11 +363,13 @@ export const CODEX_COMMANDS: Command[] = [
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
 const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "autocompact", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
-  surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
+  surface === "work"
+    ? WORK_COMMANDS
+    : engine === "codex" ? CODEX_COMMANDS : COMMANDS
 );
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
 

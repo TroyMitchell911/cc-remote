@@ -1089,6 +1089,7 @@ function HistoryConversationBrowserFixture() {
   const recoveryReplacement = params.has("recovery-replace");
   const pendingRevisionReplacement = params.has("pending-revision-replace");
   const deepBrowse = params.has("deep-browse");
+  const dirtyLiveBrowse = params.has("dirty-live-browse");
   const runtimeBrowse = params.has("runtime-browse");
   const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
@@ -1374,8 +1375,26 @@ function HistoryConversationBrowserFixture() {
     const requestSid = sid;
     const session = sessions[requestSid];
     if (!browseMode || !session?.hasNewer) return false;
+    const requestedNextPage = (session.newerPagesLoaded ?? 0) + 1;
+    const requestedLast = Math.min(
+      40, 21 + (requestedNextPage - 1) * 8 + 7,
+    );
     setNewerLoads((value) => value + 1);
     window.setTimeout(() => {
+      if (dirtyLiveBrowse && requestedLast >= 40) {
+        setBrowseMode(false);
+        setHistoryViewId("runtime");
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: latestTurns,
+            hasNewer: false,
+            windowEpoch: (current[requestSid].windowEpoch ?? 0) + 1,
+          },
+        }));
+        return;
+      }
       setSessions((current) => {
         const target = current[requestSid];
         if (!target?.hasNewer) return current;
@@ -1421,7 +1440,8 @@ function HistoryConversationBrowserFixture() {
     }, delayMs);
     return true;
   }, [
-    browseMode, delayMs, historyRevision, historyViewId, sessions, sid,
+    browseMode, delayMs, dirtyLiveBrowse, historyRevision, historyViewId,
+    latestTurns, sessions, sid,
   ]);
 
   const loadDetail = useCallback((
@@ -1514,7 +1534,9 @@ function HistoryConversationBrowserFixture() {
 
   const appendTurn = () => {
     if (deepBrowse) {
-      const next = finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
+      const next = dirtyLiveBrowse
+        ? streamingTurn("live-streaming", 4)
+        : finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
       setLatestTurns((current) => [...current, next].slice(-20));
       if (!browseMode) {
         setSessions((current) => {
@@ -1887,8 +1909,12 @@ function HistoryConversationBrowserFixture() {
           onTextSelectionGuardChange={updateTextSelectionGuard}
           onEdit={() => {}}
           onGetDiff={() => {}}
-          activeTurnId={interactiveTimeline && sid.endsWith("-a")
-            ? "streaming" : null}
+          activeTurnId={sid.endsWith("-a")
+            ? interactiveTimeline
+              ? "streaming"
+              : dirtyLiveBrowse && !browseMode
+                ? "live-streaming" : null
+            : null}
           externalPlanProgress={fixedPlanProgress ? {
             turnId: fixedPlanProgress.turnId,
             itemId: fixedPlanProgress.block.item_id,

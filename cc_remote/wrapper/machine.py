@@ -68,7 +68,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import (
     HookEventMessage, ResultMessage, TaskNotificationMessage,
     TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
-    RateLimitEvent,
+    RateLimitEvent, TERMINAL_TASK_STATUSES,
 )
 
 from cc_remote.attachments import (
@@ -102,7 +102,8 @@ from cc_remote.protocol import (
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, QueryQueueState, QueuedQueryDetail, QueuedQueryInfo,
     QueuedQueryUpdated,
-    Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
+    Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort,
+    AutoCompact, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
@@ -142,6 +143,8 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControlStoreError,
     ClaudeControls,
     last_completed_assistant_controls,
+    claude_auto_compact_cli_value,
+    valid_claude_auto_compact,
     valid_claude_model,
     valid_claude_permission,
 )
@@ -1570,6 +1573,10 @@ class WrapperMachine:
         "apply_patch", "filechange",
     })
     CLAUDE_SETTINGS_MAX_BYTES = 1024 * 1024
+    # Bound the connection-local task ledger. Overflow fails closed until the
+    # SDK generation resets instead of forgetting an unknown live background
+    # process and reconnecting across it.
+    CLAUDE_ACTIVE_TASK_CAP = 1024
     BG_JOB_SCAN_MAX = 1_000
     BG_JOB_STATE_MAX_BYTES = 64 * 1024
     FORK_RECONCILE_ATTEMPTS = 4
@@ -1621,7 +1628,7 @@ class WrapperMachine:
     BTW_SID_COMMANDS = frozenset({
         "query", "cancel_queued_query", "get_queued_query",
         "update_queued_query", "steer", "interrupt", "takeover",
-        "set_model", "set_effort",
+        "set_model", "set_effort", "set_auto_compact",
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
@@ -3580,6 +3587,8 @@ class WrapperMachine:
         snapshot = self._session_control(ctx)
         if emit and values != current:
             await self._emit(ctx, snapshot)
+            if ctx.engine == "claude":
+                await self._publish_claude_auto_compact(ctx)
         return snapshot
 
     @staticmethod
@@ -4512,6 +4521,7 @@ class WrapperMachine:
         self, ctx: SessionContext, sdk: SdkHandle,
     ) -> None:
         """Install the complete per-session Claude bridge on one SDK handle."""
+        self._reset_claude_task_lifecycle(ctx)
         if ctx.space == "code" and ctx.claude_agents is None:
             ctx.claude_agents = ClaudeAgentRegistry(self.cfg.tool_result_max)
         elif ctx.space != "code":
@@ -4527,6 +4537,8 @@ class WrapperMachine:
         sdk.background_message_callback = (
             lambda message, turn_id: self._on_claude_background_message(
                 ctx, message, turn_id))
+        sdk.lifecycle_reset_callback = (
+            lambda: self._reset_claude_task_lifecycle(ctx))
 
     @staticmethod
     def _copy_claude_runtime_options(
@@ -4558,7 +4570,314 @@ class WrapperMachine:
         if isinstance(effort, str) and effort:
             setattr(target, "effort", effort)
             setattr(target, "applied_effort", effort)
+        auto_mode, auto_threshold = valid_claude_auto_compact(
+            getattr(source, "auto_compact_mode", None),
+            getattr(source, "auto_compact_threshold_tokens", None),
+        )
+        set_auto_compact = getattr(target, "set_auto_compact", None)
+        if callable(set_auto_compact):
+            set_auto_compact(auto_mode, auto_threshold)
+        else:
+            setattr(target, "auto_compact_mode", auto_mode)
+            setattr(target, "auto_compact_threshold_tokens", auto_threshold)
         return permission, model, effort
+
+    @staticmethod
+    def _reset_claude_task_lifecycle(ctx: SessionContext) -> None:
+        ctx.claude_active_tasks.clear()
+        ctx.claude_task_tracking_overflow = False
+        ctx.claude_background_followup_pending = False
+        registry = ctx.claude_agents
+        runs = getattr(registry, "runs", None)
+        if isinstance(runs, dict):
+            for run in runs.values():
+                if getattr(run, "status", None) == "running":
+                    run.status = "cancelled"
+
+    def _observe_claude_task_lifecycle(
+        self,
+        ctx: SessionContext,
+        message: object,
+        *,
+        background: bool = False,
+    ) -> None:
+        """Track Claude background work independently from Agent presentation.
+
+        Work deliberately has no Agent detail registry but still permits
+        Bash(run_in_background=true). A terminal task delivered after the
+        parent Result may trigger an autonomous follow-up, whose later Result
+        is the first safe spawn-option reconnect boundary.
+        """
+        if isinstance(message, ResultMessage):
+            ctx.claude_background_followup_pending = False
+            return
+
+        task_id = getattr(message, "task_id", None)
+        if not isinstance(task_id, str) or not task_id:
+            return
+
+        terminal = False
+        if isinstance(message, TaskNotificationMessage):
+            terminal = message.status in TERMINAL_TASK_STATUSES
+        elif isinstance(message, TaskUpdatedMessage):
+            terminal = message.status in TERMINAL_TASK_STATUSES
+
+        if terminal:
+            ctx.claude_active_tasks.discard(task_id)
+            if (background
+                    and not ctx.claude_active_tasks
+                    and not ctx.claude_task_tracking_overflow
+                    and not (
+                        isinstance(message, TaskNotificationMessage)
+                        and message.status == "stopped"
+                    )):
+                ctx.claude_background_followup_pending = True
+            return
+
+        track = isinstance(message, (TaskStartedMessage, TaskProgressMessage))
+        if isinstance(message, TaskUpdatedMessage):
+            track = message.status in {"pending", "running", "paused"}
+        if not track:
+            return
+        if (isinstance(message, TaskStartedMessage)
+                and (message.task_type or "").lower()
+                == "in_process_teammate"):
+            # Match Claude's own runner: this is part of the current model turn,
+            # not a detached task whose lifetime extends beyond Result.
+            return
+        if task_id in ctx.claude_active_tasks:
+            return
+        if len(ctx.claude_active_tasks) >= self.CLAUDE_ACTIVE_TASK_CAP:
+            if not ctx.claude_task_tracking_overflow:
+                log.warning(
+                    "Claude active task ledger overflowed",
+                    session_id=ctx.session_id,
+                    task_cap=self.CLAUDE_ACTIVE_TASK_CAP,
+                )
+            ctx.claude_task_tracking_overflow = True
+            return
+        ctx.claude_active_tasks.add(task_id)
+
+    @staticmethod
+    def _claude_has_background_work(ctx: SessionContext) -> bool:
+        if (ctx.claude_active_tasks
+                or ctx.claude_task_tracking_overflow
+                or ctx.claude_background_followup_pending):
+            return True
+        registry = ctx.claude_agents
+        runs = getattr(registry, "runs", None)
+        return bool(isinstance(runs, dict) and any(
+            getattr(run, "status", None) == "running"
+            for run in runs.values()
+        ))
+
+    @staticmethod
+    def _claude_auto_compact_event(ctx: SessionContext) -> AutoCompact:
+        sdk = ctx.sdk
+        supports_control = callable(getattr(sdk, "set_auto_compact", None))
+        desired_mode, desired_threshold = valid_claude_auto_compact(
+            getattr(sdk, "auto_compact_mode", None),
+            getattr(sdk, "auto_compact_threshold_tokens", None),
+        )
+        raw_applied_mode = getattr(
+            sdk, "applied_auto_compact_mode", None)
+        if raw_applied_mode in {"inherit", "auto", "custom"}:
+            applied_mode, applied_threshold = valid_claude_auto_compact(
+                raw_applied_mode,
+                getattr(sdk, "applied_auto_compact_threshold_tokens", None),
+            )
+        else:
+            # Narrow embedded/test adapters predating this control have no
+            # desired/applied surface.  Treat their inherited launch as already
+            # applied instead of scheduling a reconnect they cannot represent.
+            applied_mode, applied_threshold = (
+                (None, None) if supports_control
+                else (desired_mode, desired_threshold)
+            )
+        broker_owned = bool(getattr(sdk, "is_claude_broker", False))
+        mutable = bool(
+            supports_control
+            and not broker_owned
+            and ctx.write_state == "writable"
+        )
+        pending = bool(
+            not broker_owned
+            and (applied_mode, applied_threshold)
+                != (desired_mode, desired_threshold)
+        )
+        return AutoCompact(
+            mode=desired_mode,
+            threshold_tokens=desired_threshold,
+            applied_mode=applied_mode,
+            applied_threshold_tokens=applied_threshold,
+            pending=pending,
+            mutable=mutable,
+            error=ctx.auto_compact_error,
+        )
+
+    async def _publish_claude_auto_compact(
+        self,
+        ctx: SessionContext,
+        *,
+        force: bool = False,
+    ) -> tuple[AutoCompact, bool]:
+        event = self._claude_auto_compact_event(ctx)
+        signature = (
+            event.mode,
+            event.threshold_tokens,
+            event.applied_mode,
+            event.applied_threshold_tokens,
+            event.pending,
+            event.mutable,
+            event.error,
+        )
+        changed = force or signature != ctx.announced_auto_compact
+        if changed:
+            ctx.announced_auto_compact = signature
+            await self._emit(ctx, event)
+        return event, changed
+
+    def _claude_auto_compact_reconnect_identity(
+        self, ctx: SessionContext,
+    ) -> tuple[Optional[str], bool]:
+        if not ctx.btw:
+            return ctx.session_id, False
+        if ctx.btw_real_id:
+            return ctx.btw_real_id, False
+        parent = self._ctx_by_sid(ctx.parent_sid or "")
+        parent_id = (
+            parent.session_id if parent is not None else ctx.parent_sid
+        )
+        return parent_id, True
+
+    async def _apply_pending_claude_auto_compact(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+    ) -> tuple[AutoCompact, bool]:
+        """Apply one desired spawn option without crossing a live turn.
+
+        The caller serializes this helper with ``ctx.query_lock`` and invokes it
+        only before query submission or after the real ResultMessage boundary.
+        A failed new connection is rolled back to the last applied option.  The
+        user's desired value remains pending and is retried before a later turn.
+        """
+        if (ctx.engine != "claude"
+                or getattr(ctx.sdk, "is_claude_broker", False)):
+            return await self._publish_claude_auto_compact(ctx, force=True)
+        current = self._claude_auto_compact_event(ctx)
+        if not current.pending:
+            return await self._publish_claude_auto_compact(ctx)
+        if self._claude_has_background_work(ctx):
+            return await self._publish_claude_auto_compact(ctx, force=True)
+
+        sdk = ctx.sdk
+        desired = (current.mode, current.threshold_tokens)
+        old_applied = (current.applied_mode, current.applied_threshold_tokens)
+        resume_id, fork = self._claude_auto_compact_reconnect_identity(ctx)
+        try:
+            await sdk.force_reconnect(
+                resume_id=resume_id,
+                cwd=ctx.cwd,
+                reason=reason,
+                fork=fork,
+            )
+        except Exception as apply_exc:
+            log.warning(
+                "Claude autocompact reconnect failed; restoring prior option",
+                session_id=ctx.session_id,
+                error_type=type(apply_exc).__name__,
+            )
+            recovered = False
+            if old_applied[0] is not None:
+                try:
+                    sdk.set_auto_compact(*old_applied)
+                    await sdk.force_reconnect(
+                        resume_id=resume_id,
+                        cwd=ctx.cwd,
+                        reason="restore previous autocompact after failed change",
+                        fork=fork,
+                    )
+                    recovered = True
+                except Exception as restore_exc:
+                    log.warning(
+                        "Claude autocompact rollback reconnect failed",
+                        session_id=ctx.session_id,
+                        error_type=type(restore_exc).__name__,
+                    )
+            sdk.set_auto_compact(*desired)
+            ctx.auto_compact_error = (
+                "自动压缩阈值暂未生效，已保留当前会话设置并将在下次安全边界重试。"
+                if recovered else
+                "自动压缩阈值切换后会话恢复失败；设置已保留，请重新进入会话后重试。"
+            )
+            await self._persist_claude_session_controls(ctx)
+            event, _ = await self._publish_claude_auto_compact(
+                ctx, force=True)
+            if not recovered:
+                raise RuntimeError(
+                    "Claude autocompact reconnect and rollback both failed"
+                ) from apply_exc
+            return event, False
+
+        ctx.auto_compact_error = None
+        await self._persist_claude_session_controls(ctx)
+        event, _ = await self._publish_claude_auto_compact(ctx, force=True)
+        return event, True
+
+    def _schedule_pending_claude_auto_compact(
+        self, ctx: SessionContext,
+    ) -> None:
+        """Apply an idle setting after the background worker returns its frame."""
+        existing = ctx.auto_compact_apply_task
+        if existing is not None and not existing.done():
+            return
+        if (ctx.engine != "claude" or ctx.state != "idle"
+                or getattr(ctx.sdk, "is_claude_broker", False)
+                or self._claude_has_background_work(ctx)
+                or not self._claude_auto_compact_event(ctx).pending):
+            return
+
+        async def apply() -> None:
+            # This scheduler is called from SdkHandle's background-message task.
+            # Yield once so force_reconnect never cancels/gathers its own caller.
+            await asyncio.sleep(0)
+            async with ctx.query_lock:
+                if (not self._is_resident_context(ctx)
+                        or ctx.state != "idle"
+                        or self._claude_has_background_work(ctx)):
+                    return
+                try:
+                    await self._apply_pending_claude_auto_compact(
+                        ctx, reason="autocompact after background task completion")
+                except Exception as exc:
+                    log.warning(
+                        "deferred Claude autocompact apply failed",
+                        session_id=ctx.session_id,
+                        error_type=type(exc).__name__,
+                    )
+
+        task = asyncio.create_task(apply())
+        ctx.auto_compact_apply_task = task
+
+        def clear(completed: asyncio.Task) -> None:
+            if ctx.auto_compact_apply_task is completed:
+                ctx.auto_compact_apply_task = None
+
+        task.add_done_callback(clear)
+
+    @staticmethod
+    async def _cancel_pending_claude_auto_compact(
+        ctx: SessionContext,
+    ) -> None:
+        """Stop an idle reconnect task before disposing its session context."""
+        task = ctx.auto_compact_apply_task
+        ctx.auto_compact_apply_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _sync_claude_broker_runtime_controls(
         self, ctx: SessionContext,
@@ -4566,6 +4885,7 @@ class WrapperMachine:
         """Publish only controls durably observed from the official TUI."""
         if not getattr(ctx.sdk, "is_claude_broker", False):
             return ()
+        ctx.auto_compact_error = None
         events: list[object] = []
         model = getattr(ctx.sdk, "model", None)
         if isinstance(model, str) and model and model != ctx.announced_model:
@@ -4582,50 +4902,88 @@ class WrapperMachine:
             events.append(Perm(mode=permission))
         for event in events:
             await self._emit(ctx, event)
+        auto_event, auto_changed = await self._publish_claude_auto_compact(ctx)
+        if auto_changed:
+            events.append(auto_event)
         return tuple(events)
 
     async def _persist_claude_session_controls(self, ctx: SessionContext) -> None:
-        """Persist Remote-owned Claude controls without touching global config."""
-        if (ctx.engine != "claude" or ctx.space != "code"
-                or not ctx.session_id
+        """Persist one coherent Remote-owned Claude control snapshot."""
+        if (ctx.engine != "claude" or not ctx.session_id or ctx.btw
                 or getattr(ctx.sdk, "is_claude_broker", False)):
             return
-        if self._claude_controls is not None:
+        async with ctx.claude_control_persist_lock:
+            # Read every field only after entering the per-session lock. A
+            # model command and a query-locked autocompact command may finish
+            # their engine mutations in either order; each durable write must
+            # therefore reflect the newest complete SDK state at its own
+            # serialized boundary, never a snapshot captured while waiting.
+            session_id = ctx.session_id
+            if (ctx.engine != "claude" or not session_id or ctx.btw
+                    or getattr(ctx.sdk, "is_claude_broker", False)
+                    or (ctx.key is not None
+                        and not self._is_resident_context(ctx))):
+                return
+            model = getattr(ctx.sdk, "model", None)
+            effort = getattr(ctx.sdk, "effort", None)
+            permission_mode = getattr(ctx.sdk, "permission_mode", None)
+            auto_mode, auto_threshold = valid_claude_auto_compact(
+                getattr(ctx.sdk, "auto_compact_mode", None),
+                getattr(ctx.sdk, "auto_compact_threshold_tokens", None),
+            )
+            if self._claude_controls is not None:
+                try:
+                    if ctx.space == "work":
+                        await asyncio.to_thread(
+                            self._claude_controls.update_auto_compact,
+                            session_id,
+                            mode=auto_mode,
+                            threshold_tokens=auto_threshold,
+                            preserve_other_controls=False,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self._claude_controls.update,
+                            session_id,
+                            model=model,
+                            effort=effort,
+                            permission_mode=permission_mode,
+                            auto_compact_mode=auto_mode,
+                            auto_compact_threshold_tokens=auto_threshold,
+                        )
+                except Exception as exc:
+                    # A live runtime control change already succeeded. Do not
+                    # roll it back because its private durability cache is
+                    # unavailable.
+                    log.warning(
+                        "Claude Remote controls could not be persisted",
+                        session_id=session_id,
+                        error_type=type(exc).__name__,
+                    )
+            if not self._claude_broker_enabled or ctx.space != "code":
+                return
             try:
-                await asyncio.to_thread(
-                    self._claude_controls.update,
-                    ctx.session_id,
-                    model=getattr(ctx.sdk, "model", None),
-                    effort=getattr(ctx.sdk, "effort", None),
-                    permission_mode=getattr(
-                        ctx.sdk, "permission_mode", None),
+                await self._claude_broker.set_preferences(
+                    session_id,
+                    model=model,
+                    effort=effort,
+                    permission_mode=permission_mode,
+                    auto_compact=(
+                        claude_auto_compact_cli_value(
+                            auto_mode, auto_threshold)
+                        or "inherit"
+                    ),
                 )
             except Exception as exc:
-                # A live runtime control change already succeeded. Do not roll
-                # it back because its private durability cache is unavailable.
+                # The live SDK mutation already succeeded. Keep Remote usable
+                # if the optional local broker is restarting, but make the
+                # durability gap observable instead of pretending the next TUI
+                # is guaranteed.
                 log.warning(
-                    "Claude Remote controls could not be persisted",
-                    session_id=ctx.session_id,
+                    "Claude session controls could not be persisted to broker",
+                    session_id=session_id,
                     error_type=type(exc).__name__,
                 )
-        if not self._claude_broker_enabled:
-            return
-        try:
-            await self._claude_broker.set_preferences(
-                ctx.session_id,
-                model=getattr(ctx.sdk, "model", None),
-                effort=getattr(ctx.sdk, "effort", None),
-                permission_mode=getattr(ctx.sdk, "permission_mode", None),
-            )
-        except Exception as exc:
-            # The live SDK mutation already succeeded. Keep Remote usable if the
-            # optional local broker is restarting, but make the durability gap
-            # observable instead of pretending the next TUI is guaranteed.
-            log.warning(
-                "Claude session controls could not be persisted to broker",
-                session_id=ctx.session_id,
-                error_type=type(exc).__name__,
-            )
 
     async def _load_claude_session_controls(
         self, session_id: str,
@@ -4802,7 +5160,10 @@ class WrapperMachine:
         if applied_effort and applied_effort != ctx.announced_effort:
             ctx.announced_effort = applied_effort
             await self._emit(ctx, Effort(effort=applied_effort))
+        if not self._claude_auto_compact_event(ctx).pending:
+            ctx.auto_compact_error = None
         await self._persist_claude_session_controls(ctx)
+        await self._publish_claude_auto_compact(ctx)
         return None
 
     @staticmethod
@@ -5060,6 +5421,8 @@ class WrapperMachine:
             reason=None,
             can_takeover=False,
         )
+        await self._persist_claude_session_controls(ctx)
+        await self._publish_claude_auto_compact(ctx, force=True)
         log.info(
             "restored Claude SDK after broker session exit",
             session_id=ctx.session_id,
@@ -5807,6 +6170,18 @@ class WrapperMachine:
                 await asyncio.gather(*queue_tasks, return_exceptions=True)
             for c in self.sessions.values():
                 c.queued_query_drain_task = None
+            auto_compact_tasks = [
+                c.auto_compact_apply_task for c in self.sessions.values()
+                if c.auto_compact_apply_task is not None
+                and not c.auto_compact_apply_task.done()
+            ]
+            for task in auto_compact_tasks:
+                task.cancel()
+            if auto_compact_tasks:
+                await asyncio.gather(
+                    *auto_compact_tasks, return_exceptions=True)
+            for c in self.sessions.values():
+                c.auto_compact_apply_task = None
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 disconnected = False
@@ -8294,6 +8669,18 @@ class WrapperMachine:
                     to=cmd.client_id,
                     route_id=getattr(cmd, "route_id", None),
                 ))
+                if ctx.engine == "claude":
+                    await self.transport.send(
+                        self._claude_auto_compact_event(ctx).model_copy(
+                            deep=True,
+                            update={
+                                "sid": sid,
+                                "to": cmd.client_id,
+                                "route_id": getattr(
+                                    cmd, "route_id", None),
+                            },
+                        )
+                    )
                 if ctx.engine == "codex":
                     permission_profile = _session_permission_profile(ctx)
                     ctx.announced_permission_profile = permission_profile
@@ -14551,6 +14938,80 @@ class WrapperMachine:
         log.info("effort set", sid=ctx.session_id, effort=applied, engine=ctx.engine)
         return event
 
+    async def _handle_set_auto_compact(self, cmd):
+        """Change Claude's per-session spawn-time compaction threshold safely."""
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return await self._missing_session_error(
+                cmd, "切换自动压缩阈值")
+        if ctx.engine != "claude":
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="自动压缩阈值仅适用于 Claude 会话。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
+
+        async with ctx.query_lock:
+            if not self._is_resident_context(ctx):
+                return await self._missing_session_error(
+                    cmd, "切换自动压缩阈值")
+            control_error = await self._runtime_control_preflight(
+                ctx,
+                action="切换自动压缩阈值",
+                request_id=getattr(cmd, "cmd_id", None),
+                client_id=getattr(cmd, "client_id", None),
+            )
+            if control_error is not None:
+                event, _ = await self._publish_claude_auto_compact(
+                    ctx, force=True)
+                return control_error, event
+            if getattr(ctx.sdk, "is_claude_broker", False):
+                # Broker metadata reports the flag used to launch the official
+                # terminal, but replacing that live PTY from Web would violate
+                # its single-writer ownership.  A later broker resume can adopt
+                # the stored preference through its own launch path.
+                event, _ = await self._publish_claude_auto_compact(
+                    ctx, force=True)
+                error = Error(
+                    code=ERR_AUTH,
+                    message=(
+                        "该会话由本机 Claude TUI 控制；自动压缩阈值为只读，"
+                        "请在终端重新启动会话时设置。"
+                    ),
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit(ctx, error)
+                return event, error
+
+            setter = getattr(ctx.sdk, "set_auto_compact", None)
+            if callable(setter):
+                setter(cmd.mode, cmd.threshold_tokens)
+            else:
+                # Compatibility for narrow test/embedded adapters. Protocol
+                # validation has already bounded both values.
+                ctx.sdk.auto_compact_mode = cmd.mode
+                ctx.sdk.auto_compact_threshold_tokens = cmd.threshold_tokens
+            ctx.auto_compact_error = None
+            await self._persist_claude_session_controls(ctx)
+
+            if ctx.state != "idle" or self._claude_has_background_work(ctx):
+                event, _ = await self._publish_claude_auto_compact(
+                    ctx, force=True)
+                return event
+            try:
+                event, _applied = await self._apply_pending_claude_auto_compact(
+                    ctx, reason="autocompact setting change")
+            except Exception:
+                # _apply_pending_claude_auto_compact already restored or marked
+                # the exact desired/applied projection.  Keep the control error
+                # out of conversation history; the AutoCompact frame owns it.
+                return self._claude_auto_compact_event(ctx)
+            return event
+
     async def _handle_set_service_tier(self, cmd):
         # Codex Fast is a thread setting in app-server 0.144.1. Never mutate the
         # user's global config.toml and never leak one session's choice to another.
@@ -14776,11 +15237,19 @@ class WrapperMachine:
         if effort:
             btw.announced_effort = effort
             await self._emit(btw, Effort(effort=effort))
+        if btw.engine == "claude":
+            auto_event, _ = await self._publish_claude_auto_compact(
+                btw, force=True)
+        else:
+            auto_event = None
         permission_mode = _session_permission_mode(btw)
         btw.announced_perm = permission_mode
         permission = Perm(mode=permission_mode, sid=btw.key, to=cid)
         await self.transport.send(permission)
-        responses = [ev, snap, permission]
+        responses = [ev, snap]
+        if auto_event is not None:
+            responses.append(auto_event)
+        responses.append(permission)
         if btw.engine == "codex":
             permission_profile = _session_permission_profile(btw)
             btw.announced_permission_profile = permission_profile
@@ -14815,8 +15284,12 @@ class WrapperMachine:
             await self._drop_preview_session(ctx.engine, ctx.key)
         disconnected = False
         try:
+            await self._cancel_pending_claude_auto_compact(ctx)
             tasks = {
-                task for task in (ctx.turn_task, ctx.codex_spontaneous_task)
+                task for task in (
+                    ctx.turn_task,
+                    ctx.codex_spontaneous_task,
+                )
                 if task is not None and not task.done()
             }
             for task in tasks:
@@ -15385,12 +15858,28 @@ class WrapperMachine:
                     categories=[], **work_fields)
                 await self._emit(ctx, event)
                 return event
+            raw_auto_threshold = usage.get("autoCompactThreshold")
+            auto_threshold = (
+                raw_auto_threshold
+                if isinstance(raw_auto_threshold, int)
+                and not isinstance(raw_auto_threshold, bool)
+                and raw_auto_threshold >= 0 else None
+            )
+            raw_physical_max = usage.get("rawMaxTokens")
+            physical_max = (
+                raw_physical_max
+                if isinstance(raw_physical_max, int)
+                and not isinstance(raw_physical_max, bool)
+                and raw_physical_max >= 0 else None
+            )
             event = ContextReport(
                 total_tokens=usage.get("totalTokens", 0),
                 max_tokens=usage.get("maxTokens", 0),
                 percentage=usage.get("percentage", 0.0),
                 model=usage.get("model"),
                 is_auto_compact_enabled=usage.get("isAutoCompactEnabled"),
+                auto_compact_threshold_tokens=auto_threshold,
+                raw_max_tokens=physical_max,
                 categories=usage.get("categories", []) or [],
                 **work_fields,
             )
@@ -15605,8 +16094,12 @@ class WrapperMachine:
         """
         if await self._observe_claude_rate_limit_message(message):
             return
+        self._observe_claude_task_lifecycle(
+            ctx, message, background=True)
         thread_id = self._ctx_wire_sid(ctx)
         if not thread_id:
+            if isinstance(message, ResultMessage):
+                self._schedule_pending_claude_auto_compact(ctx)
             return
         goal_changed, goal = ctx.sdk.observe_goal_message(
             message, thread_id)
@@ -15615,6 +16108,14 @@ class WrapperMachine:
         registry = ctx.claude_agents
         route = registry.route(message) if registry is not None else AgentRoute("main")
         await self._publish_claude_agent_route(ctx, route)
+        # A task/hook notification can itself trigger Claude's autonomous
+        # post-result continuation. Reconnecting on that notification races
+        # the child before the continuation's own terminal boundary and cuts it
+        # off. Only its background ResultMessage proves the autonomous response
+        # has drained; otherwise the pending setting is applied immediately
+        # before the next browser Query.
+        if isinstance(message, ResultMessage):
+            self._schedule_pending_claude_auto_compact(ctx)
         if route.target == "detail":
             return
         if not isinstance(message, (
@@ -16632,8 +17133,20 @@ class WrapperMachine:
                 reader_task.cancel()
                 await asyncio.gather(reader_task, return_exceptions=True)
 
-    async def _set_idle_after_managed_turn(self, ctx: SessionContext) -> None:
-        """Do not unlock a thread already claimed by an automatic continuation."""
+    async def _set_idle_after_managed_turn(
+        self,
+        ctx: SessionContext,
+        *,
+        claude_terminal: bool = False,
+    ) -> None:
+        """Do not unlock a thread already claimed by an automatic continuation.
+
+        A Claude stream exception is not a terminal boundary: the query may
+        still be executing in the child even though Remote lost its reader.
+        Apply spawn-time controls here only after the caller consumed the real
+        ``ResultMessage``.  Ambiguous failures keep the desired value pending;
+        the next query's preflight reconnect is the other safe boundary.
+        """
         await self._finish_codex_checkpoint(ctx)
         await self._cleanup_codex_steer_attachments(ctx)
         if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
@@ -16644,6 +17157,22 @@ class WrapperMachine:
                 await self._remember_codex_initial_turn_alias(
                     ctx, native_turn_id)
             self._release_codex_turn(ctx)
+        if (ctx.engine == "claude"
+                and claude_terminal
+                and not getattr(ctx.sdk, "is_claude_broker", False)):
+            async with ctx.query_lock:
+                if self._claude_auto_compact_event(ctx).pending:
+                    try:
+                        await self._apply_pending_claude_auto_compact(
+                            ctx, reason="autocompact after completed turn")
+                    except Exception as exc:
+                        log.warning(
+                            "post-turn Claude autocompact apply failed",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                await self._set_state(ctx, "idle")
+            return
         await self._set_state(ctx, "idle")
 
     async def _cleanup_codex_steer_attachments(
@@ -20487,6 +21016,9 @@ class WrapperMachine:
                 effort_event = Effort(effort=effort)
                 await self._emit(ctx, effort_event)
                 cached_responses.append(effort_event)
+            auto_event, _ = await self._publish_claude_auto_compact(
+                ctx, force=True)
+            cached_responses.append(auto_event)
             rate_limit_events = await self._seed_claude_rate_limits(ctx)
             cached_responses.extend(rate_limit_events)
         # Seed the chips on entering a Codex session from the authoritative
@@ -20770,6 +21302,10 @@ class WrapperMachine:
                 "engine": engine,
                 "model": requested_model,
                 "effort": getattr(cmd, "effort", None),
+                "auto_compact_mode": getattr(
+                    cmd, "auto_compact_mode", None),
+                "auto_compact_threshold_tokens": getattr(
+                    cmd, "auto_compact_threshold_tokens", None),
                 "collaboration_mode": getattr(
                     cmd, "collaboration_mode", None),
                 "permission_mode": getattr(cmd, "permission_mode", None),
@@ -20847,6 +21383,9 @@ class WrapperMachine:
             await self._emit(ctx, effort_event)
             cached_responses.append(effort_event)
         if ctx.engine == "claude":
+            auto_event, _ = await self._publish_claude_auto_compact(
+                ctx, force=True)
+            cached_responses.append(auto_event)
             rate_limit_events = await self._seed_claude_rate_limits(ctx)
             cached_responses.extend(rate_limit_events)
         permission_mode = _session_permission_mode(ctx)
@@ -21185,6 +21724,7 @@ class WrapperMachine:
                     return delete_result.error
                 codex_deleted = True
             else:
+                await self._cancel_pending_claude_auto_compact(ctx)
                 await ctx.sdk.disconnect()
                 self.sessions.pop(ctx.key or sid, None)
                 self._purge_preview_image_snapshots(
@@ -22237,6 +22777,7 @@ class WrapperMachine:
         else:
             if ctx is not None:
                 try:
+                    await self._cancel_pending_claude_auto_compact(ctx)
                     await ctx.sdk.disconnect()
                 except Exception:
                     log.exception(
@@ -23714,7 +24255,7 @@ class WrapperMachine:
         sid: str,
         cwd: str,
         ctx: Optional[SessionContext],
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         saved = await self._load_claude_session_controls(sid)
         model = valid_claude_model(
             _session_model(ctx) if ctx is not None else None
@@ -23725,6 +24266,13 @@ class WrapperMachine:
         permission = valid_claude_permission(
             _session_permission_mode(ctx) if ctx is not None else None
         ) or saved.permission_mode
+        auto_mode, auto_threshold = valid_claude_auto_compact(
+            (getattr(ctx.sdk, "auto_compact_mode", None)
+             if ctx is not None else saved.auto_compact_mode),
+            (getattr(ctx.sdk, "auto_compact_threshold_tokens", None)
+             if ctx is not None
+             else saved.auto_compact_threshold_tokens),
+        )
         if (model is None or effort is None) and ctx is None:
             try:
                 native = await asyncio.to_thread(
@@ -23742,7 +24290,7 @@ class WrapperMachine:
                     session_id=sid,
                     error_type=type(exc).__name__,
                 )
-        return {
+        controls: dict[str, object] = {
             key: value
             for key, value in (
                 ("model", model),
@@ -23751,6 +24299,11 @@ class WrapperMachine:
             )
             if isinstance(value, str) and value
         }
+        if auto_mode != "inherit":
+            controls["auto_compact_mode"] = auto_mode
+            if auto_mode == "custom":
+                controls["auto_compact_threshold_tokens"] = auto_threshold
+        return controls
 
     async def _codex_fork_control_snapshot(
         self,
@@ -23846,6 +24399,10 @@ class WrapperMachine:
             model=values.get("model"),
             effort=values.get("effort"),
             permission_mode=values.get("permission_mode"),
+            auto_compact_mode=values.get(
+                "auto_compact_mode", "inherit"),
+            auto_compact_threshold_tokens=values.get(
+                "auto_compact_threshold_tokens"),
         )
 
     async def _inherit_codex_fork_controls(
@@ -25754,6 +26311,8 @@ class WrapperMachine:
                      bootstrap: bool = False, engine: str = "claude",
                      codex_profile_id: Optional[str] = None,
                      model: Optional[str] = None, effort: Optional[str] = None,
+                     auto_compact_mode: Optional[str] = None,
+                     auto_compact_threshold_tokens: Optional[int] = None,
                      collaboration_mode: Optional[str] = None,
                      permission_mode: Optional[str] = None,
                      permission_profile: Optional[str] = None,
@@ -25767,9 +26326,9 @@ class WrapperMachine:
         on legacy-route failure (an Error has been emitted). NewSession uses
         ``raise_on_failure`` so its handler can send one correlated Error.
         `bootstrap` exempts the cap and
-        retries resume→fresh on connect failure. `model`/`effort` (new_session
-        only) pre-select those at spawn: effort BEFORE connect so the first turn
-        runs at that strength with no respawn; cc model via a live set_model
+        retries resume→fresh on connect failure. `model`/`effort`/autocompact
+        (new_session only) pre-select those at spawn: effort and autocompact
+        BEFORE connect so the first turn runs with no respawn; cc model via a live set_model
         after connect; codex model as a per-turn field. An omitted Claude model
         resolves from current settings, then falls back to the curated default;
         omitted Codex controls retain native defaults."""
@@ -25888,7 +26447,11 @@ class WrapperMachine:
             victim = next((k for k, c in self.sessions.items()
                            if k != self.focused_sid and c.state == "idle"
                            and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)), None)
+                           and not self._query_queue_task_active(c)
+                           and not c.query_lock.locked()
+                           and not c.claude_control_persist_lock.locked()
+                           and (c.auto_compact_apply_task is None
+                                or c.auto_compact_apply_task.done())), None)
             if victim is None:
                 await reject(
                     ERR_BUSY, "所有会话都在运行,先中断一个再切换")
@@ -26078,15 +26641,21 @@ class WrapperMachine:
                 )
                 return None
 
-        if (resume_id and engine == "claude" and space == "code"
-                and broker_handle is None):
+        if (resume_id and engine == "claude" and broker_handle is None):
             # Explicit command controls win. Otherwise restore only the private
             # session override owned by Remote, never Claude's global settings.
+            # Work restores only autocompact; its model and permission policy
+            # remain owned by the isolated Work runtime.
             saved_controls = await self._load_claude_session_controls(resume_id)
-            model = model or saved_controls.model
-            effort = effort or saved_controls.effort
-            permission_mode = (
-                permission_mode or saved_controls.permission_mode)
+            if space == "code":
+                model = model or saved_controls.model
+                effort = effort or saved_controls.effort
+                permission_mode = (
+                    permission_mode or saved_controls.permission_mode)
+            if auto_compact_mode is None:
+                auto_compact_mode = saved_controls.auto_compact_mode
+                auto_compact_threshold_tokens = (
+                    saved_controls.auto_compact_threshold_tokens)
         elif engine == "claude" and resume_id is None and model is None:
             # Resolve the cwd-aware default at spawn time so a fresh session
             # starts on the model shown by Remote. The browser still sends null
@@ -26142,6 +26711,26 @@ class WrapperMachine:
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
         else:
             sdk = broker_handle or SdkHandle(self.cfg)
+        if engine == "claude" and broker_handle is None:
+            checked_auto_mode, checked_auto_threshold = (
+                valid_claude_auto_compact(
+                    auto_compact_mode,
+                    auto_compact_threshold_tokens,
+                )
+            )
+            set_auto_compact = getattr(sdk, "set_auto_compact", None)
+            if callable(set_auto_compact):
+                set_auto_compact(
+                    checked_auto_mode, checked_auto_threshold)
+            else:
+                # Keep narrow embedded/test adapters source-compatible. The
+                # production SdkHandle owns the explicit desired/applied split;
+                # an adapter without that control is truthfully treated as
+                # having inherited its launch option already.
+                setattr(sdk, "auto_compact_mode", checked_auto_mode)
+                setattr(
+                    sdk, "auto_compact_threshold_tokens",
+                    checked_auto_threshold)
         if space == "work":
             if engine == "codex":
                 # The named Work permission profile grants autonomous access only
@@ -26698,6 +27287,8 @@ class WrapperMachine:
                     mode=collaboration_mode))
                 await self._emit(ctx, Fast(
                     on=_codex_fast_on(ctx.sdk.service_tier)))
+            else:
+                await self._publish_claude_auto_compact(ctx, force=True)
         log.info("session spawned", resume=resume_id, cwd=target_cwd, key=key,
                  resident=len(self.sessions))
         return ctx
@@ -26778,7 +27369,11 @@ class WrapperMachine:
             victim = next((k for k, c in self.sessions.items()
                            if k != self.focused_sid and c.state == "idle"
                            and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)), None)
+                           and not self._query_queue_task_active(c)
+                           and not c.query_lock.locked()
+                           and not c.claude_control_persist_lock.locked()
+                           and (c.auto_compact_apply_task is None
+                                or c.auto_compact_apply_task.done())), None)
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)
@@ -26826,6 +27421,19 @@ class WrapperMachine:
         elif engine != "codex":
             sdk.permission_mode = getattr(
                 parent.sdk, "permission_mode", "bypassPermissions")
+        if engine != "codex":
+            auto_mode, auto_threshold = valid_claude_auto_compact(
+                getattr(parent.sdk, "auto_compact_mode", None),
+                getattr(parent.sdk, "auto_compact_threshold_tokens", None),
+            )
+            setter = getattr(sdk, "set_auto_compact", None)
+            if callable(setter):
+                setter(auto_mode, auto_threshold)
+            else:
+                sdk.auto_compact_mode = auto_mode
+                sdk.auto_compact_threshold_tokens = auto_threshold
+                sdk.applied_auto_compact_mode = auto_mode
+                sdk.applied_auto_compact_threshold_tokens = auto_threshold
         # /btw is a quick side question — run the fork at LOW effort so the first
         # reply is snappy (the parent's own effort can be high/xhigh, which makes a
         # context-inheriting fork slow). Applied at connect (cc) / per-turn (codex).
@@ -27997,6 +28605,10 @@ class WrapperMachine:
             if effort and effort != ctx.announced_effort:
                 ctx.announced_effort = effort
                 await self._emit(ctx, Effort(effort=effort))
+            if not self._claude_auto_compact_event(ctx).pending:
+                ctx.auto_compact_error = None
+            await self._persist_claude_session_controls(ctx)
+            await self._publish_claude_auto_compact(ctx)
 
         try:
             # An EXTERNAL process (a native `claude`/`codex` in the user's terminal)
@@ -28044,6 +28656,11 @@ class WrapperMachine:
                     sid=ctx.session_id,
                 )
                 await reconnect_claude("message pump failure")
+            if (not is_codex
+                    and self._claude_auto_compact_event(ctx).pending):
+                async with ctx.query_lock:
+                    await self._apply_pending_claude_auto_compact(
+                        ctx, reason="autocompact before next turn")
             # apply a pending effort change: --effort is spawn-time, so respawn the
             # cc subprocess (resume preserves context) before issuing this turn. Only
             # fires when the level actually changed since the live client was spawned;
@@ -28500,6 +29117,7 @@ class WrapperMachine:
                 if goal_changed and ctx.goal_visible:
                     await self._emit(ctx, GoalState(goal=goal))
 
+                self._observe_claude_task_lifecycle(ctx, msg)
                 registry = ctx.claude_agents
                 route = (
                     registry.route(msg)
@@ -28546,7 +29164,8 @@ class WrapperMachine:
 
             if codex_handoff_to_spontaneous:
                 return
-            await self._set_idle_after_managed_turn(ctx)
+            await self._set_idle_after_managed_turn(
+                ctx, claude_terminal=claude_turn_completed)
             if codex_overflow_repair_turn_id is not None:
                 await self._repair_codex_projection_after_overflow(
                     ctx, codex_overflow_repair_turn_id)
@@ -28580,7 +29199,8 @@ class WrapperMachine:
                 code=ERR_CC_CRASH,
                 message="本次回复未完成，请重试。",
                 msg_id=ctx.active_msg_id))
-            await self._set_idle_after_managed_turn(ctx)
+            await self._set_idle_after_managed_turn(
+                ctx, claude_terminal=claude_turn_completed)
         finally:
             if not is_codex:
                 release_background = getattr(

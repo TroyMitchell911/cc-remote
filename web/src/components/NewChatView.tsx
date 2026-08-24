@@ -2,10 +2,12 @@
 // with a working directory, optional model/effort overrides, and attachments.
 // A null override is intentional: the wrapper/engine keeps its own local default.
 /* oxlint-disable react/only-export-components */
-import { useEffect, useRef, useState, type ClipboardEvent } from "react";
+import {
+  lazy, Suspense, useEffect, useRef, useState, type ClipboardEvent,
+} from "react";
 import { Icon } from "../icons";
 import {
-  effortsFor, modelsFor, type Catalog, type Effort, type Model,
+  effortsFor, modelsFor, parseSlash, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
 import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
@@ -22,6 +24,13 @@ import {
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
+import {
+  autoCompactSelectionLabel,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+
+const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
 
 type Engine = "claude" | "codex";
 
@@ -136,6 +145,7 @@ interface Props {
   catalog?: Catalog;
   model?: string | null;
   effort?: string | null;
+  autoCompact?: AutoCompactSelection;
   defaultModel?: string | null;
   defaultEffort?: string | null;
   codexProfiles?: CodexProfileInfo[];
@@ -150,6 +160,7 @@ interface Props {
   onPickCwd: () => void;  // open the directory picker
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
+  onPickAutoCompact?: (selection: AutoCompactSelection) => void;
   onPickCodexProfile?: (profileId: string) => void;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onGetPermissionProfiles?: (cwd: string) => void;
@@ -240,10 +251,11 @@ function displayEffort(
 export function NewChatView({ cwd, controlScopeKey,
   space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
+  autoCompact = { mode: "inherit", thresholdTokens: null },
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, onPickCodexProfile,
+  onPickModel, onPickEffort, onPickAutoCompact, onPickCodexProfile,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -254,6 +266,8 @@ export function NewChatView({ cwd, controlScopeKey,
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] =
     useState<"models" | "efforts" | null>(null);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
+  const [autoCompactNotice, setAutoCompactNotice] = useState<string | null>(null);
   const [executionControls, setExecutionControls] =
     useState<NewChatExecutionControls>(
       () => defaultExecutionControls(controlScopeKey));
@@ -275,6 +289,8 @@ export function NewChatView({ cwd, controlScopeKey,
         : defaultExecutionControls(controlScopeKey)
     ));
     setPermissionsOpen(false);
+    setAutoCompactOpen(false);
+    setAutoCompactNotice(null);
   }, [controlScopeKey]);
 
   useEffect(() => {
@@ -401,6 +417,35 @@ export function NewChatView({ cwd, controlScopeKey,
   };
 
   const send = (value = taRef.current?.value ?? text) => {
+    const command = parseSlash(value.trim());
+    if (command?.slash === "autocompact") {
+      if (engine !== "claude") {
+        setAutoCompactNotice("自动压缩阈值仅适用于 Claude 会话。");
+        setText("");
+        return;
+      }
+      if (!command.args) {
+        setAutoCompactOpen(true);
+        setAutoCompactNotice(null);
+        setText("");
+        return;
+      }
+      const parsed = parseAutoCompactArgument(command.args);
+      if (!parsed.ok) {
+        setAutoCompactNotice(parsed.error);
+        return;
+      }
+      if (!onPickAutoCompact) {
+        setAutoCompactNotice("自动压缩设置当前不可用。");
+        return;
+      }
+      onPickAutoCompact(parsed.selection);
+      setAutoCompactNotice(
+        `已设置自动压缩：${autoCompactSelectionLabel(parsed.selection)}`,
+      );
+      setText("");
+      return;
+    }
     const composed = composePastePrompt(pastes, value.trim());
     if (!composed.ok) {
       window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
@@ -558,7 +603,10 @@ export function NewChatView({ cwd, controlScopeKey,
 
         <textarea className="newchat-input"
           placeholder={space === "work" ? "描述要完成的工作，或上传文档、表格、演示…" : "发条消息开始…"} ref={taRef}
-          value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste}
+          value={text} onChange={(e) => {
+            setText(e.target.value);
+            setAutoCompactNotice(null);
+          }} onPaste={onPaste}
           autoFocus={autoFocus} rows={3}
           disabled={creating || importing}
           onCompositionStart={() => imeSubmitRef.current.startComposition()}
@@ -618,7 +666,9 @@ export function NewChatView({ cwd, controlScopeKey,
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError
               ? `创建失败：${createError}`
-              : importing ? "正在导入附件…" : creating ? "正在创建会话…" : "Enter 发送"}</span>
+              : importing ? "正在导入附件…"
+                : creating ? "正在创建会话…"
+                  : autoCompactNotice ?? "Enter 发送"}</span>
             <button className="newchat-send"
               onPointerDown={() => {
                 if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
@@ -643,6 +693,30 @@ export function NewChatView({ cwd, controlScopeKey,
           setSheetKind(null);
         }}
       />
+      <>
+        <div className={"scrim" + (autoCompactOpen ? " show" : "")}
+          onClick={() => setAutoCompactOpen(false)} />
+        <div className={"sheet auto-compact-sheet"
+          + (autoCompactOpen ? " show" : "")}
+          role="dialog" aria-label="新会话自动压缩">
+          <div className="sheet-grip" />
+          <div className="sheet-title">新会话自动压缩</div>
+          <div className="sheet-scroll">
+            <Suspense fallback={
+              <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
+              <AutoCompactControl value={autoCompact}
+                newSession
+                disabled={creating || importing}
+                onChange={(selection) => {
+                  onPickAutoCompact?.(selection);
+                  setAutoCompactNotice(
+                    `已设置自动压缩：${autoCompactSelectionLabel(selection)}`,
+                  );
+                }} />
+            </Suspense>
+          </div>
+        </div>
+      </>
       <CommandSheet
         open={permissionsOpen}
         kind="perms"

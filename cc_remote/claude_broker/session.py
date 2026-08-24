@@ -59,6 +59,9 @@ _CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 _MODEL_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@\[\]-]*$")
 _EFFORT_VALUE_RE = re.compile(r"^(?:low|medium|high|xhigh|max)$")
+_AUTOCOMPACT_VALUE_RE = re.compile(r"^(?:auto|[0-9]{6,7})$")
+_MIN_AUTOCOMPACT_TOKENS = 100_000
+_MAX_AUTOCOMPACT_TOKENS = 1_000_000
 _PERMISSION_OUTPUT_PATTERNS = (
     ("bypassPermissions", re.compile(r"\bbypass permissions on\b", re.IGNORECASE)),
     ("acceptEdits", re.compile(r"\baccept edits on\b", re.IGNORECASE)),
@@ -122,7 +125,18 @@ def _arg_value(args: list[str], name: str) -> str | None:
     return None
 
 
-def _launch_controls(args: list[str]) -> tuple[str | None, str | None, str, bool]:
+def _valid_autocompact_value(value: object) -> str | None:
+    if not isinstance(value, str) or _AUTOCOMPACT_VALUE_RE.fullmatch(value) is None:
+        return None
+    if value == "auto":
+        return value
+    tokens = int(value)
+    return value if _MIN_AUTOCOMPACT_TOKENS <= tokens <= _MAX_AUTOCOMPACT_TOKENS else None
+
+
+def _launch_controls(
+    args: list[str],
+) -> tuple[str | None, str | None, str, bool, str | None]:
     model = _arg_value(args, "--model")
     effort = _arg_value(args, "--effort")
     permission = _arg_value(args, "--permission-mode") or "default"
@@ -132,7 +146,9 @@ def _launch_controls(args: list[str]) -> tuple[str | None, str | None, str, bool
     bypass_allowed = dangerous or "--allow-dangerously-skip-permissions" in args
     if dangerous:
         permission = _PERMISSION_BYPASS
-    return model, effort, permission, bypass_allowed
+    autocompact = _valid_autocompact_value(
+        _arg_value(args, "--autocompact"))
+    return model, effort, permission, bypass_allowed, autocompact
 
 
 def _plain_output(data: bytes) -> str:
@@ -184,6 +200,15 @@ def _parse_context_markdown(content: str) -> dict[str, object] | None:
     maximum = _token_count(usage_match.group(2))
     if total is None or maximum is None or maximum <= 0:
         return None
+    threshold_match = re.search(
+        r"\*\*(?:Auto[- ]?compact(?: threshold)?):\*\*\s*([^\s]+)",
+        content,
+        re.IGNORECASE,
+    )
+    auto_threshold = (
+        _token_count(threshold_match.group(1))
+        if threshold_match is not None else None
+    )
     categories: list[dict[str, object]] = []
     for match in re.finditer(
         r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*"
@@ -201,14 +226,18 @@ def _parse_context_markdown(content: str) -> dict[str, object] | None:
                 len(categories) % len(_CONTEXT_CATEGORY_COLORS)
             ],
         })
-    return {
+    report = {
         "totalTokens": total,
         "maxTokens": maximum,
         "percentage": float(usage_match.group(3)),
         "model": model_match.group(1),
-        "isAutoCompactEnabled": None,
+        "isAutoCompactEnabled": (
+            True if auto_threshold is not None else None),
         "categories": categories,
     }
+    if auto_threshold is not None:
+        report["autoCompactThreshold"] = auto_threshold
+    return report
 
 
 def _model_from_command_stdout(content: str) -> str | None:
@@ -370,6 +399,7 @@ class PTYSession:
         effort: str | None,
         permission_mode: str,
         bypass_allowed: bool,
+        auto_compact: str | None,
     ):
         self.id = session_id
         self.process = process
@@ -407,6 +437,7 @@ class PTYSession:
         self.effort = effort
         self.permission_mode = permission_mode
         self.bypass_allowed = bypass_allowed
+        self.auto_compact = auto_compact
         self._control_lock = asyncio.Lock()
         self._control_in_progress = False
         self._native_pending_control: tuple[str, str] | None = None
@@ -430,7 +461,8 @@ class PTYSession:
         on_change: Callable[[], int],
         on_control_change: Callable[[str, str, str], None] | None = None,
     ) -> "PTYSession":
-        model, effort, permission_mode, bypass_allowed = _launch_controls(args)
+        (model, effort, permission_mode, bypass_allowed,
+         auto_compact) = _launch_controls(args)
         master_fd, slave_fd = os.openpty()
         try:
             # Claude starts before a client necessarily attaches.  Give its TUI
@@ -478,6 +510,7 @@ class PTYSession:
             effort=effort,
             permission_mode=permission_mode,
             bypass_allowed=bypass_allowed,
+            auto_compact=auto_compact,
         )
 
     def start(self) -> None:
@@ -518,6 +551,7 @@ class PTYSession:
             "effort": self.effort,
             "permission_mode": self.permission_mode,
             "bypass_allowed": self.bypass_allowed,
+            "auto_compact": self.auto_compact,
         }
 
     @property
@@ -1529,6 +1563,7 @@ class SessionManager:
     def set_preferences(
         self, session_id: object, *, model: object = None,
         effort: object = None, permission_mode: object = None,
+        auto_compact: object = None,
     ) -> dict[str, str]:
         checked = validate_resume_id(session_id)
         values: dict[str, str | None] = {}
@@ -1550,6 +1585,15 @@ class SessionManager:
             if value not in {*_PERMISSION_BASE_CYCLE, _PERMISSION_BYPASS, _PERMISSION_AUTO}:
                 raise SessionError("bad_control", "unsupported permission mode")
             values["permission_mode"] = value
+        if auto_compact is not None:
+            if auto_compact == "inherit":
+                values["auto_compact"] = None
+            else:
+                value = _valid_autocompact_value(auto_compact)
+                if value is None:
+                    raise SessionError(
+                        "bad_control", "unsupported autocompact value")
+                values["auto_compact"] = value
         running = self.sessions.get(checked)
         if running is not None and running.running:
             live = running.metadata()
@@ -1614,6 +1658,10 @@ class SessionManager:
                     and isinstance(stored_effort, str)
                     and _EFFORT_VALUE_RE.fullmatch(stored_effort)):
                 extra_args.extend(["--effort", stored_effort])
+            stored_auto_compact = stored.get("auto_compact")
+            if (_arg_value(extra_args, "--autocompact") is None
+                    and _valid_autocompact_value(stored_auto_compact) is not None):
+                extra_args.extend(["--autocompact", stored_auto_compact])
             if (not any(flag in extra_args for flag in (
                     "--dangerously-skip-permissions",
                     "--allow-dangerously-skip-permissions"))

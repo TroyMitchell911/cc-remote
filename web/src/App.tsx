@@ -42,7 +42,6 @@ import {
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { StatusSheet } from "./components/StatusSheet";
 import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
@@ -70,6 +69,7 @@ import {
 } from "./scoped-goal-ui";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor, type Catalog } from "./data";
+import type { AutoCompactSelection } from "./auto-compact";
 import {
   normalizeSessionList,
   scopedFocusForSessionList,
@@ -171,6 +171,7 @@ import {
 import {
   acceptsCachedNewerPage,
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
   prependOlderPage,
   type HistoryBrowsePage,
@@ -242,6 +243,9 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
+const StatusSheet = lazy(() => import("./components/StatusSheet").then(
+  ({ StatusSheet: Sheet }) => ({ default: Sheet }),
 ));
 const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
   ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
@@ -3321,10 +3325,12 @@ export default function App() {
         sid, rt.turns, live, revision,
         wsRef.current?.generationFor(sid),
         rt.control,
+        rt.historyHeadKnown && !rt.hasMore && !rt.historyInvalidated,
       );
     });
   }, [
     focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control,
+    rt.historyHeadKnown, rt.hasMore, rt.historyInvalidated,
     state.historyRecovery,
   ]);
 
@@ -3352,7 +3358,8 @@ export default function App() {
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
           && !historyInvalidationsRef.current.has(sid)
           && cached && Array.isArray(cached.turns)
-          && (cached.turns.length || cached.control);
+          && (cached.turns.length || cached.control
+            || cached.historyAtStart === true);
       if (valid && cached) {
         dispatch({
           type: "hydrate_cache", sid,
@@ -3362,6 +3369,7 @@ export default function App() {
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
+          historyAtStart: cached.historyAtStart === true,
         });
       }
     });
@@ -3941,6 +3949,14 @@ export default function App() {
       pageKey: browse.newerPageKey,
       anchorTurnId: anchorTurnId ?? null,
     };
+    const latestPageKey = `${HISTORY_LATEST_PAGE_KEY}:${frozen.viewId}`;
+    // The synthetic latest page is written to IndexedDB asynchronously. A
+    // quick down-swipe can reach it before that write completes; its stable
+    // page key is already sufficient to return to the authoritative live tail.
+    if (cachedLatestRequiresLiveRuntime(browse, null, latestPageKey)) {
+      dispatch({ type: "return_to_latest", sid: frozen.sid });
+      return true;
+    }
     void (async () => {
       const page = await historyPageCacheRef.current.getPage(
         scope, frozen.pageKey);
@@ -3949,17 +3965,12 @@ export default function App() {
       if (currentState.focusedSid !== frozen.sid
           || !current
           || !acceptsCachedNewerPage(current, frozen)) return;
-      if (page?.isLatest && current.latestDirty) {
-        dispatch({
-          type: "history_browse_newer_settled",
-          sid: frozen.sid,
-          scopeKey: frozen.scopeKey,
-          revision: frozen.revision,
-          generation: frozen.generation,
-          viewId: frozen.viewId,
-          windowEpoch: frozen.windowEpoch,
-          pageKey: frozen.pageKey,
-        });
+      if (cachedLatestRequiresLiveRuntime(current, page, latestPageKey)) {
+        // loadNewerHistoryPage is accepted only from a real downward gesture.
+        // The cached latest page became stale while Claude was still writing,
+        // so honor that gesture by returning to the authoritative live tail—the
+        // same destination as the explicit bottom button.
+        dispatch({ type: "return_to_latest", sid: frozen.sid });
         return;
       }
       if (!page) {
@@ -4030,7 +4041,10 @@ export default function App() {
         || restoringSurfaceScope === activeScopeKey) {
       return false;
     }
-    const { cwd, cwdSource, model, effort } = state.newChat;
+    const {
+      cwd, cwdSource, model, effort,
+      autoCompactMode, autoCompactThresholdTokens,
+    } = state.newChat;
     // Null is meaningful: let the local CLI/app-server use its configured defaults.
     // Only explicit user choices cross the wire; otherwise a stale fallback catalog
     // could silently override the machine's real model or reasoning configuration.
@@ -4050,7 +4064,11 @@ export default function App() {
         : undefined,
       engine === "codex" ? serviceTier : undefined,
       space, space === "work" ? activeWorkProjectId : undefined,
-      engine === "codex" ? newChatCodexProfileId : undefined);
+      engine === "codex" ? newChatCodexProfileId : undefined,
+      engine === "claude" ? {
+        mode: autoCompactMode,
+        thresholdTokens: autoCompactThresholdTokens,
+      } : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -4088,6 +4106,14 @@ export default function App() {
     if (!state.newChat) return;
     dispatch({ type: "set_new_chat_effort", effort });
   };
+  const pickNewChatAutoCompact = (selection: AutoCompactSelection) => {
+    if (!state.newChat || engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_auto_compact",
+      mode: selection.mode,
+      thresholdTokens: selection.thresholdTokens,
+    });
+  };
   const pickNewChatCodexProfile = (profileId: string) => {
     if (engine !== "codex") return;
     setNewChatPermissionCatalog(null);
@@ -4104,6 +4130,10 @@ export default function App() {
   const setEffort = (effort: string) => {
     wsRef.current?.sendSetEffort(effort);
   };
+  const setAutoCompact = (selection: AutoCompactSelection): boolean => (
+    wsRef.current?.sendSetAutoCompact(
+      selection.mode, selection.thresholdTokens) ?? false
+  );
   // Codex Fast mode is persisted by app-server per thread. The runtime's Fast
   // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
@@ -4461,6 +4491,12 @@ export default function App() {
   const setBtwEffort = (sid: string, effort: string) => {
     wsRef.current?.sendSetEffortTo(sid, effort);
   };
+  const setBtwAutoCompact = (
+    sid: string, selection: AutoCompactSelection,
+  ): boolean => (
+    wsRef.current?.sendSetAutoCompactTo(
+      sid, selection.mode, selection.thresholdTokens) ?? false
+  );
   const setBtwSendMode = (
     sid: string, mode: SendMode,
   ) => {
@@ -4583,13 +4619,17 @@ export default function App() {
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
+  const runtimeActiveOwnerId = displayActiveTurnOwnerId(
+    rt.liveOwner?.turnId, rt.acceptancePending);
+  const displayActiveOwnerId = historyView.recovering
+    ? historyView.activeOwnerId : runtimeActiveOwnerId;
+  const runtimeHasActiveTurn = rt.state !== "idle" || rt.mirroredRunning
+    || !!rt.acceptancePending;
   const activeTurnCandidates = activeTurnCandidateIds(
     historyView.turns,
-    displayActiveTurnOwnerId(
-      rt.liveOwner?.turnId, rt.acceptancePending),
-    !historyView.browsing && !historyView.recovering
-      && (rt.state !== "idle" || rt.mirroredRunning
-        || !!rt.acceptancePending),
+    displayActiveOwnerId,
+    !historyView.browsing && runtimeHasActiveTurn
+      && (!historyView.recovering || !!historyView.activeOwnerId),
   );
   const activeTurnId = activeTurnCandidates.length === 1
     ? activeTurnCandidates[0] : null;
@@ -4774,6 +4814,10 @@ export default function App() {
             catalog={newChatCatalog}
             model={state.newChat.model}
             effort={state.newChat.effort}
+            autoCompact={{
+              mode: state.newChat.autoCompactMode,
+              thresholdTokens: state.newChat.autoCompactThresholdTokens,
+            }}
             defaultModel={newChatDefaults.model}
             defaultEffort={newChatDefaults.effort}
             codexProfiles={state.codexProfiles}
@@ -4786,6 +4830,7 @@ export default function App() {
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
+            onPickAutoCompact={pickNewChatAutoCompact}
             onPickCodexProfile={pickNewChatCodexProfile}
             permissionProfiles={
               newChatPermissionCatalog?.machineId === machineId
@@ -4932,6 +4977,7 @@ export default function App() {
           replaceQueueCapacity={replaceQueueCapacity}
           model={rt.model}
           effort={rt.effort}
+          autoCompact={rt.autoCompact}
           perm={rt.perm}
           permissionProfile={rt.permissionProfile}
           permissionProfiles={rt.permissionProfiles}
@@ -4962,6 +5008,7 @@ export default function App() {
           }}
           onSetModel={setModel}
           onSetEffort={setEffort}
+          onSetAutoCompact={setAutoCompact}
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
           onGetPermissionProfiles={getPermissionProfiles}
@@ -5084,6 +5131,8 @@ export default function App() {
             onSetEffort={(effort) => {
               if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
             }}
+            onSetAutoCompact={(selection) => activeBtwSid
+              ? setBtwAutoCompact(activeBtwSid, selection) : false}
             onOpenFile={previewBtwFile} onClose={closeBtw}
             imageAssets={btwInlineImageAssets}
             onLoadImage={loadBtwMessageImage}
@@ -5141,14 +5190,19 @@ export default function App() {
           }}
         />
       )}
-      <StatusSheet open={shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)} report={rt.statusReport}
-        notices={rt.notices}
-        error={rt.statusError}
-        onClose={() => setStatusOpenSid(null)}
-        onRefresh={openStatus}
-        onDismissNotice={(noticeId) => {
-          if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
-        }} />
+      {shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)
+        && <Suspense fallback={null}>
+          <StatusSheet open report={rt.statusReport}
+            notices={rt.notices}
+            error={rt.statusError}
+            onClose={() => setStatusOpenSid(null)}
+            onRefresh={openStatus}
+            onDismissNotice={(noticeId) => {
+              if (focusedSid) dispatch({
+                type: "dismiss_notice", sid: focusedSid, noticeId,
+              });
+            }} />
+        </Suspense>}
       {usageActivityOpen && engine === "codex" && <Suspense fallback={null}>
         <UsageActivitySheet
           open

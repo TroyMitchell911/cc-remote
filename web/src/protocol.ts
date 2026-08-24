@@ -13,6 +13,7 @@ export type ProcessStatus = "pending" | "running" | "succeeded" | "failed" | "de
 export type ProcessAppendTarget = "summary" | "detail" | "output" | "diff" | "progress";
 export type CodexThreadStatus = "notLoaded" | "idle" | "systemError" | "active";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type AutoCompactMode = "inherit" | "auto" | "custom";
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "never" | "on-request" | "untrusted";
 export type CollaborationModeName = "default" | "plan";
 export type ControlMode = "remote" | "codex_shared" | "claude_broker" | "external_cli" | "agent_view" | "desktop";
@@ -102,6 +103,11 @@ export interface SessionControl extends Base {
 }
 export interface SetModel extends Base { type: "set_model"; model: string }
 export interface SetEffort extends Base { type: "set_effort"; effort: EffortLevel }
+export interface SetAutoCompact extends Base {
+  type: "set_auto_compact";
+  mode: AutoCompactMode;
+  threshold_tokens?: number | null;
+}
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: ServiceTier }
 export interface SetCollaborationMode extends Base { type: "set_collaboration_mode"; mode: CollaborationModeName }
 export interface Ping extends Base { type: "ping"; n: number }
@@ -119,6 +125,16 @@ export interface StateEvent extends Base {
 }
 export interface Model extends Base { type: "model"; model: string }
 export interface Effort extends Base { type: "effort"; effort: string }
+export interface AutoCompact extends Base {
+  type: "auto_compact";
+  mode: AutoCompactMode;
+  threshold_tokens?: number | null;
+  applied_mode?: AutoCompactMode | null;
+  applied_threshold_tokens?: number | null;
+  pending: boolean;
+  mutable: boolean;
+  error?: string | null;
+}
 export interface Fast extends Base { type: "fast"; on: boolean }
 export interface CollaborationMode extends Base { type: "collaboration_mode"; mode: CollaborationModeName }
 export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
@@ -279,6 +295,8 @@ export interface NewSession extends Base {
   project_id?: string | null;
   model?: string | null;
   effort?: string | null;
+  auto_compact_mode?: AutoCompactMode | null;
+  auto_compact_threshold_tokens?: number | null;
   collaboration_mode?: CollaborationModeName | null;
   permission_mode?: CodexPermissionMode | null;
   permission_profile?: CodexPermissionProfileId | null;
@@ -571,11 +589,13 @@ export interface ContextReport extends Base {
   session_percentage?: number | null;
   model?: string | null;
   is_auto_compact_enabled?: boolean | null;
+  auto_compact_threshold_tokens?: number | null;
+  raw_max_tokens?: number | null;
   categories: ContextCategory[];
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
@@ -583,7 +603,9 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 37;
+export const PROTOCOL_VERSION = 38;
+export const MIN_AUTO_COMPACT_TOKENS = 100_000;
+export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

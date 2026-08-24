@@ -28,7 +28,7 @@ import {
 } from "../composer-submit";
 import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import {
-  effortNameForDisplay, modelsFor, type Catalog,
+  effortNameForDisplay, modelsFor, parseSlash, type Catalog,
 } from "../data";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import type { InlineImageAsset } from "../inline-image-assets";
@@ -44,6 +44,12 @@ import {
   displayActiveTurnOwnerId,
 } from "../process-blocks";
 import { PanelResizer } from "./PanelResizer";
+import {
+  autoCompactSelectionLabel,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+import { AutoCompactControl } from "./AutoCompactControl";
 
 interface Props {
   sid?: string;
@@ -72,6 +78,7 @@ interface Props {
   onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
+  onSetAutoCompact: (selection: AutoCompactSelection) => boolean;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
@@ -95,6 +102,7 @@ export function BtwPanel(p: Props) {
     () => p.draftStore.get(p.draftKey));
   const [sheetKind, setSheetKind] =
     useState<"models" | "efforts" | null>(null);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -150,6 +158,7 @@ export function BtwPanel(p: Props) {
     draftKeyRef.current = p.draftKey;
     setDraft(p.draftStore.get(p.draftKey));
     setSheetKind(null);
+    setAutoCompactOpen(false);
     setNotice(null);
     if (noticeTimerRef.current !== null) {
       window.clearTimeout(noticeTimerRef.current);
@@ -193,6 +202,37 @@ export function BtwPanel(p: Props) {
 
   const submit = (value = taRef.current?.value ?? input) => {
     if (p.opening || !p.sid) return;
+    const command = parseSlash(value.trim());
+    if (command?.slash === "autocompact") {
+      if (p.engine === "codex") {
+        flash("自动压缩阈值仅适用于 Claude 会话。");
+        setInput("");
+        resetTaHeight();
+        return;
+      }
+      if (!command.args) {
+        setAutoCompactOpen(true);
+        setInput("");
+        resetTaHeight();
+        return;
+      }
+      const parsed = parseAutoCompactArgument(command.args);
+      if (!parsed.ok) {
+        flash(parsed.error);
+        return;
+      }
+      if (p.rt?.autoCompact && !p.rt.autoCompact.mutable) {
+        flash("本机 Claude TUI 正在控制此会话，请在终端启动时设置。");
+        return;
+      }
+      const queued = p.onSetAutoCompact(parsed.selection);
+      flash(queued
+        ? `正在应用自动压缩设置：${autoCompactSelectionLabel(parsed.selection)}`
+        : "自动压缩设置暂未发送，请稍后重试。");
+      setInput("");
+      resetTaHeight();
+      return;
+    }
     const composed = composePastePrompt(draft.pastes, value.trim());
     if (!composed.ok) {
       flash(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
@@ -437,6 +477,29 @@ export function BtwPanel(p: Props) {
           setSheetKind(null);
         }}
       />
+      <>
+        <div className={"scrim" + (autoCompactOpen ? " show" : "")}
+          onClick={() => setAutoCompactOpen(false)} />
+        <div className={"sheet auto-compact-sheet"
+          + (autoCompactOpen ? " show" : "")}
+          role="dialog" aria-label="BTW 自动压缩">
+          <div className="sheet-grip" />
+          <div className="sheet-title">BTW 自动压缩</div>
+          <div className="sheet-scroll">
+            <AutoCompactControl value={{
+              mode: p.rt?.autoCompact?.mode ?? "inherit",
+              thresholdTokens:
+                p.rt?.autoCompact?.threshold_tokens ?? null,
+            }} state={p.rt?.autoCompact}
+              disabled={!p.sid}
+              onChange={(selection) => {
+                if (!p.onSetAutoCompact(selection)) {
+                  flash("自动压缩设置暂未发送，请稍后重试。");
+                }
+              }} />
+          </div>
+        </div>
+      </>
     </div>
   );
 }

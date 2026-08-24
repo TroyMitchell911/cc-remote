@@ -5806,7 +5806,9 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
         types = [msg.type for msg in tr.sent]
         assert types == [
             "snapshot", "query_queue", "completion_state", "perm",
+            "auto_compact",
             "snapshot", "query_queue", "completion_state", "perm",
+            "auto_compact",
         ]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
@@ -5831,7 +5833,7 @@ def test_hello_with_cursor_replays_only_missing_tail():
 
         assert [msg.type for msg in tr.sent] == [
             "replay_start", "user_msg", "replay_end", "session_control",
-            "query_queue", "completion_state", "perm"]
+            "query_queue", "completion_state", "perm", "auto_compact"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -5857,7 +5859,7 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 
         assert [msg.type for msg in tr.sent] == [
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
-            "query_queue", "completion_state", "perm"]
+            "query_queue", "completion_state", "perm", "auto_compact"]
         assert tr.sent[2].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -7139,6 +7141,62 @@ def test_task_notification_history_is_structured_only_with_raw_origin_evidence(
     )], 10_000, internal_user_events=metadata)
     assert next(event for event in visible if isinstance(event, UserMsg)).prompt \
         == notification
+
+
+def test_background_bash_notification_stays_an_ordinary_background_task(
+        monkeypatch, tmp_path):
+    notification = """<task-notification>
+<task-id>bash-task-1</task-id>
+<tool-use-id>call-bash-1</tool-use-id>
+<status>completed</status>
+<summary>Background command completed</summary>
+</task-notification>"""
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "content": notification},
+        {"type": "assistant", "uuid": "assistant-row",
+         "message": {"role": "assistant", "content": [{
+             "type": "tool_use", "id": "call-bash-1", "name": "Bash",
+             "input": {"command": "make check", "run_in_background": True},
+         }]}},
+        {"type": "user", "uuid": "notification-row",
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": notification}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path", lambda _sid: str(path))
+
+    metadata = transcript_internal_user_events("session")
+    assert metadata["notification-row"].kind == "task"
+    messages = [
+        SimpleNamespace(
+            uuid="human-turn", type="user",
+            message={"role": "user", "content": "run checks"}),
+        SimpleNamespace(
+            uuid="assistant-row", type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-bash-1", "name": "Bash",
+                "input": {"command": "make check", "run_in_background": True},
+            }]}),
+        SimpleNamespace(
+            uuid="notification-row", type="user",
+            message={"role": "user", "content": notification}),
+    ]
+    events = translate_history(
+        messages, 10_000, internal_user_events=metadata)
+    process = next(
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "bash-task-1")
+    assert process.kind == "task"
+    assert process.parent_id == "call-bash-1"
+    assert process.title == "后台任务"
+    assert process.summary == "Background command completed"
+    assert process.background is True
+    assert not any(
+        isinstance(event, ProcessEvent) and event.kind == "agent"
+        for event in events)
 
 
 def test_history_hides_cancelled_command_placeholders_without_hiding_real_text():

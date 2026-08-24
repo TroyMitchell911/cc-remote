@@ -520,6 +520,9 @@ export interface CachedSession {
   revision: string;
   generation?: string;
   control?: SessionControl | null;
+  /** Paint-only proof that the saved projection reached the first turn.
+   * It never carries or authorizes a pagination cursor. */
+  historyAtStart?: boolean;
   savedAt: number;
 }
 
@@ -648,6 +651,7 @@ const pending = new Map<string, {
   sid: string; turns: unknown[]; lastSeq: number; revision: string;
   generation?: string;
   control?: SessionControl | null;
+  historyAtStart?: boolean;
   epoch: number;
 }>();
 // A destructive history mutation must invalidate both the committed IDB row
@@ -669,6 +673,7 @@ function sessionEpoch(sessionId: string): number {
 export function saveSession(
   sessionId: string, turns: unknown[], lastSeq: number, revision: string,
   generation?: string, control?: SessionControl | null,
+  historyAtStart?: boolean,
 ): void {
   if (typeof indexedDB === "undefined" || !sessionId || !revision) return;
   if (invalidatedSessions.has(sessionId)) return;
@@ -683,6 +688,7 @@ export function saveSession(
     revision,
     generation,
     control: controlForCachedSession(sessionId, control),
+    historyAtStart: historyAtStart === true,
     epoch: sessionEpoch(sessionId),
   });
   if (saveTimer) return;
@@ -711,6 +717,11 @@ async function flush(): Promise<void> {
           { v: CACHE_VER, turns, lastSeq: job.lastSeq,
             revision: job.revision, generation: job.generation,
             control: job.control,
+            // If cache bounding dropped an older row, this projection no
+            // longer proves the conversation start even when the live runtime
+            // had loaded it before saving.
+            historyAtStart: job.historyAtStart === true
+              && turns.length === job.turns.length,
             savedAt: Date.now() }, job.sid);
       }
       tx.oncomplete = () => resolve();

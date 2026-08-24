@@ -25,6 +25,7 @@ import {
   displayActiveTurnOwnerId,
   exactActiveTurnId,
 } from "../src/process-blocks.ts";
+import { displayHistoryProjection } from "../src/history-recovery.ts";
 
 const blockIdentity = (block: Block): string => block.kind === "text"
   ? block.message_id
@@ -111,6 +112,61 @@ assert.equal(
     ? settledCachedProcess.detailProjection.blocks[0].status : null,
   "succeeded",
   "a stale cached child cannot restart the working spark after refresh",
+);
+
+const repairedCachedBackgroundTask = restoreCachedTurnDetails([{
+  id: "cached-background-summary", prompt: "run checks", done: true,
+  processDetailState: "present", detailEventCount: 2,
+  detailLoaded: false, blocks: [],
+}], [{
+  id: "cached-background-summary", prompt: "run checks", done: true,
+  processDetailState: "present", blocks: [{
+    kind: "tool", message_id: "cached-bash-message",
+    tool_use_id: "cached-bash", tool: "Bash", category: "command",
+    input: { command: "make check", run_in_background: true }, done: true,
+  }, {
+    kind: "process", item_id: "agent:cached-bash",
+    processKind: "agent", phase: "end", status: "succeeded",
+    parent_id: "cached-bash", title: "协作代理", background: true,
+    done: true,
+  }],
+}], "idle")[0];
+const repairedCachedTask = repairedCachedBackgroundTask.detailProjection
+  ?.blocks.find((block) => block.kind === "process");
+assert.equal(
+  repairedCachedTask?.kind === "process"
+    ? repairedCachedTask.processKind : null,
+  "task",
+  "an old background Bash cache cannot retain a fake clickable Agent card",
+);
+assert.equal(
+  repairedCachedTask?.kind === "process" ? repairedCachedTask.title : null,
+  "后台任务",
+);
+
+const preservedCachedAgent = restoreCachedTurnDetails([{
+  id: "cached-agent-summary", prompt: "delegate", done: true,
+  processDetailState: "present", detailEventCount: 2,
+  detailLoaded: false, blocks: [],
+}], [{
+  id: "cached-agent-summary", prompt: "delegate", done: true,
+  processDetailState: "present", blocks: [{
+    kind: "tool", message_id: "cached-agent-message",
+    tool_use_id: "cached-agent", tool: "Agent", category: "agent",
+    input: {}, done: true,
+  }, {
+    kind: "process", item_id: "agent:cached-agent",
+    processKind: "agent", phase: "end", status: "succeeded",
+    parent_id: "cached-agent", title: "真实代理", background: true,
+    done: true,
+  }],
+}], "idle")[0];
+assert.equal(
+  preservedCachedAgent.detailProjection?.blocks.find(
+    (block) => block.kind === "process",
+  )?.processKind,
+  "agent",
+  "targeted cache repair must preserve genuine Agent cards",
 );
 
 const cachedNeutralSteerPlan = restoreCachedTurnDetails([{
@@ -811,6 +867,300 @@ try {
       "compact-gap-external"]), false,
   "external ownership cannot inherit a browser-only pending binding");
 
+  // Production ordering differs from the compact-gap fixture above: a browser
+  // can submit and bind its optimistic row first, then reconnect after the
+  // compact burst has already pushed that owner out of the bounded replay
+  // suffix. ReplayStart must move canonical history aside without deleting the
+  // one exact connection-local owner. Otherwise the suffix creates a promptless
+  // row, refocus restores the source row beside it, and activity has either zero
+  // or two display candidates.
+  const submittedGapSid = "submitted-turn-survives-later-compact-gap";
+  const submittedGapOtherSid = "submitted-turn-gap-other-session";
+  const submittedGapMessage = "submitted-gap-browser-message";
+  const submittedGapNativeTurn = "submitted-gap-native-turn";
+  const submittedGapContinuation = "submitted-gap-continuation-turn";
+  const submittedGapPrompt = "我说的是右边这个盒子。";
+  const submittedGapAnswer = "右边盒子的修复已经继续处理。";
+  const submittedGapGeneration = "submitted-gap-generation";
+  const submittedGapRevision = "submitted-gap-revision";
+  const submittedGapBase = createRuntime();
+  Object.assign(submittedGapBase, {
+    state: "idle",
+    syncReady: true,
+    turns: [{
+      id: "submitted-gap-previous", prompt: "上一轮", blocks: [],
+      done: true, ts: 1_000, doneTs: 2_000,
+    }],
+    hasMore: true,
+    oldestId: "submitted-gap-previous",
+    historyRevision: submittedGapRevision,
+    historyGeneration: submittedGapGeneration,
+    controlGeneration: submittedGapGeneration,
+    historyBuildSeq: 7,
+    historyLiveSeq: 99,
+    historyNewestId: "submitted-gap-previous",
+  });
+  let submittedGapState = {
+    ...initialState,
+    focusedSid: submittedGapSid,
+    sessions: [{
+      session_id: submittedGapSid,
+      engine: "codex" as const,
+      space: "code" as const,
+    }, {
+      session_id: submittedGapOtherSid,
+      engine: "codex" as const,
+      space: "code" as const,
+    }],
+    runtimes: {
+      [submittedGapSid]: submittedGapBase,
+      [submittedGapOtherSid]: createRuntime(),
+    },
+  };
+  submittedGapState = reduce(submittedGapState, {
+    type: "query_sent", sid: submittedGapSid,
+    msg_id: submittedGapMessage, prompt: submittedGapPrompt, ts: 10_000,
+  });
+  for (const frame of [
+    event({ type: "state", sid: submittedGapSid, seq: 100,
+      state: "running" }),
+    event({ type: "turn_binding", sid: submittedGapSid, seq: 101,
+      msg_id: submittedGapMessage, turn_id: submittedGapNativeTurn }),
+  ]) {
+    submittedGapState = reduce(submittedGapState, {
+      type: "event", event: frame,
+    });
+  }
+  const submittedGapBeforeReplay = submittedGapState;
+  const preexistingRecoveryDuplicate = reduce({
+    ...submittedGapBeforeReplay,
+    historyRecovery: {
+      sid: submittedGapSid,
+      turns: [{
+        id: "submitted-gap-frozen-history-row",
+        clientMsgId: submittedGapMessage,
+        prompt: submittedGapPrompt,
+        blocks: [], done: false, ts: 10_000,
+      }],
+      activeOwnerId: null,
+      hasMore: true,
+      oldestId: "submitted-gap-previous",
+      viewRevision: submittedGapRevision,
+      expectedGeneration: submittedGapGeneration,
+      candidateBuildSeq: 7,
+      acceptedRevision: null,
+    },
+  }, {
+    type: "event", event: event({
+      type: "replay_start", sid: submittedGapSid,
+      generation: submittedGapGeneration,
+      from_seq: 102, to_seq: 106, truncated: true, rebuild: false,
+    }),
+  });
+  const reconciledRecoveryView = displayHistoryProjection(
+    preexistingRecoveryDuplicate.historyRecovery,
+    submittedGapSid,
+    preexistingRecoveryDuplicate.runtimes[submittedGapSid],
+  );
+  assert.equal(reconciledRecoveryView.turns.filter((turn: Turn) =>
+    turn.prompt === submittedGapPrompt).length, 1,
+  "a repeated replay envelope collapses canonical and optimistic recovery rows");
+  assert.equal(activeTurnCandidateIds(
+    reconciledRecoveryView.turns,
+    reconciledRecoveryView.activeOwnerId,
+    true,
+  ).length, 1,
+  "a reconciled recovery duplicate exposes one spark candidate");
+  submittedGapState = reduce(submittedGapState, {
+    type: "event", event: event({
+      type: "replay_start", sid: submittedGapSid,
+      generation: submittedGapGeneration,
+      from_seq: 102, to_seq: 106, truncated: true, rebuild: false,
+    }),
+  });
+  assert.equal(
+    submittedGapState.runtimes[submittedGapSid].turns.filter(
+      (turn: Turn) => turn.id === submittedGapMessage
+        && turn.prompt === submittedGapPrompt).length,
+    1,
+    "a later replay gap must not erase the already-bound optimistic question",
+  );
+  const submittedGapAfterReplay =
+    submittedGapState.runtimes[submittedGapSid];
+  assert.deepEqual(activeTurnCandidateIds(
+    submittedGapAfterReplay.turns,
+    displayActiveTurnOwnerId(
+      submittedGapAfterReplay.liveOwner?.turnId,
+      submittedGapAfterReplay.acceptancePending,
+    ),
+    submittedGapAfterReplay.state !== "idle"
+      || !!submittedGapAfterReplay.acceptancePending,
+  ), [submittedGapMessage],
+  "replay recovery must keep the submitted row as the sole running spark owner");
+  const submittedRecoveryView = displayHistoryProjection(
+    submittedGapState.historyRecovery,
+    submittedGapSid,
+    submittedGapAfterReplay,
+    submittedGapState.historyBrowse,
+    submittedGapState.retainedHistoryBrowse,
+  );
+  assert.equal(submittedRecoveryView.turns.filter((turn: Turn) =>
+    turn.prompt === submittedGapPrompt).length, 1,
+  "the frozen recovery view must keep exactly one copy of the submitted question");
+  assert.deepEqual(activeTurnCandidateIds(
+    submittedRecoveryView.turns,
+    submittedRecoveryView.activeOwnerId,
+    submittedRecoveryView.recovering
+      && submittedGapAfterReplay.state !== "idle",
+  ), [submittedGapMessage],
+  "the visible recovery projection keeps the exact running spark owner");
+
+  let refocusedDuringRecovery = reduce(submittedGapState, {
+    type: "focus_session", sid: submittedGapOtherSid,
+  });
+  refocusedDuringRecovery = reduce(refocusedDuringRecovery, {
+    type: "focus_session", sid: submittedGapSid,
+  });
+  const refocusedDuringRuntime =
+    refocusedDuringRecovery.runtimes[submittedGapSid];
+  const refocusedDuringView = displayHistoryProjection(
+    refocusedDuringRecovery.historyRecovery,
+    submittedGapSid,
+    refocusedDuringRuntime,
+    refocusedDuringRecovery.historyBrowse,
+    refocusedDuringRecovery.retainedHistoryBrowse,
+  );
+  assert.equal(refocusedDuringView.turns.filter((turn: Turn) =>
+    turn.prompt === submittedGapPrompt).length, 1,
+  "switching away and back mid-recovery cannot duplicate the question");
+  assert.deepEqual(activeTurnCandidateIds(
+    refocusedDuringView.turns,
+    displayActiveTurnOwnerId(
+      refocusedDuringRuntime.liveOwner?.turnId,
+      refocusedDuringRuntime.acceptancePending,
+    ),
+    refocusedDuringRuntime.state !== "idle"
+      || !!refocusedDuringRuntime.acceptancePending,
+  ), [submittedGapMessage],
+  "switching away and back mid-recovery keeps one visible spark owner");
+  const crossGenerationGap = reduce(submittedGapBeforeReplay, {
+    type: "event", event: event({
+      type: "replay_start", sid: submittedGapSid,
+      generation: "submitted-gap-replacement-generation",
+      from_seq: 1, to_seq: 2, truncated: true, rebuild: false,
+    }),
+  }).runtimes[submittedGapSid];
+  assert.equal(crossGenerationGap.turns.some((turn: Turn) =>
+    turn.id === submittedGapMessage), false,
+  "a different wrapper generation cannot inherit the old local owner");
+  const rebuiltSubmittedGap = reduce(submittedGapBeforeReplay, {
+    type: "event", event: event({
+      type: "replay_start", sid: submittedGapSid,
+      generation: submittedGapGeneration,
+      from_seq: 1, to_seq: 2, truncated: false, rebuild: true,
+    }),
+  }).runtimes[submittedGapSid];
+  assert.equal(rebuiltSubmittedGap.turns.some((turn: Turn) =>
+    turn.id === submittedGapMessage), false,
+  "a wrapper rebuild still reconstructs narrative solely from source");
+  for (const frame of [
+    event({ type: "process", sid: submittedGapSid, seq: 102,
+      item_id: "submitted-gap-compaction", kind: "compaction", phase: "end",
+      status: "succeeded", turn_id: submittedGapContinuation,
+      title: "压缩上下文" }),
+    event({ type: "assistant_msg_start", sid: submittedGapSid, seq: 103,
+      message_id: "submitted-gap-live-answer", channel: "final" }),
+    event({ type: "delta", sid: submittedGapSid, seq: 104,
+      message_id: "submitted-gap-live-answer", channel: "final",
+      text: submittedGapAnswer }),
+    event({ type: "assistant_msg_end", sid: submittedGapSid, seq: 105,
+      message_id: "submitted-gap-live-answer", channel: "final" }),
+    event({ type: "replay_end", sid: submittedGapSid, to_seq: 105,
+      truncated: true }),
+  ]) {
+    submittedGapState = reduce(submittedGapState, {
+      type: "event", event: frame,
+    });
+  }
+  const submittedLaggingHistory = (buildSeq: number): History => event({
+    type: "history", sid: submittedGapSid, session_id: submittedGapSid,
+    revision: submittedGapRevision, generation: submittedGapGeneration,
+    build_seq: buildSeq, live_seq: 105, authoritative: true,
+    in_progress: true, external: false, has_more: true,
+    oldest_id: "submitted-gap-previous",
+    newest_id: "submitted-gap-previous", detail: "summary", events: [],
+    compaction_continuation_turn_ids: [
+      submittedGapNativeTurn, submittedGapContinuation,
+    ],
+    turns: [{
+      id: "submitted-gap-previous", prompt: "上一轮", blocks: [],
+      done: true, detailEventCount: 0, detailLoaded: false,
+      ts: 1_000, doneTs: 2_000,
+    }],
+  }) as History;
+  for (const buildSeq of [8, 9]) {
+    submittedGapState = reduce(submittedGapState, {
+      type: "event", event: submittedLaggingHistory(buildSeq),
+    });
+  }
+  const submittedCanonicalHistory = (buildSeq: number): History => event({
+    type: "history", sid: submittedGapSid, session_id: submittedGapSid,
+    revision: submittedGapRevision, generation: submittedGapGeneration,
+    build_seq: buildSeq, live_seq: 105, authoritative: true,
+    in_progress: true, external: false, has_more: true,
+    oldest_id: "submitted-gap-previous",
+    newest_id: "submitted-gap-history-message", detail: "summary", events: [],
+    compaction_continuation_turn_ids: [
+      submittedGapNativeTurn, submittedGapContinuation,
+    ],
+    turns: [{
+      id: "submitted-gap-previous", prompt: "上一轮", blocks: [],
+      done: true, detailEventCount: 0, detailLoaded: false,
+      ts: 1_000, doneTs: 2_000,
+    }, {
+      id: "submitted-gap-history-message",
+      clientMsgId: submittedGapMessage,
+      forkPointId: submittedGapNativeTurn,
+      prompt: submittedGapPrompt,
+      blocks: [{
+        kind: "text", message_id: "submitted-gap-history-answer",
+        channel: "final", text: submittedGapAnswer, done: true,
+      }],
+      done: false, detailEventCount: 2, detailLoaded: false, ts: 10_000,
+    }],
+  }) as History;
+  submittedGapState = reduce(submittedGapState, {
+    type: "event", event: submittedCanonicalHistory(10),
+  });
+  submittedGapState = reduce(submittedGapState, {
+    type: "focus_session", sid: submittedGapOtherSid,
+  });
+  submittedGapState = reduce(submittedGapState, {
+    type: "focus_session", sid: submittedGapSid,
+  });
+  submittedGapState = reduce(submittedGapState, {
+    type: "event", event: submittedCanonicalHistory(11),
+  });
+  const submittedRecovered = submittedGapState.runtimes[submittedGapSid];
+  const submittedRows = submittedRecovered.turns.filter(
+    (turn: Turn) => turn.prompt === submittedGapPrompt);
+  assert.equal(submittedRows.length, 1,
+    "canonical refocus history replaces rather than duplicates the live row");
+  assert.equal(submittedRows[0].blocks.filter((block: Block) =>
+    block.kind === "text" && block.text === submittedGapAnswer).length, 1,
+  "regenerated History/live assistant ids still render the answer once");
+  const submittedOwner = displayActiveTurnOwnerId(
+    submittedRecovered.liveOwner?.turnId,
+    submittedRecovered.acceptancePending,
+  );
+  assert.deepEqual(activeTurnCandidateIds(
+    submittedRecovered.turns,
+    submittedOwner,
+    submittedRecovered.state !== "idle"
+      || !!submittedRecovered.acceptancePending,
+  ), [submittedRows[0].id],
+  "refocus leaves exactly one display row for the still-running spark");
+
   const rollbackGapSid = "compact-gap-real-rollback";
   const rollbackGap = reduce({ ...initialState, focusedSid: rollbackGapSid,
     runtimes: { [rollbackGapSid]: compactGapRuntime() },
@@ -998,6 +1348,365 @@ try {
     "the completed row returns to its static terminal spark");
   assert.match(idleMarkup, /aria-expanded="false"/,
     "the completed process disclosure stays settled instead of flapping open");
+
+  const claudeTerminalSid = "claude-terminal-restored-foreground";
+  const claudeTerminalTurnId = "claude-terminal-user";
+  const claudeTerminalRevision = "claude-terminal-r1";
+  const claudeTerminalGeneration = "claude-terminal-g1";
+  let claudeTerminalState = {
+    ...initialState,
+    focusedSid: claudeTerminalSid,
+    sessions: [{
+      session_id: claudeTerminalSid,
+      engine: "claude" as const,
+      space: "code" as const,
+    }],
+    runtimes: { [claudeTerminalSid]: {
+      ...createRuntime(),
+      state: "idle" as const,
+      historyRevision: claudeTerminalRevision,
+      historyGeneration: claudeTerminalGeneration,
+      lastLiveSeq: 80,
+      liveDetailTurnIds: [claudeTerminalTurnId],
+      turns: [{
+        id: claudeTerminalTurnId,
+        prompt: "inspect",
+        done: true,
+        doneTs: 20_000,
+        forkPointId: "claude-terminal-assistant",
+        detailEventCount: 2,
+        blocks: [{
+          kind: "tool" as const,
+          message_id: "claude-open-tool-message",
+          tool_use_id: "claude-open-tool",
+          tool: "Bash",
+          input: { command: "tail output" },
+          output: "retained output",
+          done: false,
+        }, {
+          kind: "process" as const,
+          item_id: "claude-background-agent",
+          processKind: "agent" as const,
+          phase: "update" as const,
+          status: "running" as const,
+          title: "background agent",
+          background: true,
+          done: false,
+        }],
+      }],
+    } },
+  };
+  claudeTerminalState = reduce(claudeTerminalState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: claudeTerminalSid,
+      session_id: claudeTerminalSid,
+      revision: claudeTerminalRevision,
+      generation: claudeTerminalGeneration,
+      build_seq: 2,
+      live_seq: 80,
+      authoritative: true,
+      detail: "summary",
+      in_progress: false,
+      has_more: false,
+      newest_id: claudeTerminalTurnId,
+      events: [],
+      turns: [{
+        id: claudeTerminalTurnId,
+        prompt: "inspect",
+        done: true,
+        doneTs: 20_000,
+        forkPointId: "claude-terminal-assistant",
+        detailEventCount: 2,
+        detailLoaded: false,
+        blocks: [{
+          kind: "text",
+          message_id: "claude-terminal-final",
+          channel: "final",
+          text: "complete",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const repairedClaudeTurn =
+    claudeTerminalState.runtimes[claudeTerminalSid].turns[0];
+  const repairedClaudeTool = repairedClaudeTurn.detailProjection?.blocks.find(
+    (block: Block) => block.kind === "tool");
+  const preservedClaudeAgent = repairedClaudeTurn.detailProjection?.blocks.find(
+    (block: Block) => block.kind === "process"
+      && block.background === true);
+  assert.equal(repairedClaudeTool?.done, true,
+    "an authoritative Claude terminal settles restored foreground tools");
+  assert.equal(preservedClaudeAgent?.done, false,
+    "an authoritative parent terminal preserves detached background Agent work");
+
+  const loadedClaudeSid = "claude-terminal-loaded-background";
+  let loadedClaudeState = {
+    ...initialState,
+    focusedSid: loadedClaudeSid,
+    sessions: [{
+      session_id: loadedClaudeSid,
+      engine: "claude" as const,
+      space: "code" as const,
+    }],
+    runtimes: { [loadedClaudeSid]: {
+      ...createRuntime(),
+      state: "idle" as const,
+      historyRevision: "claude-loaded-r1",
+      historyGeneration: "claude-loaded-g1",
+      lastLiveSeq: 12,
+      turns: [{
+        id: "claude-loaded-turn", prompt: "delegate", done: true,
+        detailLoaded: true, blocks: [],
+        detailProjection: {
+          segments: [{
+            pageKey: "claude-loaded-page", before: null, events: [],
+            hasMore: false, oldestCursor: null, hasNewer: false,
+            newerCursor: null, encodedChars: 0,
+          }],
+          blocks: [{
+            kind: "process" as const,
+            item_id: "claude-loaded-agent",
+            processKind: "agent" as const,
+            phase: "update" as const,
+            status: "running" as const,
+            title: "detached agent",
+            background: true,
+            done: false,
+          }],
+          capped: false, hasMore: false, oldestCursor: null,
+          hasNewer: false, newerCursor: null,
+        },
+      }],
+    } },
+  };
+  loadedClaudeState = reduce(loadedClaudeState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: loadedClaudeSid,
+      session_id: loadedClaudeSid,
+      revision: "claude-loaded-r1",
+      generation: "claude-loaded-g1",
+      build_seq: 2,
+      live_seq: 12,
+      authoritative: true,
+      detail: "summary",
+      in_progress: false,
+      has_more: false,
+      newest_id: "claude-loaded-turn",
+      events: [],
+      turns: [{
+        id: "claude-loaded-turn", prompt: "delegate", done: true,
+        detailEventCount: 1, detailLoaded: false, blocks: [],
+      }],
+    }),
+  });
+  assert.equal(loadedClaudeState.runtimes[loadedClaudeSid].turns[0]
+    .detailProjection?.blocks[0]?.done, false,
+  "a settled summary preserves an already-loaded detached Agent projection");
+
+  const repairedClaudeMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: claudeTerminalSid,
+    turns: [repairedClaudeTurn],
+    engine: "claude",
+    onEdit: () => {},
+    onGetDiff: () => {},
+    onFork: () => {},
+  }));
+  assert.doesNotMatch(repairedClaudeMarkup, /class="turn-working"/);
+  assert.match(repairedClaudeMarkup, /class="ubub-meta ai-meta"/,
+    "the completed Claude reply regains its completion footer");
+  assert.match(repairedClaudeMarkup, /aria-label="复制"/);
+  assert.match(repairedClaudeMarkup, /aria-label="派生"/);
+  assert.match(repairedClaudeMarkup, /class="turn-done-mark"/);
+
+  const shortClaudeSid = "claude-short-known-head";
+  let shortClaudeState = {
+    ...initialState,
+    focusedSid: shortClaudeSid,
+    sessions: [{
+      session_id: shortClaudeSid,
+      engine: "claude" as const,
+      space: "code" as const,
+    }],
+    runtimes: { [shortClaudeSid]: {
+      ...createRuntime(), loading: true,
+    } },
+  };
+  shortClaudeState = reduce(shortClaudeState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: shortClaudeSid,
+      session_id: shortClaudeSid,
+      revision: "claude-short-r1",
+      generation: "claude-short-g1",
+      build_seq: 1,
+      live_seq: 0,
+      authoritative: true,
+      detail: "summary",
+      in_progress: false,
+      has_more: false,
+      events: [],
+      turns: [],
+    }),
+  });
+  assert.equal(
+    shortClaudeState.runtimes[shortClaudeSid].historyHeadKnown,
+    true,
+    "an authoritative empty/short head records that history is already at its start",
+  );
+  shortClaudeState = reduce(shortClaudeState, {
+    type: "focus_session", sid: "another-short-session",
+  });
+  shortClaudeState = reduce(shortClaudeState, {
+    type: "focus_session", sid: shortClaudeSid,
+  });
+  assert.equal(shortClaudeState.runtimes[shortClaudeSid].loading, false,
+    "refocusing a known history start cannot flash the initial history loader");
+
+  const restartedShortClaudeState = reduce(shortClaudeState, {
+    type: "event",
+    event: event({
+      type: "snapshot",
+      sid: shortClaudeSid,
+      cc_session_id: shortClaudeSid,
+      generation: "claude-short-g2",
+      state: "idle",
+    }),
+  });
+  assert.equal(
+    restartedShortClaudeState.runtimes[shortClaudeSid].historyHeadKnown,
+    false,
+    "a new wrapper generation revokes the previous empty-head proof",
+  );
+  assert.equal(
+    restartedShortClaudeState.runtimes[shortClaudeSid].loading,
+    true,
+    "an empty session waits for new-generation History after wrapper restart",
+  );
+
+  const staleCacheSid = "claude-empty-stale-cache-generation";
+  let staleCacheState = {
+    ...initialState,
+    focusedSid: staleCacheSid,
+    sessions: [{
+      session_id: staleCacheSid,
+      engine: "claude" as const,
+      space: "code" as const,
+    }],
+    runtimes: { [staleCacheSid]: {
+      ...createRuntime(), loading: true,
+    } },
+  };
+  staleCacheState = reduce(staleCacheState, {
+    type: "event",
+    event: event({
+      type: "snapshot",
+      sid: staleCacheSid,
+      cc_session_id: staleCacheSid,
+      generation: "claude-cache-live-g2",
+      state: "idle",
+    }),
+  });
+  staleCacheState = reduce(staleCacheState, {
+    type: "hydrate_cache",
+    sid: staleCacheSid,
+    turns: [],
+    revision: "claude-cache-old-r1",
+    generation: "claude-cache-old-g1",
+    historyAtStart: true,
+  });
+  assert.deepEqual({
+    controlGeneration:
+      staleCacheState.runtimes[staleCacheSid].controlGeneration,
+    historyGeneration:
+      staleCacheState.runtimes[staleCacheSid].historyGeneration,
+    historyHeadKnown:
+      staleCacheState.runtimes[staleCacheSid].historyHeadKnown,
+    loading: staleCacheState.runtimes[staleCacheSid].loading,
+  }, {
+    controlGeneration: "claude-cache-live-g2",
+    historyGeneration: null,
+    historyHeadKnown: false,
+    loading: true,
+  }, "a paint-only empty cache cannot roll a live generation backwards");
+  const staleCacheFallback = reduce(staleCacheState, {
+    type: "hydrate_cache",
+    sid: staleCacheSid,
+    turns: [],
+    revision: null,
+  });
+  assert.equal(staleCacheFallback.runtimes[staleCacheSid].loading, false,
+    "the cache timeout fallback still releases an otherwise silent loader");
+
+  const rekeyTempSid = "tmp-known-empty-head";
+  const rekeyRealSid = "claude-known-empty-head";
+  const rekeyedKnownHead = reduce({
+    ...initialState,
+    focusedSid: rekeyTempSid,
+    sessions: [{
+      session_id: rekeyTempSid,
+      engine: "claude" as const,
+      space: "code" as const,
+    }],
+    runtimes: {
+      [rekeyTempSid]: {
+        ...createRuntime(), loading: true,
+        controlGeneration: "claude-rekey-g1",
+      },
+      [rekeyRealSid]: {
+        ...createRuntime(), loading: false,
+        controlGeneration: "claude-rekey-g1",
+        historyGeneration: "claude-rekey-g1",
+        historyRevision: "claude-rekey-r1",
+        historyHeadKnown: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "session_rekey",
+      sid: rekeyTempSid,
+      old_key: rekeyTempSid,
+      session_id: rekeyRealSid,
+    }),
+  });
+  assert.deepEqual({
+    historyRevision:
+      rekeyedKnownHead.runtimes[rekeyRealSid].historyRevision,
+    historyGeneration:
+      rekeyedKnownHead.runtimes[rekeyRealSid].historyGeneration,
+    historyHeadKnown:
+      rekeyedKnownHead.runtimes[rekeyRealSid].historyHeadKnown,
+    loading: rekeyedKnownHead.runtimes[rekeyRealSid].loading,
+  }, {
+    historyRevision: "claude-rekey-r1",
+    historyGeneration: "claude-rekey-g1",
+    historyHeadKnown: true,
+    loading: false,
+  }, "rekey keeps empty-head readiness with the selected History authority");
+
+  shortClaudeState = reduce(shortClaudeState, {
+    type: "event",
+    event: event({
+      type: "history_invalidated",
+      sid: shortClaudeSid,
+      session_id: shortClaudeSid,
+      revision: "claude-short-r2",
+      reason: "rollback",
+    }),
+  });
+  assert.equal(
+    shortClaudeState.runtimes[shortClaudeSid].historyHeadKnown,
+    false,
+    "a rollback revokes the old history-start proof",
+  );
+  assert.equal(shortClaudeState.runtimes[shortClaudeSid].loading, true,
+    "an invalidated empty projection keeps the truthful cold-history loader");
 
   const repairedPlanOnlyMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "repaired-plan-summary-session",
@@ -1362,7 +2071,7 @@ try {
         blocks: [{ kind: "process" as const,
           item_id: "claude-background-agent", processKind: "agent" as const,
           phase: "start" as const, status: "running" as const,
-          title: "background", done: false }] }],
+          title: "background", background: true, done: false }] }],
     } },
   };
   claudeState = reduce(claudeState, { type: "event", event: event({
@@ -1375,7 +2084,7 @@ try {
   }) });
   assert.equal(claudeState.runtimes[claudeSid].turns[0]
     .detailProjection?.blocks[0]?.done, false,
-  "Codex idle repair cannot close a genuine Claude background process");
+  "Claude terminal repair cannot close an explicitly detached background process");
 } finally {
   await reducerHarness.close();
 }

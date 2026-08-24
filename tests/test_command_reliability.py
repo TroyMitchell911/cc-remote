@@ -753,7 +753,7 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
         # replaying the latter after an ACK loss must not roll current settings
         # back to their initial values.
         assert [entry[1].type for entry in fork.buffer._buf] == [
-            "model", "effort"]
+            "model", "effort", "auto_compact"]
         assert len([message for message in transport.sent
                     if isinstance(message, CommandAck)]) == 2
 

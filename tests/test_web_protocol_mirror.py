@@ -8,6 +8,7 @@ from typing import get_args
 
 from cc_remote.protocol import (
     AssistantChannel,
+    AutoCompactMode,
     CodexThreadStatus,
     CollaborationModeName,
     ControlMode,
@@ -173,6 +174,7 @@ def test_literal_unions_match_python_protocol():
         "ProcessStatus": ProcessStatus,
         "ProcessAppendTarget": ProcessAppendTarget,
         "EffortLevel": EffortLevel,
+        "AutoCompactMode": AutoCompactMode,
         "PermissionMode": PermissionMode,
         "CollaborationModeName": CollaborationModeName,
         "ControlMode": ControlMode,

@@ -10,9 +10,13 @@ import pytest
 
 from cc_remote.wrapper import claude_controls as controls_module
 from cc_remote.wrapper.claude_controls import (
+    ClaudeControls,
     ClaudeControlStore,
     ClaudeControlStoreError,
+    claude_auto_compact_cli_value,
+    claude_auto_compact_from_cli,
     last_completed_assistant_controls,
+    valid_claude_auto_compact,
 )
 
 
@@ -50,6 +54,76 @@ def test_remote_control_store_drops_untrusted_values(tmp_path):
 
     assert saved.as_dict() == {}
     assert store.get(SESSION_ID).as_dict() == {}
+
+
+def test_remote_control_store_roundtrips_autocompact_without_losing_controls(
+    tmp_path,
+):
+    store = ClaudeControlStore(tmp_path)
+    store.update(
+        SESSION_ID,
+        model="claude-opus-4-6[1m]",
+        effort="max",
+        permission_mode="plan",
+        auto_compact_mode="custom",
+        auto_compact_threshold_tokens=250_000,
+    )
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+    assert saved == ClaudeControls(
+        model="claude-opus-4-6[1m]",
+        effort="max",
+        permission_mode="plan",
+        auto_compact_mode="custom",
+        auto_compact_threshold_tokens=250_000,
+    )
+
+    cleared = store.update_auto_compact(
+        SESSION_ID, mode="inherit", threshold_tokens=None)
+    assert cleared.model == saved.model
+    assert cleared.effort == saved.effort
+    assert cleared.permission_mode == saved.permission_mode
+    assert cleared.auto_compact_mode == "inherit"
+    assert "auto_compact_mode" not in store.get(SESSION_ID).as_dict()
+
+
+def test_work_autocompact_store_clears_stale_code_controls(tmp_path):
+    store = ClaudeControlStore(tmp_path)
+    store.update(
+        SESSION_ID,
+        model="claude-opus-4-6[1m]",
+        effort="max",
+        permission_mode="plan",
+    )
+
+    saved = store.update_auto_compact(
+        SESSION_ID,
+        mode="custom",
+        threshold_tokens=300_000,
+        preserve_other_controls=False,
+    )
+
+    assert saved == ClaudeControls(
+        auto_compact_mode="custom",
+        auto_compact_threshold_tokens=300_000,
+    )
+    assert ClaudeControlStore(tmp_path).get(SESSION_ID) == saved
+
+
+def test_autocompact_helpers_accept_only_canonical_cli_values():
+    assert valid_claude_auto_compact("auto") == ("auto", None)
+    assert valid_claude_auto_compact("custom", 200_000) == (
+        "custom", 200_000)
+    assert valid_claude_auto_compact("custom", True) == ("inherit", None)
+    assert valid_claude_auto_compact("custom", 99_999) == (
+        "inherit", None)
+    assert claude_auto_compact_cli_value("inherit") is None
+    assert claude_auto_compact_cli_value("auto") == "auto"
+    assert claude_auto_compact_cli_value("custom", 200_000) == "200000"
+    assert claude_auto_compact_from_cli("auto") == ("auto", None)
+    assert claude_auto_compact_from_cli("200000") == ("custom", 200_000)
+    assert claude_auto_compact_from_cli("200k") == ("inherit", None)
+    assert claude_auto_compact_from_cli("9" * 10_000) == ("inherit", None)
 
 
 def test_remote_control_store_rejects_public_or_symlink_state(tmp_path):

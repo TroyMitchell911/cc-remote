@@ -6,9 +6,11 @@
 
 - Claude Agent SDK 升级到 `0.2.142`；wrapper 继续固定到这个经过验证的精确
   patch 版本，并仍然启动用户配置的 Claude Code 可执行文件。
-- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v37。Claude 子代理详情、
-  脱离父回合的后台过程归属、分页回合详情及脱敏后的 Claude 额度事件现在具有明确
-  的兼容边界；Codex steer 归属冲突也不会再把空闲会话的旧火花重新点亮。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v38。Claude 子代理详情、
+  脱离父回合的后台过程归属、分页回合详情、脱敏后的 Claude 额度事件及会话级自动
+  压缩控制现在具有明确的兼容边界。Code、Work、BTW、新会话与 fork 可选择跟随
+  Claude、自动模式或 `100K–1M` token 阈值；忙碌时的修改会等待可确认的回合终态。
+  Codex steer 归属冲突也不会再把空闲会话的旧火花重新点亮。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v36。会话摘要现在会区分
   “确定有可展示过程”“确定为直接回复”和“原生摘要尚不能确定”；截断正文使用独立
   的详情入口，Codex 过程计时也改从首个真实可展示事件开始，不再继承用户消息时间。

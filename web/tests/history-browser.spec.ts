@@ -1654,6 +1654,54 @@ test("instant session cache preserves a heavy turn's complete process skeleton",
   ]);
 });
 
+test("instant session cache persists a bounded history-start proof only", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+  const result = await page.evaluate(async () => {
+    const cache = await import("/src/cache.ts");
+    await cache.clearCache();
+    const turn = (id: string) => ({
+      id, prompt: id, blocks: [], done: true,
+    });
+    cache.saveSession(
+      "complete-history-head",
+      [turn("complete-turn")],
+      0,
+      "complete-history-r1",
+      "complete-history-g1",
+      null,
+      true,
+    );
+    cache.saveSession(
+      "trimmed-history-head",
+      Array.from({ length: 101 }, (_, index) => turn(`trimmed-${index}`)),
+      0,
+      "trimmed-history-r1",
+      "trimmed-history-g1",
+      null,
+      true,
+    );
+    await new Promise((resolve) => window.setTimeout(resolve, 700));
+    const complete = await cache.loadSession("complete-history-head");
+    const trimmed = await cache.loadSession("trimmed-history-head");
+    return {
+      completeAtStart: complete?.historyAtStart,
+      trimmedAtStart: trimmed?.historyAtStart,
+      trimmedTurns: trimmed?.turns.length,
+      pagingKeys: complete == null
+        ? []
+        : ["hasMore", "oldestId", "cursor"].filter((key) => (
+            Object.prototype.hasOwnProperty.call(complete, key)
+          )),
+    };
+  });
+  expect(result.completeAtStart).toBe(true);
+  expect(result.trimmedAtStart).toBe(false);
+  expect(result.trimmedTurns).toBe(100);
+  expect(result.pagingKeys).toEqual([]);
+});
+
 test("session cache rejects stale Claude and replay-orphan rows", async ({
   page,
 }) => {
@@ -4090,6 +4138,29 @@ test("live append follows at the bottom but not while reading history", async ({
   await expect(page.locator('[data-turn-id="live-42"]')).toHaveCount(0);
   expect(await page.locator(".turn").count()).toBeLessThan(40);
   await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name);
+});
+
+test("scrolling a live-dirty history window to its latest edge restores the active tail", async ({
+  page,
+}, testInfo) => {
+  await page.goto(
+    "/tests/history-browser.html?deep-browse=1&dirty-live-browse=1&engine=claude",
+  );
+  await expect(page.locator('[data-turn-id="m20"]')).toBeVisible();
+  await page.getByTestId("append-turn").click();
+  await expect(page.locator('[data-turn-id="live-streaming"]')).toHaveCount(0);
+
+  for (let pageIndex = 0; pageIndex < 5; pageIndex += 1) {
+    await scrollThreadToEdge(page, "end", testInfo.project.name);
+    if (await page.locator('[data-turn-id="live-streaming"] .turn-working')
+      .count()) break;
+    await page.waitForTimeout(80);
+  }
+
+  await expect(page.locator('[data-turn-id="live-streaming"] .turn-working'))
+    .toBeVisible();
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("live-streaming");
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
 });
 
 test("returning to a background-grown live turn settles at its current tail", async ({

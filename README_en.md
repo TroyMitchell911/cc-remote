@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v37
+**Current release: v3.0.0** · Wire protocol v38
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -62,7 +62,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. Exact files outside cwd require confirmation in the requesting session and are bound to that file identity; user-approved Markdown stays read-only, while only files successfully written by the session can be saved. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v33. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v38. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -86,7 +86,7 @@ requirements.
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
 | **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports explicit compact, native Review, isolated Git worktree forks, and moving an idle conversation to another working directory. |
-| **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses one compact `/permissions` sheet for approval policy, official execution-environment profiles, and Cached/Live Web Search. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
+| **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Claude Code/Work can use `/autocompact` per session to inherit the local setting, use automatic mode, or choose a `100K–1M` token threshold. Codex Code uses one compact `/permissions` sheet for approval policy, official execution-environment profiles, and Cached/Live Web Search. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
 | **Real extension catalog** | Open `/extensions`, `/skills`, `/plugins`, `/apps`, `/mcp`, or `/hooks` against the current engine. Code can manage Skills, plugins, and Claude Hooks where the engine allows it; Codex Hooks remain read-only because the official API has no write path. Work presents every extension category read-only to preserve its private environment. |
 | **Continuity** | Let background sessions keep running and synchronize them across clients. Paint the browser projection first, validate paged materialized summaries from Claude transcripts or Codex rollouts, and resume only the live tail after reconnecting. |
 | **Multi-machine and PWA** | Connect multiple named wrappers to one relay and optionally restrict accounts to selected machines. Install the web client as a PWA; notifications default to a generic privacy mode, with an explicit opt-in for a safely truncated session name and exact navigation. |
@@ -214,7 +214,7 @@ an existing custom or ambiguous layout is never replaced. Exactly one profile
 must set `default: true`. Relay and Web receive only
 the public profile id, label, and availability—not the local path or credentials.
 Restart the wrapper after changing the registry, and deploy wrapper, relay, and
-Web together for protocol v33.
+Web together for protocol v38.
 Profile-id changes and single/multi-profile transitions migrate local controls
 and recovery state by the resolved `CODEX_HOME`. If that migration is
 interrupted, keep the same target registry and restart the wrapper to resume it.
@@ -569,14 +569,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v37:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v38:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v37 relay and v37 wrapper so the old wrapper cannot occupy the
+> then start the v38 relay and v38 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`. When upgrading from a pre-v34 release, retain
 > the Work SQLite migration protection introduced by v34: a manual release must
 > run `deploy/work_registry_snapshot.py snapshot` before the new wrapper starts.
@@ -639,7 +639,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v37 wrapper after success.
+release's `/healthz` is verified. Start the v38 wrapper after success.
 
 Verify:
 

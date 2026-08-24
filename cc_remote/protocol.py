@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 37
+PROTOCOL_VERSION = 38
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -61,6 +61,7 @@ CodexThreadStatus = Literal["notLoaded", "idle", "systemError", "active"]
 EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ]
+AutoCompactMode = Literal["inherit", "auto", "custom"]
 PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
     "never", "on-request", "untrusted",
@@ -91,6 +92,8 @@ MAX_ENCODED_ATTACHMENT_CHARS = ((MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3) * 4
 MAX_QUERY_QUEUE_ITEMS = 32
 MAX_QUERY_QUEUE_BYTES = 64 * 1024 * 1024
 MAX_QUERY_QUEUE_PREVIEW_CHARS = 512
+MIN_AUTO_COMPACT_TOKENS = 100_000
+MAX_AUTO_COMPACT_TOKENS = 1_000_000
 ASK_QUESTION_MAX_CHARS = 16 * 1024
 ASK_OPTION_LABEL_MAX_CHARS = 512
 ASK_OPTION_DESCRIPTION_MAX_CHARS = 2 * 1024
@@ -516,6 +519,32 @@ class SetEffort(_Command):
     effort: EffortLevel
 
 
+class SetAutoCompact(_Command):
+    """Set one Claude session's spawn-time automatic compaction threshold.
+
+    ``inherit`` omits Claude's CLI flag, ``auto`` asks Claude to choose its
+    recommended threshold, and ``custom`` carries an exact bounded token count.
+    The wrapper may defer the reconnect until the active turn reaches its real
+    terminal boundary; it never interrupts a turn to apply this command.
+    """
+
+    type: Literal["set_auto_compact"] = "set_auto_compact"
+    mode: AutoCompactMode
+    threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+
+    @model_validator(mode="after")
+    def threshold_matches_mode(self):
+        if self.mode == "custom" and self.threshold_tokens is None:
+            raise ValueError("custom autocompact requires threshold_tokens")
+        if self.mode != "custom" and self.threshold_tokens is not None:
+            raise ValueError("threshold_tokens is only valid for custom autocompact")
+        return self
+
+
 class SetServiceTier(_Command):
     """client -> wrapper: set the Codex service tier (codex only). "fast" maps to
     app-server's persisted per-thread service tier; "" / "default" clears the
@@ -635,6 +664,48 @@ class Effort(_Base):
     client restores the effort readout."""
     type: Literal["effort"] = "effort"
     effort: str
+
+
+class AutoCompact(_Base):
+    """Claude session-level automatic compaction control state.
+
+    Desired and applied values are separate because this is a process-start
+    option. ``pending`` remains true until a safe resume reconnect succeeds.
+    ``mutable`` is false while an official terminal/broker owns the session;
+    those surfaces are observed but never controlled through Web commands.
+    """
+
+    type: Literal["auto_compact"] = "auto_compact"
+    mode: AutoCompactMode = "inherit"
+    threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+    applied_mode: Optional[AutoCompactMode] = None
+    applied_threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+    pending: bool = False
+    mutable: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def thresholds_match_modes(self):
+        if self.mode == "custom" and self.threshold_tokens is None:
+            raise ValueError("custom autocompact requires threshold_tokens")
+        if self.mode != "custom" and self.threshold_tokens is not None:
+            raise ValueError("threshold_tokens is only valid for custom autocompact")
+        if self.applied_mode == "custom" and self.applied_threshold_tokens is None:
+            raise ValueError(
+                "applied custom autocompact requires applied_threshold_tokens")
+        if (self.applied_mode != "custom"
+                and self.applied_threshold_tokens is not None):
+            raise ValueError(
+                "applied_threshold_tokens is only valid for applied custom autocompact")
+        return self
 
 
 class Fast(_Base):
@@ -997,6 +1068,12 @@ class NewSession(_Command):
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
+    auto_compact_mode: Optional[AutoCompactMode] = None  # Claude only; None -> inherit
+    auto_compact_threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
     permission_mode: Optional[
         Literal["never", "on-request", "untrusted"]
@@ -1029,6 +1106,18 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if (self.auto_compact_mode is not None
+                or self.auto_compact_threshold_tokens is not None):
+            if self.engine != "claude":
+                raise ValueError("autocompact only supported for Claude sessions")
+            if (self.auto_compact_mode == "custom"
+                    and self.auto_compact_threshold_tokens is None):
+                raise ValueError(
+                    "custom autocompact requires auto_compact_threshold_tokens")
+            if (self.auto_compact_mode != "custom"
+                    and self.auto_compact_threshold_tokens is not None):
+                raise ValueError(
+                    "auto_compact_threshold_tokens is only valid for custom autocompact")
         if self.space == "work" and self.cwd is not None:
             raise ValueError("Work session cwd is assigned by the wrapper")
         if self.space == "work" and self.web_search is not None:
@@ -1644,6 +1733,11 @@ class ContextReport(_Base):
     session_percentage: Optional[float] = None
     model: Optional[str] = None
     is_auto_compact_enabled: Optional[bool] = None
+    # Claude's effective automatic-compaction boundary and physical context
+    # capacity. They are observations from get_context_usage(), not substitutes
+    # for the desired/applied session control carried by AutoCompact.
+    auto_compact_threshold_tokens: Optional[int] = Field(default=None, ge=0)
+    raw_max_tokens: Optional[int] = Field(default=None, ge=0)
     categories: list[dict[str, Any]] = []
 
 
@@ -2336,8 +2430,8 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2351,7 +2445,7 @@ AnyMessage = Union[
 # control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
 # wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "turn_steered", "state", "model", "effort", "perm",
+    "user_msg", "turn_steered", "state", "model", "effort", "auto_compact", "perm",
     "permission_profile", "web_search", "fast",
     "collaboration_mode", "session_control", "query_queue", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
@@ -2376,6 +2470,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "session_control": SessionControl,
     "set_model": SetModel,
     "set_effort": SetEffort,
+    "set_auto_compact": SetAutoCompact,
     "set_service_tier": SetServiceTier,
     "set_collaboration_mode": SetCollaborationMode,
     "open_btw": OpenBtw,
@@ -2444,6 +2539,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "state": StateEvent,
     "model": Model,
     "effort": Effort,
+    "auto_compact": AutoCompact,
     "fast": Fast,
     "collaboration_mode": CollaborationMode,
     "perm": Perm,
@@ -2545,6 +2641,10 @@ def serialize(msg: BaseModel) -> str:
             })
         if msg.available is None:
             exclude.add("available")
+        if msg.auto_compact_threshold_tokens is None:
+            exclude.add("auto_compact_threshold_tokens")
+        if msg.raw_max_tokens is None:
+            exclude.add("raw_max_tokens")
         if exclude:
             return msg.model_dump_json(exclude=exclude)
     return msg.model_dump_json()

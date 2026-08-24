@@ -334,6 +334,7 @@ class BrokerServer:
                 model=request.get("model"),
                 effort=request.get("effort"),
                 permission_mode=request.get("permission_mode"),
+                auto_compact=request.get("auto_compact"),
             )
             await self._success(writer, preferences=preferences)
             return

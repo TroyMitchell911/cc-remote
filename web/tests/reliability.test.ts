@@ -43,6 +43,7 @@ import {
 import {
   acceptsCachedNewerPage,
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
 } from "../src/history-browse.ts";
 import {
   acknowledgeCompletion,
@@ -8745,8 +8746,8 @@ try {
     if (!current || !acceptsCachedNewerPage(current, frozenCachedLatest)) {
       return "discarded" as const;
     }
-    if (page.isLatest && current.latestDirty) {
-      return "settle" as const;
+    if (cachedLatestRequiresLiveRuntime(current, page)) {
+      return "latest" as const;
     }
     return appendNewerPage(current, page, {
       expectedScopeKey: frozenCachedLatest.scopeKey,
@@ -8768,26 +8769,14 @@ try {
     isLatest: true,
   });
   const deferredOutcome = await deferredInstall;
-  assert.equal(deferredOutcome, "settle",
-    "a live delta during the cache read must revoke the frozen latest page");
+  assert.equal(deferredOutcome, "latest",
+    "a live delta during the cache read must return to the live runtime");
   cacheRaceState = reduce(cacheRaceState, {
-    type: "history_browse_newer_settled",
+    type: "return_to_latest",
     sid: frozenCachedLatest.sid,
-    scopeKey: frozenCachedLatest.scopeKey,
-    revision: frozenCachedLatest.revision,
-    generation: frozenCachedLatest.generation,
-    viewId: frozenCachedLatest.viewId,
-    windowEpoch: frozenCachedLatest.windowEpoch,
-    pageKey: frozenCachedLatest.pageKey,
   });
-  assert.equal(cacheRaceState.historyBrowse?.latestDirty, true);
-  assert.equal(cacheRaceState.historyBrowse?.hasNewer, true);
-  assert.equal(cacheRaceState.historyBrowse?.newerPageKey, "ordered-head",
-    "rejecting stale cached latest must not clear the newer affordance");
-  assert.equal(
-    cacheRaceState.historyBrowse?.windowEpoch,
-    frozenCachedLatest.windowEpoch + 1,
-    "settling stale cached latest must release ChatView's accepted page request");
+  assert.equal(cacheRaceState.historyBrowse, null,
+    "the explicit downward gesture must reveal the authoritative live tail");
 
   const browseAfterOtherSidSend = reduce({
     ...orderedHistory,
@@ -11666,6 +11655,7 @@ try {
     historyRecovery: {
       sid: crossGenerationSid,
       turns: [staleCrossGenerationTurn],
+      activeOwnerId: null,
       hasMore: true,
       oldestId: "rekey-old-cursor",
       viewRevision: "rekey-old-revision",
@@ -17478,7 +17468,9 @@ const btwPanelSource = readFileSync(
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
 }
-assert.match(appSource, /const \{ cwd, cwdSource, model, effort \} = state\.newChat/);
+assert.match(appSource,
+  /const \{[\s\S]{0,160}cwd,[\s\S]{0,160}autoCompactMode,[\s\S]{0,120}\} = state\.newChat/,
+  "new-session autocompact must be captured with cwd/model before the atomic create");
 assert.match(appSource, /data-lock-horizontal-swipe/);
 assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /draftKey=\{focusedComposerDraftKey\}/);

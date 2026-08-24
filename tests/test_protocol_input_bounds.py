@@ -11,7 +11,10 @@ from pydantic import ValidationError
 from cc_remote.attachments import MAX_ATTACHMENT_COUNT, validate_attachments
 from cc_remote.protocol import (
     ASK_ANSWER_MAX_CHARS,
+    MAX_AUTO_COMPACT_TOKENS,
+    MIN_AUTO_COMPACT_TOKENS,
     AnswerQuestion,
+    AutoCompact,
     AuthorizePreview,
     CollaborationMode,
     ForkSessionWorktree,
@@ -31,6 +34,7 @@ from cc_remote.protocol import (
     Query,
     SaveMarkdown,
     SetEffort,
+    SetAutoCompact,
     SetCollaborationMode,
     SetModel,
     SetPerm,
@@ -227,6 +231,43 @@ def test_known_dynamic_control_values_remain_supported():
     assert deserialize(serialize(result)) == result
     assert is_downstream(required) is False
     assert is_downstream(result) is False
+
+
+def test_claude_autocompact_modes_and_thresholds_are_strictly_bounded():
+    assert SetAutoCompact(mode="inherit").threshold_tokens is None
+    assert SetAutoCompact(mode="auto").threshold_tokens is None
+    assert SetAutoCompact(
+        mode="custom", threshold_tokens=MIN_AUTO_COMPACT_TOKENS,
+    ).threshold_tokens == MIN_AUTO_COMPACT_TOKENS
+    assert NewSession(
+        engine="claude",
+        auto_compact_mode="custom",
+        auto_compact_threshold_tokens=MAX_AUTO_COMPACT_TOKENS,
+    ).auto_compact_threshold_tokens == MAX_AUTO_COMPACT_TOKENS
+
+    for factory in (
+        lambda: SetAutoCompact(mode="custom"),
+        lambda: SetAutoCompact(
+            mode="custom", threshold_tokens=MIN_AUTO_COMPACT_TOKENS - 1),
+        lambda: SetAutoCompact(
+            mode="custom", threshold_tokens=MAX_AUTO_COMPACT_TOKENS + 1),
+        lambda: SetAutoCompact(mode="auto", threshold_tokens=200_000),
+        lambda: NewSession(
+            engine="claude", auto_compact_mode="custom"),
+        lambda: NewSession(
+            engine="codex", auto_compact_mode="auto"),
+    ):
+        with pytest.raises(ValidationError):
+            factory()
+
+    state = AutoCompact(
+        mode="custom",
+        threshold_tokens=200_000,
+        applied_mode="inherit",
+        pending=True,
+    )
+    assert deserialize(serialize(state)) == state
+    assert is_downstream(state) is True
 
 
 def test_markdown_save_content_is_bounded_by_utf8_bytes():

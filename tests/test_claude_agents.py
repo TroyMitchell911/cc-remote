@@ -121,6 +121,33 @@ def test_parallel_agent_lifecycle_statuses_remain_isolated():
     assert registry.snapshot(public_agent_run_id("agent-b")).status == "running"
 
 
+def test_local_background_bash_never_creates_clickable_agent_run():
+    registry = ClaudeAgentRegistry(64 * 1024)
+    registry.route(_assistant([ToolUseBlock(
+        id="background-bash",
+        name="Bash",
+        input={"command": "make check", "run_in_background": True},
+    )]))
+
+    routed = registry.route(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="bash-task",
+        description="Run checks", uuid="bash-start", session_id="session",
+        tool_use_id="background-bash", task_type="local_bash",
+    ))
+
+    assert routed.target == "main"
+    assert routed.touched_run_ids == ()
+    assert registry.runs == {}
+
+    explicit_agent = registry.route(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="agent-task",
+        description="Review", uuid="agent-start", session_id="session",
+        tool_use_id="unseen-agent-tool", task_type="local_agent",
+    ))
+    assert explicit_agent.touched_run_ids == (
+        public_agent_run_id("unseen-agent-tool"),)
+
+
 def test_agent_detail_fails_closed_for_codex_and_work():
     async def run():
         machine, _transport = _mk_machine()
@@ -214,3 +241,73 @@ def test_cold_agent_translation_rejects_unbounded_sdk_read(
 
     with pytest.raises(AgentSourceTooLarge):
         translate_source_agent("session", location, str(tmp_path), 64 * 1024)
+
+
+def test_agent_detail_distinguishes_nested_agent_from_background_bash(
+    monkeypatch,
+):
+    location = SourceAgentLocation(
+        run_id=public_agent_run_id("root-agent"),
+        title="根代理",
+        parent_run_id=None,
+        status="succeeded",
+        agent_id="private-root",
+        source_path=None,
+    )
+    background_notification = """<task-notification>
+<task-id>bash-task</task-id>
+<tool-use-id>background-bash</tool-use-id>
+<status>completed</status>
+<summary>checks passed</summary>
+</task-notification>"""
+    nested_notification = """<task-notification>
+<task-id>nested-task</task-id>
+<tool-use-id>nested-agent</tool-use-id>
+<status>completed</status>
+<summary>review passed</summary>
+</task-notification>"""
+    messages = [
+        SimpleNamespace(
+            uuid="tools", type="assistant", message={
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "background-bash",
+                     "name": "Bash", "input": {
+                         "command": "make check", "run_in_background": True,
+                     }},
+                    {"type": "tool_use", "id": "nested-agent",
+                     "name": "Agent", "input": {
+                         "description": "Review", "subagent_type": "reviewer",
+                         "prompt": "PRIVATE NESTED PROMPT",
+                     }},
+                ],
+            },
+        ),
+        SimpleNamespace(
+            uuid="bash-notification", type="user",
+            message={"role": "user", "content": background_notification},
+        ),
+        SimpleNamespace(
+            uuid="agent-notification", type="user",
+            message={"role": "user", "content": nested_notification},
+        ),
+    ]
+    monkeypatch.setattr(
+        agent_module, "get_subagent_messages",
+        lambda *_args, **_kwargs: messages,
+    )
+
+    detail = translate_source_agent(
+        "session", location, "/tmp/project", 64 * 1024)
+    processes = {
+        event["item_id"]: event
+        for event in detail.events if event["type"] == "process"
+    }
+
+    assert processes["bash-task"]["kind"] == "task"
+    assert processes["bash-task"]["parent_id"] == "background-bash"
+    nested_run_id = public_agent_run_id("nested-agent")
+    assert processes[nested_run_id]["kind"] == "agent"
+    assert processes[nested_run_id]["parent_id"] == "nested-agent"
+    assert "PRIVATE NESTED PROMPT" not in json.dumps(
+        detail.events, ensure_ascii=False)

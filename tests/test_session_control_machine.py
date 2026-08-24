@@ -29,8 +29,10 @@ def test_control_revision_changes_only_when_public_value_changes():
             can_takeover=True,
         )
         assert changed.revision == 1
-        assert len(transport.sent) == 1
+        assert [event.type for event in transport.sent] == [
+            "session_control", "auto_compact"]
         assert isinstance(transport.sent[0], SessionControl)
+        assert transport.sent[1].mutable is False
 
         duplicate = await machine._set_session_control(
             ctx,
@@ -41,7 +43,7 @@ def test_control_revision_changes_only_when_public_value_changes():
             can_takeover=True,
         )
         assert duplicate.revision == 1
-        assert len(transport.sent) == 1
+        assert len(transport.sent) == 2
         assert machine._control_revision_epochs["sid"] == 1
 
     asyncio.run(go())
@@ -74,7 +76,9 @@ def test_control_revision_advances_when_same_sid_context_is_rebuilt():
             terminal_attached=False,
         )
         assert duplicate.revision == 2
-        assert len(transport.sent) == 1
+        assert [event.type for event in transport.sent] == [
+            "session_control", "auto_compact"]
+        assert transport.sent[1].mode == "inherit"
         assert machine._control_revision_epochs["sid"] == 2
 
     asyncio.run(go())

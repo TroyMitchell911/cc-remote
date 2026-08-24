@@ -501,6 +501,46 @@ def test_task_updates_keep_origin_turn_across_translator_instances():
     assert "must-not-forward" not in wire and "/private/task-output" not in wire
 
 
+def test_background_bash_task_is_not_presented_as_collaborating_agent():
+    item_turns = {}
+    item_titles = {}
+    item_meta = {}
+    first = StreamTranslator(
+        4096, turn_id="bash-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    first.feed(_assistant([ToolUseBlock(
+        id="bash-tool", name="Bash",
+        input={"command": "make check", "run_in_background": True},
+    )], stop_reason="tool_use"))
+    started = first.feed(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="bash-task",
+        description="Run checks", uuid="bash-start", session_id="s1",
+        tool_use_id="bash-tool", task_type="local_bash",
+    ))
+
+    assert len(started) == 1
+    assert started[0].item_id == "bash-task"
+    assert started[0].kind == "task"
+    assert started[0].parent_id == "bash-tool"
+    assert started[0].background is True
+
+    second = StreamTranslator(
+        4096, turn_id="later-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    completed = second.feed(TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="bash-task",
+        status="completed", output_file="/private/output",
+        summary="checks passed", uuid="bash-end", session_id="s1",
+        tool_use_id="bash-tool",
+    ))
+    assert len(completed) == 1
+    assert completed[0].item_id == "bash-task"
+    assert completed[0].kind == "task"
+    assert completed[0].turn_id == "bash-turn"
+    assert completed[0].status == "succeeded"
+    assert completed[0].background is True
+
+
 def test_live_agent_tool_has_dedicated_realtime_lifecycle():
     translator = StreamTranslator(10_000, turn_id="user-turn")
     started = translator.feed(_assistant([

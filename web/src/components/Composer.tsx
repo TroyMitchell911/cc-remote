@@ -2,6 +2,8 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  lazy,
+  Suspense,
   useRef,
   useState,
   type ClipboardEvent,
@@ -11,7 +13,7 @@ import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
   StatusRateLimit,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem, PermissionProfileInfo,
+  EngineCapabilityItem, PermissionProfileInfo, AutoCompact,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -46,6 +48,13 @@ import { QueuedQueryChip } from "./QueuedQueryDialog";
 import { UsageMeter } from "./UsageMeter";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
+import {
+  normalizeAutoCompactSelection,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+
+const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
 
 interface Props {
   draftKey: string;
@@ -65,6 +74,7 @@ interface Props {
   replaceQueueCapacity: QueueCapacity;
   model: string;
   effort: string;
+  autoCompact?: AutoCompact | null;
   perm: string;
   permissionProfile: string | null;
   permissionProfiles: PermissionProfileInfo[] | null;
@@ -91,6 +101,7 @@ interface Props {
   onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
+  onSetAutoCompact?: (selection: AutoCompactSelection) => boolean;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
   onSetPermissionProfile: (profile: string) => void;
@@ -167,6 +178,7 @@ export function Composer(p: Props) {
   };
   const [ctxOpen, setCtxOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -190,6 +202,7 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     setNotice(null);
     if (noticeTimer.current !== null) {
       window.clearTimeout(noticeTimer.current);
@@ -198,18 +211,20 @@ export function Composer(p: Props) {
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [p.draftKey, p.draftStore]);
 
-  // Context and account-usage popovers share one anchor and close together.
+  // Context, account usage and autocompact share one anchor, but each has its
+  // own small popover. Only one may be visible at a time.
   useEffect(() => {
-    if (!ctxOpen && !usageOpen) return;
+    if (!ctxOpen && !usageOpen && !autoCompactOpen) return;
     const onDoc = (e: MouseEvent) => {
       if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) {
         setCtxOpen(false);
         setUsageOpen(false);
+        setAutoCompactOpen(false);
       }
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [ctxOpen, usageOpen]);
+  }, [autoCompactOpen, ctxOpen, usageOpen]);
 
   // <details> has no controlled open state here, so keep one document-level
   // listener active for mouse and touch and close it when focus moves outside.
@@ -219,6 +234,7 @@ export function Composer(p: Props) {
       workSettingsRef.current.open = false;
       setCtxOpen(false);
       setUsageOpen(false);
+      setAutoCompactOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = workSettingsRef.current;
@@ -272,6 +288,7 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
 
@@ -498,8 +515,41 @@ export function Composer(p: Props) {
       case "context":
         p.onContext();
         setUsageOpen(false);
+        setAutoCompactOpen(false);
         setCtxOpen(true);
         break;
+      case "autocompact": {
+        if (p.engine !== "claude") {
+          flash("自动压缩阈值仅适用于 Claude 会话。");
+          break;
+        }
+        if (!args.trim()) {
+          p.onContext();
+          setUsageOpen(false);
+          setCtxOpen(false);
+          setAutoCompactOpen(true);
+          if (p.surface === "work" && workSettingsRef.current) {
+            workSettingsRef.current.open = true;
+          }
+          break;
+        }
+        const parsed = parseAutoCompactArgument(args);
+        if (!parsed.ok) {
+          flash(parsed.error);
+          return;
+        }
+        if (p.autoCompact && !p.autoCompact.mutable) {
+          flash("本机 Claude TUI 正在控制此会话，请在终端启动时设置。");
+          return;
+        }
+        const queued = p.onSetAutoCompact?.(parsed.selection) ?? false;
+        flash(queued
+          ? (busy
+            ? "已保存，将在下一次可确认的回合终态或下一条消息前切换。"
+            : "正在应用自动压缩设置…")
+          : "自动压缩设置暂未发送，请稍后重试。");
+        break;
+      }
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
       case "rewind": flash("Claude Rewind 暂未开放"); break;
@@ -584,6 +634,14 @@ export function Composer(p: Props) {
   // Pick a command from the palette. Client commands run now; cc skills
   // (/code-review …) fill the composer so the user can add args, then send.
   const pickCommand = (slash: string) => {
+    // Autocompact is intentionally command-only: choosing its suggestion fills
+    // the composer, and only an explicit send may apply a value or open the UI.
+    if (slash === "autocompact") {
+      setInput("/autocompact ");
+      focusTa();
+      growTa();
+      return;
+    }
     if (clientSlashesFor(p.engine).has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
     setInput("/" + slash + " ");
     focusTa(); growTa();
@@ -652,6 +710,27 @@ export function Composer(p: Props) {
   const workContext = workSurface && p.contextReport && contextAvailable
     ? workContextMetrics(p.contextReport)
     : null;
+  const autoCompactSelection = normalizeAutoCompactSelection(
+    p.autoCompact?.mode ?? "inherit",
+    p.autoCompact?.threshold_tokens,
+  );
+  const autoCompactControl = (
+    <Suspense fallback={
+      <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
+      <AutoCompactControl
+        value={autoCompactSelection}
+        state={p.autoCompact}
+        effectiveThresholdTokens={
+          p.contextReport?.auto_compact_threshold_tokens}
+        rawMaxTokens={p.contextReport?.raw_max_tokens}
+        disabled={locked || !p.onSetAutoCompact}
+        onChange={(selection) => {
+          if (!p.onSetAutoCompact?.(selection)) {
+            flash("自动压缩设置暂未发送，请稍后重试。");
+          }
+        }} />
+    </Suspense>
+  );
   // Do not substitute catalog defaults for an existing session.  Until the
   // wrapper reports its authoritative settings, the controls explicitly show
   // that they are still being read.  Unknown/hidden ids remain visible verbatim.
@@ -844,7 +923,13 @@ export function Composer(p: Props) {
                   <span>Artifacts · {p.workArtifactCount}</span>
                 </button>
               )}
-              <details className="work-settings" ref={workSettingsRef}>
+              <details className="work-settings" ref={workSettingsRef}
+                onToggle={(event) => {
+                  if (event.currentTarget.open) return;
+                  setCtxOpen(false);
+                  setUsageOpen(false);
+                  setAutoCompactOpen(false);
+                }}>
                 <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
                 <div className="work-settings-pop" ref={ctxWrapRef}>
                   <button type="button" onClick={() => setSheetKind("models")}
@@ -855,7 +940,13 @@ export function Composer(p: Props) {
                     disabled={locked}>
                     <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
+                  <button type="button" aria-expanded={ctxOpen}
+                    onClick={() => {
+                      p.onContext();
+                      setUsageOpen(false);
+                      setAutoCompactOpen(false);
+                      setCtxOpen((o) => !o);
+                    }}>
                     <span>会话上下文</span><b>{p.contextReport?.available === false
                       ? "暂不可用"
                       : workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
@@ -883,6 +974,12 @@ export function Composer(p: Props) {
                           <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
                         </>
                       ) : <div className="ctx-pop-loading">读取上下文占用…</div>}
+                    </div>
+                  )}
+                  {p.engine === "claude" && autoCompactOpen && (
+                    <div className="ctx-pop work-ctx-pop auto-compact-pop"
+                      role="dialog" aria-label="Work 自动压缩">
+                      {autoCompactControl}
                     </div>
                   )}
                 </div>
@@ -967,6 +1064,7 @@ export function Composer(p: Props) {
                 onToggle={() => {
                   const opening = !usageOpen;
                   setCtxOpen(false);
+                  setAutoCompactOpen(false);
                   setUsageOpen(opening);
                   if (opening && p.engine === "codex") p.onRefreshUsage?.();
                 }}
@@ -980,11 +1078,13 @@ export function Composer(p: Props) {
             )}
             <button
               className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
+              aria-expanded={ctxOpen}
               aria-label="上下文占用"
               title="上下文占用"
               onClick={() => {
                 p.onContext();
                 setUsageOpen(false);
+                setAutoCompactOpen(false);
                 setCtxOpen((o) => !o);
               }}
             >
@@ -1026,12 +1126,17 @@ export function Composer(p: Props) {
                         ))}
                       </div>
                     )}
-                    {p.contextReport.is_auto_compact_enabled && <div className="ctx-pop-auto">autocompact 已启用</div>}
                     <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
                   </>
                 ) : (
                   <div className="ctx-pop-loading">读取上下文占用…</div>
                 )}
+              </div>
+            )}
+            {p.engine === "claude" && autoCompactOpen && (
+              <div className="ctx-pop auto-compact-pop" role="dialog"
+                aria-label="自动压缩">
+                {autoCompactControl}
               </div>
             )}
           </div>

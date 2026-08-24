@@ -140,6 +140,13 @@ class SessionContext:
     # Read-only projection of Claude-owned Agent runs. Kept resident across SDK
     # reconnects; Work and broker-owned TUI sessions leave it unset.
     claude_agents: Any = None
+    # Connection-local Claude task lifecycle, independent from the optional
+    # Agent detail projection above. Work deliberately has no Agent registry but
+    # still permits Bash(run_in_background=true), so spawn-time controls must
+    # wait for these tasks and their autonomous post-result follow-up to drain.
+    claude_active_tasks: set[str] = field(default_factory=set)
+    claude_task_tracking_overflow: bool = False
+    claude_background_followup_pending: bool = False
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.
@@ -151,6 +158,18 @@ class SessionContext:
     btw_real_id: Optional[str] = None
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
+    # Claude autocompact is a spawn-time session option.  Keep the last public
+    # projection and any recoverable reconnect error on the resident context so
+    # hello/focus refreshes do not make a still-pending choice look applied.
+    announced_auto_compact: Optional[tuple[object, ...]] = None
+    auto_compact_error: Optional[str] = None
+    auto_compact_apply_task: Optional[asyncio.Task] = None
+    # Model/effort/permission mutations and the spawn-time autocompact control
+    # use separate command paths.  Persist one coherent SDK snapshot per
+    # resident Claude session so an older async write cannot land after a newer
+    # control and silently undo it in the private store/broker preferences.
+    claude_control_persist_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock)
     # Model/cwd/process changes and thread/settings notifications can arrive
     # while config/read or model/list is resolving a nullable Codex effort.
     # Serialize those presentation-only probes per resident session; the

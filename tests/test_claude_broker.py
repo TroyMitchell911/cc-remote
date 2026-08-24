@@ -678,12 +678,14 @@ async def test_broker_persists_sdk_controls_into_next_native_resume(
         model="claude-fable-5",
         effort="max",
         permission_mode="plan",
+        auto_compact="250000",
     )
 
     resumed = await client.resume(sid, cwd=str(tmp_path))
     assert resumed["session"]["model"] == "claude-fable-5"
     assert resumed["session"]["effort"] == "max"
     assert resumed["session"]["permission_mode"] == "plan"
+    assert resumed["session"]["auto_compact"] == "250000"
     assert resumed["session"]["bypass_allowed"] is True
     attachment = await client.attach(sid)
     output = await _output_until(attachment, b"READY")
@@ -693,6 +695,7 @@ async def test_broker_persists_sdk_controls_into_next_native_resume(
     assert args[args.index("--model") + 1] == "claude-fable-5"
     assert args[args.index("--effort") + 1] == "max"
     assert args[args.index("--permission-mode") + 1] == "plan"
+    assert args[args.index("--autocompact") + 1] == "250000"
     assert "--allow-dangerously-skip-permissions" in args
     await attachment.close()
     await client.stop(sid)
@@ -818,12 +821,21 @@ def test_explicit_cli_keeps_its_options_out_of_official_claude_argv():
 
 
 def test_launch_controls_normalize_official_manual_permission_alias():
-    _model, _effort, permission, bypass_allowed = _launch_controls([
+    (_model, _effort, permission, bypass_allowed,
+     auto_compact) = _launch_controls([
         "--permission-mode", "manual",
         "--allow-dangerously-skip-permissions",
     ])
     assert permission == "default"
     assert bypass_allowed is True
+    assert auto_compact is None
+
+
+def test_launch_controls_observe_only_bounded_autocompact_values():
+    assert _launch_controls(["--autocompact", "auto"])[-1] == "auto"
+    assert _launch_controls(["--autocompact", "200000"])[-1] == "200000"
+    assert _launch_controls(["--autocompact", "99999"])[-1] is None
+    assert _launch_controls(["--autocompact", "200k"])[-1] is None
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,7 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
         assert [msg.type for msg in replay_frames] == [
             "replay_start", "delta", "turn_end", "replay_end",
             "session_control", "query_queue", "completion_state", "perm",
+            "auto_compact",
         ]
         assert all(msg.to == "client-1" for msg in replay_frames)
         assert all(msg.sid == "s-replay" for msg in replay_frames)
@@ -75,7 +76,7 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
                         if msg.type == "snapshot" and msg.sid == "s-new")
         assert snapshot.to == "client-1"
         assert snapshot.route_id == "route-1"
-        assert transport.sent[-1].type == "perm"
+        assert transport.sent[-1].type == "auto_compact"
         assert transport.sent[-1].sid == "s-new"
         # Routed copies must not contaminate the shared ring event.
         assert delta.to is None and delta.route_id is None
@@ -383,9 +384,11 @@ def test_duplicate_new_session_replays_snapshot_and_focus_without_creating_again
 
         assert spawns == 1
         assert [msg.type for msg in transport.sent] == [
-            "snapshot", "session_focus", "perm", "command_ack",
+            "snapshot", "session_focus", "auto_compact", "perm",
+            "command_ack",
         ]
-        replayed_snapshot, replayed_focus, permission, _ = transport.sent
+        replayed_snapshot, replayed_focus, auto_compact, permission, _ = (
+            transport.sent)
         assert replayed_snapshot.sid == "tmp-created"
         assert replayed_snapshot.generation == machine.instance_id
         assert replayed_snapshot.state == "running"
@@ -393,6 +396,7 @@ def test_duplicate_new_session_replays_snapshot_and_focus_without_creating_again
         assert replayed_focus.session_id == "tmp-created"
         assert replayed_focus.request_id == "create-request"
         assert replayed_focus.to == "client-1"
+        assert auto_compact.mode == "inherit"
         assert permission.mode == "bypassPermissions"
         assert isinstance(transport.sent[-1], CommandAck)
 
@@ -425,9 +429,10 @@ def test_cached_create_response_tracks_temp_to_real_rekey():
 
         assert spawns == 1
         assert [msg.type for msg in transport.sent] == [
-            "snapshot", "session_rekey", "session_focus", "perm", "command_ack",
+            "snapshot", "session_rekey", "session_focus", "auto_compact",
+            "perm", "command_ack",
         ]
-        snapshot, rekey, focus, permission, _ = transport.sent
+        snapshot, rekey, focus, auto_compact, permission, _ = transport.sent
         assert snapshot.sid == "tmp-created"
         assert snapshot.cc_session_id == "real-session"
         assert rekey.old_key == "tmp-created"
@@ -436,6 +441,8 @@ def test_cached_create_response_tracks_temp_to_real_rekey():
         assert focus.session_id == "real-session"
         assert focus.sid == "real-session"
         assert focus.to == "client-1"
+        assert auto_compact.sid == "real-session"
+        assert auto_compact.mode == "inherit"
         assert permission.sid == "real-session"
         assert permission.mode == "bypassPermissions"
 

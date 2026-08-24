@@ -18,12 +18,17 @@ from cc_remote.wrapper.stream import (
     recover_claude_delayed_retry_tail,
     transcript_path,
 )
+from cc_remote.protocol import (
+    MAX_AUTO_COMPACT_TOKENS,
+    MIN_AUTO_COMPACT_TOKENS,
+)
 
 
 CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 CLAUDE_PERMISSION_MODES = frozenset({
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
 })
+CLAUDE_AUTO_COMPACT_MODES = frozenset({"inherit", "auto", "custom"})
 
 _MODEL_ID = re.compile(r"^claude-[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,254}$")
 _MAX_ENTRIES = 4096
@@ -44,15 +49,23 @@ class ClaudeControls:
     model: str | None = None
     effort: str | None = None
     permission_mode: str | None = None
+    auto_compact_mode: str = "inherit"
+    auto_compact_threshold_tokens: int | None = None
 
-    def as_dict(self) -> dict[str, str]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             key: value for key, value in (
                 ("model", self.model),
                 ("effort", self.effort),
                 ("permission_mode", self.permission_mode),
             ) if value is not None
         }
+        if self.auto_compact_mode != "inherit":
+            payload["auto_compact_mode"] = self.auto_compact_mode
+            if self.auto_compact_mode == "custom":
+                payload["auto_compact_threshold_tokens"] = (
+                    self.auto_compact_threshold_tokens)
+        return payload
 
 
 def _canonical_session_id(value: object) -> str:
@@ -85,6 +98,59 @@ def valid_claude_permission(value: object) -> str | None:
     )
 
 
+def valid_claude_auto_compact(
+    mode: object,
+    threshold_tokens: object = None,
+) -> tuple[str, int | None]:
+    """Return one canonical safe config; malformed persisted state inherits."""
+    if mode is None:
+        mode = "inherit"
+    if not isinstance(mode, str) or mode not in CLAUDE_AUTO_COMPACT_MODES:
+        return "inherit", None
+    if mode == "custom":
+        if (not isinstance(threshold_tokens, int)
+                or isinstance(threshold_tokens, bool)
+                or not MIN_AUTO_COMPACT_TOKENS <= threshold_tokens
+                <= MAX_AUTO_COMPACT_TOKENS):
+            return "inherit", None
+        return mode, threshold_tokens
+    if threshold_tokens is not None:
+        return "inherit", None
+    return mode, None
+
+
+def claude_auto_compact_cli_value(
+    mode: object,
+    threshold_tokens: object = None,
+) -> str | None:
+    """Map the canonical session config onto Claude's ``--autocompact`` value."""
+    checked_mode, checked_threshold = valid_claude_auto_compact(
+        mode, threshold_tokens)
+    if checked_mode == "inherit":
+        return None
+    if checked_mode == "auto":
+        return "auto"
+    assert checked_threshold is not None
+    return str(checked_threshold)
+
+
+def claude_auto_compact_from_cli(value: object) -> tuple[str, int | None]:
+    """Parse only canonical broker launch values, never user settings text."""
+    if value is None:
+        return "inherit", None
+    if value == "auto":
+        return "auto", None
+    # Broker metadata is a local trust boundary nevertheless: bound the string
+    # before ``int`` so a corrupt/compromised response cannot trigger Python's
+    # huge-integer conversion path while Remote is adopting a terminal session.
+    if (isinstance(value, str)
+            and 6 <= len(value) <= 7
+            and value.isascii()
+            and value.isdecimal()):
+        return valid_claude_auto_compact("custom", int(value))
+    return "inherit", None
+
+
 class ClaudeControlStore:
     """Atomic, bounded per-session preferences owned only by cc-remote."""
 
@@ -97,10 +163,16 @@ class ClaudeControlStore:
         session_id = _canonical_session_id(session_id)
         with self._lock:
             raw = dict(self._sessions.get(session_id, {}))
+        auto_mode, auto_threshold = valid_claude_auto_compact(
+            raw.get("auto_compact_mode"),
+            raw.get("auto_compact_threshold_tokens"),
+        )
         return ClaudeControls(
             model=valid_claude_model(raw.get("model")),
             effort=valid_claude_effort(raw.get("effort")),
             permission_mode=valid_claude_permission(raw.get("permission_mode")),
+            auto_compact_mode=auto_mode,
+            auto_compact_threshold_tokens=auto_threshold,
         )
 
     def update(
@@ -110,12 +182,18 @@ class ClaudeControlStore:
         model: str | None,
         effort: str | None,
         permission_mode: str | None,
+        auto_compact_mode: str = "inherit",
+        auto_compact_threshold_tokens: int | None = None,
     ) -> ClaudeControls:
         session_id = _canonical_session_id(session_id)
+        checked_auto_mode, checked_auto_threshold = valid_claude_auto_compact(
+            auto_compact_mode, auto_compact_threshold_tokens)
         controls = ClaudeControls(
             model=valid_claude_model(model),
             effort=valid_claude_effort(effort),
             permission_mode=valid_claude_permission(permission_mode),
+            auto_compact_mode=checked_auto_mode,
+            auto_compact_threshold_tokens=checked_auto_threshold,
         )
         payload = controls.as_dict()
         with self._lock:
@@ -133,6 +211,48 @@ class ClaudeControlStore:
             self._sessions = updated
         return controls
 
+    def update_auto_compact(
+        self,
+        session_id: str,
+        *,
+        mode: str,
+        threshold_tokens: int | None,
+        preserve_other_controls: bool = True,
+    ) -> ClaudeControls:
+        """Atomically replace autocompact, optionally clearing Code controls.
+
+        Work sessions share the Claude engine but do not expose Code's
+        model/effort/permission preferences.  Their caller passes ``False`` so
+        a legacy record for the same native UUID cannot leak those controls
+        back into a later Code resume.
+        """
+        session_id = _canonical_session_id(session_id)
+        checked_mode, checked_threshold = valid_claude_auto_compact(
+            mode, threshold_tokens)
+        with self._lock:
+            raw = (
+                dict(self._sessions.get(session_id, {}))
+                if preserve_other_controls else {}
+            )
+            controls = ClaudeControls(
+                model=valid_claude_model(raw.get("model")),
+                effort=valid_claude_effort(raw.get("effort")),
+                permission_mode=valid_claude_permission(
+                    raw.get("permission_mode")),
+                auto_compact_mode=checked_mode,
+                auto_compact_threshold_tokens=checked_threshold,
+            )
+            payload = controls.as_dict()
+            updated = dict(self._sessions)
+            updated.pop(session_id, None)
+            if payload:
+                updated[session_id] = payload
+            while len(updated) > _MAX_ENTRIES:
+                updated.pop(next(iter(updated)))
+            self._persist(updated)
+            self._sessions = updated
+        return controls
+
     def inherit_if_absent(
         self,
         session_id: str,
@@ -140,23 +260,37 @@ class ClaudeControlStore:
         model: str | None,
         effort: str | None,
         permission_mode: str | None,
+        auto_compact_mode: str = "inherit",
+        auto_compact_threshold_tokens: int | None = None,
     ) -> ClaudeControls:
         """Seed a new fork once without overwriting later child choices."""
         session_id = _canonical_session_id(session_id)
+        checked_auto_mode, checked_auto_threshold = valid_claude_auto_compact(
+            auto_compact_mode, auto_compact_threshold_tokens)
         controls = ClaudeControls(
             model=valid_claude_model(model),
             effort=valid_claude_effort(effort),
             permission_mode=valid_claude_permission(permission_mode),
+            auto_compact_mode=checked_auto_mode,
+            auto_compact_threshold_tokens=checked_auto_threshold,
         )
         payload = controls.as_dict()
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
+                existing_auto_mode, existing_auto_threshold = (
+                    valid_claude_auto_compact(
+                        existing.get("auto_compact_mode"),
+                        existing.get("auto_compact_threshold_tokens"),
+                    )
+                )
                 return ClaudeControls(
                     model=valid_claude_model(existing.get("model")),
                     effort=valid_claude_effort(existing.get("effort")),
                     permission_mode=valid_claude_permission(
                         existing.get("permission_mode")),
+                    auto_compact_mode=existing_auto_mode,
+                    auto_compact_threshold_tokens=existing_auto_threshold,
                 )
             if not payload:
                 return controls
@@ -168,7 +302,7 @@ class ClaudeControlStore:
             self._sessions = updated
         return controls
 
-    def _load(self) -> dict[str, dict[str, str]]:
+    def _load(self) -> dict[str, dict[str, Any]]:
         try:
             info = self.path.lstat()
         except FileNotFoundError:
@@ -191,7 +325,7 @@ class ClaudeControlStore:
                 or not isinstance(sessions, dict)
                 or len(sessions) > _MAX_ENTRIES):
             raise ClaudeControlStoreError("Claude control store has invalid shape")
-        loaded: dict[str, dict[str, str]] = {}
+        loaded: dict[str, dict[str, Any]] = {}
         for raw_id, values in sessions.items():
             if not isinstance(values, dict):
                 continue
@@ -199,17 +333,23 @@ class ClaudeControlStore:
                 session_id = _canonical_session_id(raw_id)
             except ClaudeControlStoreError:
                 continue
+            auto_mode, auto_threshold = valid_claude_auto_compact(
+                values.get("auto_compact_mode"),
+                values.get("auto_compact_threshold_tokens"),
+            )
             controls = ClaudeControls(
                 model=valid_claude_model(values.get("model")),
                 effort=valid_claude_effort(values.get("effort")),
                 permission_mode=valid_claude_permission(
                     values.get("permission_mode")),
+                auto_compact_mode=auto_mode,
+                auto_compact_threshold_tokens=auto_threshold,
             ).as_dict()
             if controls:
                 loaded[session_id] = controls
         return loaded
 
-    def _persist(self, sessions: dict[str, dict[str, str]]) -> None:
+    def _persist(self, sessions: dict[str, dict[str, Any]]) -> None:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(parent, 0o700)
