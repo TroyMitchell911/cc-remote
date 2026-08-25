@@ -9,7 +9,12 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from claude_agent_sdk.types import ResultMessage, ToolResultBlock, UserMessage
+from claude_agent_sdk.types import (
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    UserMessage,
+)
 
 from cc_remote.protocol import (
     AssistantMsgStart, ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent,
@@ -93,12 +98,22 @@ def test_claude_replayed_user_id_excludes_tool_protocol_envelopes():
         uuid=native_id,
         parent_tool_use_id="tool-1",
     )) is None
+    assert replayed_user_message_id(UserMessage(
+        content="<task-notification>done</task-notification>",
+        uuid=native_id,
+        origin={"kind": "task-notification"},
+    )) is None
+    assert replayed_user_message_id(UserMessage(
+        content=[TextBlock(text="[Request interrupted by user]")],
+        uuid=native_id,
+    )) is None
 
 
 def test_claude_live_replayed_user_uuid_is_persisted_as_browser_alias(
     monkeypatch, tmp_path,
 ):
     session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    interrupt_id = "2259073b-7676-455f-b7b0-010101010101"
     native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
     client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
     transcript = tmp_path / f"{session_id}.jsonl"
@@ -116,6 +131,12 @@ def test_claude_live_replayed_user_uuid_is_persisted_as_browser_alias(
             return None
 
         async def receive_response(self):
+            # A replacement turn can see the preceding turn's late synthetic
+            # interrupt row before its own replayed user UUID.
+            yield UserMessage(
+                content=[TextBlock(text="[Request interrupted by user]")],
+                uuid=interrupt_id,
+            )
             yield UserMessage(content="继续", uuid=native_id)
             yield ResultMessage(
                 subtype="success",
@@ -484,6 +505,91 @@ def test_interrupt_during_preflight_reconnect_never_submits_query():
                      if isinstance(message, (UserMsg, TurnEnd))]
         assert [message.type for message in narrative] == ["user_msg", "turn_end"]
         assert narrative[-1].result.subtype == "error_during_execution"
+
+    asyncio.run(run())
+
+
+def test_managed_finalizer_reconciles_background_result_race(monkeypatch):
+    class FinalizerRaceSdk:
+        effort = "max"
+        applied_effort = "max"
+        model = None
+        next_turn_id = None
+        is_claude_broker = False
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-race",
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("session-race", "session-race")
+        ctx.sdk = FinalizerRaceSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "message-race"
+        ctx.claude_background_followup_pending = True
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+        original_set_idle = machine._set_idle_after_managed_turn
+        delivered = False
+
+        async def settle_then_deliver_background(
+            target, *, claude_terminal=False,
+        ):
+            nonlocal delivered
+            await original_set_idle(
+                target, claude_terminal=claude_terminal)
+            if claude_terminal and not delivered:
+                delivered = True
+                assert target.state == "running"
+                await machine._on_claude_background_message(
+                    target,
+                    ResultMessage(
+                        subtype="success",
+                        duration_ms=1,
+                        duration_api_ms=1,
+                        is_error=False,
+                        num_turns=1,
+                        session_id="session-race",
+                    ),
+                    "message-race",
+                )
+                assert target.state == "running"
+
+        monkeypatch.setattr(
+            machine, "_set_idle_after_managed_turn",
+            settle_then_deliver_background)
+        turn = asyncio.create_task(machine._run_turn(ctx, "race"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(turn, timeout=1)
+
+        assert delivered is True
+        assert ctx.turn_task is None
+        assert ctx.claude_background_followup_pending is False
+        assert ctx.state == "idle"
 
     asyncio.run(run())
 

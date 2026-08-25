@@ -1108,6 +1108,8 @@ assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
 
 const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
+const autoCompactControlSource = readFileSync(resolve(
+  process.cwd(), "src/components/AutoCompactControl.tsx"), "utf8");
 assert.equal(HISTORY_INITIAL_PAGE, 4,
   "the newest history page must stay small enough for an immediate first paint");
 assert.equal(HISTORY_MORE_PAGE, 12,
@@ -1287,11 +1289,14 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 20/,
-  "v37 must invalidate browser rows containing parser-time process clocks");
+assert.match(cacheSource, /const CACHE_VER = 23/,
+  "leading-compaction history repair must invalidate polluted browser rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
+assert.match(autoCompactControlSource,
+  /设置已应用；上下文用量将在下一次可靠读取后更新。/,
+  "an applied setting without a fresh context report must not claim it is pending");
 
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
@@ -3557,6 +3562,92 @@ try {
   } as ServerEvent);
   assert.equal(createRuntime().sendMode, "steer",
     "Codex running input uses steer mode by default");
+  const autoCompactSid = "claude-autocompact-context";
+  const oldContextReport = event({
+    type: "context_report",
+    sid: autoCompactSid,
+    total_tokens: 125_000,
+    max_tokens: 500_000,
+    percentage: 25,
+    auto_compact_threshold_tokens: 500_000,
+    raw_max_tokens: 1_000_000,
+    categories: [],
+  });
+  let autoCompactState = {
+    ...initialState,
+    focusedSid: autoCompactSid,
+    runtimes: {
+      [autoCompactSid]: {
+        ...createRuntime(),
+        contextReport: oldContextReport,
+        autoCompact: event({
+          type: "auto_compact",
+          sid: autoCompactSid,
+          mode: "custom",
+          threshold_tokens: 500_000,
+          applied_mode: "custom",
+          applied_threshold_tokens: 500_000,
+          pending: false,
+          mutable: true,
+        }),
+      },
+    },
+  };
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: event({
+      type: "auto_compact",
+      sid: autoCompactSid,
+      mode: "custom",
+      threshold_tokens: 400_000,
+      applied_mode: "custom",
+      applied_threshold_tokens: 500_000,
+      pending: true,
+      mutable: true,
+    }),
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    oldContextReport,
+    "a desired autocompact change must retain usage from the still-live child",
+  );
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: event({
+      type: "auto_compact",
+      sid: autoCompactSid,
+      mode: "custom",
+      threshold_tokens: 400_000,
+      applied_mode: "custom",
+      applied_threshold_tokens: 400_000,
+      pending: false,
+      mutable: true,
+    }),
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    null,
+    "an applied autocompact change must invalidate the prior child context",
+  );
+  const refreshedContextReport = event({
+    type: "context_report",
+    sid: autoCompactSid,
+    total_tokens: 126_000,
+    max_tokens: 400_000,
+    percentage: 31.5,
+    auto_compact_threshold_tokens: 400_000,
+    raw_max_tokens: 1_000_000,
+    categories: [],
+  });
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: refreshedContextReport,
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    refreshedContextReport,
+    "the next-generation context report must repopulate applied autocompact usage",
+  );
   let desktopCompletion = reduce(initialState, {
     type: "event",
     event: event({
@@ -7903,6 +7994,71 @@ try {
   assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
+
+  const terminalCompactSid = "terminal-compact-keeps-question";
+  let terminalCompactState = {
+    ...initialState,
+    focusedSid: terminalCompactSid,
+    sessions: [{ session_id: terminalCompactSid,
+      engine: "codex" as const, space: "code" as const }],
+    runtimes: {
+      [terminalCompactSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        turns: [{ ...compactDuplicateLiveTurn }],
+      },
+    },
+  };
+  terminalCompactState = reduce(terminalCompactState, {
+    type: "event", event: event({
+      type: "history",
+      sid: terminalCompactSid,
+      session_id: terminalCompactSid,
+      revision: "terminal-compact-revision",
+      generation: "terminal-compact-generation",
+      build_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: false,
+      events: [],
+      turns: [{
+        id: "terminal-compact-user",
+        forkPointId: compactDuplicateNativeTurn,
+        prompt: "继续修复问题",
+        done: true,
+        detailEventCount: 2,
+        detailLoaded: false,
+        blocks: [{
+          kind: "process" as const,
+          item_id: "terminal-compact-marker",
+          processKind: "compaction" as const,
+          phase: "end" as const,
+          status: "succeeded" as const,
+          turn_id: compactDuplicateNativeTurn,
+          title: "压缩上下文",
+          done: true,
+        }, {
+          kind: "text" as const,
+          message_id: "terminal-compact-answer",
+          channel: "final" as const,
+          text: "已完成",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const terminalCompactTurns =
+    terminalCompactState.runtimes[terminalCompactSid].turns;
+  assert.equal(terminalCompactTurns.length, 1,
+    "terminal compact History must retain exactly one user question");
+  assert.equal(terminalCompactTurns[0].prompt, "继续修复问题");
+  assert.equal(terminalCompactTurns[0].done, true);
+  assert.equal(terminalCompactTurns[0].blocks.filter(
+    (block: { kind: string; processKind?: string }) =>
+      block.kind === "process" && block.processKind === "compaction").length, 1);
+  assert.equal(terminalCompactTurns[0].blocks.some(
+    (block: { kind: string; text?: string }) =>
+      block.kind === "text" && block.text === "已完成"), true);
 
   const cachedCompactionSid = "canonical-history-repairs-cached-compaction";
   const cachedCompactionOwner = {
@@ -15843,11 +15999,13 @@ try {
   // A background task can be consumed after ResultMessage, when a new turn is
   // already open. Its authoritative engine turn id must route it back to the
   // old turn instead of creating a phantom third turn or attaching to the tail.
+  state.runtimes[richSid].turns[0].clientMsgId = "turn-rich-client";
+  state.runtimes[richSid].turns[0].historyTurnId = "turn-rich-history";
   state = reduce(state, { type: "query_sent", sid: richSid, prompt: "下一问",
     msg_id: "rich-next", ts: 34_000 });
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
-    phase: "end", status: "succeeded", turn_id: "turn-rich",
+    phase: "end", status: "succeeded", turn_id: "turn-rich-client",
     title: "后台代理完成", background: true,
   }) });
   assert.equal(state.runtimes[richSid].turns.length, 2);
@@ -15856,6 +16014,41 @@ try {
       && block.item_id === "late-agent"));
   assert.ok(!state.runtimes[richSid].turns[1].blocks.some(
     (block: { kind: string; item_id?: string }) => block.item_id === "late-agent"));
+
+  // Autonomous Claude narrative uses the same explicit owner. Text and tool
+  // frames must not fall through to the newer optimistic question merely
+  // because their message/tool ids have not been seen before.
+  state = reduce(state, { type: "event", event: event({
+    type: "assistant_msg_start", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "delta", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+    text: "后台结果正文",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "tool_use", sid: richSid, message_id: "late-answer",
+    tool_use_id: "late-read", turn_id: "turn-rich-history", background: true,
+    tool: "Read", input: { file_path: "README.md" },
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "tool_result", sid: richSid, tool_use_id: "late-read",
+    turn_id: "turn-rich-history", background: true, content: "done", is_error: false,
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "assistant_msg_end", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+  }) });
+  const oldNarrativeOwner = state.runtimes[richSid].turns[0];
+  const newNarrativeTail = state.runtimes[richSid].turns[1];
+  assert.ok(oldNarrativeOwner.blocks.some((block: Block) => block.kind === "text"
+    && block.message_id === "late-answer" && block.text === "后台结果正文"));
+  assert.ok(oldNarrativeOwner.blocks.some((block: Block) => block.kind === "tool"
+    && block.tool_use_id === "late-read" && block.done));
+  assert.ok(!newNarrativeTail.blocks.some((block: Block) => block.kind === "text"
+    ? block.message_id === "late-answer"
+    : block.kind === "tool" && block.tool_use_id === "late-read"));
 
   // A late detached background update remains visible inside the completed
   // turn without reopening its session-level working affordance.
@@ -17635,8 +17828,8 @@ assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
   "Code must retain the engine-total context reading");
 assert.match(composerSource, /contextAvailable = p\.contextReport\?\.available !== false/,
   "an absent tokenUsage report must not be rendered as a real zero");
-assert.match(composerSource, /尚未收到 Codex 的 tokenUsage/,
-  "the context popover must explain the temporary unknown state");
+assert.match(composerSource, /暂未收到可靠的上下文用量/,
+  "the engine-neutral context popover must explain the temporary unknown state");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
 assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "选择模型"/,

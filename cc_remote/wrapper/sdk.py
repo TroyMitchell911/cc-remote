@@ -18,7 +18,7 @@ from claude_agent_sdk import (
     __version__ as SDK_VERSION,
 )
 from claude_agent_sdk._internal.message_parser import parse_message as _parse_sdk_message
-from claude_agent_sdk.types import ResultMessage, SystemMessage
+from claude_agent_sdk.types import ResultMessage, SystemMessage, UserMessage
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
@@ -55,6 +55,7 @@ CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
 CLAUDE_DEFAULT_EFFORT = "max"
 CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024
 _CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
+_CONTEXT_CONTROL_TIMEOUT = 5.0
 
 # Work keeps the file primitives needed for documents and other deliverables,
 # plus first-party web research.  Deliberately omit Agent/Task, Skill,
@@ -81,6 +82,19 @@ class _MessagePumpFailure:
 _MESSAGE_PUMP_END = object()
 
 
+class ClaudeAutonomousFollowupPending(RuntimeError):
+    """A background Claude continuation owns the next response boundary."""
+
+
+def _message_origin_kind(message: Any) -> str | None:
+    """Return the SDK's authoritative turn provenance when one is present."""
+    origin = getattr(message, "origin", None)
+    if not isinstance(origin, dict):
+        return None
+    kind = origin.get("kind")
+    return kind if isinstance(kind, str) and kind else None
+
+
 def _explicit_cli_path(value: str) -> str | None:
     """Normalize an opt-in CLI path without changing blank/PATH behavior."""
     value = value.strip()
@@ -90,6 +104,28 @@ def _explicit_cli_path(value: str) -> str | None:
     if not os.path.isabs(path):
         raise RuntimeError("CLAUDE_BIN must be an absolute path")
     return path
+
+
+def _is_control_request_timeout(
+    error: BaseException,
+    *,
+    subtype: str,
+) -> bool:
+    """Recognize the pinned SDK's untyped control-timeout wrapper.
+
+    The SDK currently raises a plain ``Exception`` and preserves the timeout
+    only in its message. Walk the local exception chain as well so a narrow
+    adapter can add context without hiding the poisoned-control signal.
+    """
+    marker = f"control request timeout: {subtype}".casefold()
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if marker in str(current).casefold():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class SdkHandle:
@@ -132,6 +168,21 @@ class SdkHandle:
         # runtime change cannot land on the old child after the new options were
         # already captured.
         self._permission_reconnect_lock = asyncio.Lock()
+        # Context inspection and query acceptance both write the SDK's one
+        # stdin control stream. Keep their acceptance windows ordered even
+        # though the SDK can track multiple request ids: Claude Code may process
+        # a slow context rebuild synchronously and otherwise strand a prompt
+        # behind it.
+        self._control_request_lock = asyncio.Lock()
+        # A timed-out control request is not cancelled inside Claude Code by the
+        # SDK. The current child is therefore unsafe to reuse even if its
+        # process and stdout reader still look alive.
+        self.control_plane_failed = False
+        # A replacement generation created after such a timeout deliberately
+        # skips context probing until one real successful ResultMessage proves
+        # that its turn path is healthy.
+        self.context_probe_suppressed = False
+        self._last_context_usage: dict[str, Any] | None = None
         self._conversation_rewind_probe_lock = asyncio.Lock()
         self._conversation_rewind_capability: (
             ClaudeConversationRewindCapability | None
@@ -150,6 +201,14 @@ class SdkHandle:
         # UI immediately without racing the next receive_response() consumer.
         self.background_message_callback: Callable[
             [Any, str | None], Awaitable[None]] | None = None
+        # Query launch and background delivery share one ordered boundary.  The
+        # machine guard is deliberately synchronous: it runs after every
+        # already-routed background callback completed, while the pump cannot
+        # classify another message, and immediately before the user prompt is
+        # written to Claude Code.
+        self.query_launch_guard: Callable[[], None] | None = None
+        self.message_pump_failure_callback: Callable[
+            [BaseException], Awaitable[None]] | None = None
         # Machine owns the connection-local task ledger because lifecycle
         # messages must be observed in delivery order. Disconnect nevertheless
         # invalidates that whole generation, so give it one synchronous reset
@@ -164,10 +223,22 @@ class SdkHandle:
         self._background_task: asyncio.Task | None = None
         self._turn_messages: asyncio.Queue | None = None
         self._background_messages: asyncio.Queue | None = None
+        # ``_turn_active`` means a wrapper-submitted prompt is still waiting for
+        # its own ResultMessage. Claude may inject complete autonomous turns on
+        # the same stream before that result; ``_message_route_owner`` follows
+        # their UserMessage/ResultMessage ``origin`` instead of assigning every
+        # frame to whichever browser query happened to write most recently.
         self._turn_active = False
         self._turn_consumer_active = False
+        self._message_route_owner: str | None = None
         self._turn_background_release: asyncio.Event | None = None
+        self._pending_turn_background_release: asyncio.Event | None = None
+        self._pending_turn_origin_id: str | None = None
         self._message_pump_error: BaseException | None = None
+        self._message_route_lock = asyncio.Lock()
+        self._background_callbacks_pending = 0
+        self._background_callbacks_drained = asyncio.Event()
+        self._background_callbacks_drained.set()
 
     async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
         callback = self.permission_callback
@@ -303,61 +374,71 @@ class SdkHandle:
 
     async def connect(self, resume_id: str | None = None, cwd: str | None = None,
                       fork: bool = False,
-                      model_override: str | None = None) -> None:
+                      model_override: str | None = None,
+                      _suppress_context_probe: bool = False) -> None:
         opts = self._options(
             resume_id, cwd, fork=fork, model_override=model_override)
         self.client = ClaudeSDKClient(options=opts)
         self._conversation_rewind_capability = None
         await self.client.connect()
-        try:
-            # The verified SDK's public helper hardcodes a 60s timeout. This
-            # project pins and preflights it, so use the same control
-            # request with a bounded timeout; its implementation also cleans both
-            # pending maps on timeout instead of leaking a cancelled request.
-            query = getattr(self.client, "_query", None)
-            send_control = getattr(query, "_send_control_request", None)
-            if not callable(send_control):
-                raise RuntimeError("bounded model control request unavailable")
-            usage = await send_control(
-                {"subtype": "get_context_usage"}, timeout=5.0)
-            model = usage.get("model") if isinstance(usage, dict) else None
-            if isinstance(model, str) and 0 < len(model.strip()) <= 256:
-                self.model = model.strip()
-            auto_threshold = (
-                usage.get("autoCompactThreshold")
-                if isinstance(usage, dict) else None
-            )
-            self.effective_auto_compact_threshold_tokens = (
-                auto_threshold
-                if isinstance(auto_threshold, int)
-                and not isinstance(auto_threshold, bool)
-                and auto_threshold >= 0 else None
-            )
-            raw_max = (
-                usage.get("rawMaxTokens")
-                if isinstance(usage, dict) else None
-            )
-            self.raw_context_max_tokens = (
-                raw_max
-                if isinstance(raw_max, int)
-                and not isinstance(raw_max, bool)
-                and raw_max >= 0 else None
-            )
-            if (self.work_mode and not resume_id
-                    and self.work_context_baseline_tokens is None):
-                total_tokens = (
-                    usage.get("totalTokens")
-                    if isinstance(usage, dict) else None
+        # Context usage belongs to one concrete Claude child generation.  A
+        # reconnect can change the effective autocompact window, model, or
+        # transcript projection; retaining the prior child's reading makes the
+        # Web UI report (for example) 500k after the new child was launched with
+        # ``--autocompact 400000``.  Clear it before the new control probe.  If
+        # that probe is deliberately suppressed after an earlier timeout, the
+        # machine will report usage as unavailable instead of serving stale
+        # numbers until a successful turn makes probing safe again.
+        self._last_context_usage = None
+        self.effective_auto_compact_threshold_tokens = None
+        self.raw_context_max_tokens = None
+        self.control_plane_failed = False
+        self.context_probe_suppressed = bool(_suppress_context_probe)
+        if not _suppress_context_probe:
+            try:
+                usage = await self._read_context_usage_control()
+            except Exception as exc:
+                if _is_control_request_timeout(
+                    exc, subtype="get_context_usage"
+                ):
+                    # The SDK forgets its waiter on timeout but sends no cancel
+                    # frame to Claude Code. Destroy this generation immediately;
+                    # otherwise its still-blocked control loop also swallows the
+                    # first query and interrupt. The replacement must not repeat
+                    # the same eager probe before it has completed a real turn.
+                    self.control_plane_failed = True
+                    self.context_probe_suppressed = True
+                    log.warning(
+                        "Claude startup context probe timed out; replacing child"
+                    )
+                    try:
+                        await self.disconnect()
+                    except Exception as disconnect_exc:
+                        log.warning(
+                            "disconnect after Claude context timeout failed",
+                            error_type=type(disconnect_exc).__name__,
+                        )
+                    await self.connect(
+                        resume_id=resume_id,
+                        cwd=cwd,
+                        fork=fork,
+                        model_override=model_override,
+                        _suppress_context_probe=True,
+                    )
+                    return
+                # Model readout is useful control state, but a semantic or
+                # capability failure does not poison an otherwise live child.
+                log.warning(
+                    "Claude model state unavailable",
+                    error=type(exc).__name__,
                 )
-                if (isinstance(total_tokens, int)
-                        and not isinstance(total_tokens, bool)
-                        and total_tokens >= 0):
-                    self.work_context_baseline_tokens = total_tokens
-        except Exception as exc:
-            # Model readout is useful control state, but failure to obtain it
-            # must not make an otherwise healthy Claude session unusable.
-            log.warning("Claude model state unavailable",
-                        error=type(exc).__name__)
+            else:
+                self._record_context_usage(
+                    usage,
+                    update_model=True,
+                    capture_work_baseline=not resume_id,
+                )
+
         self.goal_session_id = None if fork else resume_id
         self.goal = None
         self._goal_message_tokens.clear()
@@ -372,34 +453,163 @@ class SdkHandle:
                  effort=self.effort, permission_mode=self.permission_mode,
                  auto_compact=self.auto_compact_mode,
                  auto_compact_threshold=self.auto_compact_threshold_tokens,
+                 context_probe_suppressed=self.context_probe_suppressed,
                  sdk_version=SDK_VERSION)
+
+    async def _read_context_usage_control(self) -> dict:
+        """Issue one bounded read on the pinned SDK control protocol."""
+        async with self._control_request_lock:
+            if self.control_plane_failed:
+                raise RuntimeError("Claude SDK control plane is unhealthy")
+            client = self.client
+            if client is None:
+                raise RuntimeError("Claude SDK is not connected")
+            # The public helper hardcodes a 60-second timeout. A timeout cannot
+            # be cancelled in the child, so bound it tightly and poison this
+            # exact generation rather than letting later controls pile up.
+            query = getattr(client, "_query", None)
+            send_control = getattr(query, "_send_control_request", None)
+            if not callable(send_control):
+                raise RuntimeError("bounded model control request unavailable")
+            try:
+                usage = await send_control(
+                    {"subtype": "get_context_usage"},
+                    timeout=_CONTEXT_CONTROL_TIMEOUT,
+                )
+            except Exception as exc:
+                if _is_control_request_timeout(
+                    exc, subtype="get_context_usage"
+                ):
+                    self.control_plane_failed = True
+                    self.context_probe_suppressed = True
+                    self._conversation_rewind_capability = None
+                raise
+            if not isinstance(usage, dict):
+                return {}
+            return usage
+
+    def _record_context_usage(
+        self,
+        usage: dict,
+        *,
+        update_model: bool = False,
+        capture_work_baseline: bool = False,
+    ) -> None:
+        """Cache one successful reading and update generation metadata."""
+        self._last_context_usage = dict(usage)
+        if update_model:
+            model = usage.get("model") if isinstance(usage, dict) else None
+            if isinstance(model, str) and 0 < len(model.strip()) <= 256:
+                self.model = model.strip()
+        auto_threshold = usage.get("autoCompactThreshold")
+        self.effective_auto_compact_threshold_tokens = (
+            auto_threshold
+            if isinstance(auto_threshold, int)
+            and not isinstance(auto_threshold, bool)
+            and auto_threshold >= 0 else None
+        )
+        raw_max = usage.get("rawMaxTokens")
+        self.raw_context_max_tokens = (
+            raw_max
+            if isinstance(raw_max, int)
+            and not isinstance(raw_max, bool)
+            and raw_max >= 0 else None
+        )
+        if (capture_work_baseline and self.work_mode
+                and self.work_context_baseline_tokens is None):
+            total_tokens = usage.get("totalTokens")
+            if (isinstance(total_tokens, int)
+                    and not isinstance(total_tokens, bool)
+                    and total_tokens >= 0):
+                self.work_context_baseline_tokens = total_tokens
+
+    def cached_context_usage(self) -> dict | None:
+        """Return the last successful reading without touching the child."""
+        if self._last_context_usage is None:
+            return None
+        return dict(self._last_context_usage)
+
+    def _activate_pending_turn_route(self) -> None:
+        """Bind post-Result background frames to the submitted browser turn."""
+        release = self._pending_turn_background_release
+        if release is None:
+            return
+        self._turn_background_release = release
+        self._turn_origin_id = self._pending_turn_origin_id
+        self._pending_turn_background_release = None
+        self._pending_turn_origin_id = None
+
+    def _discard_pending_turn_route(self) -> None:
+        release = self._pending_turn_background_release
+        if release is not None:
+            release.set()
+        self._pending_turn_background_release = None
+        self._pending_turn_origin_id = None
 
     async def query(self, prompt) -> None:
         """Send a request. `prompt` is a string, or an async iterable of user-
         message dicts (used for multimodal input — text + image blocks)."""
-        assert self.client is not None
-        if self._message_pump_task is not None:
-            if self._message_pump_task.done():
-                raise RuntimeError("Claude SDK message pump is not running") from self._message_pump_error
-            if self._turn_active or self._turn_consumer_active:
-                raise RuntimeError("Claude SDK already has an active response")
-            # Each turn gets its own barrier. Background messages retain the
-            # barrier belonging to the Result they followed, so a later query
-            # cannot re-block old queued notifications and deadlock the reader.
-            self._turn_background_release = asyncio.Event()
-            self._turn_origin_id = self.next_turn_id
-            self.next_turn_id = None
-            self._turn_active = True
-            try:
-                await self.client.query(prompt)
-            except BaseException:
-                self._turn_active = False
-                self._turn_background_release.set()
-                raise
-            return
-        # Compatibility for tests/custom clients that install a client without
-        # going through connect(). Real SDK connections always use the sole pump.
-        await self.client.query(prompt)
+        async with self._control_request_lock:
+            if self.control_plane_failed:
+                raise RuntimeError("Claude SDK control plane is unhealthy")
+            client = self.client
+            if client is None:
+                raise RuntimeError("Claude SDK is not connected")
+            if self._message_pump_task is not None:
+                if self._message_pump_task.done():
+                    raise RuntimeError("Claude SDK message pump is not running") from self._message_pump_error
+                if self._turn_active or self._turn_consumer_active:
+                    raise RuntimeError("Claude SDK already has an active response")
+                # Do not let a Query overtake a task notification that the sole
+                # reader already routed but whose machine callback has not yet
+                # established the autonomous-follow-up latch.  Holding the route
+                # lock through client.query() also prevents a same-tick message
+                # from being classified against a half-started turn.
+                async with self._message_route_lock:
+                    if (
+                        self._message_pump_error is not None
+                        or self._message_pump_task.done()
+                    ):
+                        raise RuntimeError(
+                            "Claude SDK message pump is not running"
+                        ) from self._message_pump_error
+                    await self._background_callbacks_drained.wait()
+                    if (
+                        self._message_pump_error is not None
+                        or self._message_pump_task.done()
+                    ):
+                        raise RuntimeError(
+                            "Claude SDK message pump is not running"
+                        ) from self._message_pump_error
+                    guard = self.query_launch_guard
+                    try:
+                        if guard is not None:
+                            guard()
+                    except BaseException:
+                        # This id belongs only to the rejected browser prompt.
+                        # Keeping it would mis-attach later autonomous frames.
+                        self.next_turn_id = None
+                        raise
+                    # Do not replace the current background barrier yet. An
+                    # autonomous turn can already be present in the SDK's
+                    # internal receive queue even though our sole pump has not
+                    # been scheduled. Its origin-marked User/Result frames must
+                    # keep the preceding turn's released barrier. The new one is
+                    # activated only when the pump sees this submitted turn.
+                    self._pending_turn_background_release = asyncio.Event()
+                    self._pending_turn_origin_id = self.next_turn_id
+                    self.next_turn_id = None
+                    self._turn_active = True
+                    try:
+                        await client.query(prompt)
+                    except BaseException:
+                        self._turn_active = False
+                        self._discard_pending_turn_route()
+                        raise
+                return
+            # Compatibility for tests/custom clients that install a client without
+            # going through connect(). Real SDK connections always use the sole pump.
+            await client.query(prompt)
 
     async def interrupt(self) -> None:
         assert self.client is not None
@@ -434,23 +644,12 @@ class SdkHandle:
 
     async def get_context_usage(self) -> dict:
         """Return the cc session's context window usage (matches CLI /context)."""
-        assert self.client is not None
-        usage = await self.client.get_context_usage()
-        if isinstance(usage, dict):
-            threshold = usage.get("autoCompactThreshold")
-            self.effective_auto_compact_threshold_tokens = (
-                threshold
-                if isinstance(threshold, int)
-                and not isinstance(threshold, bool)
-                and threshold >= 0 else None
+        if self.context_probe_suppressed:
+            raise RuntimeError(
+                "Claude context probe is suppressed until a successful turn"
             )
-            raw_max = usage.get("rawMaxTokens")
-            self.raw_context_max_tokens = (
-                raw_max
-                if isinstance(raw_max, int)
-                and not isinstance(raw_max, bool)
-                and raw_max >= 0 else None
-            )
+        usage = await self._read_context_usage_control()
+        self._record_context_usage(usage)
         return usage
 
     async def rewind_files(self, user_message_id: str) -> None:
@@ -709,6 +908,12 @@ class SdkHandle:
             message = self._parse_compat_message(data)
             if message is None:
                 continue
+            if (isinstance(message, ResultMessage)
+                    and not bool(getattr(message, "is_error", False))):
+                # A complete successful turn proves that a no-probe replacement
+                # can service normal conversation traffic. Context inspection
+                # may be attempted again once the machine returns to idle.
+                self.context_probe_suppressed = False
             yield message
             if isinstance(message, ResultMessage):
                 return
@@ -722,10 +927,17 @@ class SdkHandle:
         self._background_messages = asyncio.Queue(maxsize=cap)
         self._turn_active = False
         self._turn_consumer_active = False
+        self._message_route_owner = None
         self._message_pump_error = None
+        self._message_route_lock = asyncio.Lock()
+        self._background_callbacks_pending = 0
+        self._background_callbacks_drained = asyncio.Event()
+        self._background_callbacks_drained.set()
         initial_release = asyncio.Event()
         initial_release.set()
         self._turn_background_release = initial_release
+        self._pending_turn_background_release = None
+        self._pending_turn_origin_id = None
         client = self.client
         assert client is not None
         self._message_pump_task = asyncio.create_task(
@@ -749,44 +961,139 @@ class SdkHandle:
                 message = self._parse_compat_message(data) if parse_raw else data
                 if message is None:
                     continue
-                if self._turn_active:
-                    await self._turn_messages.put(message)
+                if (isinstance(message, ResultMessage)
+                        and not bool(getattr(message, "is_error", False))):
+                    self.context_probe_suppressed = False
+                async with self._message_route_lock:
+                    origin_kind = _message_origin_kind(message)
+                    top_level_user = bool(
+                        isinstance(message, UserMessage)
+                        and not message.parent_tool_use_id
+                    )
+                    if top_level_user:
+                        if origin_kind is not None and origin_kind != "human":
+                            owner = "background"
+                        elif self._turn_active:
+                            owner = "managed"
+                            self._activate_pending_turn_route()
+                        else:
+                            owner = "background"
+                        self._message_route_owner = owner
+                    elif isinstance(message, ResultMessage):
+                        # Result.origin is the authoritative boundary in the
+                        # pinned SDK. A non-human result closes only the injected
+                        # turn; the browser query remains pending for its later
+                        # human/legacy-unattributed result on the same stream.
+                        if origin_kind is not None and origin_kind != "human":
+                            owner = "background"
+                        elif self._turn_active:
+                            owner = "managed"
+                            self._activate_pending_turn_route()
+                        else:
+                            owner = self._message_route_owner or "background"
+                    else:
+                        owner = self._message_route_owner
+                        if owner is None:
+                            # While a newly submitted prompt is still waiting
+                            # for its replayed human User/Result boundary, any
+                            # already-buffered unattributed frame belongs to the
+                            # preceding autonomous/background stream. This is
+                            # the exact race where a task notification was in
+                            # Claude Code's queue before client.query() wrote the
+                            # browser prompt. The human boundary below remains
+                            # the only authority that activates the new route.
+                            owner = (
+                                "background"
+                                if self._pending_turn_background_release
+                                is not None
+                                else (
+                                    "managed"
+                                    if self._turn_active
+                                    else "background"
+                                )
+                            )
+
+                    if owner == "managed":
+                        await self._turn_messages.put(message)
+                        if isinstance(message, ResultMessage):
+                            self._turn_active = False
+                            self._message_route_owner = None
+                        continue
+                    release = self._turn_background_release
+                    if release is None:
+                        release = asyncio.Event()
+                        release.set()
+                    self._background_callbacks_pending += 1
+                    self._background_callbacks_drained.clear()
+                    try:
+                        await self._background_messages.put(
+                            (message, release, self._turn_origin_id))
+                    except BaseException:
+                        self._background_callback_completed()
+                        raise
                     if isinstance(message, ResultMessage):
-                        self._turn_active = False
-                    continue
-                release = self._turn_background_release
-                if release is None:
-                    release = asyncio.Event()
-                    release.set()
-                await self._background_messages.put(
-                    (message, release, self._turn_origin_id))
+                        self._message_route_owner = None
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
             self._message_pump_error = exc
             if self._turn_active:
                 self._turn_active = False
+                self._discard_pending_turn_route()
                 await self._turn_messages.put(_MessagePumpFailure(exc))
             else:
                 log.warning(
                     "Claude SDK message pump stopped",
                     error_type=type(exc).__name__)
+            await self._notify_message_pump_failure(exc)
         else:
+            error = RuntimeError(
+                "Claude SDK stream ended without a ResultMessage")
+            self._message_pump_error = error
             if self._turn_active:
                 self._turn_active = False
+                self._discard_pending_turn_route()
                 await self._turn_messages.put(_MESSAGE_PUMP_END)
+            await self._notify_message_pump_failure(error)
+
+    async def _notify_message_pump_failure(
+        self, error: BaseException,
+    ) -> None:
+        callback = self.message_pump_failure_callback
+        if callback is None:
+            return
+        try:
+            await callback(error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Failure recovery is advisory to the session state machine.  It
+            # must never replace the pump's authoritative failure or strand
+            # disconnect() while reporting a secondary UI problem.
+            log.warning(
+                "Claude message pump failure callback failed",
+                error_type=type(exc).__name__,
+            )
+
+    def _background_callback_completed(self) -> None:
+        if self._background_callbacks_pending > 0:
+            self._background_callbacks_pending -= 1
+        if self._background_callbacks_pending == 0:
+            self._background_callbacks_drained.set()
 
     async def _background_message_worker(self) -> None:
         """Deliver idle notifications in order with bounded backpressure."""
         assert self._background_messages is not None
         while True:
             message, release, turn_id = await self._background_messages.get()
-            await release.wait()
-            callback = self.background_message_callback
-            if callback is None:
-                continue
             try:
-                await callback(message, turn_id)
+                await release.wait()
+                callback = self.background_message_callback
+                if (
+                    callback is not None
+                    and self._message_pump_error is None
+                ):
+                    await callback(message, turn_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -795,6 +1102,8 @@ class SdkHandle:
                 log.warning(
                     "Claude background message callback failed",
                     error_type=type(exc).__name__)
+            finally:
+                self._background_callback_completed()
 
     async def _receive_response_pumped(self):
         queue = self._turn_messages
@@ -841,6 +1150,9 @@ class SdkHandle:
         release = self._turn_background_release
         if release is not None:
             release.set()
+        pending_release = self._pending_turn_background_release
+        if pending_release is not None:
+            pending_release.set()
         tasks = [task for task in (
             self._message_pump_task, self._background_task) if task is not None]
         for task in tasks:
@@ -853,8 +1165,13 @@ class SdkHandle:
         self._background_messages = None
         self._turn_active = False
         self._turn_consumer_active = False
+        self._message_route_owner = None
         self._turn_background_release = None
+        self._pending_turn_background_release = None
+        self._pending_turn_origin_id = None
         self._turn_origin_id = None
+        self._background_callbacks_pending = 0
+        self._background_callbacks_drained.set()
 
     async def disconnect(self) -> None:
         try:
@@ -884,6 +1201,9 @@ class SdkHandle:
         apply a spawn-time option change (e.g. effort) to a live session."""
         async with self._permission_reconnect_lock:
             log.warning("force-reconnecting SDK client", reason=reason)
+            suppress_context_probe = bool(
+                self.control_plane_failed or self.context_probe_suppressed
+            )
             try:
                 await self.disconnect()
             except Exception as e:
@@ -895,4 +1215,5 @@ class SdkHandle:
                 self.model = None
             await self.connect(
                 resume_id=resume_id, cwd=cwd,
-                model_override=model_override, fork=fork)
+                model_override=model_override, fork=fork,
+                _suppress_context_probe=suppress_context_probe)

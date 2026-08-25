@@ -50,6 +50,9 @@ class _FakeClaudeClient:
         if self.fail_permission:
             raise RuntimeError("runtime permission rejected")
 
+    async def query(self, prompt):
+        self.prompt = prompt
+
     async def receive_messages(self):
         await asyncio.Event().wait()
         if False:  # pragma: no cover - make this an async generator
@@ -157,6 +160,172 @@ def test_claude_model_probe_failure_does_not_fail_connect(monkeypatch):
         await handle.connect(cwd="/tmp")
         assert handle.client is not None
         assert handle.model is None
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_model_probe_timeout_replaces_the_poisoned_generation(
+    monkeypatch,
+):
+    class ProbeTimeout(_FakeClaudeClient):
+        probes = 0
+
+        async def _send_control_request(self, request, timeout):
+            assert request == {"subtype": "get_context_usage"}
+            assert timeout == 5.0
+            type(self).probes += 1
+            raise Exception("Control request timeout: get_context_usage")
+
+    async def go():
+        ProbeTimeout.created = []
+        ProbeTimeout.probes = 0
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ProbeTimeout)
+        handle = SdkHandle(WrapperConfig())
+
+        await handle.connect(
+            resume_id="11111111-1111-4111-8111-111111111111",
+            cwd="/tmp",
+        )
+
+        assert ProbeTimeout.probes == 1
+        assert len(ProbeTimeout.created) == 2
+        assert ProbeTimeout.created[0].disconnected is True
+        assert handle.client is ProbeTimeout.created[1]
+        assert handle.control_plane_failed is False
+        assert handle.context_probe_suppressed is True
+
+        await handle.query("继续")
+        assert ProbeTimeout.created[1].prompt == "继续"
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_context_timeout_poisoning_is_generation_scoped(monkeypatch):
+    class ContextTimeout(_FakeClaudeClient):
+        fail_context = False
+
+        async def _send_control_request(self, request, timeout):
+            assert request == {"subtype": "get_context_usage"}
+            assert timeout == 5.0
+            if self.fail_context:
+                raise Exception("Control request timeout: get_context_usage")
+            return {"model": "claude-mythos-5", "totalTokens": 123}
+
+    async def go():
+        ContextTimeout.created = []
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ContextTimeout)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+        first = ContextTimeout.created[-1]
+        first.fail_context = True
+
+        with pytest.raises(Exception, match="Control request timeout"):
+            await handle.get_context_usage()
+        assert handle.control_plane_failed is True
+        assert handle.context_probe_suppressed is True
+        with pytest.raises(RuntimeError, match="control plane is unhealthy"):
+            await handle.query("must not reach the poisoned child")
+        assert not hasattr(first, "prompt")
+
+        await handle.force_reconnect(None, "/tmp", reason="control plane failure")
+        replacement = ContextTimeout.created[-1]
+        assert replacement is not first
+        assert handle.control_plane_failed is False
+        await handle.query("safe after replacement")
+        assert replacement.prompt == "safe after replacement"
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_suppressed_autocompact_reconnect_drops_previous_context_generation(
+    monkeypatch,
+):
+    class ContextTimeout(_FakeClaudeClient):
+        fail_context = False
+
+        async def _send_control_request(self, request, timeout):
+            assert request == {"subtype": "get_context_usage"}
+            assert timeout == 5.0
+            if self.fail_context:
+                raise Exception("Control request timeout: get_context_usage")
+            return {
+                "model": "claude-mythos-5[1m]",
+                "totalTokens": 125_000,
+                "maxTokens": 500_000,
+                "percentage": 25.0,
+                "autoCompactThreshold": 500_000,
+                "rawMaxTokens": 1_000_000,
+                "categories": [],
+            }
+
+    async def go():
+        ContextTimeout.created = []
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", ContextTimeout)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+        first = ContextTimeout.created[-1]
+        assert handle.cached_context_usage()["maxTokens"] == 500_000
+        assert handle.effective_auto_compact_threshold_tokens == 500_000
+
+        first.fail_context = True
+        with pytest.raises(Exception, match="Control request timeout"):
+            await handle.get_context_usage()
+
+        handle.set_auto_compact("custom", 400_000)
+        await handle.force_reconnect(
+            None, "/tmp", reason="autocompact setting change")
+
+        replacement = ContextTimeout.created[-1]
+        assert replacement is not first
+        assert replacement.options.extra_args["autocompact"] == "400000"
+        assert handle.applied_auto_compact_mode == "custom"
+        assert handle.applied_auto_compact_threshold_tokens == 400_000
+        assert handle.context_probe_suppressed is True
+        assert handle.cached_context_usage() is None
+        assert handle.effective_auto_compact_threshold_tokens is None
+        assert handle.raw_context_max_tokens is None
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_context_read_serializes_query_acceptance(monkeypatch):
+    class BlockingContext(_FakeClaudeClient):
+        block_context = False
+        context_started: asyncio.Event
+        release_context: asyncio.Event
+
+        async def _send_control_request(self, request, timeout):
+            assert request == {"subtype": "get_context_usage"}
+            assert timeout == 5.0
+            if self.block_context:
+                self.context_started.set()
+                await self.release_context.wait()
+            return {"model": "claude-mythos-5", "totalTokens": 123}
+
+    async def go():
+        BlockingContext.created = []
+        BlockingContext.context_started = asyncio.Event()
+        BlockingContext.release_context = asyncio.Event()
+        monkeypatch.setattr(sdk_module, "ClaudeSDKClient", BlockingContext)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+        client = BlockingContext.created[-1]
+        client.block_context = True
+
+        context_task = asyncio.create_task(handle.get_context_usage())
+        await asyncio.wait_for(
+            BlockingContext.context_started.wait(), timeout=1)
+        query_task = asyncio.create_task(handle.query("after context"))
+        await asyncio.sleep(0)
+        assert not hasattr(client, "prompt")
+
+        BlockingContext.release_context.set()
+        await asyncio.gather(context_task, query_task)
+        assert client.prompt == "after context"
         await handle.disconnect()
 
     asyncio.run(go())

@@ -125,6 +125,10 @@ class SessionContext:
     # consumed the original binding frame. It never survives a terminal/idle
     # boundary and is not a substitute for the engine's native lifecycle.
     active_turn_binding: Optional[ActiveTurnBinding] = None
+    # First visible Codex process work is persisted once per exact logical /
+    # native owner. This in-memory marker only suppresses repeated sidecar reads
+    # for commentary deltas; it never participates in running/idle ownership.
+    codex_process_clock_binding: Optional[tuple[str, str]] = None
     # Interrupt must wake a consumer that is already blocked in queue.get().  The
     # absolute monotonic deadline prevents each subsequent queue item from
     # restarting the drain timeout.
@@ -146,7 +150,28 @@ class SessionContext:
     # wait for these tasks and their autonomous post-result follow-up to drain.
     claude_active_tasks: set[str] = field(default_factory=set)
     claude_task_tracking_overflow: bool = False
-    claude_background_followup_pending: bool = False
+    # Every terminal background notification can enqueue its own autonomous
+    # Claude turn.  Keep an insertion-ordered ledger instead of a boolean so an
+    # earlier Result cannot release a later notification which was already
+    # delivered. Values are ``notified`` until the injected top-level user
+    # boundary is observed, then ``active`` until that turn's Result.
+    claude_background_followups: dict[str, str] = field(default_factory=dict)
+    claude_background_followup_nonce: int = 0
+    # A corrupt or adversarial stream must not grow the exact-origin ledger
+    # without bound. Overflow fails closed until one controlled reconnect resets
+    # the complete connection-local lifecycle.
+    claude_background_followup_overflow: bool = False
+    claude_followup_recovery_task: Optional[asyncio.Task] = None
+    # One injected Claude turn can contain streamed text and several assembled
+    # tool blocks after its parent Result. Preserve translator state until that
+    # injected turn's own Result so live rendering matches history translation.
+    claude_background_translator: Optional[StreamTranslator] = None
+    # An autonomous post-Result continuation has no managed turn consumer.
+    # Stop therefore owns a bounded watchdog which reconnects the child if its
+    # terminal Result never reaches the background pump.
+    claude_autonomous_interrupt_task: Optional[asyncio.Task] = None
+    claude_autonomous_interrupt_wakeup: asyncio.Event = field(
+        default_factory=asyncio.Event)
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.
@@ -355,6 +380,26 @@ class SessionContext:
 
     def __post_init__(self) -> None:
         self.codex_steer_gate.set()
+
+    @property
+    def claude_background_followup_pending(self) -> bool:
+        """Compatibility view for callers which only need the aggregate latch."""
+        return bool(
+            self.claude_background_followups
+            or self.claude_background_followup_overflow
+        )
+
+    @claude_background_followup_pending.setter
+    def claude_background_followup_pending(self, pending: bool) -> None:
+        # Narrow tests and embedded adapters historically seeded this latch
+        # directly. Preserve that API without letting production lifecycle code
+        # collapse the real per-origin ledger back into one boolean.
+        if pending:
+            if not self.claude_background_followups:
+                self.claude_background_followups["legacy:manual"] = "active"
+        else:
+            self.claude_background_followups.clear()
+            self.claude_background_followup_overflow = False
 
     def next_seq(self) -> int:
         self.seq += 1

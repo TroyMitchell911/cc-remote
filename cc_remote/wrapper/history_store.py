@@ -37,7 +37,15 @@ from cc_remote.protocol import ConversationTurn
 # image assets, and compact ancestry remain source-valid. v20 adds the Claude
 # Agent detail cache. v21 discards Codex pages/details that may contain parser-
 # time timestamps created when official turns omitted startedAt/completedAt.
-_SCHEMA_VERSION = 21
+# v22 rebuilds Claude pages/details whose browser-message alias may have been
+# attached to a synthetic interrupt marker instead of the replacement prompt.
+# v23 rebuilds Codex projections whose bounded single-turn tail treated a late
+# compaction marker as the first public-process timestamp.
+# v24 rebuilds Codex pages after source-bound live process clocks become an
+# independent input which can change without modifying rollout bytes. v25
+# rebuilds Codex pages whose leading compact marker was projected as a separate
+# prompt-less turn before the owning user item reached the full snapshot.
+_SCHEMA_VERSION = 25
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -1131,6 +1139,26 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
+            if current in range(10, 22):
+                # v22 changes Claude turn identity without changing transcript
+                # bytes: an old browser alias bound to the synthetic interrupt
+                # marker is transferred to the immediately following real SDK
+                # user row.  Rebuild only Claude narrative projections so the
+                # corrected client_msg_id reaches History; source-bound images,
+                # compact ancestry, and Agent detail payloads stay valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='claude'")
+            if current in (21, 22, 23, 24):
+                # v23 restores the first real public-process timestamp from an
+                # omitted oversized prefix. v24 additionally overlays a
+                # source-bound live clock which can appear without changing
+                # rollout bytes. v25 repairs leading compaction ownership.
+                # Only Codex narrative projections need rebuilding; Claude
+                # history and binary assets remain valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
             if current in (10, 11, 12, 13, 14, 15, 16):
                 # v16 makes browser/native ownership durable; v17 reuses the
                 # adjacent native response-item id for legacy Codex user rows.
@@ -1147,18 +1175,23 @@ class HistoryIndexStore:
                 # Page payloads are rebuildable and may contain either the old
                 # pre-summary size truncation or no v36 process-detail state.
                 # v21 additionally invalidates Codex details whose official
-                # events may contain parser-time timestamps. Claude details and
-                # all source-bound image assets remain valid.
+                # events may contain parser-time timestamps; the independent
+                # v22 block above has already invalidated Claude details. All
+                # source-bound image assets remain valid.
                 connection.execute("DELETE FROM history_pages")
                 connection.execute(
                     "DELETE FROM history_turn_details WHERE engine='codex'")
             elif current in (19, 20):
                 # v20 adds an independent source-bound Claude Agent detail LRU.
-                # v21 rebuilds only timestamp-bearing Codex projections; Claude
-                # history, images and Agent details remain byte-for-byte valid.
+                # v21 rebuilds timestamp-bearing Codex projections; the v22
+                # block above rebuilds Claude narrative identity. Images and
+                # Agent detail payloads remain byte-for-byte valid.
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
+            elif current in (21, 22, 23, 24):
+                # The independent v22/v23/v24/v25 invalidations above suffice.
+                pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the

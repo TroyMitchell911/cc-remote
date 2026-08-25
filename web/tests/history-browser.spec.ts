@@ -1714,6 +1714,7 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
     const activeCompactionOrphanSid = "active-compaction-replay-orphan";
     const recoveredOwnerV16Sid = "completed-recovery-owner-v16";
     const lateSeedV17Sid = "active-late-binding-seed-v17";
+    const pollutedAliasV20Sid = "claude-interrupt-alias-v20";
     const optimisticSteerSid = "healthy-optimistic-steer";
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("cc_remote_cache", 1);
@@ -1865,6 +1866,21 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
       tx.objectStore("sessions").put({
         v: 20,
         turns: [{
+          id: "interrupt-marker-uuid",
+          clientMsgId: "interrupt-marker-uuid",
+          historyTurnId: "native-user-uuid",
+          prompt: "continue after interrupt",
+          blocks: [],
+          done: false,
+        }],
+        lastSeq: 46,
+        revision: "interrupt-alias-r1",
+        generation: "interrupt-alias-g1",
+        savedAt: Date.now(),
+      }, pollutedAliasV20Sid);
+      tx.objectStore("sessions").put({
+        v: 23,
+        turns: [{
           id: "active-before-steer",
           prompt: "first prompt",
           forkPointId: "shared-native-turn",
@@ -1892,6 +1908,7 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
     const activeCompactionOrphan = await cache.loadSession(
       activeCompactionOrphanSid);
     const lateSeedV17 = await cache.loadSession(lateSeedV17Sid);
+    const pollutedAliasV20 = await cache.loadSession(pollutedAliasV20Sid);
     const optimisticSteer = await cache.loadSession(optimisticSteerSid);
     const replay = await cache.loadAllReplayState();
     await new Promise((resolve) => window.setTimeout(resolve, 100));
@@ -1924,6 +1941,8 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
       prunedCompactionOrphan,
       lateSeedV17,
       lateSeedV17Cursor: replay.cursors[lateSeedV17Sid],
+      pollutedAliasV20,
+      pollutedAliasV20Cursor: replay.cursors[pollutedAliasV20Sid],
       optimisticSteerCount: optimisticSteer?.turns.length,
       optimisticSteerCursor: replay.cursors[optimisticSteerSid],
       currentIds: current?.turns.map((turn: {
@@ -1942,6 +1961,8 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
   expect(result.prunedCompactionOrphan).toBeNull();
   expect(result.lateSeedV17).toBeNull();
   expect(result.lateSeedV17Cursor).toBeUndefined();
+  expect(result.pollutedAliasV20).toBeNull();
+  expect(result.pollutedAliasV20Cursor).toBeUndefined();
   expect(result.optimisticSteerCount).toBe(2);
   expect(result.optimisticSteerCursor).toBe(47);
   expect(result.currentIds).toEqual([[

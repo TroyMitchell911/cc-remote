@@ -6,7 +6,7 @@
 
 - Claude Agent SDK 升级到 `0.2.142`；wrapper 继续固定到这个经过验证的精确
   patch 版本，并仍然启动用户配置的 Claude Code 可执行文件。
-- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v38。Claude 子代理详情、
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v39。Claude 子代理详情、
   脱离父回合的后台过程归属、分页回合详情、脱敏后的 Claude 额度事件及会话级自动
   压缩控制现在具有明确的兼容边界。Code、Work、BTW、新会话与 fork 可选择跟随
   Claude、自动模式或 `100K–1M` token 阈值；忙碌时的修改会等待可确认的回合终态。

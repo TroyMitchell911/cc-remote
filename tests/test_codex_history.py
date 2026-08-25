@@ -18,6 +18,7 @@ from cc_remote.wrapper.codex_rpc import (
     CodexRpcResponseTooLarge,
 )
 from cc_remote.wrapper.codex_stream import (
+    codex_history_boundary_process_start,
     codex_history_native_witness,
     codex_history_process_witnesses,
     codex_history_image_views,
@@ -25,6 +26,7 @@ from cc_remote.wrapper.codex_stream import (
     codex_history_turn_user,
     codex_history_turn_users,
     codex_history_window,
+    codex_history_window_info,
     codex_translate_history,
 )
 from cc_remote.protocol import UserMsg
@@ -513,6 +515,93 @@ def test_native_history_witness_recovers_public_process_without_direct_reply(
     process = witness.process_by_visible_id["user-process"]
     assert process.started_ms == 1_787_274_065_000
     assert process.done_ms == 1_787_274_068_000
+
+
+def test_boundary_process_start_does_not_borrow_newer_steer_work(tmp_path):
+    path = tmp_path / "direct-then-steer.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-08-21T01:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-multi"},
+        },
+        {
+            "timestamp": "2026-08-21T01:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"},
+        },
+        {
+            "timestamp": "2026-08-21T01:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "final_answer",
+                "message": "hi",
+            },
+        },
+        {
+            "timestamp": "2026-08-21T01:00:03Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "inspect"},
+        },
+        {
+            "timestamp": "2026-08-21T01:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "id": "call-steer",
+                "call_id": "call-steer",
+                "name": "exec_command",
+                "input": {},
+            },
+        },
+    ]
+    path.write_bytes(b"".join(
+        json.dumps(value).encode() + b"\n" for value in rows
+    ))
+
+    assert codex_history_boundary_process_start(str(path), 0) is None
+    window = codex_history_window_info(
+        str(path), before=None, limit=1,
+    )
+    assert window.newest_native_turn_id == "native-multi"
+    assert window.newest_segment_index == 1
+
+
+def test_forced_window_keeps_native_owner_separate_from_user_cursor(tmp_path):
+    path = tmp_path / "native-owner-vs-user-item.jsonl"
+    task = {
+        "type": "event_msg",
+        "payload": {"type": "task_started", "turn_id": "native-turn"},
+    }
+    user_item = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "id": "msg-native-user",
+            "content": [{"type": "input_text", "text": "inspect"}],
+        },
+    }
+    user = {
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "inspect"},
+    }
+    compact = {
+        "type": "compacted",
+        "payload": {"replacement_history": ["x" * (1100 * 1024)]},
+    }
+    path.write_text("".join(
+        json.dumps(row) + "\n" for row in (task, user_item, user, compact)
+    ))
+
+    window = codex_history_window_info(
+        str(path), before=None, limit=1, max_bytes=1024 * 1024,
+    )
+    assert window.forced_oldest_cursor == "msg-native-user"
+    assert window.forced_boundary_offset == 0
+    assert window.forced_native_turn_id == "native-turn"
+    assert window.forced_segment_index == 0
 
 
 def test_native_process_witness_numbers_steer_segments_chronologically(
@@ -1060,6 +1149,94 @@ def test_active_summary_hydrates_exact_full_turn_and_preserves_steers():
     asyncio.run(run())
 
 
+def test_leading_context_compaction_belongs_to_following_user():
+    summary = _turn(
+        "native-compact",
+        [
+            _user("user-after-compact", "html有修改嘛？"),
+            _agent("answer-after-compact", "done"),
+        ],
+    )
+    full = _turn(
+        "native-compact",
+        [
+            {"type": "contextCompaction", "id": "compact-leading"},
+            _user("user-after-compact", "html有修改嘛？"),
+            _agent("comment-after-compact", "checking", phase="commentary"),
+            _agent("answer-after-compact", "done"),
+        ],
+        items_view="full",
+    )
+
+    async def rpc(_method, params, cwd=None):
+        assert cwd is None
+        turn = summary if params["itemsView"] == "summary" else full
+        return {"data": [turn], "nextCursor": None}
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-compact",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+            include_live_detail=True,
+        )
+
+        assert len(page.turns) == 1
+        turn = page.turns[0]
+        assert turn["id"] == "user-after-compact"
+        assert turn["prompt"] == "html有修改嘛？"
+        assert [block["kind"] for block in turn["blocks"]] == [
+            "process", "text", "text"]
+        assert turn["blocks"][0]["item_id"] == "compact-leading"
+        assert turn["blocks"][0]["processKind"] == "compaction"
+        assert turn["done"] is True
+
+    asyncio.run(run())
+
+
+def test_non_compaction_prefix_remains_an_automatic_continuation():
+    summary = _turn(
+        "native-continuation",
+        [
+            _user("user-after-continuation", "next question"),
+            _agent("next-answer", "next answer"),
+        ],
+    )
+    full = _turn(
+        "native-continuation",
+        [
+            _agent("automatic-answer", "background result"),
+            _user("user-after-continuation", "next question"),
+            _agent("next-answer", "next answer"),
+        ],
+        items_view="full",
+    )
+
+    async def rpc(_method, params, cwd=None):
+        assert cwd is None
+        turn = summary if params["itemsView"] == "summary" else full
+        return {"data": [turn], "nextCursor": None}
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-continuation",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+            include_live_detail=True,
+        )
+
+        assert [turn["prompt"] for turn in page.turns] == [
+            "", "next question"]
+        assert page.turns[0]["id"] == "native-continuation"
+        assert page.turns[1]["id"] == "user-after-continuation"
+
+    asyncio.run(run())
+
+
 def test_active_full_shape_survives_completed_summary_collapse():
     responses = [
         {
@@ -1261,7 +1438,7 @@ def test_terminal_summary_keeps_final_when_full_refresh_is_oversized():
         {
             "data": [_turn(
                 "native-active",
-                [_user("user-first", "first"),
+                [_user("user-first", "summary-only first"),
                  _agent("answer-final", "final answer")],
                 status="completed",
                 completed_at=109,
@@ -1273,7 +1450,7 @@ def test_terminal_summary_keeps_final_when_full_refresh_is_oversized():
         {
             "data": [_turn(
                 "native-active",
-                [_user("user-first", "first"),
+                [_user("user-first", "summary-only first"),
                  _agent("answer-final", "final answer")],
                 status="completed",
                 completed_at=109,
@@ -1318,8 +1495,98 @@ def test_terminal_summary_keeps_final_when_full_refresh_is_oversized():
             "summary", "full", "summary", "full", "summary"]
         assert [turn["id"] for turn in completed.turns] == [
             "user-first", "user-steer"]
+        assert completed.turns[0]["prompt"] == "first"
         assert completed.turns[-1]["blocks"][-1]["text"] == "final answer"
         assert completed.turns[-1]["done"] is True
+        assert refreshed.turns == completed.turns
+        assert responses == []
+
+    asyncio.run(run())
+
+
+def test_terminal_summary_restores_user_after_leading_compaction_race():
+    compact = {"type": "contextCompaction", "id": "compact-leading"}
+    terminal_summary = _turn(
+        "native-active",
+        [
+            _user("user-after-compact", "html有修改嘛？"),
+            _agent("answer-final", "final answer"),
+        ],
+        status="completed",
+        completed_at=109,
+        duration_ms=9000,
+    )
+    responses = [
+        {
+            "data": [_turn(
+                "native-active",
+                [compact],
+                status="interrupted",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {
+            "data": [_turn(
+                "native-active",
+                [compact],
+                status="interrupted",
+                items_view="full",
+                completed_at=None,
+                duration_ms=None,
+            )],
+            "nextCursor": None,
+        },
+        {"data": [terminal_summary], "nextCursor": None},
+        CodexRpcResponseTooLarge("terminal full turn is oversized"),
+        {"data": [terminal_summary], "nextCursor": None},
+    ]
+    calls = []
+
+    async def rpc(method, params, cwd=None):
+        calls.append((method, params))
+        assert cwd is None
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            include_live_detail=True,
+            active_turn_ids={"native-active"},
+        )
+        completed = await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+            include_live_detail=True,
+        )
+        refreshed = await history.summary_page(
+            "thread-active",
+            before=None,
+            limit=1,
+            hydrate_recent=1,
+            include_live_detail=True,
+        )
+
+        assert [params["itemsView"] for _method, params in calls] == [
+            "summary", "full", "summary", "full", "summary"]
+        assert len(completed.turns) == 1
+        turn = completed.turns[0]
+        assert turn["id"] == "user-after-compact"
+        assert turn["prompt"] == "html有修改嘛？"
+        assert turn["done"] is True
+        assert [block["kind"] for block in turn["blocks"]] == [
+            "process", "text"]
+        assert turn["blocks"][0]["item_id"] == "compact-leading"
+        assert turn["blocks"][1]["text"] == "final answer"
         assert refreshed.turns == completed.turns
         assert responses == []
 

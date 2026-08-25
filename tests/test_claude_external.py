@@ -675,6 +675,16 @@ class _FailedMessagePumpSdk(_ClaudeRunSdk):
         self.message_pump_failed = False
 
 
+class _FailedControlPlaneSdk(_ClaudeRunSdk):
+    def __init__(self):
+        super().__init__()
+        self.control_plane_failed = True
+
+    async def force_reconnect(self, **kwargs):
+        await super().force_reconnect(**kwargs)
+        self.control_plane_failed = False
+
+
 def test_claude_init_upstream_model_never_overwrites_selected_alias():
     class GatewaySdk(_ClaudeRunSdk):
         model = "claude-mythos-5[1m]"
@@ -1694,6 +1704,41 @@ def test_failed_claude_message_pump_forces_resume_before_next_query(monkeypatch)
         assert sdk.queries == 2
         assert sdk.message_pump_failed is False
         assert ctx.needs_reload is False
+        assert ctx.state == "idle"
+
+    asyncio.run(go())
+
+
+def test_failed_claude_control_plane_forces_resume_before_next_query(
+    monkeypatch,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-control-failed"
+        sdk = _FailedControlPlaneSdk()
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner,
+            raising=False,
+        )
+
+        await machine._run_turn(ctx, "继续")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "control plane failure",
+            "preserve_model": True,
+        }]
+        assert sdk.queries == 1
         assert ctx.state == "idle"
 
     asyncio.run(go())

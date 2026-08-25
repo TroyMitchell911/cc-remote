@@ -107,6 +107,18 @@ def replayed_user_message_id(message: Any) -> str | None:
     """
     if not isinstance(message, UserMessage) or message.parent_tool_use_id:
         return None
+    origin = getattr(message, "origin", None)
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        # Streaming-input sessions replay autonomous task/channel/peer prompts
+        # through the same UserMessage class. Only a human/unattributed prompt
+        # can own the browser's optimistic row.
+        return None
+    if _is_interrupted_user_content(message.content):
+        # Claude replays its synthetic interrupt marker through the same
+        # UserMessage channel as a real browser prompt.  A replacement query
+        # can start before that late marker reaches the SDK reader; binding it
+        # would give the next optimistic row the preceding turn's UUID.
+        return None
     content = message.content if isinstance(message.content, list) else []
     if any(isinstance(block, (ToolResultBlock, ServerToolResultBlock))
            for block in content):
@@ -487,6 +499,14 @@ class StreamTranslator:
                 self.item_meta.pop(old, None)
         return turn
 
+    def _background_for_turn(self, turn: str | None) -> bool | None:
+        """Mark an item restored from an older translator as detached work."""
+        return bool(
+            turn is not None
+            and self.turn_id is not None
+            and turn != self.turn_id
+        ) or None
+
     def _message_id(self, channel_key: str, suggested: str | None = None) -> str:
         current = self._message_ids.get(channel_key)
         if current:
@@ -501,7 +521,8 @@ class StreamTranslator:
                         suggested: str | None = None) -> str:
         mid = self._message_id(channel_key, suggested)
         if channel_key not in self._started_channels:
-            events.append(AssistantMsgStart(message_id=mid, channel=channel))
+            events.append(AssistantMsgStart(
+                message_id=mid, turn_id=self.turn_id, channel=channel))
             self._started_channels.add(channel_key)
         return mid
 
@@ -513,16 +534,20 @@ class StreamTranslator:
         if not bounded:
             return
         mid = self._ensure_channel(events, channel_key, channel, suggested)
-        events.append(Delta(message_id=mid, text=bounded, channel=channel))
+        events.append(Delta(
+            message_id=mid, turn_id=self.turn_id,
+            text=bounded, channel=channel))
         self._emitted[channel_key] += len(bounded)
 
     def _finish_message(self, events: list, text_channel: str) -> None:
         if "thinking" in self._started_channels:
             events.append(AssistantMsgEnd(
-                message_id=self._message_ids["thinking"], channel="thinking"))
+                message_id=self._message_ids["thinking"],
+                turn_id=self.turn_id, channel="thinking"))
         if "text" in self._started_channels:
             events.append(AssistantMsgEnd(
-                message_id=self._message_ids["text"], channel=text_channel))
+                message_id=self._message_ids["text"],
+                turn_id=self.turn_id, channel=text_channel))
         self._message_ids.clear()
         self._started_channels.clear()
         self._emitted = {"thinking": 0, "text": 0}
@@ -552,19 +577,21 @@ class StreamTranslator:
         if not self._admit_tool_item(tool_id, events):
             return
         parent = _wire_id(parent_id, "tool") if parent_id else None
+        tool_turn = self._remember_turn(tool_id, parent)
         redacted_input = _redact_sensitive_input(block.input)
         public_input = _public_tool_input(block.name, block.input)
         safe_input = bounded_tool_input(public_input, self.tool_result_max)
         category, title, server = _tool_meta(
             block.name, redacted_input, server_tool=server_tool)
         events.append(ToolUse(
-            message_id=message_id, tool_use_id=tool_id, tool=block.name,
+            message_id=message_id, tool_use_id=tool_id,
+            turn_id=tool_turn, tool=block.name,
             input=safe_input, category=category, title=title,
             parent_id=parent, server=server,
+            background=self._background_for_turn(tool_turn),
         ))
         self._tool_names[tool_id] = block.name
         self.item_titles[tool_id] = title
-        self._remember_turn(tool_id, parent)
         diff, was_truncated = _tool_diff(
             block.name, block.input, self.tool_result_max)
         if diff:
@@ -628,10 +655,13 @@ class StreamTranslator:
             "failed" if is_error else
             agent_status if is_agent and agent_status else "succeeded"
         )
+        tool_turn = self._remember_turn(tool_id)
         events.append(ToolResult(
-            tool_use_id=tool_id, content=text, is_error=bool(is_error),
+            tool_use_id=tool_id, turn_id=tool_turn,
+            content=text, is_error=bool(is_error),
             truncated=truncated, status=result_status,
             summary=summary, diff=diff,
+            background=self._background_for_turn(tool_turn),
         ))
         if is_agent and agent_terminal is not False:
             events.append(self._agent_tool_event(
@@ -705,7 +735,11 @@ class StreamTranslator:
         self._tool_pending.pop(key, None)
         self._tool_last_emit[key] = now
         self._tool_delta_totals[tool_id] = total + len(pending)
-        events.append(ToolDelta(tool_use_id=tool_id, stream=stream, delta=pending))
+        tool_turn = self._remember_turn(tool_id)
+        events.append(ToolDelta(
+            tool_use_id=tool_id, turn_id=tool_turn,
+            stream=stream, delta=pending,
+            background=self._background_for_turn(tool_turn)))
         return events
 
     def _flush_tool_deltas(self, tool_id: str, except_stream: str | None = None) -> list:
@@ -719,8 +753,12 @@ class StreamTranslator:
             remaining = max(0, self.tool_result_max - total)
             pending = pending[:min(remaining, _MAX_TOOL_DELTA_CHARS)]
             if pending:
+                tool_turn = self._remember_turn(tool_id)
                 events.append(ToolDelta(
-                    tool_use_id=tool_id, stream=key[1], delta=pending))
+                    tool_use_id=tool_id,
+                    turn_id=tool_turn,
+                    stream=key[1], delta=pending,
+                    background=self._background_for_turn(tool_turn)))
                 self._tool_delta_totals[tool_id] = total + len(pending)
         return events
 
@@ -1044,6 +1082,7 @@ class StreamTranslator:
             return [ProcessEvent(
                 item_id=item_id, kind="hook", phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
+                background=self._background_for_turn(turn),
             )]
         exit_code = data.get("exit_code")
         exit_code = exit_code if isinstance(exit_code, int) else None
@@ -1063,6 +1102,7 @@ class StreamTranslator:
             item_id=item_id, kind="hook", phase="end", status=status,
             turn_id=turn, parent_id=parent, title=title, summary=summary,
             exit_code=exit_code, duration_ms=duration_ms,
+            background=self._background_for_turn(turn),
         )]
 
     def feed(self, msg) -> list:
@@ -1088,7 +1128,8 @@ class StreamTranslator:
             if (not msg.is_error and not self._has_final_text
                     and self._ambiguous_final_mid is not None):
                 events.append(AssistantMsgEnd(
-                    message_id=self._ambiguous_final_mid, channel="final"))
+                    message_id=self._ambiguous_final_mid,
+                    turn_id=self.turn_id, channel="final"))
             for tool_id in sorted({key[0] for key in self._tool_pending}):
                 events.extend(self._flush_tool_deltas(tool_id))
             events.append(TurnEnd(result=TurnResult(
@@ -2150,6 +2191,13 @@ def translate_history(
     ambiguous_final_mid: str | None = None
     ambiguous_final_start: int | None = None
     turn_failed = False
+    # Older wrappers could bind a replacement query's browser id to Claude's
+    # late ``[Request interrupted by user]`` record.  The marker terminates the
+    # preceding turn; transfer that proven-but-misplaced alias only when the
+    # immediately following canonical message is the replacement's visible
+    # top-level user row.  Any intervening row cancels the repair, preventing an
+    # alias from crossing tool protocol, model output, metadata, or a branch.
+    pending_interrupted_alias: tuple[int, str] | None = None
 
     def _history_id(value, kind: str, position: str) -> str:
         """Keep valid engine ids; deterministically repair malformed legacy rows.
@@ -2173,7 +2221,15 @@ def translate_history(
     client_message_ids = client_message_ids or {}
 
     def _um(uid, prompt):
+        nonlocal pending_interrupted_alias
         client_msg_id = client_message_ids.get(uid)
+        if (
+            client_msg_id is None
+            and pending_interrupted_alias is not None
+            and pending_interrupted_alias[0] == message_index
+        ):
+            client_msg_id = pending_interrupted_alias[1]
+        pending_interrupted_alias = None
         um = UserMsg(
             msg_id=uid,
             client_msg_id=client_msg_id,
@@ -2237,6 +2293,11 @@ def translate_history(
             turn_failed = False
 
     for message_index, m in enumerate(messages):
+        if (
+            pending_interrupted_alias is not None
+            and pending_interrupted_alias[0] < message_index
+        ):
+            pending_interrupted_alias = None
         msg = m.message
         if not isinstance(msg, dict):
             continue
@@ -2274,6 +2335,11 @@ def translate_history(
                     current_turn_id = message_uid
             elif isinstance(content, list):
                 if _is_interrupted_user_content(content):
+                    misplaced_alias = client_message_ids.get(message_uid)
+                    pending_interrupted_alias = (
+                        (message_index + 1, misplaced_alias)
+                        if misplaced_alias is not None else None
+                    )
                     marker_ts = _ts(source_uid)
                     if marker_ts is not None:
                         last_ts = marker_ts
@@ -2359,6 +2425,7 @@ def translate_history(
                 continue
             if _is_synthetic_no_response(msg):
                 continue
+            pending_interrupted_alias = None
             if _is_synthetic_api_error(msg):
                 turn_failed = True
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
@@ -2774,13 +2841,21 @@ def _is_interrupted_user_content(content: Any) -> bool:
     This row is lifecycle metadata for the preceding prompt, not a second
     human-authored message. Claude currently persists it as one text block.
     """
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    block = content[0]
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        text = block.get("text")
+    elif isinstance(block, TextBlock):
+        block_type = "text"
+        text = block.text
+    else:
+        return False
     return (
-        isinstance(content, list)
-        and len(content) == 1
-        and isinstance(content[0], dict)
-        and content[0].get("type") == "text"
-        and isinstance(content[0].get("text"), str)
-        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
+        block_type == "text"
+        and isinstance(text, str)
+        and text.strip() == _INTERRUPTED_USER_TEXT
     )
 
 

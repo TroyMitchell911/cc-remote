@@ -954,7 +954,7 @@ export function Composer(p: Props) {
                   {ctxOpen && (
                     <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
                       {p.contextReport?.available === false ? (
-                        <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后更新。</div>
+                        <div className="ctx-pop-loading">暂未收到可靠的上下文用量；完成一次模型回合后更新。</div>
                       ) : p.contextReport && workContext ? (
                         <>
                           <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
@@ -1105,7 +1105,7 @@ export function Composer(p: Props) {
                 {p.contextError ? (
                   <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
                 ) : p.contextReport?.available === false ? (
-                  <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后会自动更新。上下文仍由 Codex 原生管理。</div>
+                  <div className="ctx-pop-loading">暂未收到可靠的上下文用量；完成一次模型回合后会自动更新。上下文仍由当前引擎原生管理。</div>
                 ) : p.contextReport ? (
                   <>
                     <div className="ctx-pop-row">

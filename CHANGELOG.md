@@ -7,7 +7,7 @@
 - Upgrade Claude Agent SDK to `0.2.142`; the wrapper remains pinned to this
   exact verified patch and continues to launch the user's configured Claude
   Code executable.
-- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v38. Claude
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v39. Claude
   subagent detail, detached background-process ownership, paged turn detail,
   sanitized Claude quota events, and per-session automatic-compaction controls
   now cross an explicit compatibility boundary. Code, Work, BTW, new sessions,

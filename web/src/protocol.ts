@@ -178,12 +178,14 @@ export interface SessionMigrated extends Base {
 }
 export interface UserMsg extends Base { type: "user_msg"; msg_id: string; client_msg_id?: string | null; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
 export interface TurnSteered extends Base { type: "turn_steered"; msg_id: string; turn_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
-export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string; channel?: AssistantChannel }
-export interface Delta extends Base { type: "delta"; message_id: string; text: string; channel?: AssistantChannel }
+export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel }
+export interface Delta extends Base { type: "delta"; message_id: string; turn_id?: string | null; background?: boolean | null; text: string; channel?: AssistantChannel }
 export interface ToolUse extends Base {
   type: "tool_use";
   message_id: string;
   tool_use_id: string;
+  turn_id?: string | null;
+  background?: boolean | null;
   tool: string;
   input: Record<string, unknown>;
   category?: ToolCategory;
@@ -194,12 +196,16 @@ export interface ToolUse extends Base {
 export interface ToolDelta extends Base {
   type: "tool_delta";
   tool_use_id: string;
+  turn_id?: string | null;
+  background?: boolean | null;
   stream: "progress" | "output" | "diff" | "summary" | "terminal";
   delta: string;
 }
 export interface ToolResult extends Base {
   type: "tool_result";
   tool_use_id: string;
+  turn_id?: string | null;
+  background?: boolean | null;
   content: string;
   is_error: boolean;
   truncated?: boolean | null;
@@ -209,7 +215,7 @@ export interface ToolResult extends Base {
   exit_code?: number | null;
   duration_ms?: number | null;
 }
-export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; channel?: AssistantChannel }
+export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel }
 export interface ProcessEvent extends Base {
   type: "process";
   item_id: string;
@@ -603,7 +609,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 38;
+export const PROTOCOL_VERSION = 39;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

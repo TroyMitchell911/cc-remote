@@ -172,11 +172,11 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
         machine.sessions[ctx.key] = ctx
         queries = []
 
-        async def handle_query(query):
+        async def handle_query(_ctx, query):
             queries.append(query)
             return None
 
-        machine._handle_query = handle_query
+        machine._handle_immediate_query = handle_query
         result = await machine._handle_set_goal(SimpleNamespace(
             sid=ctx.key, objective="finish tests", status="active",
             token_budget=None,
@@ -201,5 +201,31 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
                   if isinstance(message, GoalState)]
         assert states[-2].goal.objective == "finish tests"
         assert states[-1].goal is None
+
+    asyncio.run(run())
+
+
+def test_clear_goal_preserves_state_during_autonomous_claude_followup():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-goal-followup", "claude-goal-followup")
+        ctx.engine = "claude"
+        handle = SdkHandle(SimpleNamespace())
+        handle.goal = make_claude_goal(
+            ctx.session_id, "keep this goal", now=100)
+        handle.goal_session_id = ctx.session_id
+        ctx.sdk = handle
+        ctx.goal_visible = True
+        ctx.claude_background_followup_pending = True
+        machine.sessions[ctx.key] = ctx
+
+        result = await machine._handle_clear_goal(SimpleNamespace(sid=ctx.key))
+
+        assert isinstance(result, Error)
+        assert result.code == "busy"
+        assert handle.goal is not None
+        assert handle.goal["objective"] == "keep this goal"
+        assert ctx.goal_visible is True
+        assert transport.sent[-1] is result
 
     asyncio.run(run())

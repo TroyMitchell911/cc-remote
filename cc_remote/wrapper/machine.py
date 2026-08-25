@@ -66,9 +66,9 @@ from claude_agent_sdk import (
     rename_session, tag_session,
 )
 from claude_agent_sdk.types import (
-    HookEventMessage, ResultMessage, TaskNotificationMessage,
+    ResultMessage, TaskNotificationMessage,
     TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
-    RateLimitEvent, TERMINAL_TASK_STATUSES,
+    RateLimitEvent, TERMINAL_TASK_STATUSES, UserMessage,
 )
 
 from cc_remote.attachments import (
@@ -99,6 +99,7 @@ from cc_remote.workspaces import (
 )
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
+    MAX_SAFE_WIRE_INTEGER,
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, QueryQueueState, QueuedQueryDetail, QueuedQueryInfo,
     QueuedQueryUpdated,
@@ -113,8 +114,9 @@ from cc_remote.protocol import (
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
     State, TakeoverState, SessionControl,
-    UserMsg, TurnSteered,
+    UserMsg, TurnSteered, Delta,
     ToolUse, ToolResult, ProcessEvent, TurnPlan, TurnBinding, TurnEnd,
+    TurnDiff,
     TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
@@ -185,6 +187,7 @@ from cc_remote.wrapper.claude_questions import (
 from cc_remote.wrapper.sdk import (
     CLAUDE_DEFAULT_EFFORT,
     CLAUDE_DEFAULT_MODEL,
+    ClaudeAutonomousFollowupPending,
     SdkHandle,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
@@ -238,6 +241,12 @@ from cc_remote.wrapper.codex_client_messages import (
     CodexClientMessageStore,
     CodexClientMessageStoreError,
 )
+from cc_remote.wrapper.codex_process_clocks import (
+    CodexProcessClocks,
+    CodexProcessClockObservation,
+    CodexProcessClockStore,
+    CodexProcessClockStoreError,
+)
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexHistoryImageView, CodexHistoryNativeWitness,
@@ -248,10 +257,11 @@ from cc_remote.wrapper.codex_stream import (
     codex_live_user_message,
     codex_rollout_task_bindings,
     codex_history_image_views, codex_session_id, is_turn_terminal,
-    codex_history_boundary_user, codex_history_turn_user,
+    codex_history_boundary_process_start, codex_history_boundary_user,
+    codex_history_turn_user,
     codex_history_turn_users,
     codex_history_native_witness, codex_history_process_witnesses,
-    codex_history_window,
+    codex_history_window_info,
     codex_native_rollback_turns,
     codex_translate_history,
 )
@@ -1289,6 +1299,18 @@ class _CodexProcessWitnessCache:
 
 
 @dataclass(frozen=True)
+class _CodexProcessClockBoundaryCheck:
+    """Growth boundary for one exact rollout-native steer segment.
+
+    ``next_scan_size=None`` is a settled positive/negative result. Otherwise
+    the same immutable segment is reconsidered only after the rollout reaches
+    the first byte size which could change the previous bounded scan result.
+    """
+
+    next_scan_size: int | None
+
+
+@dataclass(frozen=True)
 class _CodexDeleteRejection:
     error: Error
     outcome: Literal["failed", "unknown"]
@@ -1414,6 +1436,50 @@ def _apply_codex_process_witness(
             # with the parser-time ``0s`` produced by a hydrated native turn.
             turn.pop("processStartedTs", None)
             turn.pop("processDoneTs", None)
+
+
+def _apply_codex_process_clocks(
+    turns: tuple[dict, ...] | list[dict],
+    clocks: CodexProcessClocks,
+) -> None:
+    """Overlay exact live starts without changing turn lifecycle.
+
+    The browser alias and sidecar are both tied to the same rollout inode. A
+    clock therefore proves process presence and its earliest start, but never
+    proves that the turn is still running or that it reached a terminal.
+    """
+    if not clocks.has_clocks:
+        return
+    for turn in turns:
+        visible_id = turn.get("id")
+        client_message_id = turn.get("clientMsgId")
+        if not isinstance(client_message_id, str):
+            client_message_id = (
+                visible_id
+                if isinstance(visible_id, str)
+                and visible_id in clocks.by_client_message_id
+                else None
+            )
+        native_turn_id = turn.get("forkPointId")
+        started_ms = clocks.resolve(
+            client_message_id,
+            native_turn_id if isinstance(native_turn_id, str) else None,
+        )
+        if started_ms is None:
+            continue
+        current = turn.get("processStartedTs")
+        turn["processStartedTs"] = (
+            min(current, started_ms)
+            if isinstance(current, int) and not isinstance(current, bool)
+            else started_ms
+        )
+        turn["processDetailState"] = "present"
+        reasons = list(turn.get("detailReasons") or [])
+        if "process" not in reasons:
+            reasons.append("process")
+        turn["detailReasons"] = reasons
+        turn["detailEventCount"] = max(
+            1, int(turn.get("detailEventCount") or 0))
 
 
 def _codex_visible_process_offsets(
@@ -1741,6 +1807,13 @@ class WrapperMachine:
         except CodexClientMessageStoreError:
             self._codex_client_messages = None
             log.exception("Codex client-message identity store unavailable")
+        try:
+            self._codex_process_clocks: CodexProcessClockStore | None = (
+                CodexProcessClockStore(cfg.state_dir)
+            )
+        except CodexProcessClockStoreError:
+            self._codex_process_clocks = None
+            log.exception("Codex process-clock store unavailable")
         self._claude_broker = BrokerClient(
             getattr(cfg, "claude_broker_socket", None))
         # Claude's official SDK/CLI does not expose a supported multi-writer
@@ -1775,6 +1848,15 @@ class WrapperMachine:
         # page instead of rescanning a multi-gigabyte file from its tail.
         self._codex_process_witness_caches: OrderedDict[
             str, _CodexProcessWitnessCache
+        ] = OrderedDict()
+        # The official summary path needs one legacy backfill for an enormous
+        # native turn whose first process event sits outside the bounded tail.
+        # Memoize successful/settled checks by exact rollout inode + native
+        # owner + steer segment, with growth thresholds for appendable sources,
+        # so a multi-hour task is not rescanned on every paint.
+        self._codex_process_clock_boundary_checks: OrderedDict[
+            tuple[str, int, int, str, int],
+            _CodexProcessClockBoundaryCheck,
         ] = OrderedDict()
         # SessionContext objects are evicted and recreated while this wrapper
         # generation stays alive. Keep each sid's control revision outside the
@@ -2864,6 +2946,383 @@ class WrapperMachine:
             )
             return CodexClientMessageAliases({}, {})
 
+    def _codex_process_clocks_for_source(
+        self,
+        source_path: str | None,
+    ) -> CodexProcessClocks:
+        """Load presentation clocks proven against one rollout inode."""
+        store = getattr(self, "_codex_process_clocks", None)
+        if store is None or not source_path:
+            return CodexProcessClocks({})
+        try:
+            return store.get(source_path)
+        except Exception as exc:
+            log.warning(
+                "Codex process clocks unavailable",
+                error_type=type(exc).__name__,
+            )
+            return CodexProcessClocks({})
+
+    async def _persist_codex_process_start(
+        self,
+        source_path: str,
+        client_message_id: str,
+        native_turn_id: str,
+        started_ms: int,
+    ) -> CodexProcessClockObservation | None:
+        """Persist one best-effort presentation fact outside turn ownership."""
+        store = getattr(self, "_codex_process_clocks", None)
+        if store is None:
+            return None
+        try:
+            return await asyncio.to_thread(
+                store.observe_start,
+                source_path,
+                client_message_id,
+                native_turn_id,
+                started_ms,
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex process start could not be persisted",
+                turn_id=native_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return None
+
+    async def _backfill_official_codex_process_clock(
+        self,
+        source_path: str | None,
+        source: HistorySourceFingerprint | None,
+        aliases: CodexClientMessageAliases,
+        page: CodexHistoryPage,
+        *,
+        limit: int | None,
+        in_progress: bool,
+        clocks: CodexProcessClocks,
+    ) -> CodexProcessClocks:
+        """Seed one pre-sidecar oversized turn without trusting a tail clock."""
+        if (
+            not source_path
+            or source is None
+            or not page.native_turn_ids
+        ):
+            return clocks
+        native_turn_id = page.native_turn_ids[0]
+        page_segments = {
+            segment_index
+            for owner, segment_index
+            in page.native_segment_by_visible_id.values()
+            if (
+                owner == native_turn_id
+                and isinstance(segment_index, int)
+                and not isinstance(segment_index, bool)
+                and segment_index >= 0
+            )
+        }
+        # Current official pages always expose the native segment join. Keep a
+        # separate unknown coordinate for a malformed/incomplete response so a
+        # source append can retry it without poisoning a later exact segment.
+        newest_page_segment = max(page_segments) if page_segments else -1
+        check_key = (
+            source.path,
+            source.device,
+            source.inode,
+            native_turn_id,
+            newest_page_segment,
+        )
+        checks = self._codex_process_clock_boundary_checks
+        remembered = checks.get(check_key)
+        if remembered is not None and (
+            remembered.next_scan_size is None
+            or source.size < remembered.next_scan_size
+        ):
+            checks.move_to_end(check_key)
+            return clocks
+        checks.pop(check_key, None)
+
+        def remember_check(
+            key: tuple[str, int, int, str, int],
+            *,
+            next_scan_size: int | None,
+        ) -> None:
+            checks[key] = _CodexProcessClockBoundaryCheck(
+                next_scan_size=next_scan_size,
+            )
+            checks.move_to_end(key)
+            while len(checks) > 256:
+                checks.popitem(last=False)
+
+        byte_budget = max(
+            1024 * 1024,
+            int(self.cfg.codex_history_window_max_bytes),
+        )
+        if source.size <= byte_budget:
+            remember_check(
+                check_key,
+                next_scan_size=byte_budget + 1,
+            )
+            return clocks
+
+        # A durable clock already attached to the exact newest segment makes
+        # the compatibility scan unnecessary after a wrapper restart.
+        for turn in page.turns:
+            visible_id = turn.get("id")
+            if not isinstance(visible_id, str):
+                continue
+            if page.native_segment_by_visible_id.get(visible_id) != (
+                native_turn_id,
+                newest_page_segment,
+            ):
+                continue
+            client_message_id = turn.get("clientMsgId")
+            if clocks.resolve(
+                client_message_id
+                if isinstance(client_message_id, str) else None,
+                native_turn_id,
+            ) is not None:
+                remember_check(check_key, next_scan_size=None)
+                return clocks
+
+        try:
+            window = await asyncio.to_thread(
+                codex_history_window_info,
+                source_path,
+                before=None,
+                limit=max(1, int(limit or 4)),
+                max_bytes=byte_budget,
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex process-clock boundary lookup failed open",
+                error_type=type(exc).__name__,
+            )
+            return clocks
+
+        newest_segment = window.newest_segment_index
+        newest_owner = window.newest_native_turn_id
+        if (
+            newest_owner != native_turn_id
+            or isinstance(newest_segment, bool)
+            or not isinstance(newest_segment, int)
+            or newest_segment < 0
+            or (newest_owner, newest_segment)
+            not in page.native_segment_by_visible_id.values()
+        ):
+            # The official page and rollout sample did not prove the same
+            # segment. Never persist across that ambiguity; retry only after an
+            # append changes the sampled source.
+            remember_check(
+                check_key,
+                next_scan_size=max(source.size, window.end_offset) + 1,
+            )
+            return clocks
+
+        exact_key = (
+            source.path,
+            source.device,
+            source.inode,
+            newest_owner,
+            newest_segment,
+        )
+        if (
+            window.forced_oldest_cursor is None
+            or window.forced_boundary_offset is None
+        ):
+            # The newest segment still fits. Its first possible oversized byte
+            # is deterministic from the boundary already found by this scan;
+            # unrelated older turns and sub-threshold appends need no rescan.
+            next_scan_size = (
+                window.newest_boundary_offset + byte_budget + 1
+                if window.newest_boundary_offset is not None
+                else max(source.size, window.end_offset) + 1
+            )
+            remember_check(
+                exact_key,
+                next_scan_size=max(
+                    max(source.size, window.end_offset) + 1,
+                    next_scan_size,
+                ),
+            )
+            return clocks
+        if (
+            window.forced_native_turn_id != newest_owner
+            or window.forced_segment_index != newest_segment
+        ):
+            remember_check(
+                exact_key,
+                next_scan_size=max(source.size, window.end_offset) + 1,
+            )
+            return clocks
+
+        recovered_user = await asyncio.to_thread(
+            codex_history_boundary_user,
+            source_path,
+            window.forced_boundary_offset,
+            window.forced_oldest_cursor,
+        )
+        if recovered_user is None:
+            remember_check(
+                exact_key,
+                next_scan_size=(
+                    max(source.size, window.end_offset) + 1
+                    if in_progress else None
+                ),
+            )
+            return clocks
+        client_message_id = recovered_user.client_msg_id
+        if client_message_id is None:
+            client_message_id = aliases.resolve(
+                newest_owner,
+                newest_segment,
+                recovered_user.msg_id,
+            )
+        if client_message_id is None:
+            refreshed_aliases = await asyncio.to_thread(
+                self._codex_history_client_message_ids,
+                source_path,
+            )
+            if refreshed_aliases.matches_source(
+                source.path, source.device, source.inode,
+            ):
+                client_message_id = refreshed_aliases.resolve(
+                    newest_owner,
+                    newest_segment,
+                    recovered_user.msg_id,
+                )
+        started_ms = await asyncio.to_thread(
+            codex_history_boundary_process_start,
+            source_path,
+            window.forced_boundary_offset,
+        )
+        if client_message_id is None or started_ms is None:
+            # A completed direct reply is a stable negative check. A running
+            # turn may emit its first visible process later and remains eligible.
+            remember_check(
+                exact_key,
+                next_scan_size=(
+                    max(source.size, window.end_offset) + 1
+                    if in_progress else None
+                ),
+            )
+            return clocks
+        observation = await self._persist_codex_process_start(
+            source_path,
+            client_message_id,
+            newest_owner,
+            started_ms,
+        )
+        if observation is None:
+            return clocks
+        remember_check(exact_key, next_scan_size=None)
+        refreshed = await asyncio.to_thread(
+            self._codex_process_clocks_for_source,
+            source_path,
+        )
+        if not refreshed.matches_source(
+            source.path, source.device, source.inode,
+        ):
+            return clocks
+        return refreshed
+
+    @staticmethod
+    def _is_visible_codex_process_event(msg: object) -> bool:
+        """Mirror the browser's public process classifier for live Codex."""
+        if isinstance(msg, Delta):
+            return msg.channel == "commentary" and bool(msg.text)
+        if isinstance(msg, (ToolUse, TurnPlan, TurnDiff)):
+            return True
+        if not isinstance(msg, ProcessEvent):
+            return False
+        if msg.kind == "reasoning":
+            return False
+        if msg.kind != "hook":
+            return True
+        return msg.status in {
+            "failed", "declined", "cancelled", "interrupted",
+        }
+
+    async def _observe_codex_process_clock(
+        self,
+        ctx: SessionContext,
+        msg: object,
+    ) -> None:
+        """Record the first visible event for one exact live Remote segment."""
+        if (
+            ctx.engine != "codex"
+            or ctx.btw
+            or not self._is_visible_codex_process_event(msg)
+        ):
+            return
+        binding = ctx.active_turn_binding
+        if binding is None:
+            return
+        msg_turn_id = getattr(msg, "turn_id", None)
+        if (
+            isinstance(msg_turn_id, str)
+            and msg_turn_id != binding.turn_id
+        ):
+            # A late item from another native turn must never start the active
+            # browser message's presentation clock.
+            return
+        binding_key = (binding.msg_id, binding.turn_id)
+        if ctx.codex_process_clock_binding == binding_key:
+            return
+        raw_ts = getattr(msg, "ts", None)
+        if (
+            isinstance(raw_ts, bool)
+            or not isinstance(raw_ts, (int, float))
+            or not math.isfinite(float(raw_ts))
+            or raw_ts < 0
+        ):
+            return
+        started_ms = (
+            MAX_SAFE_WIRE_INTEGER
+            if raw_ts > MAX_SAFE_WIRE_INTEGER / 1000
+            else max(0, int(round(float(raw_ts) * 1000)))
+        )
+        sid = self._ctx_wire_sid(ctx)
+        if not sid:
+            return
+        try:
+            source_path = await asyncio.to_thread(
+                self._codex_rollout_for_wire, sid)
+        except (OSError, TypeError, ValueError):
+            return
+        except Exception as exc:
+            # Unexpected lookup failures are actionable, but one broken
+            # binding can emit thousands of deltas. Record and suppress the
+            # rest without delaying or hiding their authoritative live frames.
+            ctx.codex_process_clock_binding = binding_key
+            log.warning(
+                "Codex process-clock rollout lookup failed open",
+                session_id=sid,
+                turn_id=binding.turn_id,
+                error_type=type(exc).__name__,
+            )
+            return
+        if ctx.active_turn_binding != binding:
+            return
+        if not source_path:
+            return
+        observation = await self._persist_codex_process_start(
+            source_path,
+            binding.msg_id,
+            binding.turn_id,
+            started_ms,
+        )
+        # Store failure is presentation-only. Suppress one error per binding;
+        # a later restart/history scan can backfill without delaying every text
+        # delta in this already-running response.
+        ctx.codex_process_clock_binding = binding_key
+        if observation is not None and observation.changed:
+            if observation.started_ms < started_ms:
+                log.debug(
+                    "retained earlier Codex process clock",
+                    session_id=sid,
+                    turn_id=binding.turn_id,
+                )
+
     @staticmethod
     def _overlay_codex_cached_client_aliases(
         rows: list[dict],
@@ -3211,16 +3670,32 @@ class WrapperMachine:
         self,
         source_path: str | None,
     ) -> None:
-        store = getattr(self, "_codex_client_messages", None)
-        if store is None or not source_path:
+        if not source_path:
             return
-        try:
-            await asyncio.to_thread(store.delete_path, source_path)
-        except CodexClientMessageStoreError as exc:
-            log.warning(
-                "Codex client-message alias cleanup failed",
-                error_type=type(exc).__name__,
-            )
+        alias_store = getattr(self, "_codex_client_messages", None)
+        if alias_store is not None:
+            try:
+                await asyncio.to_thread(alias_store.delete_path, source_path)
+            except CodexClientMessageStoreError as exc:
+                log.warning(
+                    "Codex client-message alias cleanup failed",
+                    error_type=type(exc).__name__,
+                )
+        clock_store = getattr(self, "_codex_process_clocks", None)
+        if clock_store is not None:
+            try:
+                await asyncio.to_thread(clock_store.delete_path, source_path)
+            except CodexProcessClockStoreError as exc:
+                log.warning(
+                    "Codex process-clock cleanup failed",
+                    error_type=type(exc).__name__,
+                )
+        real_path = os.path.realpath(source_path)
+        boundary_checks = getattr(
+            self, "_codex_process_clock_boundary_checks", {})
+        for key in tuple(boundary_checks):
+            if key[0] == real_path:
+                boundary_checks.pop(key, None)
 
     def _claude_history_client_message_ids(
         self,
@@ -4537,6 +5012,10 @@ class WrapperMachine:
         sdk.background_message_callback = (
             lambda message, turn_id: self._on_claude_background_message(
                 ctx, message, turn_id))
+        sdk.query_launch_guard = (
+            lambda: self._guard_claude_query_launch(ctx))
+        sdk.message_pump_failure_callback = (
+            lambda error: self._on_claude_message_pump_failure(ctx, error))
         sdk.lifecycle_reset_callback = (
             lambda: self._reset_claude_task_lifecycle(ctx))
 
@@ -4584,15 +5063,168 @@ class WrapperMachine:
 
     @staticmethod
     def _reset_claude_task_lifecycle(ctx: SessionContext) -> None:
+        watchdog = ctx.claude_autonomous_interrupt_task
+        ctx.claude_autonomous_interrupt_wakeup.set()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if (
+            watchdog is not None
+            and watchdog is not current
+            and not watchdog.done()
+        ):
+            watchdog.cancel()
+        ctx.claude_autonomous_interrupt_task = None
+        recovery = ctx.claude_followup_recovery_task
+        if recovery is not current:
+            if recovery is not None and not recovery.done():
+                recovery.cancel()
+            ctx.claude_followup_recovery_task = None
         ctx.claude_active_tasks.clear()
         ctx.claude_task_tracking_overflow = False
-        ctx.claude_background_followup_pending = False
+        ctx.claude_background_followups.clear()
+        ctx.claude_background_followup_nonce = 0
+        ctx.claude_background_followup_overflow = False
+        ctx.claude_background_translator = None
+        # A queue worker may be sleeping solely on the cleared autonomous latch.
+        # Disconnect/reconnect and pump failure must always make it re-evaluate.
+        ctx.queued_query_wakeup.set()
         registry = ctx.claude_agents
         runs = getattr(registry, "runs", None)
         if isinstance(runs, dict):
             for run in runs.values():
                 if getattr(run, "status", None) == "running":
                     run.status = "cancelled"
+
+    @staticmethod
+    def _claude_followup_origin_key(origin: object) -> str | None:
+        """Return a stable injected-turn identity when the SDK supplied one."""
+        if not isinstance(origin, dict):
+            return None
+        kind = origin.get("kind")
+        if not isinstance(kind, str) or not kind or kind == "human":
+            return None
+        # Claude versions have emitted both spellings for the same task id.
+        # Normalize them before retaining the field namespace so a notification
+        # cannot be claimed under taskId and retired under task_id.
+        for field_name in ("taskId", "task_id"):
+            value = origin.get(field_name)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                rendered = str(value).strip()
+                if rendered:
+                    return f"{kind}:task:{rendered}"
+        # The remaining fields identify channel/peer/coordinator continuations.
+        for field_name in (
+            "senderTaskId", "fromSession", "verifiedPeerPid", "from",
+            "server", "name",
+        ):
+            value = origin.get(field_name)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                rendered = str(value).strip()
+                if rendered:
+                    return f"{kind}:{field_name}:{rendered}"
+        return None
+
+    @classmethod
+    def _store_claude_followup(
+        cls, ctx: SessionContext, key: str, phase: str,
+    ) -> bool:
+        current = ctx.claude_background_followups.get(key)
+        if current is not None:
+            if phase == "active":
+                ctx.claude_background_followups[key] = phase
+            return False
+        if len(ctx.claude_background_followups) >= cls.CLAUDE_ACTIVE_TASK_CAP:
+            if not ctx.claude_background_followup_overflow:
+                log.error(
+                    "Claude autonomous follow-up ledger overflowed",
+                    session_id=ctx.session_id,
+                    followup_cap=cls.CLAUDE_ACTIVE_TASK_CAP,
+                )
+            ctx.claude_background_followup_overflow = True
+            return True
+        ctx.claude_background_followups[key] = phase
+        return False
+
+    @classmethod
+    def _claim_claude_followup_notification(
+        cls, ctx: SessionContext, task_id: str,
+    ) -> bool:
+        key = cls._claude_followup_origin_key({
+            "kind": "task-notification",
+            "taskId": task_id,
+        })
+        assert key is not None
+        return cls._store_claude_followup(ctx, key, "notified")
+
+    @classmethod
+    def _activate_claude_followup(
+        cls, ctx: SessionContext, message: UserMessage,
+    ) -> bool:
+        origin = getattr(message, "origin", None)
+        key = cls._claude_followup_origin_key(origin)
+        if key is not None and key in ctx.claude_background_followups:
+            ctx.claude_background_followups[key] = "active"
+            return False
+
+        origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+        if origin_kind == "task-notification" and key is None:
+            # Older CLI builds omit taskId from the injected user boundary. Its
+            # source order still lets one boundary activate exactly one pending
+            # task notification without collapsing the later entries.
+            for pending_key, phase in ctx.claude_background_followups.items():
+                if (
+                    pending_key.startswith("task-notification:")
+                    and phase == "notified"
+                ):
+                    ctx.claude_background_followups[pending_key] = "active"
+                    return False
+
+        if key is None:
+            ctx.claude_background_followup_nonce += 1
+            key = (
+                f"{origin_kind or 'injected'}:anonymous:"
+                f"{ctx.claude_background_followup_nonce}"
+            )
+        return cls._store_claude_followup(ctx, key, "active")
+
+    @classmethod
+    def _retire_claude_followup(
+        cls, ctx: SessionContext, message: ResultMessage,
+    ) -> bool:
+        """Retire only the autonomous turn closed by this exact Result."""
+        origin = getattr(message, "origin", None)
+        origin_kind = origin.get("kind") if isinstance(origin, dict) else None
+        if origin_kind == "human":
+            # A human Result can be routed through the idle/background path
+            # during recovery, but it never owns an autonomous continuation.
+            return False
+        key = cls._claude_followup_origin_key(origin)
+        if key is not None:
+            if key in ctx.claude_background_followups:
+                ctx.claude_background_followups.pop(key, None)
+                return True
+            # Once Claude supplies an exact origin identity, a mismatch is
+            # authoritative. Falling back to insertion order here could retire
+            # a different task whose autonomous turn is still running.
+            return False
+
+        candidates = tuple(ctx.claude_background_followups.items())
+        if origin_kind == "task-notification":
+            candidates = tuple(
+                item for item in candidates
+                if item[0].startswith("task-notification:")
+            ) or candidates
+        for phase in ("active", "notified"):
+            match = next((
+                pending_key for pending_key, pending_phase in candidates
+                if pending_phase == phase
+            ), None)
+            if match is not None:
+                ctx.claude_background_followups.pop(match, None)
+                return True
+        return False
 
     def _observe_claude_task_lifecycle(
         self,
@@ -4609,7 +5241,29 @@ class WrapperMachine:
         is the first safe spawn-option reconnect boundary.
         """
         if isinstance(message, ResultMessage):
-            ctx.claude_background_followup_pending = False
+            # Only the background callback knows that this Result closes an
+            # injected turn. A managed human Result may overlap a notification
+            # from an older task and must never retire that autonomous claim.
+            return
+
+        if isinstance(message, UserMessage):
+            origin = getattr(message, "origin", None)
+            origin_kind = (
+                origin.get("kind") if isinstance(origin, dict) else None
+            )
+            if (
+                background
+                and isinstance(origin_kind, str)
+                and origin_kind != "human"
+                and not getattr(message, "parent_tool_use_id", None)
+            ):
+                # The pinned SDK marks every injected turn at its replayed
+                # top-level user boundary. This is stronger than inferring a
+                # continuation only from the last active task: channel/peer
+                # turns and each completion in a multi-task run are covered too.
+                overflowed = self._activate_claude_followup(ctx, message)
+                if overflowed:
+                    self._schedule_claude_followup_overflow_recovery(ctx)
             return
 
         task_id = getattr(message, "task_id", None)
@@ -4625,13 +5279,14 @@ class WrapperMachine:
         if terminal:
             ctx.claude_active_tasks.discard(task_id)
             if (background
-                    and not ctx.claude_active_tasks
-                    and not ctx.claude_task_tracking_overflow
                     and not (
                         isinstance(message, TaskNotificationMessage)
                         and message.status == "stopped"
                     )):
-                ctx.claude_background_followup_pending = True
+                overflowed = self._claim_claude_followup_notification(
+                    ctx, task_id)
+                if overflowed:
+                    self._schedule_claude_followup_overflow_recovery(ctx)
             return
 
         track = isinstance(message, (TaskStartedMessage, TaskProgressMessage))
@@ -4662,7 +5317,8 @@ class WrapperMachine:
     def _claude_has_background_work(ctx: SessionContext) -> bool:
         if (ctx.claude_active_tasks
                 or ctx.claude_task_tracking_overflow
-                or ctx.claude_background_followup_pending):
+                or ctx.claude_background_followups
+                or ctx.claude_background_followup_overflow):
             return True
         registry = ctx.claude_agents
         runs = getattr(registry, "runs", None)
@@ -4670,6 +5326,235 @@ class WrapperMachine:
             getattr(run, "status", None) == "running"
             for run in runs.values()
         ))
+
+    @staticmethod
+    def _claude_autonomous_followup_pending(ctx: SessionContext) -> bool:
+        """Whether an idle-looking Claude child already owns a response."""
+        return bool(
+            ctx.engine == "claude"
+            and (
+                ctx.claude_background_followups
+                or ctx.claude_background_followup_overflow
+            )
+        )
+
+    async def _settle_claude_lifecycle_if_quiescent(
+        self, ctx: SessionContext,
+    ) -> bool:
+        """Release a Claude session after both possible terminal owners finish.
+
+        Managed Result handling and the background callback are independent
+        tasks. Each calls this after dropping its own claim, so either event
+        order reaches the same final state without a lost wakeup.
+        """
+        if (
+            ctx.engine != "claude"
+            or getattr(ctx.sdk, "is_claude_broker", False)
+            or not self._is_resident_context(ctx)
+        ):
+            return False
+        async with ctx.query_lock:
+            managed = ctx.turn_task
+            if (
+                (managed is not None and not managed.done())
+                or self._claude_autonomous_followup_pending(ctx)
+            ):
+                return False
+            ctx.active_msg_id = None
+            ctx.interrupt_deadline = None
+            ctx.interrupt_event.clear()
+            if ctx.state != "idle":
+                await self._set_state(ctx, "idle")
+            else:
+                ctx.queued_query_wakeup.set()
+        return True
+
+    def _schedule_claude_followup_overflow_recovery(
+        self, ctx: SessionContext,
+    ) -> None:
+        current = ctx.claude_followup_recovery_task
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            self._recover_claude_followup_overflow(ctx),
+            name=f"claude-followup-overflow-{self._ctx_wire_sid(ctx)}",
+        )
+        ctx.claude_followup_recovery_task = task
+
+        def clear(completed: asyncio.Task) -> None:
+            if ctx.claude_followup_recovery_task is completed:
+                ctx.claude_followup_recovery_task = None
+
+        task.add_done_callback(clear)
+
+    async def _recover_claude_followup_overflow(
+        self, ctx: SessionContext,
+    ) -> None:
+        # Never reconnect from inside SdkHandle's background callback: its
+        # disconnect path gathers that worker. A fresh task also lets the exact
+        # callback which detected overflow finish its accounting first.
+        await asyncio.sleep(0)
+        async with ctx.query_lock:
+            if (
+                not self._is_resident_context(ctx)
+                or not ctx.claude_background_followup_overflow
+                or getattr(ctx.sdk, "is_claude_broker", False)
+            ):
+                return
+            await self._emit(ctx, Error(
+                code=ERR_CC_CRASH,
+                message="Claude 后台任务状态过多，已重连恢复会话。",
+                msg_id=ctx.active_msg_id,
+            ))
+            resume_id, fork = self._claude_reconnect_identity(ctx)
+            try:
+                await ctx.sdk.force_reconnect(
+                    resume_id=resume_id,
+                    cwd=ctx.cwd,
+                    reason="autonomous follow-up ledger overflow",
+                    fork=fork,
+                )
+            except Exception as exc:
+                log.exception(
+                    "Claude follow-up overflow reconnect failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message="Claude 会话重连失败，请重新进入后重试。",
+                    msg_id=ctx.active_msg_id,
+                ))
+            finally:
+                self._reset_claude_task_lifecycle(ctx)
+                ctx.active_msg_id = None
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+                if self._is_resident_context(ctx) and ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
+
+    @staticmethod
+    def _guard_claude_query_launch(ctx: SessionContext) -> None:
+        """Reject the real SDK write if an autonomous response won the race."""
+        if WrapperMachine._claude_autonomous_followup_pending(ctx):
+            raise ClaudeAutonomousFollowupPending(
+                "Claude autonomous follow-up owns the response stream"
+            )
+
+    async def _on_claude_message_pump_failure(
+        self,
+        ctx: SessionContext,
+        error: BaseException,
+    ) -> None:
+        """Release an idle/autonomous session whose sole SDK reader stopped."""
+        self._reset_claude_task_lifecycle(ctx)
+        if not self._is_resident_context(ctx):
+            return
+        managed = ctx.turn_task
+        if managed is not None and not managed.done():
+            # The managed reader receives the same failure sentinel and owns its
+            # visible Error/idle transition.  Waking its queue here is enough.
+            return
+        log.warning(
+            "Claude idle message pump failed",
+            session_id=ctx.session_id,
+            error_type=type(error).__name__,
+        )
+        ctx.active_msg_id = None
+        ctx.interrupt_deadline = None
+        ctx.interrupt_event.clear()
+        if ctx.state != "idle":
+            await self._set_state(ctx, "idle")
+
+    def _schedule_claude_autonomous_interrupt_watchdog(
+        self, ctx: SessionContext,
+    ) -> None:
+        current = ctx.claude_autonomous_interrupt_task
+        if current is not None and not current.done():
+            return
+        ctx.claude_autonomous_interrupt_wakeup.clear()
+        task = asyncio.create_task(
+            self._watch_claude_autonomous_interrupt(ctx),
+            name=f"claude-autonomous-interrupt-{self._ctx_wire_sid(ctx)}",
+        )
+        ctx.claude_autonomous_interrupt_task = task
+
+    async def _watch_claude_autonomous_interrupt(
+        self, ctx: SessionContext,
+    ) -> None:
+        current = asyncio.current_task()
+        try:
+            deadline = ctx.interrupt_deadline
+            if deadline is None:
+                deadline = (
+                    asyncio.get_running_loop().time()
+                    + self.cfg.drain_timeout
+                )
+            remaining = max(
+                0.0, deadline - asyncio.get_running_loop().time())
+            try:
+                await asyncio.wait_for(
+                    ctx.claude_autonomous_interrupt_wakeup.wait(),
+                    timeout=remaining,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if (
+                not self._is_resident_context(ctx)
+                or not self._claude_autonomous_followup_pending(ctx)
+                or ctx.state not in {"interrupting", "draining"}
+            ):
+                return
+            log.error(
+                "Claude autonomous interrupt drain timed out",
+                session_id=ctx.session_id,
+            )
+            await self._emit(ctx, Error(
+                code=ERR_DRAIN_TIMEOUT,
+                message="Claude 后台续跑停止超时，已重连恢复会话。",
+                msg_id=ctx.active_msg_id,
+            ))
+            resume_id, fork = self._claude_reconnect_identity(ctx)
+            try:
+                await ctx.sdk.force_reconnect(
+                    resume_id=resume_id,
+                    cwd=ctx.cwd,
+                    reason="autonomous interrupt drain timeout",
+                    fork=fork,
+                )
+                model = _session_model(ctx)
+                if model and model != ctx.announced_model:
+                    ctx.announced_model = model
+                    await self._emit(ctx, Model(model=model))
+                effort = _session_effort(ctx)
+                if effort and effort != ctx.announced_effort:
+                    ctx.announced_effort = effort
+                    await self._emit(ctx, Effort(effort=effort))
+                await self._publish_claude_auto_compact(ctx)
+            except Exception as exc:
+                log.exception(
+                    "Claude autonomous interrupt reconnect failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message="Claude 会话重连失败，请重新进入后重试。",
+                    msg_id=ctx.active_msg_id,
+                ))
+            finally:
+                self._reset_claude_task_lifecycle(ctx)
+                ctx.active_msg_id = None
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+                if self._is_resident_context(ctx) and ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if ctx.claude_autonomous_interrupt_task is current:
+                ctx.claude_autonomous_interrupt_task = None
 
     @staticmethod
     def _claude_auto_compact_event(ctx: SessionContext) -> AutoCompact:
@@ -4737,9 +5622,10 @@ class WrapperMachine:
             await self._emit(ctx, event)
         return event, changed
 
-    def _claude_auto_compact_reconnect_identity(
+    def _claude_reconnect_identity(
         self, ctx: SessionContext,
     ) -> tuple[Optional[str], bool]:
+        """Return the native resume id and whether a private BTW must re-fork."""
         if not ctx.btw:
             return ctx.session_id, False
         if ctx.btw_real_id:
@@ -4775,7 +5661,7 @@ class WrapperMachine:
         sdk = ctx.sdk
         desired = (current.mode, current.threshold_tokens)
         old_applied = (current.applied_mode, current.applied_threshold_tokens)
-        resume_id, fork = self._claude_auto_compact_reconnect_identity(ctx)
+        resume_id, fork = self._claude_reconnect_identity(ctx)
         try:
             await sdk.force_reconnect(
                 resume_id=resume_id,
@@ -4824,6 +5710,13 @@ class WrapperMachine:
         ctx.auto_compact_error = None
         await self._persist_claude_session_controls(ctx)
         event, _ = await self._publish_claude_auto_compact(ctx, force=True)
+        # force_reconnect() either captured context usage from this exact child
+        # generation or deliberately suppressed the probe.  Publish that state
+        # immediately after AutoCompact so the browser cannot remain stuck with
+        # its invalidated prior-generation report.  Cached-only mode must never
+        # issue a second synchronous control RPC against the fresh child.
+        await self._handle_get_context_locked(
+            ctx, None, prefer_cached_claude=True)
         return event, True
 
     def _schedule_pending_claude_auto_compact(
@@ -6182,6 +7075,18 @@ class WrapperMachine:
                     *auto_compact_tasks, return_exceptions=True)
             for c in self.sessions.values():
                 c.auto_compact_apply_task = None
+            followup_recovery_tasks = [
+                c.claude_followup_recovery_task for c in self.sessions.values()
+                if c.claude_followup_recovery_task is not None
+                and not c.claude_followup_recovery_task.done()
+            ]
+            for task in followup_recovery_tasks:
+                task.cancel()
+            if followup_recovery_tasks:
+                await asyncio.gather(
+                    *followup_recovery_tasks, return_exceptions=True)
+            for c in self.sessions.values():
+                c.claude_followup_recovery_task = None
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 disconnected = False
@@ -7261,6 +8166,17 @@ class WrapperMachine:
         await self.transport.send(live)
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
+        try:
+            await self._observe_codex_process_clock(ctx, msg)
+        except Exception as exc:
+            # This sidecar is presentation-only. No malformed timestamp,
+            # rollout lookup, storage failure, or future implementation bug may
+            # suppress an authoritative engine frame.
+            log.warning(
+                "Codex process-clock observation failed open",
+                session_id=self._ctx_wire_sid(ctx),
+                error_type=type(exc).__name__,
+            )
         await self._observe_preview_image_event(ctx, msg)
         await self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
@@ -7783,7 +8699,14 @@ class WrapperMachine:
                     if task is not None and not task.done()
                     and task is not current_task
                 ), None)
-                if active is not None or ctx.state != "idle":
+                autonomous_claude_followup = (
+                    self._claude_autonomous_followup_pending(ctx)
+                )
+                if (
+                    active is not None
+                    or ctx.state != "idle"
+                    or autonomous_claude_followup
+                ):
                     ctx.queued_query_wakeup.clear()
                     if active is not None:
                         active.add_done_callback(
@@ -7792,6 +8715,7 @@ class WrapperMachine:
                     # completion that happened immediately before the callback.
                     if (
                         ctx.state == "idle"
+                        and not self._claude_autonomous_followup_pending(ctx)
                         and not any(
                             task is not None and not task.done()
                             for task in (
@@ -7805,6 +8729,7 @@ class WrapperMachine:
 
                 command = None
                 result = None
+                launch_receipt: asyncio.Future[bool] | None = None
                 launch_error: str | None = None
                 # Any meaningful queue/state mutation after this point requests
                 # another preflight.  If this attempt fails and nobody changes
@@ -7822,7 +8747,11 @@ class WrapperMachine:
                             for task in (
                                 ctx.turn_task, ctx.codex_spontaneous_task)
                         )
-                        if ctx.state != "idle" or active_now:
+                        if (
+                            ctx.state != "idle"
+                            or active_now
+                            or self._claude_autonomous_followup_pending(ctx)
+                        ):
                             continue
                         async with ctx.queued_query_lock:
                             if ctx.queued_queries:
@@ -7832,46 +8761,65 @@ class WrapperMachine:
                         if command is not None:
                             immediate = command.model_copy(
                                 deep=True, update={"delivery": "immediate"})
+                            launch_receipt = (
+                                asyncio.get_running_loop().create_future()
+                            )
                             result = await self._handle_immediate_query(
-                                ctx, immediate)
-                            if not isinstance(result, Error):
-                                async with ctx.emit_lock:
-                                    async with ctx.queued_query_lock:
-                                        index = next((
-                                            index for index, queued
-                                            in enumerate(ctx.queued_queries)
-                                            if queued.msg_id == command.msg_id
-                                        ), None)
-                                        if index is not None:
-                                            removed = ctx.queued_queries.pop(
-                                                index)
-                                            size = self._queued_query_size(
-                                                removed)
-                                            ctx.queued_query_bytes -= size
-                                            self._queued_query_count -= 1
-                                            self._queued_query_bytes -= size
-                                        ctx.queued_query_errors.pop(
-                                            command.msg_id, None)
-                                        if (
-                                            ctx.queued_query_starting_msg_id
-                                            == command.msg_id
-                                        ):
-                                            ctx.queued_query_starting_msg_id = (
-                                                None)
-                                        try:
-                                            await self._emit_locked(
-                                                ctx,
-                                                self._query_queue_state(ctx),
-                                            )
-                                        except Exception as exc:
-                                            log.warning(
-                                                "query queue start projection "
-                                                "delayed",
-                                                session_id=(
-                                                    self._ctx_wire_sid(ctx)
-                                                ),
-                                                error_type=type(exc).__name__,
-                                            )
+                                ctx,
+                                immediate,
+                                launch_receipt=launch_receipt,
+                            )
+                    if (
+                        command is not None
+                        and not isinstance(result, Error)
+                        and launch_receipt is not None
+                    ):
+                        launched = await launch_receipt
+                        if not launched:
+                            # The final SDK boundary proved that an autonomous
+                            # turn won, and also proved this queued prompt was
+                            # never written. Keep the complete Query wrapper-
+                            # owned and retry only after that Result wakes us.
+                            async with ctx.emit_lock:
+                                async with ctx.queued_query_lock:
+                                    if (
+                                        ctx.queued_query_starting_msg_id
+                                        == command.msg_id
+                                    ):
+                                        ctx.queued_query_starting_msg_id = None
+                                    await self._emit_locked(
+                                        ctx, self._query_queue_state(ctx))
+                            continue
+                    if command is not None and not isinstance(result, Error):
+                        async with ctx.emit_lock:
+                            async with ctx.queued_query_lock:
+                                index = next((
+                                    index for index, queued
+                                    in enumerate(ctx.queued_queries)
+                                    if queued.msg_id == command.msg_id
+                                ), None)
+                                if index is not None:
+                                    removed = ctx.queued_queries.pop(index)
+                                    size = self._queued_query_size(removed)
+                                    ctx.queued_query_bytes -= size
+                                    self._queued_query_count -= 1
+                                    self._queued_query_bytes -= size
+                                ctx.queued_query_errors.pop(
+                                    command.msg_id, None)
+                                if (
+                                    ctx.queued_query_starting_msg_id
+                                    == command.msg_id
+                                ):
+                                    ctx.queued_query_starting_msg_id = None
+                                try:
+                                    await self._emit_locked(
+                                        ctx, self._query_queue_state(ctx))
+                                except Exception as exc:
+                                    log.warning(
+                                        "query queue start projection delayed",
+                                        session_id=self._ctx_wire_sid(ctx),
+                                        error_type=type(exc).__name__,
+                                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -10395,8 +11343,13 @@ class WrapperMachine:
         source_window_has_more = False
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
+        source_window_recovered_user_id = None
+        source_window_native_turn_id = None
+        source_window_segment_index = None
+        source_window_process_started_ms = None
         oversized_compact_page = None
         codex_client_aliases = CodexClientMessageAliases({}, {})
+        codex_process_clocks = CodexProcessClocks({})
         try:
             source_path = await asyncio.to_thread(
                 self._codex_rollout_for_wire
@@ -10414,6 +11367,8 @@ class WrapperMachine:
             if is_codex_hist:
                 codex_client_aliases = await asyncio.to_thread(
                     self._codex_history_client_message_ids, source_path)
+                codex_process_clocks = await asyncio.to_thread(
+                    self._codex_process_clocks_for_source, source_path)
             try:
                 source_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_path)
@@ -10471,6 +11426,19 @@ class WrapperMachine:
             # capture. Fail closed instead of applying old browser ownership to
             # a different native source which reused an id.
             codex_client_aliases = CodexClientMessageAliases({}, {})
+        if (
+            is_codex_hist
+            and codex_process_clocks.has_clocks
+            and (
+                source_fingerprint is None
+                or not codex_process_clocks.matches_source(
+                    source_fingerprint.path,
+                    source_fingerprint.device,
+                    source_fingerprint.inode,
+                )
+            )
+        ):
+            codex_process_clocks = CodexProcessClocks({})
         if (
             indexed_page is not None
             and not is_codex_hist
@@ -10622,6 +11590,9 @@ class WrapperMachine:
                 ) if is_codex_hist else [
                     dict(turn) for turn in indexed_page.turns
                 ]
+                if is_codex_hist:
+                    _apply_codex_process_clocks(
+                        cached_turns, codex_process_clocks)
                 cached_history.turns = [
                     ConversationTurn.model_validate(turn)
                     for turn in cached_turns
@@ -10723,14 +11694,27 @@ class WrapperMachine:
                 path = source_path or await asyncio.to_thread(
                     self._codex_rollout_for_wire, sid)
                 if path:
-                    (start_offset, end_offset, source_window_has_more,
-                     source_window_oldest_cursor,
-                     source_window_boundary_offset) = await asyncio.to_thread(
-                        codex_history_window,
+                    source_window = await asyncio.to_thread(
+                        codex_history_window_info,
                         path,
                         before=before,
                         limit=limit,
                         max_bytes=self.cfg.codex_history_window_max_bytes,
+                    )
+                    start_offset = source_window.start_offset
+                    end_offset = source_window.end_offset
+                    source_window_has_more = source_window.has_older
+                    source_window_oldest_cursor = (
+                        source_window.forced_oldest_cursor
+                    )
+                    source_window_boundary_offset = (
+                        source_window.forced_boundary_offset
+                    )
+                    source_window_native_turn_id = (
+                        source_window.forced_native_turn_id
+                    )
+                    source_window_segment_index = (
+                        source_window.forced_segment_index
                     )
                     events, mdl = await asyncio.to_thread(
                         codex_translate_history,
@@ -10767,13 +11751,38 @@ class WrapperMachine:
                             source_window_oldest_cursor,
                         )
                         if recovered_user is not None:
-                            if recovered_user.client_msg_id is None:
+                            if (
+                                recovered_user.client_msg_id is None
+                                and source_window_native_turn_id is not None
+                                and source_window_segment_index is not None
+                            ):
                                 recovered_user.client_msg_id = (
                                     codex_client_aliases.resolve(
-                                        source_window_oldest_cursor,
-                                        0,
+                                        source_window_native_turn_id,
+                                        source_window_segment_index,
                                         recovered_user.msg_id,
                                     )
+                                )
+                            source_window_recovered_user_id = (
+                                recovered_user.msg_id
+                            )
+                            source_window_process_started_ms = (
+                                await asyncio.to_thread(
+                                    codex_history_boundary_process_start,
+                                    path,
+                                    source_window_boundary_offset,
+                                )
+                            )
+                            if (
+                                source_window_process_started_ms is not None
+                                and recovered_user.client_msg_id is not None
+                                and source_window_native_turn_id is not None
+                            ):
+                                await self._persist_codex_process_start(
+                                    path,
+                                    recovered_user.client_msg_id,
+                                    source_window_native_turn_id,
+                                    source_window_process_started_ms,
                                 )
                             events.insert(0, recovered_user)
             except Exception as e:
@@ -11049,6 +12058,44 @@ class WrapperMachine:
                     compaction_continuation_turn_ids),
             )
 
+        def repair_source_window_process_start(
+            materialized_turns: tuple[dict, ...],
+        ) -> tuple[dict, ...]:
+            """Apply exact source evidence omitted from one bounded Codex tail."""
+            if not (
+                source_window_process_started_ms is None
+                or source_window_recovered_user_id is None
+            ):
+                for turn in materialized_turns:
+                    if turn.get("id") != source_window_recovered_user_id:
+                        continue
+                    current = turn.get("processStartedTs")
+                    if (
+                        not isinstance(current, int)
+                        or isinstance(current, bool)
+                    ):
+                        turn["processStartedTs"] = (
+                            source_window_process_started_ms)
+                    else:
+                        turn["processStartedTs"] = min(
+                            current, source_window_process_started_ms,
+                        )
+                    if turn.get("processDetailState") != "present":
+                        turn["processDetailState"] = "present"
+                        reasons = list(turn.get("detailReasons") or [])
+                        if "process" not in reasons:
+                            reasons.append("process")
+                        turn["detailReasons"] = reasons
+                        turn["detailEventCount"] = max(
+                            1, int(turn.get("detailEventCount") or 0),
+                        )
+                    break
+            _apply_codex_process_clocks(
+                materialized_turns,
+                codex_process_clocks,
+            )
+            return materialized_turns
+
         # A History response is one WebSocket frame. Keep it below the transport
         # cap by reducing the number of oldest turns in this page; pagination can
         # retrieve those turns on the next request. This prevents a large transcript
@@ -11070,9 +12117,11 @@ class WrapperMachine:
             # summary page is only a few KiB.
             projected = make_history(groups, group_start)
             source_events = tuple(dict(row) for row in projected.events)
-            summary_turns = materialize_history_turns(
-                source_events,
-                include_live_detail=include_live_summary,
+            summary_turns = repair_source_window_process_start(
+                materialize_history_turns(
+                    source_events,
+                    include_live_detail=include_live_summary,
+                )
             )
             projected.turns = [
                 ConversationTurn.model_validate(turn)
@@ -11188,9 +12237,11 @@ class WrapperMachine:
             detail_source_events = tuple(
                 dict(row) for row in history.events
             )
-            detail_source_turns = materialize_history_turns(
-                detail_source_events,
-                include_live_detail=include_live_summary,
+            detail_source_turns = repair_source_window_process_start(
+                materialize_history_turns(
+                    detail_source_events,
+                    include_live_detail=include_live_summary,
+                )
             )
 
             if frame_size > frame_budget:
@@ -11654,6 +12705,8 @@ class WrapperMachine:
             source_capture_failed = before is None and source_path is not None
         aliases = await asyncio.to_thread(
             self._codex_history_client_message_ids, source_path)
+        process_clocks = await asyncio.to_thread(
+            self._codex_process_clocks_for_source, source_path)
         if aliases.has_aliases and (
             source_before is None
             or not aliases.matches_source(
@@ -11663,6 +12716,15 @@ class WrapperMachine:
             )
         ):
             aliases = CodexClientMessageAliases({}, {})
+        if process_clocks.has_clocks and (
+            source_before is None
+            or not process_clocks.matches_source(
+                source_before.path,
+                source_before.device,
+                source_before.inode,
+            )
+        ):
+            process_clocks = CodexProcessClocks({})
         alias_kwargs = (
             {
                 "client_message_ids": aliases.native_messages,
@@ -11718,17 +12780,40 @@ class WrapperMachine:
                 identities,
             )
 
-        if aliases.has_aliases and source_path:
+        if before is None:
+            process_clocks = (
+                await self._backfill_official_codex_process_clock(
+                    source_path,
+                    source_before,
+                    aliases,
+                    page,
+                    limit=limit,
+                    in_progress=in_progress,
+                    clocks=process_clocks,
+                )
+            )
+
+        if (aliases.has_aliases or process_clocks.has_clocks) and source_path:
             try:
                 source_identity_after = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_path)
             except OSError:
                 source_identity_changed = True
             else:
-                source_identity_changed = not aliases.matches_source(
-                    source_identity_after.path,
-                    source_identity_after.device,
-                    source_identity_after.inode,
+                source_identity_changed = bool(
+                    aliases.has_aliases
+                    and not aliases.matches_source(
+                        source_identity_after.path,
+                        source_identity_after.device,
+                        source_identity_after.inode,
+                    )
+                ) or bool(
+                    process_clocks.has_clocks
+                    and not process_clocks.matches_source(
+                        source_identity_after.path,
+                        source_identity_after.device,
+                        source_identity_after.inode,
+                    )
                 )
             if source_identity_changed:
                 if _identity_retry:
@@ -11897,6 +12982,8 @@ class WrapperMachine:
                 "stable rollout contains turns omitted by official history")
         if projection_outcome == "mismatch":
             projection_outcome = "inconclusive"
+
+        _apply_codex_process_clocks(page.turns, process_clocks)
 
         control_rows: list[dict] = []
         if before is None and ctx is not None:
@@ -13397,11 +14484,30 @@ class WrapperMachine:
                 return await self._missing_session_error(cmd, "发送消息")
             return await self._handle_immediate_query(ctx, cmd)
 
-    async def _handle_immediate_query(self, ctx: SessionContext, cmd):
+    async def _handle_immediate_query(
+        self,
+        ctx: SessionContext,
+        cmd,
+        *,
+        launch_receipt: asyncio.Future[bool] | None = None,
+    ):
         if ctx.state != "idle":
             error = Error(
                 code=ERR_BUSY, message="该会话正忙,先 interrupt",
                 msg_id=getattr(cmd, "msg_id", None))
+            await self._emit(ctx, error)
+            return error
+        if self._claude_autonomous_followup_pending(ctx):
+            # Claude may emit a task notification after the parent Result and
+            # immediately start an autonomous response while the wrapper still
+            # looks idle. Claiming the SDK response queue in this narrow window
+            # would bind that autonomous Result to the new browser prompt. An
+            # explicitly queued prompt waits for the background Result instead.
+            error = Error(
+                code=ERR_BUSY,
+                message="Claude 正在处理后台任务结果，请稍后重试或排队发送",
+                msg_id=getattr(cmd, "msg_id", None),
+            )
             await self._emit(ctx, error)
             return error
         if ctx.engine == "claude" and ctx.space == "code":
@@ -13525,6 +14631,17 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
+        if self._claude_autonomous_followup_pending(ctx):
+            # Ownership and Work preflights above contain awaits. A task
+            # notification can start its autonomous follow-up during one of
+            # them, so revalidate at the final synchronous acceptance boundary.
+            error = Error(
+                code=ERR_BUSY,
+                message="Claude 正在处理后台任务结果，请稍后重试或排队发送",
+                msg_id=getattr(cmd, "msg_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         # All synchronous rejection paths have passed. A new conversation may
         # now finish before the next sidebar catalog read, so remember its first
         # accepted prompt under the temporary key; capture migrates it to the
@@ -13545,9 +14662,28 @@ class WrapperMachine:
             await self._emit_locked(ctx, StateEvent(state="running"))
         runner = (self._run_claude_broker_turn
                   if is_claude_broker else self._run_turn)
-        ctx.turn_task = asyncio.create_task(
-            runner(ctx, cmd.prompt, getattr(cmd, "images", None),
-                   getattr(cmd, "files", None)))
+        runner_args = (
+            ctx,
+            cmd.prompt,
+            getattr(cmd, "images", None),
+            getattr(cmd, "files", None),
+        )
+        runner_coro = (
+            runner(*runner_args)
+            if launch_receipt is None
+            else runner(*runner_args, launch_receipt=launch_receipt)
+        )
+        turn_task = asyncio.create_task(runner_coro)
+        ctx.turn_task = turn_task
+        if launch_receipt is not None:
+            # A task cancelled before its coroutine receives its first schedule
+            # never executes the runner's finally block. Do not leave the queue
+            # worker waiting forever in that narrow shutdown/eviction race.
+            def settle_unstarted_launch(_task: asyncio.Task) -> None:
+                if not launch_receipt.done():
+                    launch_receipt.set_result(True)
+
+            turn_task.add_done_callback(settle_unstarted_launch)
 
     async def _handle_steer(self, cmd):
         """Append one user instruction to the exact active Codex turn.
@@ -14005,6 +15141,11 @@ class WrapperMachine:
             cmd_id=getattr(cmd, "cmd_id", None),
         )
         await self._emit(ctx, StateEvent(state="interrupting"))
+        if self._claude_autonomous_followup_pending(ctx):
+            # No managed receive_response() consumer owns this continuation.
+            # Its Result arrives through the background pump, so give Stop its
+            # own bounded recovery path if that terminal never arrives.
+            self._schedule_claude_autonomous_interrupt_watchdog(ctx)
         # A turn can still be reconnecting to apply effort/tier changes and may
         # not have submitted its query yet.  Serialize against that final launch
         # window: if the turn observes our event and aborts, it changes state to
@@ -14031,7 +15172,11 @@ class WrapperMachine:
                 # queued. Do not surface raw app-server text or force idle here.
                 # The managed/spontaneous consumer drains that frame; if it never
                 # arrives, the absolute interrupt deadline reconnects and unlocks.
-                if ctx.turn_task is None and ctx.codex_spontaneous_task is None:
+                if (
+                    ctx.turn_task is None
+                    and ctx.codex_spontaneous_task is None
+                    and not self._claude_autonomous_followup_pending(ctx)
+                ):
                     await self._set_state(ctx, "idle")
 
     @classmethod
@@ -15791,6 +16936,11 @@ class WrapperMachine:
         if (ctx.engine != "claude" or ctx.space != "work"
                 or not ctx.work_context_baseline_pending):
             return
+        if ctx.state != "idle" or self._claude_has_background_work(ctx):
+            # Context inspection is a synchronous CLI control request. Never
+            # inject it into an active/autonomous turn merely to improve Work's
+            # optional presentation baseline.
+            return
         try:
             usage = await ctx.sdk.get_context_usage()
         except Exception:
@@ -15809,8 +16959,62 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "读取上下文")
+        # Query acceptance uses the same lock. Whichever command arrives first
+        # completes its bounded decision before the other can mutate this
+        # session, so an idle context probe cannot race the prompt launch.
+        async with ctx.query_lock:
+            if not self._is_resident_context(ctx):
+                return await self._missing_session_error(cmd, "读取上下文")
+            return await self._handle_get_context_locked(ctx, cmd)
+
+    async def _handle_get_context_locked(
+        self,
+        ctx: SessionContext,
+        cmd,
+        *,
+        prefer_cached_claude: bool = False,
+    ):
         try:
-            usage = await ctx.sdk.get_context_usage()
+            use_cached_claude_usage = bool(
+                ctx.engine == "claude"
+                and not getattr(ctx.sdk, "is_claude_broker", False)
+                and (
+                    prefer_cached_claude
+                    or ctx.state != "idle"
+                    or self._claude_has_background_work(ctx)
+                    or getattr(ctx.sdk, "control_plane_failed", False)
+                    or getattr(ctx.sdk, "context_probe_suppressed", False)
+                )
+            )
+            if use_cached_claude_usage:
+                cached = getattr(ctx.sdk, "cached_context_usage", None)
+                usage = cached() if callable(cached) else None
+                if not isinstance(usage, dict):
+                    # Do not send a control request while a turn/background
+                    # continuation owns the Claude child, or while this
+                    # generation is intentionally quarantined. An unavailable
+                    # reading is safer than blocking its sole control loop.
+                    event = ContextReport(
+                        total_tokens=0,
+                        max_tokens=0,
+                        percentage=0.0,
+                        available=False,
+                        model=getattr(ctx.sdk, "model", None),
+                        is_auto_compact_enabled=None,
+                        auto_compact_threshold_tokens=getattr(
+                            ctx.sdk,
+                            "effective_auto_compact_threshold_tokens",
+                            None,
+                        ),
+                        raw_max_tokens=getattr(
+                            ctx.sdk, "raw_context_max_tokens", None
+                        ),
+                        categories=[],
+                    )
+                    await self._emit(ctx, event)
+                    return event
+            else:
+                usage = await ctx.sdk.get_context_usage()
             work_fields: dict[str, int | float] = {}
             if ctx.space == "work" and ctx.work_id:
                 raw_key = "used_tokens" if ctx.engine == "codex" else "totalTokens"
@@ -16085,53 +17289,98 @@ class WrapperMachine:
     async def _on_claude_background_message(
         self, ctx: SessionContext, message, turn_id: str | None,
     ) -> None:
-        """Forward Claude task/hook lifecycle frames emitted after Result.
+        """Project one SDK-attributed autonomous Claude turn in source order.
 
         SdkHandle is the sole consumer of the SDK Query stream and calls this
-        only while no managed turn owns a response.  A fresh translator is
-        sufficient because stable item -> origin-turn/title/kind maps live on
-        the SessionContext and are shared across all translator instances.
+        for injected turns even when a browser prompt is already queued behind
+        them. Translator state survives from the injected UserMessage through
+        its Result so streamed text and assembled tools remain identical to a
+        normal managed turn; only the duplicate TurnEnd is suppressed because
+        the autonomous work extends its origin turn rather than creating a new
+        visible human turn.
         """
         if await self._observe_claude_rate_limit_message(message):
             return
+        is_result = isinstance(message, ResultMessage)
+        followup_was_pending = self._claude_autonomous_followup_pending(ctx)
         self._observe_claude_task_lifecycle(
             ctx, message, background=True)
-        thread_id = self._ctx_wire_sid(ctx)
-        if not thread_id:
-            if isinstance(message, ResultMessage):
-                self._schedule_pending_claude_auto_compact(ctx)
-            return
-        goal_changed, goal = ctx.sdk.observe_goal_message(
-            message, thread_id)
-        if goal_changed and ctx.goal_visible:
-            await self._emit(ctx, GoalState(goal=goal))
-        registry = ctx.claude_agents
-        route = registry.route(message) if registry is not None else AgentRoute("main")
-        await self._publish_claude_agent_route(ctx, route)
-        # A task/hook notification can itself trigger Claude's autonomous
-        # post-result continuation. Reconnecting on that notification races
-        # the child before the continuation's own terminal boundary and cuts it
-        # off. Only its background ResultMessage proves the autonomous response
-        # has drained; otherwise the pending setting is applied immediately
-        # before the next browser Query.
-        if isinstance(message, ResultMessage):
-            self._schedule_pending_claude_auto_compact(ctx)
-        if route.target == "detail":
-            return
-        if not isinstance(message, (
-            HookEventMessage, TaskStartedMessage, TaskProgressMessage,
-            TaskUpdatedMessage, TaskNotificationMessage,
-        )):
-            return
-        translator = StreamTranslator(
-            self.cfg.tool_result_max,
-            turn_id=turn_id,
-            item_turns=ctx.claude_item_turns,
-            item_titles=ctx.claude_item_titles,
-            item_meta=ctx.claude_item_meta,
-        )
-        for event in translator.feed(message):
-            await self._emit(ctx, event)
+        followup_is_pending = self._claude_autonomous_followup_pending(ctx)
+        if not is_result and followup_is_pending and not followup_was_pending:
+            # Parent Result may already have published idle, or may still be in
+            # its finalizer. Either way the autonomous continuation is now the
+            # real running owner and Stop must remain available.
+            if ctx.state == "idle":
+                await self._set_state(ctx, "running")
+            elif ctx.state in {"interrupting", "draining"}:
+                # Stop was accepted against the parent just before the task
+                # notification exposed its autonomous continuation. Extend the
+                # same absolute drain deadline to that newly-visible owner.
+                self._schedule_claude_autonomous_interrupt_watchdog(ctx)
+        try:
+            thread_id = self._ctx_wire_sid(ctx)
+            route = AgentRoute("main")
+            if thread_id:
+                goal_changed, goal = ctx.sdk.observe_goal_message(
+                    message, thread_id)
+                if goal_changed and ctx.goal_visible:
+                    await self._emit(ctx, GoalState(goal=goal))
+                registry = ctx.claude_agents
+                route = (
+                    registry.route(message)
+                    if registry is not None else AgentRoute("main")
+                )
+                await self._publish_claude_agent_route(ctx, route)
+
+                if route.target != "detail":
+                    translator = ctx.claude_background_translator
+                    if translator is None:
+                        translator = StreamTranslator(
+                            self.cfg.tool_result_max,
+                            turn_id=turn_id,
+                            item_turns=ctx.claude_item_turns,
+                            item_titles=ctx.claude_item_titles,
+                            item_meta=ctx.claude_item_meta,
+                        )
+                        ctx.claude_background_translator = translator
+                    for event in translator.feed(message):
+                        if isinstance(event, TurnEnd):
+                            continue
+                        if "background" in type(event).model_fields:
+                            event = event.model_copy(
+                                update={"background": True})
+                        await self._emit(ctx, event)
+        finally:
+            if is_result:
+                # Keep the lifecycle claim through every Goal/Agent/narrative
+                # projection above. Even malformed presentation data must retire
+                # exactly this Result and restore a usable session state.
+                retired = self._retire_claude_followup(ctx, message)
+                ctx.claude_background_translator = None
+                followup_finished = bool(
+                    followup_was_pending
+                    and retired
+                    and not self._claude_autonomous_followup_pending(ctx)
+                )
+                try:
+                    if followup_finished:
+                        # Wake rather than cancel: if the watchdog crossed its
+                        # timeout and began reconnecting, cancellation could
+                        # strand the replacement child halfway through recovery.
+                        ctx.claude_autonomous_interrupt_wakeup.set()
+                        managed = ctx.turn_task
+                        managed_active = (
+                            managed is not None and not managed.done()
+                        )
+                        if not managed_active:
+                            await self._settle_claude_lifecycle_if_quiescent(ctx)
+                finally:
+                    # A task/hook notification can itself trigger Claude's
+                    # autonomous post-result continuation. Apply spawn options
+                    # and wake queued work only after the exact Result above has
+                    # been retired; both schedulers re-check the remaining ledger.
+                    self._schedule_pending_claude_auto_compact(ctx)
+                    self._schedule_query_queue_drain(ctx)
 
     def _resident_agent_detail_revision(self, run) -> str:
         return (
@@ -17157,10 +18406,26 @@ class WrapperMachine:
                 await self._remember_codex_initial_turn_alias(
                     ctx, native_turn_id)
             self._release_codex_turn(ctx)
+        if (
+            ctx.engine == "claude"
+            and self._claude_autonomous_followup_pending(ctx)
+            and not getattr(ctx.sdk, "is_claude_broker", False)
+        ):
+            # The managed browser prompt either just completed or lost the
+            # final SDK launch race to an autonomous continuation.  In both
+            # cases that continuation is the real owner until its background
+            # Result (or pump-failure recovery) clears the latch.
+            if ctx.state == "idle":
+                await self._set_state(ctx, "running")
+            return
         if (ctx.engine == "claude"
                 and claude_terminal
                 and not getattr(ctx.sdk, "is_claude_broker", False)):
             async with ctx.query_lock:
+                if self._claude_autonomous_followup_pending(ctx):
+                    if ctx.state == "idle":
+                        await self._set_state(ctx, "running")
+                    return
                 if self._claude_auto_compact_event(ctx).pending:
                     try:
                         await self._apply_pending_claude_auto_compact(
@@ -17839,35 +19104,50 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
-            if ctx.state != "idle":
-                error = Error(
-                    code=ERR_BUSY, message="该会话正忙,先 interrupt",
-                    request_id=getattr(cmd, "cmd_id", None),
-                    to=getattr(cmd, "client_id", None))
-                await self._emit(ctx, error)
-                return error
+            # prepare_goal reads context usage before submitting the native
+            # /goal turn. Keep that control read and query acceptance under the
+            # same session lock used by ordinary GetContext/Query commands.
+            async with ctx.query_lock:
+                if (ctx.state != "idle"
+                        or self._claude_has_background_work(ctx)):
+                    error = Error(
+                        code=ERR_BUSY,
+                        message="该会话仍有 Claude 任务运行，请完成或打断后重试",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        to=getattr(cmd, "client_id", None))
+                    await self._emit(ctx, error)
+                    return error
 
-            previous = dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
-            try:
-                goal = await ctx.sdk.prepare_goal(
-                    ctx.session_id or ctx.key, objective)
-                query_result = await self._handle_query(Query(
-                    sid=ctx.key,
-                    prompt=f"/goal {objective}",
-                    msg_id=f"goal-{uuid4().hex}",
-                ))
-                if isinstance(query_result, Error):
+                previous = (
+                    dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
+                )
+                try:
+                    goal = await ctx.sdk.prepare_goal(
+                        ctx.session_id or ctx.key, objective)
+                    query_result = await self._handle_immediate_query(
+                        ctx,
+                        Query(
+                            sid=ctx.key,
+                            prompt=f"/goal {objective}",
+                            msg_id=f"goal-{uuid4().hex}",
+                        ),
+                    )
+                    if isinstance(query_result, Error):
+                        ctx.sdk.restore_goal_state(previous)
+                        return query_result
+                    ctx.goal_visible = True
+                    event = GoalState(goal=goal)
+                    await self._emit(ctx, event)
+                    return event
+                except Exception as exc:
                     ctx.sdk.restore_goal_state(previous)
-                    return query_result
-                ctx.goal_visible = True
-                event = GoalState(goal=goal)
-                await self._emit(ctx, event)
-                return event
-            except Exception as exc:
-                ctx.sdk.restore_goal_state(previous)
-                log.warning(
-                    "Claude set_goal failed", error_type=type(exc).__name__)
-                return await self._emit_goal_error(ctx, cmd, "设置 Goal 失败")
+                    log.warning(
+                        "Claude set_goal failed",
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._emit_goal_error(
+                        ctx, cmd, "设置 Goal 失败"
+                    )
         try:
             # thread/goal/set(status=active) can synchronously launch an app-server
             # turn. Claim before the RPC so a query arriving before turn/started
@@ -17952,33 +19232,43 @@ class WrapperMachine:
         if ctx is None:
             return await self._missing_session_error(cmd, "清除 Goal")
         if ctx.engine != "codex":
-            if ctx.state != "idle":
-                error = Error(
-                    code=ERR_BUSY, message="该会话正忙,先 interrupt",
-                    request_id=getattr(cmd, "cmd_id", None),
-                    to=getattr(cmd, "client_id", None))
-                await self._emit(ctx, error)
-                return error
-            previous = dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
-            ctx.sdk.clear_goal_state()
-            try:
-                query_result = await self._handle_query(Query(
-                    sid=ctx.key,
-                    prompt="/goal clear",
-                    msg_id=f"goal-{uuid4().hex}",
-                ))
-                if isinstance(query_result, Error):
+            async with ctx.query_lock:
+                if ctx.state != "idle":
+                    error = Error(
+                        code=ERR_BUSY, message="该会话正忙,先 interrupt",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        to=getattr(cmd, "client_id", None))
+                    await self._emit(ctx, error)
+                    return error
+                previous = (
+                    dict(ctx.sdk.goal) if ctx.sdk.goal is not None else None
+                )
+                ctx.sdk.clear_goal_state()
+                try:
+                    query_result = await self._handle_immediate_query(
+                        ctx,
+                        Query(
+                            sid=ctx.key,
+                            prompt="/goal clear",
+                            msg_id=f"goal-{uuid4().hex}",
+                        ),
+                    )
+                    if isinstance(query_result, Error):
+                        ctx.sdk.restore_goal_state(previous)
+                        return query_result
+                    ctx.goal_visible = False
+                    event = GoalState(goal=None)
+                    await self._emit(ctx, event)
+                    return event
+                except Exception as exc:
                     ctx.sdk.restore_goal_state(previous)
-                    return query_result
-                ctx.goal_visible = False
-                event = GoalState(goal=None)
-                await self._emit(ctx, event)
-                return event
-            except Exception as exc:
-                ctx.sdk.restore_goal_state(previous)
-                log.warning(
-                    "Claude clear_goal failed", error_type=type(exc).__name__)
-                return await self._emit_goal_error(ctx, cmd, "清除 Goal 失败")
+                    log.warning(
+                        "Claude clear_goal failed",
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._emit_goal_error(
+                        ctx, cmd, "清除 Goal 失败"
+                    )
         if (ctx.state != "idle"
                 and ctx.codex_spontaneous_turn_id is None):
             error = Error(
@@ -26451,7 +27741,9 @@ class WrapperMachine:
                            and not c.query_lock.locked()
                            and not c.claude_control_persist_lock.locked()
                            and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())), None)
+                                or c.auto_compact_apply_task.done())
+                           and (c.claude_followup_recovery_task is None
+                                or c.claude_followup_recovery_task.done())), None)
             if victim is None:
                 await reject(
                     ERR_BUSY, "所有会话都在运行,先中断一个再切换")
@@ -27373,7 +28665,9 @@ class WrapperMachine:
                            and not c.query_lock.locked()
                            and not c.claude_control_persist_lock.locked()
                            and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())), None)
+                                or c.auto_compact_apply_task.done())
+                           and (c.claude_followup_recovery_task is None
+                                or c.claude_followup_recovery_task.done())), None)
             if victim is None:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)
@@ -27921,6 +29215,8 @@ class WrapperMachine:
         prompt: str,
         images: Optional[list] = None,
         files: Optional[list] = None,
+        *,
+        launch_receipt: asyncio.Future[bool] | None = None,
     ) -> None:
         """Submit one atomic prompt to the broker-owned official Claude TUI.
 
@@ -27930,6 +29226,7 @@ class WrapperMachine:
         history and the authoritative user/end-turn boundaries used here.
         """
         started_at = time.monotonic()
+        display_prompt = prompt
         temp_dir: Optional[str] = None
         path: Optional[str] = None
         offset = 0
@@ -27941,13 +29238,37 @@ class WrapperMachine:
         last_mirror_at = 0.0
         file_meta = ([{"filename": item.get("filename", "attachment")}
                       for item in (files or [])] or None)
+        user_echoed = False
         # A broker turn learns its native user UUID from the source-bounded
         # transcript append below rather than Agent SDK replay. Reset the
         # per-query latch just as _run_turn does so only the first human row
         # after this accepted submit can bind to the browser message id.
         ctx.claude_client_alias_bound_msg_id = None
 
-        async def close_turn(*, error: bool, subtype: str) -> None:
+        def settle_launch(accepted: bool) -> None:
+            if launch_receipt is not None and not launch_receipt.done():
+                launch_receipt.set_result(accepted)
+
+        async def publish_user() -> None:
+            nonlocal user_echoed
+            if user_echoed:
+                return
+            await self._emit(ctx, UserMsg(
+                msg_id=ctx.active_msg_id or uuid4().hex,
+                prompt=display_prompt,
+                images=images,
+                files=file_meta,
+            ))
+            user_echoed = True
+
+        async def close_turn(
+            *, error: bool, subtype: str, materialize: bool = False,
+        ) -> None:
+            # A pre-submit interrupt is already a visible lifecycle on its origin
+            # browser. Materialize it everywhere before the unbound terminal; an
+            # ordinary broker rejection remains unsent and keeps prior semantics.
+            if materialize:
+                await publish_user()
             duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
             await self._emit(ctx, TurnEnd(
                 result=TurnResult(
@@ -27984,7 +29305,11 @@ class WrapperMachine:
                         message="消息在写入 Claude TUI 前已打断",
                         msg_id=ctx.active_msg_id,
                     ))
-                    await close_turn(error=True, subtype="error_during_execution")
+                    await close_turn(
+                        error=True,
+                        subtype="error_during_execution",
+                        materialize=True,
+                    )
                     return
 
                 if files or images:
@@ -28006,18 +29331,18 @@ class WrapperMachine:
                         message="消息在写入 Claude TUI 前已打断",
                         msg_id=ctx.active_msg_id,
                     ))
-                    await close_turn(error=True, subtype="error_during_execution")
+                    await close_turn(
+                        error=True,
+                        subtype="error_during_execution",
+                        materialize=True,
+                    )
                     return
                 await ctx.sdk.submit(prompt)
+                settle_launch(True)
                 # The broker accepted one atomic prompt+Enter. Only now publish
                 # the authoritative echo: a terminal half-line can race the
                 # earlier status probe and make submit fail with input_busy.
-                await self._emit(ctx, UserMsg(
-                    msg_id=ctx.active_msg_id or uuid4().hex,
-                    prompt=prompt,
-                    images=images,
-                    files=file_meta,
-                ))
+                await publish_user()
 
             # Keep polling indefinitely for a normal turn.  Long reasoning and
             # tools are valid; only an explicit interrupt gets the existing
@@ -28127,6 +29452,11 @@ class WrapperMachine:
             ))
             await close_turn(error=True, subtype="error_during_execution")
         finally:
+            # Preserve the pre-existing queue contract for every broker failure
+            # other than the explicit SDK autonomous-follow-up rejection (which
+            # cannot occur on this path): once a runner owned the turn, a failed
+            # broker attempt is terminal and must not be retried invisibly.
+            settle_launch(True)
             if ctx.turn_task is asyncio.current_task():
                 ctx.turn_task = None
             ctx.active_msg_id = None
@@ -28141,10 +29471,18 @@ class WrapperMachine:
                     log.warning(
                         "broker turn attachment cleanup failed", error=str(exc))
 
-    async def _run_turn(self, ctx: SessionContext, prompt: str,
-                        images: Optional[list] = None, files: Optional[list] = None) -> None:
+    async def _run_turn(
+        self,
+        ctx: SessionContext,
+        prompt: str,
+        images: Optional[list] = None,
+        files: Optional[list] = None,
+        *,
+        launch_receipt: asyncio.Future[bool] | None = None,
+    ) -> None:
         is_codex = ctx.engine == "codex"
         is_codex_shared = self._codex_shared_affinity(ctx)
+        display_prompt = prompt
         ctx.translator = (CodexStreamTranslator(self.cfg.tool_result_max) if is_codex
                           else StreamTranslator(
                               self.cfg.tool_result_max,
@@ -28172,6 +29510,33 @@ class WrapperMachine:
         codex_handoff_to_spontaneous = False
         codex_query_reconnected = False
         native_turn_id: Optional[str] = None
+        file_meta = ([{"filename": item.get("filename", "attachment")}
+                      for item in (files or [])] or None)
+        prelaunch_terminal_emitted = False
+
+        def settle_launch(accepted: bool) -> None:
+            if launch_receipt is not None and not launch_receipt.done():
+                launch_receipt.set_result(accepted)
+
+        async def close_unsubmitted_turn() -> None:
+            """Publish one exact visible lifecycle for an interrupted preflight."""
+            nonlocal prelaunch_terminal_emitted
+            if prelaunch_terminal_emitted:
+                return
+            prelaunch_terminal_emitted = True
+            await self._emit(ctx, UserMsg(
+                msg_id=ctx.active_msg_id or uuid4().hex,
+                prompt=display_prompt,
+                images=images,
+                files=file_meta,
+            ))
+            await self._emit(ctx, TurnEnd(result=TurnResult(
+                subtype="error_during_execution",
+                duration_ms=0,
+                is_error=True,
+            )))
+            await self._set_idle_after_managed_turn(ctx)
+
         if not is_codex:
             ctx.claude_last_activity_at = asyncio.get_running_loop().time()
             ctx.claude_activity_event.clear()
@@ -28593,10 +29958,14 @@ class WrapperMachine:
 
         async def reconnect_claude(reason: str) -> None:
             """Reconnect without hiding transcript changes during the await."""
+            resume_id, fork = self._claude_reconnect_identity(ctx)
+            fork_option = {"fork": True} if fork else {}
             await ctx.sdk.force_reconnect(
-                resume_id=ctx.session_id, cwd=ctx.cwd, reason=reason,
+                resume_id=resume_id, cwd=ctx.cwd, reason=reason,
                 preserve_model=not reason.startswith(
-                    "external transcript change"))
+                    "external transcript change"),
+                **fork_option,
+            )
             model = _session_model(ctx)
             if model and model != ctx.announced_model:
                 ctx.announced_model = model
@@ -28642,6 +30011,19 @@ class WrapperMachine:
                     # during reconnect can set it again without being overwritten.
                     ctx.needs_reload = False
                     await reconnect_claude("external transcript change")
+            # A get_context_usage timeout leaves the request running inside the
+            # Claude child even after the SDK has dropped its local waiter. That
+            # generation must never receive a prompt: resume first, with the
+            # handle's context probe suppression carried into the replacement.
+            if (
+                not is_codex
+                and getattr(ctx.sdk, "control_plane_failed", False)
+            ):
+                log.warning(
+                    "recovering failed Claude control plane before query",
+                    sid=ctx.session_id,
+                )
+                await reconnect_claude("control plane failure")
             # A failed sole SDK reader cannot be reused even though its Claude
             # child may have kept writing the transcript. External transcript
             # authority above takes precedence when both conditions are present;
@@ -28672,39 +30054,16 @@ class WrapperMachine:
             # Serialize the final launch window against interrupt().  An interrupt
             # may have arrived while one of the reconnects above was in flight; in
             # that case it targeted no live turn and we must not submit the prompt
-            # afterwards.  Re-check once more after the UserMsg send because that
-            # await is also a scheduling point.
-            file_meta = ([{"filename": item.get("filename", "attachment")}
-                          for item in (files or [])] or None)
+            # afterwards. Re-check after every later ownership/reconnect await as
+            # well; UserMsg is published only after the engine accepts the query.
             async with ctx.launch_lock:
                 if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
                     # Other clients do not have the origin's optimistic turn. Echo
                     # it before the terminal marker so TurnEnd cannot accidentally
                     # close the previous visible turn on those clients.
-                    await self._emit(ctx, UserMsg(
-                        msg_id=ctx.active_msg_id or uuid4().hex,
-                        prompt=prompt,
-                        images=images,
-                        files=file_meta,
-                    ))
-                    await self._emit(ctx, TurnEnd(result=TurnResult(
-                        subtype="error_during_execution",
-                        duration_ms=0,
-                        is_error=True,
-                    )))
-                    await self._set_idle_after_managed_turn(ctx)
+                    await close_unsubmitted_turn()
                     return
 
-                # Emit the authoritative user echo immediately before sdk.query(),
-                # after any slow resume/reload. Its timestamp now matches the
-                # transcript's user record closely enough to reconcile optimistic ids
-                # without confusing repeated prompts such as "继续".
-                await self._emit(ctx, UserMsg(
-                    msg_id=ctx.active_msg_id or uuid4().hex,
-                    prompt=prompt,
-                    images=images,
-                    files=file_meta,
-                ))
                 stage_images = bool(images and (
                     is_codex or ctx.space == "work"))
                 staged_image_paths: list[str] = []
@@ -28730,12 +30089,7 @@ class WrapperMachine:
                     if stage_images:
                         staged_image_paths = self._stash_images(images, temp_dir)
                 if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
-                    await self._emit(ctx, TurnEnd(result=TurnResult(
-                        subtype="error_during_execution",
-                        duration_ms=0,
-                        is_error=True,
-                    )))
-                    await self._set_idle_after_managed_turn(ctx)
+                    await close_unsubmitted_turn()
                     return
                 if not is_codex and ctx.session_id:
                     # A terminal can append after _handle_query's probe but before
@@ -28744,12 +30098,7 @@ class WrapperMachine:
                     external = await self._prime_claude_ownership(ctx.session_id)
                     if (ctx.interrupt_event.is_set()
                             or ctx.state == "interrupting"):
-                        await self._emit(ctx, TurnEnd(result=TurnResult(
-                            subtype="error_during_execution",
-                            duration_ms=0,
-                            is_error=True,
-                        )))
-                        await self._set_idle_after_managed_turn(ctx)
+                        await close_unsubmitted_turn()
                         return
                     if external:
                         await self._emit(ctx, Error(
@@ -28771,23 +30120,13 @@ class WrapperMachine:
                             "external transcript change at final preflight")
                         if (ctx.interrupt_event.is_set()
                                 or ctx.state == "interrupting"):
-                            await self._emit(ctx, TurnEnd(result=TurnResult(
-                                subtype="error_during_execution",
-                                duration_ms=0,
-                                is_error=True,
-                            )))
-                            await self._set_idle_after_managed_turn(ctx)
+                            await close_unsubmitted_turn()
                             return
                         external = await self._prime_claude_ownership(
                             ctx.session_id)
                         if (ctx.interrupt_event.is_set()
                                 or ctx.state == "interrupting"):
-                            await self._emit(ctx, TurnEnd(result=TurnResult(
-                                subtype="error_during_execution",
-                                duration_ms=0,
-                                is_error=True,
-                            )))
-                            await self._set_idle_after_managed_turn(ctx)
+                            await close_unsubmitted_turn()
                             return
                         if external or ctx.needs_reload:
                             message = (
@@ -28835,12 +30174,7 @@ class WrapperMachine:
                         external = await self._prime_codex_ownership(route_sid)
                         if (ctx.interrupt_event.is_set()
                                 or ctx.state == "interrupting"):
-                            await self._emit(ctx, TurnEnd(result=TurnResult(
-                                subtype="error_during_execution",
-                                duration_ms=0,
-                                is_error=True,
-                            )))
-                            await self._set_idle_after_managed_turn(ctx)
+                            await close_unsubmitted_turn()
                             return
                         if external:
                             await self._emit(ctx, Error(
@@ -28873,23 +30207,13 @@ class WrapperMachine:
                             ctx.needs_reload = False
                             if (ctx.interrupt_event.is_set()
                                     or ctx.state == "interrupting"):
-                                await self._emit(ctx, TurnEnd(result=TurnResult(
-                                    subtype="error_during_execution",
-                                    duration_ms=0,
-                                    is_error=True,
-                                )))
-                                await self._set_idle_after_managed_turn(ctx)
+                                await close_unsubmitted_turn()
                                 return
                             external = await self._prime_codex_ownership(
                                 route_sid)
                             if (ctx.interrupt_event.is_set()
                                     or ctx.state == "interrupting"):
-                                await self._emit(ctx, TurnEnd(result=TurnResult(
-                                    subtype="error_during_execution",
-                                    duration_ms=0,
-                                    is_error=True,
-                                )))
-                                await self._set_idle_after_managed_turn(ctx)
+                                await close_unsubmitted_turn()
                                 return
                             if external or ctx.needs_reload:
                                 await self._emit(ctx, Error(
@@ -28904,12 +30228,7 @@ class WrapperMachine:
                     await self._begin_codex_checkpoint(ctx)
                     if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
                         await self._abort_codex_checkpoint(ctx)
-                        await self._emit(ctx, TurnEnd(result=TurnResult(
-                            subtype="error_during_execution",
-                            duration_ms=0,
-                            is_error=True,
-                        )))
-                        await self._set_idle_after_managed_turn(ctx)
+                        await close_unsubmitted_turn()
                         return
                     query_generation = getattr(ctx.sdk, "_generation", None)
                     native_turn_id = await ctx.sdk.query(
@@ -28917,6 +30236,17 @@ class WrapperMachine:
                         images=img_paths,
                         client_user_message_id=ctx.active_msg_id,
                     )
+                    # Publish only after the native acceptance boundary. A
+                    # Claude autonomous guard (and every earlier preflight)
+                    # must not turn an unsent queued prompt into conversation
+                    # history merely because its runner became visible.
+                    await self._emit(ctx, UserMsg(
+                        msg_id=ctx.active_msg_id or uuid4().hex,
+                        prompt=display_prompt,
+                        images=images,
+                        files=file_meta,
+                    ))
+                    settle_launch(True)
                     current_query_generation = getattr(
                         ctx.sdk, "_generation", None)
                     codex_query_reconnected = bool(
@@ -28972,6 +30302,14 @@ class WrapperMachine:
                     ctx.sdk.next_turn_id = ctx.active_msg_id
                     ctx.claude_write_active = True
                     await ctx.sdk.query(prompt)
+                if not is_codex:
+                    await self._emit(ctx, UserMsg(
+                        msg_id=ctx.active_msg_id or uuid4().hex,
+                        prompt=display_prompt,
+                        images=images,
+                        files=file_meta,
+                    ))
+                    settle_launch(True)
             # Codex sessions don't emit a Model event like cc's init SystemMessage,
             # so announce the configured codex model (gpt-*) once — else the header
             # would keep showing a stale Claude model.
@@ -29169,6 +30507,28 @@ class WrapperMachine:
             if codex_overflow_repair_turn_id is not None:
                 await self._repair_codex_projection_after_overflow(
                     ctx, codex_overflow_repair_turn_id)
+        except ClaudeAutonomousFollowupPending:
+            # The machine preflights were clean, but a post-Result task
+            # notification reached the sole SDK reader before the actual write.
+            # The dedicated launch guard proves this prompt was not sent; keep
+            # the autonomous lifecycle running and report a retryable rejection
+            # instead of misclassifying its Result or showing a generic crash.
+            log.info(
+                "Claude query lost launch race to autonomous follow-up",
+                session_id=ctx.session_id,
+                msg_id=ctx.active_msg_id,
+            )
+            settle_launch(False)
+            if launch_receipt is None:
+                await self._emit(ctx, Error(
+                    code=ERR_BUSY,
+                    message=(
+                        "Claude 正在处理后台任务结果，本次消息未发送，"
+                        "请稍后重试"
+                    ),
+                    msg_id=ctx.active_msg_id,
+                ))
+            await self._set_idle_after_managed_turn(ctx)
         except asyncio.TimeoutError:
             log.error("drain timeout — interrupt did not yield a ResultMessage",
                       prompt_length=len(prompt))
@@ -29202,6 +30562,11 @@ class WrapperMachine:
             await self._set_idle_after_managed_turn(
                 ctx, claude_terminal=claude_turn_completed)
         finally:
+            # All other runner exits retain the historical queue semantics: the
+            # attempt has entered a visible turn lifecycle and is removed rather
+            # than silently retried. Only the launch guard above can prove that
+            # Claude never received the queued prompt.
+            settle_launch(True)
             if not is_codex:
                 release_background = getattr(
                     ctx.sdk, "release_background_messages", None)
@@ -29213,10 +30578,21 @@ class WrapperMachine:
             ctx.codex_account_handoff = False
             ctx.translator = None
             ctx.turn_task = None
+            if not is_codex:
+                # The autonomous Result may have retired its final claim while
+                # this task was still alive. Reconcile again only after dropping
+                # the managed owner so that event order cannot strand ``running``.
+                await self._settle_claude_lifecycle_if_quiescent(ctx)
             if ctx.codex_spontaneous_turn_id is None:
                 ctx.active_msg_id = None
-                ctx.interrupt_deadline = None
-                ctx.interrupt_event.clear()
+                preserve_autonomous_interrupt = bool(
+                    not is_codex
+                    and self._claude_autonomous_followup_pending(ctx)
+                    and ctx.state in {"interrupting", "draining"}
+                )
+                if not preserve_autonomous_interrupt:
+                    ctx.interrupt_deadline = None
+                    ctx.interrupt_event.clear()
             # cc keeps flushing this turn's lines to the transcript for a moment after
             # the result. Re-baseline only after its authoritative Result arrived;
             # preflight/query/reader failures must not hide an external append.
@@ -29243,3 +30619,9 @@ class WrapperMachine:
                 codex_restart_watch_task.cancel()
                 await asyncio.gather(
                     codex_restart_watch_task, return_exceptions=True)
+            if not is_codex:
+                # In the managed-finalizer-wins race, the background callback
+                # already attempted these schedulers while state was running.
+                # Retry after final quiescence; both schedulers are idempotent.
+                self._schedule_pending_claude_auto_compact(ctx)
+                self._schedule_query_queue_drain(ctx)

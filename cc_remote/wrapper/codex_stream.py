@@ -307,6 +307,39 @@ class _CodexHistoryBoundary:
     segment_count: int = 1
 
 
+@dataclass(frozen=True)
+class CodexHistoryWindow:
+    """One bounded rollout page plus exact metadata from its boundary scan.
+
+    The legacy five-tuple exposed by :func:`codex_history_window` deliberately
+    omits native ownership.  Callers which need to persist source-bound facts
+    must use this richer result rather than reopening one boundary record and
+    guessing its enclosing task: a later steer boundary can be a paired
+    ``response_item`` which does not carry ``turn_id`` itself.
+    """
+
+    start_offset: int
+    end_offset: int
+    has_older: bool
+    forced_oldest_cursor: str | None = None
+    forced_boundary_offset: int | None = None
+    forced_native_turn_id: str | None = None
+    forced_segment_index: int | None = None
+    newest_boundary_offset: int | None = None
+    newest_cursor: str | None = None
+    newest_native_turn_id: str | None = None
+    newest_segment_index: int | None = None
+
+    def legacy(self) -> tuple[int, int, bool, str | None, int | None]:
+        return (
+            self.start_offset,
+            self.end_offset,
+            self.has_older,
+            self.forced_oldest_cursor,
+            self.forced_boundary_offset,
+        )
+
+
 @dataclass
 class _HistoryProcessAccumulator:
     """Mutable reverse-scan accumulator for one visible user segment."""
@@ -1418,14 +1451,12 @@ def codex_history_process_witnesses(
     )
 
 
-def codex_history_window(
+def codex_history_window_info(
     path: str, *, before: str | None, limit: int | None,
     max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
-) -> tuple[int, int, bool, str | None, int | None]:
-    """Select a bounded Codex history page by scanning user turns backwards.
+) -> CodexHistoryWindow:
+    """Select a bounded Codex history page and retain exact boundary identity.
 
-    Returns ``(start_offset, end_offset, has_older, forced_oldest_cursor,
-    forced_boundary_offset)``.
     The rollout can be many gigabytes: only boundary records are decoded while
     locating the latest page, and the forward translator sees at most the
     configured source window.  ``forced_oldest_cursor`` preserves pagination
@@ -1435,7 +1466,7 @@ def codex_history_window(
     """
     size = os.path.getsize(path)
     if size <= 0 or not isinstance(limit, int) or limit <= 0:
-        return 0, size, False, None, None
+        return CodexHistoryWindow(0, size, False)
     byte_budget = max(1024 * 1024, int(max_bytes))
 
     # Current app-server rollouts have an authoritative task_started boundary
@@ -1444,7 +1475,8 @@ def codex_history_window(
     for use_turns in (True, False):
         end_offset = size
         target_found = before is None
-        boundaries: list[tuple[int, str]] = []
+        boundaries: list[_CodexHistoryBoundary] = []
+        newest_boundary: _CodexHistoryBoundary | None = None
         saw_boundary = False
         for boundary in _history_boundary_records(path, use_turns=use_turns):
             offset = boundary.offset
@@ -1458,28 +1490,167 @@ def codex_history_window(
                     target_found = True
                     end_offset = offset
                 continue
-            boundaries.append((offset, cursor))
+            boundaries.append(boundary)
+            if newest_boundary is None:
+                newest_boundary = boundary
             if end_offset - offset > byte_budget:
                 if len(boundaries) > 1:
-                    start_offset, _ = boundaries[-2]
-                    return start_offset, end_offset, True, None, None
+                    return CodexHistoryWindow(
+                        start_offset=boundaries[-2].offset,
+                        end_offset=end_offset,
+                        has_older=True,
+                        newest_boundary_offset=newest_boundary.offset,
+                        newest_cursor=newest_boundary.cursor,
+                        newest_native_turn_id=newest_boundary.native_turn_id,
+                        newest_segment_index=newest_boundary.segment_index,
+                    )
                 # Preserve the recent tail of a pathological single turn. Its
                 # visible boundary cursor remains available for older history.
                 start_offset = _next_jsonl_offset(
                     path, max(0, end_offset - byte_budget), end_offset)
-                return start_offset, end_offset, True, cursor, offset
+                return CodexHistoryWindow(
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    has_older=True,
+                    forced_oldest_cursor=cursor,
+                    forced_boundary_offset=offset,
+                    forced_native_turn_id=boundary.native_turn_id,
+                    forced_segment_index=boundary.segment_index,
+                    newest_boundary_offset=newest_boundary.offset,
+                    newest_cursor=newest_boundary.cursor,
+                    newest_native_turn_id=newest_boundary.native_turn_id,
+                    newest_segment_index=newest_boundary.segment_index,
+                )
             if len(boundaries) > limit:
-                start_offset, _ = boundaries[limit - 1]
-                return start_offset, end_offset, True, None, None
+                return CodexHistoryWindow(
+                    start_offset=boundaries[limit - 1].offset,
+                    end_offset=end_offset,
+                    has_older=True,
+                    newest_boundary_offset=newest_boundary.offset,
+                    newest_cursor=newest_boundary.cursor,
+                    newest_native_turn_id=newest_boundary.native_turn_id,
+                    newest_segment_index=newest_boundary.segment_index,
+                )
         if saw_boundary:
             if before is not None and not target_found:
-                return 0, 0, False, None, None
-            return 0, end_offset, False, None, None
+                return CodexHistoryWindow(0, 0, False)
+            return CodexHistoryWindow(
+                start_offset=0,
+                end_offset=end_offset,
+                has_older=False,
+                newest_boundary_offset=(
+                    newest_boundary.offset if newest_boundary is not None
+                    else None
+                ),
+                newest_cursor=(
+                    newest_boundary.cursor if newest_boundary is not None
+                    else None
+                ),
+                newest_native_turn_id=(
+                    newest_boundary.native_turn_id
+                    if newest_boundary is not None else None
+                ),
+                newest_segment_index=(
+                    newest_boundary.segment_index
+                    if newest_boundary is not None else None
+                ),
+            )
     if size > byte_budget:
         start_offset = _next_jsonl_offset(
             path, size - byte_budget, size)
-        return start_offset, size, True, None, None
-    return 0, size, False, None, None
+        return CodexHistoryWindow(start_offset, size, True)
+    return CodexHistoryWindow(0, size, False)
+
+
+def codex_history_window(
+    path: str, *, before: str | None, limit: int | None,
+    max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+) -> tuple[int, int, bool, str | None, int | None]:
+    """Compatibility five-tuple for callers which need only page offsets."""
+    return codex_history_window_info(
+        path,
+        before=before,
+        limit=limit,
+        max_bytes=max_bytes,
+    ).legacy()
+
+
+def codex_history_boundary_process_start(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
+) -> int | None:
+    """Recover the first public-process timestamp omitted by a tail window.
+
+    ``codex_history_window`` can retain only the recent tail of one enormous
+    native turn. The tail may begin at a late compaction record even though a
+    commentary/tool event was persisted near the original user boundary. Scan
+    forward from that already-proven boundary and stop at the first visible
+    process event belonging to that exact user segment. A direct final answer,
+    private reasoning, and ordinary lifecycle plumbing remain non-evidence, so
+    this helper cannot recreate an empty ``已处理`` disclosure.
+
+    The scan is byte-bounded and oversized JSONL records are skipped by
+    ``_bounded_jsonl_records``. A timestamp is returned only after the segment's
+    real visible user row has also been observed; assistant-only boundaries are
+    therefore never attached to an unrelated prompt.
+    """
+    if (
+        isinstance(boundary_offset, bool)
+        or not isinstance(boundary_offset, int)
+        or boundary_offset < 0
+        or isinstance(max_scan_bytes, bool)
+        or not isinstance(max_scan_bytes, int)
+        or max_scan_bytes <= 0
+    ):
+        return None
+    try:
+        size = os.path.getsize(path)
+        end_offset = min(
+            size,
+            boundary_offset + max(1024 * 1024, max_scan_bytes),
+        )
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return None
+
+    saw_user = False
+    process_before_user: int | None = None
+    with source:
+        source.seek(boundary_offset)
+        for _offset, line in _bounded_jsonl_records(
+            source, end_offset=end_offset,
+        ):
+            if len(line) <= _MAX_HISTORY_REVERSE_RECORD_BYTES:
+                visible_process, stamp_ms = _history_visible_process_stamp(
+                    line.encode("utf-8"),
+                )
+                if visible_process and stamp_ms is not None:
+                    if saw_user:
+                        return stamp_ms
+                    if process_before_user is None:
+                        process_before_user = stamp_ms
+
+            # Avoid decoding ordinary output, token and large compact rows just
+            # to discover the one visible user boundary.
+            if "user_message" not in line and "item_completed" not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            user = codex_rollout_user_message(payload)
+            if user is None or not user.prompt:
+                continue
+            if saw_user:
+                # Any later public work belongs to this newer steer segment.
+                return None
+            saw_user = True
+            if process_before_user is not None:
+                return process_before_user
+    return None
 
 
 def codex_history_boundary_user(

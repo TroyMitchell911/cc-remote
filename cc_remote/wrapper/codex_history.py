@@ -269,9 +269,34 @@ def _user_message(item: dict[str, Any], *, ts: float | None) -> UserMsg:
 
 
 def _segments(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    ordered_items = items
+    first_user_index = next((
+        index
+        for index, item in enumerate(items)
+        if item.get("type") == "userMessage"
+    ), None)
+    if (
+        first_user_index is not None
+        and first_user_index > 0
+        and all(
+            item.get("type") == "contextCompaction"
+            for item in items[:first_user_index]
+        )
+    ):
+        # Codex can persist automatic compaction before the user item which
+        # logically owns the new turn.  Leaving that prefix in place creates a
+        # synthetic prompt-less continuation followed by the real question.
+        # Normalize only an all-compaction leading prefix: assistant/tool
+        # prefixes are genuine autonomous continuations and must stay separate.
+        ordered_items = [
+            items[first_user_index],
+            *items[:first_user_index],
+            *items[first_user_index + 1:],
+        ]
+
     segments: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    for item in items:
+    for item in ordered_items:
         if item.get("type") == "userMessage" and current:
             segments.append(current)
             current = []
@@ -423,11 +448,11 @@ def _needs_terminal_full_refresh(
     )
 
 
-def _merge_terminal_summary_agents(
+def _merge_terminal_summary_messages(
     cached_items: list[dict[str, Any]],
     summary_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep steer shape while restoring terminal agents after full-read failure."""
+    """Keep full shape while restoring terminal messages after read failure."""
     merged = list(cached_items)
     indices = {
         item.get("id"): index
@@ -435,7 +460,8 @@ def _merge_terminal_summary_agents(
         if isinstance(item.get("id"), str)
     }
     for item in summary_items:
-        if item.get("type") != "agentMessage":
+        item_type = item.get("type")
+        if item_type not in {"userMessage", "agentMessage"}:
             continue
         item_id = item.get("id")
         if not isinstance(item_id, str):
@@ -444,7 +470,11 @@ def _merge_terminal_summary_agents(
         if index is None:
             indices[item_id] = len(merged)
             merged.append(item)
-        else:
+        elif item_type == "agentMessage":
+            # A full user item may retain richer content than its summary
+            # counterpart (notably attachment metadata). User content is
+            # immutable once its stable id exists, while terminal agent shells
+            # legitimately gain their final text and phase.
             merged[index] = item
     return merged
 
@@ -851,11 +881,12 @@ class CodexOfficialHistory:
                     # Keep the exact full item sequence but accept lifecycle and
                     # timing from the newest official summary response. If the
                     # terminal full read failed, at least merge its authoritative
-                    # final agent so the collapsed process row cannot hide the
-                    # completed answer behind a detail click.
+                    # terminal user/agent messages so a full snapshot captured
+                    # between compaction and the user-item flush cannot retain
+                    # an empty prompt or hide the completed answer.
                     items = cached_full["items"]
                     if terminal_refresh:
-                        items = _merge_terminal_summary_agents(
+                        items = _merge_terminal_summary_messages(
                             items, summary_turn["items"])
                     turn = {
                         **cached_full,

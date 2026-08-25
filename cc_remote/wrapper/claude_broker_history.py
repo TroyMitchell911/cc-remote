@@ -23,6 +23,7 @@ _META_USER_PREFIXES = (
     "<local-command-stdout>",
     "<local-command-stderr>",
 )
+_INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,17 @@ def _is_real_user_message(row: dict, message: dict) -> bool:
         text = content.lstrip()
         return bool(text) and not text.startswith(_META_USER_PREFIXES)
     if not isinstance(content, list):
+        return False
+    if (
+        len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
+    ):
+        # Lifecycle metadata from the preceding turn can be flushed after a
+        # replacement query has already frozen its transcript boundary.  It is
+        # SDK-authored but is never the new human prompt.
         return False
     # Tool results are represented as user-role rows but do not start a new
     # human turn.  A genuine multimodal prompt has text/image/document blocks.

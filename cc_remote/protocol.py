@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 38
+PROTOCOL_VERSION = 39
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -766,12 +766,16 @@ class TurnSteered(_Base):
 class AssistantMsgStart(_Base):
     type: Literal["assistant_msg_start"] = "assistant_msg_start"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
 
 
 class Delta(_Base):
     type: Literal["delta"] = "delta"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     text: str
     # Some engines only reveal whether text is commentary or final on the
     # assembled message. Repeating the channel on deltas/end lets the client
@@ -783,6 +787,8 @@ class ToolUse(_Base):
     type: Literal["tool_use"] = "tool_use"
     message_id: WireId
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     tool: str
     input: dict[str, Any]
     category: ToolCategory = "tool"
@@ -795,6 +801,8 @@ class ToolDelta(_Base):
     """Incremental progress/output for a previously-started tool call."""
     type: Literal["tool_delta"] = "tool_delta"
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     stream: Literal["progress", "output", "diff", "summary", "terminal"]
     delta: str = Field(max_length=512 * 1024)
 
@@ -802,6 +810,8 @@ class ToolDelta(_Base):
 class ToolResult(_Base):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     content: str
     is_error: bool
     truncated: Optional[bool] = None
@@ -815,6 +825,8 @@ class ToolResult(_Base):
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
 
 

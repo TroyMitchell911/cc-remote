@@ -772,7 +772,7 @@ function eventTimestampMs(ts: number | null | undefined): number | undefined {
 function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn | undefined {
   if (!id) return undefined;
   return [...turns].reverse().find((turn) =>
-    turn.id === id || turn.liveTaskId === id
+    turnHasIdentityAlias(turn, id) || turn.liveTaskId === id
     || turn.forkPointId === id || turn.codexTurnId === id
     || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && block.turn_id === id));
@@ -4908,7 +4908,29 @@ function reduceEvent(
     case "effort":
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
     case "auto_compact":
-      return patch(state, e.sid, (rt) => { rt.autoCompact = e; });
+      return patch(state, e.sid, (rt) => {
+        const previous = rt.autoCompact;
+        const appliedChanged = previous != null && (
+          previous.applied_mode !== e.applied_mode
+          || previous.applied_threshold_tokens
+            !== e.applied_threshold_tokens
+        );
+        const firstStateContradictsReport = previous == null
+          && e.pending !== true
+          && e.applied_mode === "custom"
+          && e.applied_threshold_tokens != null
+          && rt.contextReport?.auto_compact_threshold_tokens != null
+          && rt.contextReport.auto_compact_threshold_tokens
+            !== e.applied_threshold_tokens;
+        rt.autoCompact = e;
+        if (appliedChanged || firstStateContradictsReport) {
+          // ContextReport is generation-bound.  Keep it while a busy session
+          // merely queues a desired setting, but never display the old window
+          // after the replacement Claude child has applied a new threshold.
+          rt.contextReport = null;
+          rt.contextError = null;
+        }
+      });
     case "fast":
       return patch(state, e.sid, (rt) => { rt.fast = e.on; });
     case "collaboration_mode":
@@ -5466,11 +5488,20 @@ function reduceEvent(
     case "assistant_msg_start":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = findTurnOwningMessage(turns, e.message_id)
-          ?? preSteerTurn(rt, turns)
-          ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
-        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const t = explicit ?? (!e.turn_id
+          ? findTurnOwningMessage(turns, e.message_id)
+            ?? preSteerTurn(rt, turns)
+            ?? openUnboundLiveTurn(
+              rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq)
+          : undefined);
+        // An explicit owner outside the materialized page must never fall
+        // through to a newer live tail. Canonical History will restore it.
+        if (!t) { rt.turns = turns; return; }
+        const detachedBackground = e.background === true && t.done;
+        if (!detachedBackground) {
+          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        }
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
           && b.message_id === e.message_id) as TextBlock | undefined;
@@ -5485,11 +5516,18 @@ function reduceEvent(
     case "delta":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = findTurnOwningMessage(turns, e.message_id)
-          ?? preSteerTurn(rt, turns)
-          ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
-        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const t = explicit ?? (!e.turn_id
+          ? findTurnOwningMessage(turns, e.message_id)
+            ?? preSteerTurn(rt, turns)
+            ?? openUnboundLiveTurn(
+              rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq)
+          : undefined);
+        if (!t) { rt.turns = turns; return; }
+        const detachedBackground = e.background === true && t.done;
+        if (!detachedBackground) {
+          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        }
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
           && b.message_id === e.message_id) as TextBlock | undefined;
@@ -5520,12 +5558,19 @@ function reduceEvent(
     case "tool_use":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        const t = findTurnOwningItem(turns, e.tool_use_id)
-          ?? findTurnOwningMessage(turns, e.message_id)
-          ?? preSteerTurn(rt, turns)
-          ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
-        markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const t = explicit ?? (!e.turn_id
+          ? findTurnOwningItem(turns, e.tool_use_id)
+            ?? findTurnOwningMessage(turns, e.message_id)
+            ?? preSteerTurn(rt, turns)
+            ?? openUnboundLiveTurn(
+              rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq)
+          : undefined);
+        if (!t) { rt.turns = turns; return; }
+        const detachedBackground = e.background === true && t.done;
+        if (!detachedBackground) {
+          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+        }
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;
         const existing = mutableTurnBlocks(t).find((b) => b.kind === "tool"
@@ -5550,11 +5595,17 @@ function reduceEvent(
     case "tool_delta":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        for (const t of turns) {
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const candidates = e.turn_id ? [explicit] : turns;
+        for (const t of candidates) {
+          if (!t) continue;
           const block = mutableTurnBlocks(t).find((b) => b.kind === "tool"
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (!block) continue;
-          markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+          const detachedBackground = e.background === true && t.done;
+          if (!detachedBackground) {
+            markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+          }
           markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
           markVisibleProcessStarted(t, eventTimestampMs(e.ts));
           if (e.stream === "progress" || e.stream === "summary") {
@@ -5575,11 +5626,17 @@ function reduceEvent(
     case "tool_result":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        for (const t of turns) {
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const candidates = e.turn_id ? [explicit] : turns;
+        for (const t of candidates) {
+          if (!t) continue;
           const b = mutableTurnBlocks(t).find((b) => b.kind === "tool"
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (b) {
-            markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+            const detachedBackground = e.background === true && t.done;
+            if (!detachedBackground) {
+              markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+            }
             markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
             b.result = { content: e.content, is_error: e.is_error,
               truncated: e.truncated ?? undefined, status: e.status,
@@ -5599,11 +5656,17 @@ function reduceEvent(
     case "assistant_msg_end":
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
-        for (const t of turns) {
+        const explicit = findTurnByEngineId(turns, e.turn_id);
+        const candidates = e.turn_id ? [explicit] : turns;
+        for (const t of candidates) {
+          if (!t) continue;
           const b = mutableTurnBlocks(t).find((b) => b.kind === "text"
             && b.message_id === e.message_id) as TextBlock | undefined;
           if (b) {
-            markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+            const detachedBackground = e.background === true && t.done;
+            if (!detachedBackground) {
+              markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
+            }
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
             b.done = true;
             if (b.channel === "commentary" && b.text.length > 0) {

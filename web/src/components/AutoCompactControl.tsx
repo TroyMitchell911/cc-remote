@@ -140,9 +140,9 @@ export function AutoCompactControl({
         {newSession && (
           <span>随新会话首次启动生效，不会额外重连。</span>
         )}
-        {!newSession && !state?.pending && !readOnly && !state?.error
+        {!newSession && state != null && !state.pending && !readOnly && !state.error
           && effectiveThresholdTokens == null && (
-            <span>新设置只在安全重连后生效，不会打断当前回合。</span>
+            <span>设置已应用；上下文用量将在下一次可靠读取后更新。</span>
           )}
       </div>
     </div>

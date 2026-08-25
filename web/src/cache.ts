@@ -56,7 +56,14 @@ const SCHEMA = 1;
 // v20 discards v19 Codex process clocks which may contain parser-time defaults.
 // SQLite projection migrations cannot invalidate a browser's IndexedDB copy,
 // and a hard refresh deliberately preserves that local cache.
-const CACHE_VER = 20;
+// v21 discards Claude projections which may have persisted an interrupt marker
+// as the browser alias for the following native user row.  The rebuilt v22
+// History store fixes the owner, but IndexedDB needs its own explicit fence.
+// v22 discards Codex turns whose bounded post-compact tail persisted a late
+// process start. The wrapper now overlays an exact source-bound live clock.
+// v23 discards Codex projections which may contain a prompt-less leading
+// compaction row split from the real user message that owns the turn.
+const CACHE_VER = 23;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

@@ -1475,6 +1475,83 @@ def test_managed_broker_turn_finishes_on_engine_transcript_boundary(
     asyncio.run(go())
 
 
+def test_broker_attachment_paths_are_submitted_but_not_echoed(
+        monkeypatch, tmp_path):
+    async def go():
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _broker_ctx(
+            tmp_path,
+            transcript=transcript,
+            append_completion=True,
+        )
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-attachment"
+        machine.sessions[SESSION_ID] = ctx
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(transcript))
+        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(
+            machine,
+            "_stash_files",
+            lambda prompt, _files, temp_dir, engine: (
+                f"{prompt}\n\n@{temp_dir}/private-upload.txt"
+            ),
+        )
+
+        async def mirror(_sid):
+            return None
+
+        monkeypatch.setattr(machine, "_push_mirrored_history", mirror)
+        task = asyncio.create_task(machine._run_claude_broker_turn(
+            ctx,
+            "inspect attachment",
+            files=[{"filename": "public.txt", "data": "contents"}],
+        ))
+        ctx.turn_task = task
+        await asyncio.wait_for(task, timeout=1)
+
+        submitted = ctx.sdk.submitted[0]
+        assert "private-upload.txt" in submitted
+        user = next(event for event in transport.sent
+                    if event.type == "user_msg")
+        assert user.prompt == "inspect attachment"
+        assert user.files == [{"filename": "public.txt"}]
+        assert "private-upload.txt" not in user.model_dump_json()
+
+    asyncio.run(go())
+
+
+def test_broker_pre_submit_interrupt_materializes_before_terminal(
+        monkeypatch, tmp_path):
+    async def go():
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _broker_ctx(tmp_path, transcript=transcript)
+        ctx.state = "interrupting"
+        ctx.active_msg_id = "msg-interrupted"
+        ctx.interrupt_event.set()
+        machine.sessions[SESSION_ID] = ctx
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(transcript))
+
+        task = asyncio.create_task(
+            machine._run_claude_broker_turn(ctx, "do not submit"))
+        ctx.turn_task = task
+        await asyncio.wait_for(task, timeout=1)
+
+        assert ctx.sdk.submitted == []
+        lifecycle = [event for event in transport.sent
+                     if event.type in {"user_msg", "turn_end"}]
+        assert [event.type for event in lifecycle] == ["user_msg", "turn_end"]
+        assert lifecycle[0].prompt == "do not submit"
+        assert lifecycle[1].result.subtype == "error_during_execution"
+
+    asyncio.run(go())
+
+
 def test_submit_input_busy_race_does_not_publish_unsent_user_message(
         monkeypatch, tmp_path):
     async def go():
