@@ -2966,7 +2966,17 @@ export default function App() {
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
-            ws.sendGetContextTo(msg.sid);
+            const runtime = stateRef.current.runtimes[msg.sid];
+            if (!runtime?.contextRequestId) {
+              const requestId = ws.sendGetContextTo(msg.sid);
+              if (requestId) {
+                dispatch({
+                  type: "begin_context_request",
+                  sid: msg.sid,
+                  requestId,
+                });
+              }
+            }
             if (sessionActivityPendingRef.current.delete(msg.sid)) {
               const listed = Object.values(sessionListsBySurfaceRef.current)
                 .flat().find((session) => session.session_id === msg.sid);

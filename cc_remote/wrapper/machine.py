@@ -16967,6 +16967,25 @@ class WrapperMachine:
                 return await self._missing_session_error(cmd, "读取上下文")
             return await self._handle_get_context_locked(ctx, cmd)
 
+    @staticmethod
+    def _unavailable_context_report(ctx: SessionContext) -> ContextReport:
+        """Describe a generation whose control plane is unsafe to query now."""
+        return ContextReport(
+            total_tokens=0,
+            max_tokens=0,
+            percentage=0.0,
+            available=False,
+            model=getattr(ctx.sdk, "model", None),
+            is_auto_compact_enabled=None,
+            auto_compact_threshold_tokens=getattr(
+                ctx.sdk,
+                "effective_auto_compact_threshold_tokens",
+                None,
+            ),
+            raw_max_tokens=getattr(ctx.sdk, "raw_context_max_tokens", None),
+            categories=[],
+        )
+
     async def _handle_get_context_locked(
         self,
         ctx: SessionContext,
@@ -16994,23 +17013,7 @@ class WrapperMachine:
                     # continuation owns the Claude child, or while this
                     # generation is intentionally quarantined. An unavailable
                     # reading is safer than blocking its sole control loop.
-                    event = ContextReport(
-                        total_tokens=0,
-                        max_tokens=0,
-                        percentage=0.0,
-                        available=False,
-                        model=getattr(ctx.sdk, "model", None),
-                        is_auto_compact_enabled=None,
-                        auto_compact_threshold_tokens=getattr(
-                            ctx.sdk,
-                            "effective_auto_compact_threshold_tokens",
-                            None,
-                        ),
-                        raw_max_tokens=getattr(
-                            ctx.sdk, "raw_context_max_tokens", None
-                        ),
-                        categories=[],
-                    )
+                    event = self._unavailable_context_report(ctx)
                     await self._emit(ctx, event)
                     return event
             else:
@@ -17091,6 +17094,10 @@ class WrapperMachine:
             return event
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
+            # Preserve the last valid reading in every browser. The requester
+            # tracks this automatic post-TurnEnd probe by cmd_id, so a routed
+            # failure closes only that context control and cannot become a
+            # global command banner or alter the completed turn.
             error = Error(
                 code=ERR_INTERNAL,
                 message="上下文状态暂不可用，请稍后重试。",

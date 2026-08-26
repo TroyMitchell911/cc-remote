@@ -314,7 +314,22 @@ body{
 
 /* THREAD */
 .thread-shell{ flex:1; min-height:0; position:relative; display:flex; flex-direction:column; }
-.thread{ flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; overflow-anchor:none; -webkit-overflow-scrolling:touch; padding:0; position:relative; z-index:1; }
+.thread{ flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; overflow-anchor:none; -webkit-overflow-scrolling:touch; padding:0; position:relative; z-index:1;
+  color-scheme:light; scrollbar-width:thin;
+  scrollbar-color:color-mix(in srgb,var(--faint) 78%,transparent) transparent; }
+:root[data-theme="dark"] .thread{ color-scheme:dark;
+  scrollbar-color:color-mix(in srgb,var(--faint) 90%,transparent) transparent; }
+.thread::-webkit-scrollbar{ width:10px; }
+.thread::-webkit-scrollbar-track{ background:transparent; }
+.thread::-webkit-scrollbar-thumb{ min-height:36px; border:3px solid transparent;
+  border-radius:999px; background:color-mix(in srgb,var(--faint) 78%,transparent);
+  background-clip:padding-box; }
+:root[data-theme="dark"] .thread::-webkit-scrollbar-thumb{
+  background:color-mix(in srgb,var(--faint) 90%,transparent);
+  background-clip:padding-box; }
+.thread:hover::-webkit-scrollbar-thumb{
+  background:color-mix(in srgb,var(--dim) 88%,transparent);
+  background-clip:padding-box; }
 /* Keep scroll geometry entirely in the virtualizer and in-flow content. The
    scroll container itself stays padding-free so keyed offset restoration has
    one coordinate system across Chromium and WebKit. */

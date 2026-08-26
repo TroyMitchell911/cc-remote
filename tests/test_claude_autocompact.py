@@ -22,6 +22,7 @@ from claude_agent_sdk.types import (
 )
 
 from cc_remote.protocol import (
+    ContextReport,
     Delta,
     Error,
     GetContext,
@@ -473,6 +474,34 @@ def test_quarantined_claude_context_without_cache_reports_unavailable():
         assert report.available is False
         assert report.total_tokens == 0
         assert report.max_tokens == 0
+
+    asyncio.run(run())
+
+
+def test_context_control_timeout_is_routed_without_replacing_last_report():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+        context_probe_suppressed = False
+
+        async def get_context_usage(self):
+            raise TimeoutError("control request timed out")
+
+    async def run():
+        machine, transport, _ctx = _machine_with_sdk(ContextSdk())
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            cmd_id="context-command",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, Error)
+        assert report.request_id == "context-command"
+        assert report.to == "browser-one"
+        assert transport.sent[-1] == report
+        assert not any(
+            isinstance(item, ContextReport) for item in transport.sent
+        )
 
     asyncio.run(run())
 

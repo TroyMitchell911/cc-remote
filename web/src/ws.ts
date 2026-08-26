@@ -830,8 +830,10 @@ export class RelayWs {
     });
   }
 
-  sendGetContextTo(sid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
+  sendGetContextTo(sid: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs(),
+    });
   }
 
   sendGetDiff(file: string, theme: DiffTheme): string | null {

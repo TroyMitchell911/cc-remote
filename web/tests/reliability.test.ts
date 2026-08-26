@@ -7370,6 +7370,71 @@ try {
   assert.equal(controlRequestState.runtimes[sid].contextError,
     "当前会话暂时不可用，请重新进入后重试。",
     "a targeted context failure must replace the infinite loading state");
+  assert.equal(controlRequestState.banner, undefined,
+    "a correlated context failure must stay inside the context control");
+  const completedContextSid = "completed-turn-context-failure";
+  const completedContextReport = event({
+    type: "context_report",
+    sid: completedContextSid,
+    total_tokens: 120_000,
+    max_tokens: 500_000,
+    percentage: 24,
+    available: true,
+    categories: [],
+  });
+  let completedContextState = {
+    ...initialState,
+    focusedSid: completedContextSid,
+    runtimes: {
+      [completedContextSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        contextReport: completedContextReport,
+        turns: [{
+          id: "completed-context-turn",
+          prompt: "finish normally",
+          done: true,
+          doneTs: 20_000,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "completed-context-answer",
+            channel: "final" as const,
+            text: "done",
+            done: true,
+          }],
+        }],
+      },
+    },
+  };
+  completedContextState = reduce(completedContextState, {
+    type: "begin_context_request",
+    sid: completedContextSid,
+    requestId: "post-turn-context",
+  });
+  completedContextState = reduce(completedContextState, {
+    type: "event", event: event({
+      type: "error", sid: completedContextSid, code: "internal",
+      message: "Control request timeout: get_context_usage",
+      request_id: "post-turn-context",
+    }),
+  });
+  assert.equal(completedContextState.banner, undefined);
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].contextReport,
+    completedContextReport,
+    "a failed refresh must preserve the last valid context reading",
+  );
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].turns[0].done,
+    true,
+    "a post-turn metadata failure must not reopen the completed narrative",
+  );
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].turns[0]
+      .blocks[0].done,
+    true,
+    "a post-turn metadata failure must preserve the terminal answer footer",
+  );
   controlRequestState = reduce(controlRequestState, {
     type: "begin_status_request", sid, requestId: "status-request",
   });

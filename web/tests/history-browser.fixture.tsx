@@ -1210,7 +1210,7 @@ function HistoryConversationBrowserFixture() {
     deepBrowse
       ? Array.from({ length: 20 }, (_, index) =>
         finalTurn(`m${index + 21}`, 3))
-      : []);
+      : runtimeBrowse ? initialA : []);
   const nextLiveTurnRef = useRef(41);
   const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
   const detailRequestCountRef = useRef(0);

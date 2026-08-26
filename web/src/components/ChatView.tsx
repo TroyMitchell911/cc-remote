@@ -80,6 +80,10 @@ const THREAD_CONTENT_BOTTOM_PX = 8;
 const WORK_THREAD_CONTENT_TOP_PX = 26;
 const WORK_THREAD_CONTENT_BOTTOM_PX = 20;
 const USER_SCROLL_INTENT_IDLE_MS = 260;
+// Overlay scrollbars do not subtract their painted width from clientWidth.
+// Keep a small right-edge hit region for the native thumb while still
+// requiring the event target to be the scroll container itself.
+const SCROLLBAR_POINTER_GUTTER_PX = 14;
 // HistoryRequestCoordinator allows replacement after 15 seconds. Release the
 // local anchor just after that boundary so an unanswered command cannot lock
 // pagination forever.
@@ -413,6 +417,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const userScrollIntentRef = useRef(false);
   const userScrollDirectionRef = useRef<UserScrollDirection | null>(null);
   const userScrollIntentTimerRef = useRef<number | null>(null);
+  const scrollbarDragIntentRef = useRef<{
+    scope: string;
+    pointerId: number;
+  } | null>(null);
+  // A real downward gesture may finish while the final cached-newer page is
+  // still installing. Remember only that exact viewport scope so the settled
+  // page can hand back to the live runtime without requiring a second scroll.
+  const manualLatestIntentRef = useRef<string | null>(null);
   const turnKeySnapshotRef = useRef<TurnKeySnapshot | null>(null);
   const turnImagePreviewCacheRef = useRef(new TurnImagePreviewCache());
   // `historyViewRevision` is kept as a compatibility scope for the
@@ -1099,6 +1111,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   useEffect(() => {
     const handlePointerEnd = (event: globalThis.PointerEvent) => {
+      if (scrollbarDragIntentRef.current?.pointerId === event.pointerId) {
+        scrollbarDragIntentRef.current = null;
+      }
       const candidate = textSelectionCandidateRef.current;
       if (candidate?.pointerId === event.pointerId) {
         textSelectionCandidateRef.current = null;
@@ -1578,6 +1593,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       touchEventClockOffsetRef.current = null;
       userScrollIntentRef.current = false;
       userScrollDirectionRef.current = null;
+      scrollbarDragIntentRef.current = null;
+      manualLatestIntentRef.current = null;
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
         userScrollIntentTimerRef.current = null;
@@ -1714,10 +1731,48 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     );
   };
 
+  const leaveHistoryBrowse = useCallback((): boolean => {
+    if (!browseMode || !onReturnLatest) return false;
+    const requestActivityKey = historyRequestRef.current?.activityKey;
+    scrollbarDragIntentRef.current = null;
+    manualLatestIntentRef.current = null;
+    cancelDetailAnchorFnRef.current?.();
+    cancelHistoryAnchor();
+    historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
+    completeHistoryLoadGates();
+    setMeasurementBoundary(null);
+    onReturnLatest();
+    return true;
+  }, [
+    browseMode, cancelHistoryAnchor, clearHistoryRequestTimeout,
+    completeHistoryLoadGates, completeHistoryPageActivity, onReturnLatest,
+  ]);
+
   const onThreadPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     markUserScrollIntent("unknown");
+    scrollbarDragIntentRef.current = null;
     if (event.pointerType !== "mouse" || event.button !== 0
         || !event.isPrimary) {
+      textSelectionCandidateRef.current = null;
+      return;
+    }
+    const thread = event.currentTarget;
+    const rect = thread.getBoundingClientRect();
+    const paintedScrollbarWidth = Math.max(
+      thread.offsetWidth - thread.clientWidth,
+      SCROLLBAR_POINTER_GUTTER_PX,
+    );
+    const ownsVerticalScrollbar = event.target === thread
+      && thread.scrollHeight > thread.clientHeight + 0.5
+      && event.clientX >= rect.right - paintedScrollbarWidth
+      && event.clientX <= rect.right;
+    if (ownsVerticalScrollbar) {
+      scrollbarDragIntentRef.current = {
+        scope: scrollScope,
+        pointerId: event.pointerId,
+      };
       textSelectionCandidateRef.current = null;
       return;
     }
@@ -1824,6 +1879,35 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
         }
       }
     }
+    if (userDrivenScroll && movingTowardHistory) {
+      manualLatestIntentRef.current = null;
+    }
+    const scrollbarReachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && scrollbarDragIntentRef.current?.scope === scrollScope
+      && movingTowardLatest
+      && isAtLatestEdge(metrics);
+    if (scrollbarReachedBrowseTail) {
+      lastScrollTopRef.current = metrics.scrollTop;
+      leaveHistoryBrowse();
+      return;
+    }
+    const reachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && movingTowardLatest
+      && !textSelectionDragging
+      && isAtLatestEdge(metrics)
+      && userDrivenScroll;
+    if (reachedBrowseTail) {
+      if (userDrivenScroll) manualLatestIntentRef.current = scrollScope;
+      if (!hasNewer
+          && !historyRequestRef.current
+          && !historyAnchorRef.current.current()) {
+        lastScrollTopRef.current = metrics.scrollTop;
+        leaveHistoryBrowse();
+        return;
+      }
+    }
     lastScrollTopRef.current = metrics.scrollTop;
     const nextScrollState = userDrivenScroll
       ? controller.observeScroll(
@@ -1848,6 +1932,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       );
     }
   };
+
+  useEffect(() => {
+    const intentScope = manualLatestIntentRef.current;
+    if (!browseMode || intentScope !== scrollScope) {
+      manualLatestIntentRef.current = null;
+      return;
+    }
+    // The final cached-newer response clears its keyed request/anchor in the
+    // preceding layout effects. If the user's gesture already left the DOM at
+    // the real bottom, complete the same action as the explicit button.
+    if (hasNewer || historyRequestRef.current
+        || historyAnchorRef.current.current()) return;
+    const el = scrollRef.current;
+    if (!el || !isAtLatestEdge(readScrollMetrics(el))
+        || textSelectionRef.current?.dragging) return;
+    leaveHistoryBrowse();
+  }, [
+    activeHistoryGeneration, browseMode, hasNewer, historyWindowEpoch,
+    leaveHistoryBrowse, scrollScope, turns,
+  ]);
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (Math.abs(event.deltaY) <= 0.5) return;
@@ -2039,19 +2143,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const returnToLatest = () => {
-    if (!browseMode || !onReturnLatest) {
-      scrollToBottom();
-      return;
-    }
-    const requestActivityKey = historyRequestRef.current?.activityKey;
-    cancelDetailAnchorFnRef.current?.();
-    cancelHistoryAnchor();
-    historyRequestRef.current = null;
-    clearHistoryRequestTimeout();
-    completeHistoryPageActivity(requestActivityKey);
-    setMeasurementBoundary(null);
-    completeHistoryLoadGates();
-    onReturnLatest();
+    if (leaveHistoryBrowse()) return;
+    scrollToBottom();
   };
 
   const beginProcessInteraction = useCallback((): number => {

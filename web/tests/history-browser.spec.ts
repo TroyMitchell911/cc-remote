@@ -2808,6 +2808,79 @@ test("the first runtime-to-browse page preserves its captured reading row", asyn
   ).toBeLessThan(2);
 });
 
+test("a script-only bottom write cannot leave history browse", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?runtime-browse=1&delay=5&manual-growth=1",
+  );
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await page.locator(".load-more-btn").dispatchEvent("click");
+  await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
+  await expect(page.getByRole("button", { name: "回到最新" })).toBeVisible();
+  await waitForScrollIdle(page);
+
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await page.waitForTimeout(100);
+
+  await expect(page.getByRole("button", { name: "回到最新" })).toBeVisible();
+});
+
+test("dragging the deep-history scrollbar to the bottom returns to the live tail", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?deep-browse=1&delay=5");
+  const viewport = page.locator(".thread");
+  await viewport.evaluate((node) => { node.scrollTop = 0; });
+  await waitForScrollIdle(page);
+  await expect(page.getByRole("button", { name: "回到最新" })).toBeVisible();
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("m20");
+
+  const gutterPoint = await viewport.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.right - 2, y: rect.top + 24 };
+  });
+
+  await viewport.dispatchEvent("pointerdown", {
+    pointerType: "mouse", button: 0, buttons: 1, isPrimary: true,
+    pointerId: 71, clientX: gutterPoint.x, clientY: gutterPoint.y,
+  });
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+
+  await expect(page.getByRole("button", { name: "回到最新" })).toHaveCount(0);
+  await expect(page.getByTestId("newer-load-count")).toHaveText("0");
+  await expect(page.getByTestId("newest-turn-id")).toHaveText("m40");
+  const completedTail = page.locator('[data-turn-id="m40"]');
+  await expect(completedTail.locator(".turn-done-mark")).toBeVisible();
+  await expect(completedTail.locator(".ai-meta .ubub-time")).toBeVisible();
+  await expect(completedTail.locator(
+    '.ai-meta .ubub-act[aria-label="复制"]',
+  )).toBeVisible();
+});
+
+test("dark chat threads expose a contrasting native scrollbar", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?large=40");
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+  });
+  const style = await page.locator(".thread").evaluate((node) => {
+    const computed = getComputedStyle(node);
+    return {
+      colorScheme: computed.colorScheme,
+      // WebKit applies scrollbar-color/color-scheme but does not expose the
+      // non-standard scrollbarColor DOM property through getComputedStyle.
+      scrollbarColor: computed.getPropertyValue("scrollbar-color").trim(),
+    };
+  });
+  expect(style.colorScheme).toBe("dark");
+  if (style.scrollbarColor) {
+    expect(style.scrollbarColor).not.toBe("auto");
+    expect(style.scrollbarColor)
+      .not.toMatch(/^transparent(?:\s+transparent)?$/);
+  }
+});
+
 test("one upward gesture starts at most one older-page request", async ({
   page,
 }, testInfo) => {
