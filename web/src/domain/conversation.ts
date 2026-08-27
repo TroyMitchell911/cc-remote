@@ -159,6 +159,8 @@ export interface Turn {
   /** Exact failed page request retained only long enough for an in-place retry. */
   detailRetryBefore?: string | null;
   detailRetryDirection?: "initial" | "older" | "newer";
+  /** A stale cursor is being replaced from the authoritative newest page. */
+  detailResetPending?: boolean;
   detailHasMore?: boolean;
   detailOldestCursor?: string | null;
   detailHasNewer?: boolean;

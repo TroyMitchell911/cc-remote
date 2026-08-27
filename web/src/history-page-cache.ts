@@ -162,6 +162,7 @@ function sanitizeTurn(turn: Turn): Turn {
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: undefined,
     detailHasMore: undefined,
     detailOldestCursor: undefined,

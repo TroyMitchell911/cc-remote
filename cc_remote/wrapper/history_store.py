@@ -73,7 +73,16 @@ json_set(
 """.strip()
 _COMPACT_SOURCE_LIMIT = 16
 _SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_DETAIL_SNAPSHOT_TOKEN = re.compile(r"^[0-9a-f]{64}$")
+_DETAIL_SNAPSHOT_TURN_HASH = re.compile(r"^[0-9a-f]{16}$")
 _GENERIC_HISTORY_TURN_FAILURE = "该轮未正常结束"
+
+
+def history_turn_snapshot_hash(turn_id: str) -> str:
+    """Return the compact, non-reversible turn key used in detail cursors."""
+    return hashlib.sha256(
+        turn_id.encode("utf-8", "surrogatepass")
+    ).hexdigest()[:16]
 
 
 def _summary_projection_fallback(
@@ -345,6 +354,20 @@ class MaterializedHistoryPage:
             in_progress=raw_in_progress,
             active_task_ids=tuple(sorted(set(raw_active_task_ids))),
         )
+
+
+@dataclass(frozen=True)
+class MaterializedTurnDetail:
+    """One source-bound heavyweight turn projection.
+
+    ``source_token`` is populated only for a standalone immutable detail row.
+    A group recovered from a compact page remains readable, but must not issue
+    snapshot-bound cursors because its tighter detail row may already be gone.
+    """
+
+    events: tuple[dict[str, Any], ...]
+    turn_id: str
+    source_token: str | None = None
 
 
 def _event_ms(value: Any) -> int | None:
@@ -1938,13 +1961,30 @@ class HistoryIndexStore:
             )
             self._prune_details(connection)
 
-    def get_turn_detail(
+    @staticmethod
+    def _decode_turn_detail_payload(
+        payload_json: Any,
+        turn_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        try:
+            payload = json.loads(bytes(payload_json).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return None
+        if (
+            not isinstance(payload, list)
+            or not all(isinstance(event, dict) for event in payload)
+            or _turn_id(payload) != turn_id
+        ):
+            return None
+        return tuple(payload)
+
+    def get_turn_detail_snapshot(
         self,
         session_id: str,
         engine: str,
         source: HistorySourceFingerprint,
         turn_id: str,
-    ) -> tuple[dict[str, Any], ...] | None:
+    ) -> MaterializedTurnDetail | None:
         """Return one materialized turn without reading a complete page.
 
         Prefer the exact source snapshot.  If the transcript only appended
@@ -1964,24 +2004,23 @@ class HistoryIndexStore:
                 (session_id, engine, source.path, turn_id, source.token),
             ).fetchone()
             if row is not None:
-                try:
-                    payload = json.loads(
-                        bytes(row["payload_json"]).decode("utf-8"))
-                    if (isinstance(payload, list)
-                            and all(isinstance(event, dict) for event in payload)
-                            and _turn_id(payload) == turn_id):
-                        connection.execute(
-                            """
-                            UPDATE history_turn_details SET accessed_at=?
-                            WHERE session_id=? AND engine=?
-                              AND source_token=? AND turn_id=?
-                            """,
-                            (now, session_id, engine,
-                             row["source_token"], turn_id),
-                        )
-                        return tuple(payload)
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                    pass
+                events = self._decode_turn_detail_payload(
+                    row["payload_json"], turn_id)
+                if events is not None:
+                    connection.execute(
+                        """
+                        UPDATE history_turn_details SET accessed_at=?
+                        WHERE session_id=? AND engine=?
+                          AND source_token=? AND turn_id=?
+                        """,
+                        (now, session_id, engine,
+                         row["source_token"], turn_id),
+                    )
+                    return MaterializedTurnDetail(
+                        events=events,
+                        turn_id=turn_id,
+                        source_token=str(row["source_token"]),
+                    )
 
                 # A malformed derived row must not mask the canonical page
                 # fallback below.
@@ -2045,8 +2084,93 @@ class HistoryIndexStore:
                         "UPDATE history_pages SET accessed_at=? WHERE rowid=?",
                         (now, page_row["rowid"]),
                     )
-                    return tuple(group)
+                    return MaterializedTurnDetail(
+                        events=tuple(group),
+                        turn_id=turn_id,
+                    )
         return None
+
+    def get_turn_detail(
+        self,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        turn_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        """Compatibility wrapper returning only the materialized events."""
+        detail = self.get_turn_detail_snapshot(
+            session_id, engine, source, turn_id)
+        return detail.events if detail is not None else None
+
+    def get_turn_detail_by_snapshot(
+        self,
+        session_id: str,
+        engine: str,
+        source_token: str,
+        turn_hash: str,
+    ) -> MaterializedTurnDetail | None:
+        """Resolve one immutable detail row from an opaque scoped cursor.
+
+        Query turn ids before payloads so a hash collision fails closed without
+        decoding multiple potentially large detail blobs.
+        """
+        if (
+            _DETAIL_SNAPSHOT_TOKEN.fullmatch(source_token) is None
+            or _DETAIL_SNAPSHOT_TURN_HASH.fullmatch(turn_hash) is None
+        ):
+            return None
+        now = time.time()
+        with self._connect() as connection:
+            turn_ids = connection.execute(
+                """
+                SELECT turn_id FROM history_turn_details
+                WHERE session_id=? AND engine=? AND source_token=?
+                """,
+                (session_id, engine, source_token),
+            )
+            matches = [
+                str(row["turn_id"])
+                for row in turn_ids
+                if history_turn_snapshot_hash(str(row["turn_id"])) == turn_hash
+            ]
+            if len(matches) != 1:
+                return None
+            turn_id = matches[0]
+            row = connection.execute(
+                """
+                SELECT payload_json FROM history_turn_details
+                WHERE session_id=? AND engine=?
+                  AND source_token=? AND turn_id=?
+                """,
+                (session_id, engine, source_token, turn_id),
+            ).fetchone()
+            if row is None:
+                return None
+            events = self._decode_turn_detail_payload(
+                row["payload_json"], turn_id)
+            if events is None:
+                connection.execute(
+                    """
+                    DELETE FROM history_turn_details
+                    WHERE session_id=? AND engine=?
+                      AND source_token=? AND turn_id=?
+                    """,
+                    (session_id, engine, source_token, turn_id),
+                )
+                return None
+            connection.execute(
+                """
+                UPDATE history_turn_details SET accessed_at=?
+                WHERE session_id=? AND engine=?
+                  AND source_token=? AND turn_id=?
+                """,
+                (now, session_id, engine, source_token, turn_id),
+            )
+            return MaterializedTurnDetail(
+                events=events,
+                turn_id=turn_id,
+                source_token=source_token,
+            )
 
     def put_agent_detail(
         self,

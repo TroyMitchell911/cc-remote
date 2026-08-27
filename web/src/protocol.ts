@@ -431,7 +431,7 @@ export interface ConversationTurn { id: string; clientMsgId?: string | null; pro
 export interface CodexTerminalFence { turn_id: string; status: "completed" | "interrupted" | "failed"; duration_ms?: number | null; completed_at?: number | null }
 export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; compaction_continuation_turn_ids?: string[]; terminal_fences?: CodexTerminalFence[]; reset?: boolean }
 export interface GetTurnDetail extends Base { type: "get_turn_detail"; session_id: string; turn_id: string; client_id?: string | null; revision?: string | null; before?: string | null; limit?: number | null }
-export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more?: boolean; oldest_cursor?: string | null; has_newer?: boolean; newer_cursor?: string | null; before?: string | null }
+export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; reset_required?: boolean; events: ServerEvent[]; has_more?: boolean; oldest_cursor?: string | null; has_newer?: boolean; newer_cursor?: string | null; before?: string | null }
 export interface GetAgentDetail extends Base { type: "get_agent_detail"; session_id: string; run_id: string; request_id: string; client_id?: string | null; revision?: string | null; detail_revision?: string | null; before?: string | null; limit?: number | null }
 export interface AgentDetail extends Base { type: "agent_detail"; session_id: string; run_id: string; request_id?: string | null; revision: string; detail_revision: string; authoritative?: boolean; live?: boolean; title: string; parent_run_id?: string | null; status: ProcessStatus; error?: string | null; events: ServerEvent[]; through_seq: number; has_more?: boolean; oldest_cursor?: string | null; has_newer?: boolean; newer_cursor?: string | null; before?: string | null }
 export interface GetHistoryImage extends Base { type: "get_history_image"; session_id: string; turn_id: string; image_id: string; variant: "thumbnail" | "full"; request_id: string; client_id?: string | null; revision?: string | null }
@@ -609,7 +609,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 39;
+export const PROTOCOL_VERSION = 40;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

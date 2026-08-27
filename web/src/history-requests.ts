@@ -472,6 +472,31 @@ export class HistoryDetailRequestCoordinator {
     }
   }
 
+  cancelTurn(input: {
+    sid: string;
+    revision: string;
+    turnId: string;
+  }): HistoryDetailRequestContext[] {
+    const cancelled: HistoryDetailRequestContext[] = [];
+    for (const [key, pending] of this.pending) {
+      const retained = pending.contexts.filter((context) => {
+        const matches = context.sid === input.sid
+          && context.revision === input.revision
+          && context.turnId === input.turnId;
+        if (matches) cancelled.push({ ...context });
+        return !matches;
+      });
+      if (retained.length === pending.contexts.length) continue;
+      if (retained.length > 0) {
+        pending.contexts = retained;
+      } else {
+        this.pending.delete(key);
+        this.cancelTimer(pending.timer);
+      }
+    }
+    return cancelled;
+  }
+
   clear(): HistoryDetailRequestContext[] {
     const contexts = [...this.pending.values()].flatMap((pending) => {
       this.cancelTimer(pending.timer);

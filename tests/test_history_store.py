@@ -10,7 +10,9 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    MaterializedTurnDetail,
     history_source_extends,
+    history_turn_snapshot_hash,
     materialize_history_turns,
 )
 
@@ -150,6 +152,75 @@ def test_turn_detail_survives_append_but_not_destructive_invalidation(tmp_path):
     store.invalidate_session("session-1")
     assert store.get_turn_detail(
         "session-1", "codex", changed, "message-1") is None
+
+
+def test_turn_detail_snapshot_lookup_is_immutable_and_scope_bound(tmp_path):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    original = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    original_events = (
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "process", "item_id": "old-step", "phase": "end"},
+        {"type": "turn_end", "turn_id": "native-1", "result": {
+            "subtype": "success", "duration_ms": 1, "is_error": False,
+        }},
+    )
+    store.put_turn_details(
+        "session-1", "codex", original, original_events)
+
+    first = store.get_turn_detail_snapshot(
+        "session-1", "codex", original, "message-1")
+    assert first == MaterializedTurnDetail(
+        events=original_events,
+        turn_id="message-1",
+        source_token=original.token,
+    )
+
+    with source_path.open("a") as stream:
+        stream.write('{"type":"second"}\n')
+    appended = HistorySourceFingerprint.capture(source_path)
+    appended_events = (
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "process", "item_id": "new-step", "phase": "end"},
+        {"type": "turn_end", "turn_id": "native-1", "result": {
+            "subtype": "success", "duration_ms": 2, "is_error": False,
+        }},
+    )
+    store.put_turn_details(
+        "session-1", "codex", appended, appended_events)
+
+    turn_hash = history_turn_snapshot_hash("message-1")
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token, turn_hash,
+    ) == first
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", appended.token, turn_hash,
+    ) == MaterializedTurnDetail(
+        events=appended_events,
+        turn_id="message-1",
+        source_token=appended.token,
+    )
+    assert store.get_turn_detail_by_snapshot(
+        "session-2", "codex", original.token, turn_hash,
+    ) is None
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "claude", original.token, turn_hash,
+    ) is None
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token,
+        history_turn_snapshot_hash("message-2"),
+    ) is None
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "DELETE FROM history_turn_details "
+            "WHERE session_id=? AND engine=? AND source_token=?",
+            ("session-1", "codex", original.token),
+        )
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token, turn_hash,
+    ) is None
 
 
 def test_turn_detail_recovers_from_retained_page_after_detail_lru_eviction(

@@ -431,6 +431,46 @@ assert.deepEqual(detailCoordinator.complete({
   before: olderDetailContext.before,
 }), olderDetailContext,
   "the response before cursor is part of the exact coordinator key");
+
+const resetDetailCoordinator = new HistoryDetailRequestCoordinator();
+const resetRuntimeContext = {
+  ...newestDetailContext,
+  turnId: "reset-turn",
+};
+const resetOlderContext = {
+  ...resetRuntimeContext,
+  before: "stale-snapshot-cursor",
+};
+const retainedOtherTurn = {
+  ...resetRuntimeContext,
+  turnId: "unrelated-turn",
+};
+assert.deepEqual(resetDetailCoordinator.register(resetRuntimeContext), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.register(resetOlderContext), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.register(retainedOtherTurn), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.cancelTurn({
+  sid: resetRuntimeContext.sid,
+  revision: resetRuntimeContext.revision,
+  turnId: resetRuntimeContext.turnId,
+}), [resetRuntimeContext, resetOlderContext],
+"snapshot reset cancels every stale page waiter for only that exact turn");
+assert.deepEqual(resetDetailCoordinator.completeAll({
+  session_id: resetRuntimeContext.sid,
+  revision: resetRuntimeContext.revision,
+  turn_id: resetRuntimeContext.turnId,
+}), [], "a late stale response cannot re-enter the replacement projection");
+assert.deepEqual(resetDetailCoordinator.completeAll({
+  session_id: retainedOtherTurn.sid,
+  revision: retainedOtherTurn.revision,
+  turn_id: retainedOtherTurn.turnId,
+}), [retainedOtherTurn], "resetting one turn cannot cancel another detail read");
+
 detailCoordinator.begin({
   target: "runtime",
   scopeKey: "machine-a:code:codex",

@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v40. Codex
+  heavyweight turn-detail pagination now binds every cursor to an immutable,
+  source-scoped snapshot, so an actively growing multi-hundred-MiB rollout
+  cannot invalidate the next page or silently substitute a different window.
+  If that bounded snapshot is later evicted, Web keeps the expanded content
+  mounted and performs one fresh-head reset instead of retrying the stale
+  cursor, duplicating rows, or jumping the reader's position.
+- Treat an unexpected shared Codex daemon replacement as an incomplete control
+  boundary: reconnect once without replaying the prompt or inventing a terminal,
+  and retain an explicit reasoning effort only for the same thread, model, and
+  working directory when the replacement resume reports a nullable value.
 - Upgrade Claude Agent SDK to `0.2.142`; the wrapper remains pinned to this
   exact verified patch and continues to launch the user's configured Claude
   Code executable.

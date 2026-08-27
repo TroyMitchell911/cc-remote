@@ -573,6 +573,7 @@ export function markBrowseDetailLoading(
     before: string | null;
     direction: "initial" | "older" | "newer";
   } | null,
+  resetPending?: boolean,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -589,7 +590,9 @@ export function markBrowseDetailLoading(
             || (turn.detailRetryBefore === (
               retry === null ? undefined : retry.before)
               && turn.detailRetryDirection === (
-                retry === null ? undefined : retry.direction)))) return turn;
+                retry === null ? undefined : retry.direction)))
+          && (resetPending === undefined
+            || !!turn.detailResetPending === resetPending)) return turn;
       changed = true;
       return {
         ...turn,
@@ -601,6 +604,8 @@ export function markBrowseDetailLoading(
           ? turn.detailRetryBefore : retry?.before,
         detailRetryDirection: retry === undefined
           ? turn.detailRetryDirection : retry?.direction,
+        detailResetPending:
+          resetPending ?? turn.detailResetPending,
       };
     }),
   }));

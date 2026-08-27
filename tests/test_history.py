@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -3977,6 +3978,15 @@ def test_materialized_summary_never_exposes_untrusted_error_text():
         events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],
     )
     assert deserialize(serialize(detail)) == detail
+    reset = TurnDetail(
+        session_id="s1",
+        turn_id="u1",
+        revision="test-revision",
+        authoritative=False,
+        error="详细过程已更新，请重新加载该轮",
+        reset_required=True,
+    )
+    assert deserialize(serialize(reset)) == reset
 
 
 def test_history_revision_is_boot_scoped_and_monotonic():
@@ -4161,6 +4171,232 @@ def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
         assert stale.authoritative is False and stale.events == []
 
         assert transport.sent[-2:] == [response, stale]
+
+    asyncio.run(go())
+
+
+def test_codex_turn_detail_snapshot_cursor_survives_rollout_append(
+    tmp_path,
+):
+    rollout = tmp_path / "snapshot-detail.jsonl"
+    rollout.write_text('{"type":"first"}\n')
+    original_events = (
+        {"type": "user_msg", "sid": "snapshot-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        *(
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": f"old-step-{index}", "kind": "command",
+             "phase": "end", "status": "succeeded"}
+            for index in range(5)
+        ),
+        {"type": "turn_end", "sid": "snapshot-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+
+    class MissingLocator:
+        async def turn_events(self, *_args, **_kwargs):
+            raise CodexHistoryCursorError("rollout locator expired")
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-snapshot")
+        machine._codex_history = MissingLocator()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("snapshot-detail", "snapshot-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        original = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", original, original_events)
+        revision = machine._history_revision(ctx.key)
+
+        newest = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=2,
+        ))
+        assert newest.authoritative is True
+        assert newest.has_more is True
+        assert newest.oldest_cursor is not None
+        assert newest.oldest_cursor.startswith("td1.")
+        snapshot_cursor = newest.oldest_cursor
+        numeric_boundary = snapshot_cursor.rsplit(".", 1)[-1]
+
+        with rollout.open("a") as stream:
+            stream.write('{"type":"second"}\n')
+        appended = HistorySourceFingerprint.capture(rollout)
+        appended_events = (
+            *original_events[:-1],
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": "new-after-append", "kind": "command",
+             "phase": "end", "status": "succeeded"},
+            original_events[-1],
+        )
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", appended, appended_events)
+
+        older = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        expected = mm._turn_detail_page(
+            list(original_events), before=numeric_boundary, limit=2)[0]
+        assert older.authoritative is True
+        assert older.events == expected
+        assert all(
+            row.get("item_id") != "new-after-append"
+            for row in older.events
+        )
+
+        malformed_parts = snapshot_cursor.split(".")
+        malformed_parts[2] = "0" * 16
+        malformed = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=".".join(malformed_parts),
+            limit=2,
+        ))
+        assert malformed.authoritative is False
+        assert malformed.reset_required is True
+
+        snapshot_reader = (
+            machine._history_index.get_turn_detail_by_snapshot)
+
+        def locked_snapshot(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        machine._history_index.get_turn_detail_by_snapshot = locked_snapshot
+        transient = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        assert transient.authoritative is False
+        assert transient.reset_required is False
+        assert transient.error == "详细过程暂时不可用，请稍后重试"
+        machine._history_index.get_turn_detail_by_snapshot = snapshot_reader
+
+        with sqlite3.connect(machine._history_index.path) as connection:
+            connection.execute(
+                "DELETE FROM history_turn_details WHERE source_token=?",
+                (original.token,),
+            )
+        expired = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        assert expired.authoritative is False
+        assert expired.reset_required is True
+        assert expired.events == []
+
+    asyncio.run(go())
+
+
+def test_codex_turn_detail_prefers_visible_index_and_resets_invalid_legacy_page(
+    tmp_path,
+):
+    rollout = tmp_path / "visible-index-detail.jsonl"
+    rollout.write_text('{"type":"first"}\n')
+    indexed_events = (
+        {"type": "user_msg", "sid": "visible-index-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "tool_use", "sid": "visible-index-detail",
+         "tool_use_id": "indexed-tool", "tool": "Read", "input": {}},
+        {"type": "tool_result", "sid": "visible-index-detail",
+         "tool_use_id": "indexed-tool", "content": "indexed result",
+         "is_error": False},
+        {"type": "turn_end", "sid": "visible-index-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+    official_events = [
+        {"type": "user_msg", "sid": "visible-index-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "turn_end", "sid": "visible-index-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    ]
+
+    class LostSupplementLocator:
+        async def turn_events(self, *_args, **_kwargs):
+            return list(official_events)
+
+        @staticmethod
+        def turn_detail_source(*_args, **_kwargs):
+            return "full"
+
+        @staticmethod
+        def rollout_fallback(*_args, **_kwargs):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id="native-1",
+                segment_count=1,
+                segment_index=0,
+            )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-visible")
+        machine._codex_history = LostSupplementLocator()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("visible-index-detail", "visible-index-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", source, indexed_events)
+
+        async def unavailable_history(*_args, **_kwargs):
+            raise CodexHistoryCursorError("segment locator disappeared")
+
+        machine._build_history = unavailable_history
+        revision = machine._history_revision(ctx.key)
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=192,
+        ))
+        assert detail.authoritative is True
+        assert any(
+            row.get("tool_use_id") == "indexed-tool"
+            for row in detail.events
+        )
+
+        invalid_page = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before="999",
+            limit=192,
+        ))
+        assert invalid_page.authoritative is False
+        assert invalid_page.reset_required is True
+        assert invalid_page.events == []
 
     asyncio.run(go())
 

@@ -4,6 +4,14 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v40。Codex 重型回合详情
+  的每个分页 cursor 现在都绑定到不可变、源文件隔离的快照；即使数百 MiB 的
+  rollout 仍在持续追加，下一页也不会失效或被静默替换成另一段内容。若这个有界
+  快照之后被淘汰，Web 会保留已经展开的内容并只执行一次最新页重置，不会反复
+  请求旧 cursor、重复合并行或改变用户的阅读位置。
+- Codex 共享 daemon 被意外替换时现在会按“不完整控制边界”处理：只重连一次，
+  不重放 prompt，也不伪造回合终态；替换后的 resume 返回空思考强度时，仅在原生
+  thread、模型与工作目录均未变化的前提下保留此前明确选择的强度。
 - Claude Agent SDK 升级到 `0.2.142`；wrapper 继续固定到这个经过验证的精确
   patch 版本，并仍然启动用户配置的 Claude Code 可执行文件。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v39。Claude 子代理详情、

@@ -459,6 +459,7 @@ export default function App() {
       dispatch({ type: "history_detail_cancelled", context });
     },
   ));
+  const historyDetailResetAttemptsRef = useRef(new Set<string>());
   const clearHistoryDetailRequests = useCallback(() => {
     for (const context of historyDetailRequestsRef.current.clear()) {
       dispatch({ type: "history_detail_cancelled", context });
@@ -2332,9 +2333,40 @@ export default function App() {
               "detail", msg.session_id, msg.revision, msg.turn_id,
               msg.before ?? "",
             ].join("\u0000");
-            if (msg.authoritative === false) {
+            const activeDetailTargets = (
+              targets: readonly HistoryDetailRequestContext[],
+              retrying = false,
+            ) => {
+              const current = stateRef.current;
+              return targets.filter((detailTarget) => {
+                if (detailTarget.target === "browse") {
+                  const browse = current.historyBrowse;
+                  return !!browse
+                    && current.focusedSid === detailTarget.sid
+                    && browse.sid === detailTarget.sid
+                    && browse.scopeKey === detailTarget.scopeKey
+                    && browse.viewId === detailTarget.viewId
+                    && browse.revision === detailTarget.revision
+                    && browse.turns.some((turn) =>
+                      canonicalTurnId(turn) === detailTarget.turnId
+                      || turn.id === detailTarget.turnId);
+                }
+                const runtime = current.runtimes[detailTarget.sid];
+                const turn = runtime?.turns.find(
+                  (item) => canonicalTurnId(item) === detailTarget.turnId
+                    || item.id === detailTarget.turnId);
+                return current.focusedSid === detailTarget.sid
+                  && !!turn
+                  && (!retrying
+                    || !!detailTarget.before || !turn.detailLoaded)
+                  && runtime?.historyRevision === detailTarget.revision;
+              });
+            };
+            const releaseDetailFailure = (
+              targets: readonly HistoryDetailRequestContext[],
+            ) => {
               let runtimeReleased = false;
-              for (const detailTarget of detailTargets) {
+              for (const detailTarget of targets) {
                 if (detailTarget.target === "browse") {
                   dispatch({
                     type: "history_browse_detail",
@@ -2346,6 +2378,7 @@ export default function App() {
                     turnId: detailTarget.turnId,
                     events: [],
                     error: msg.error,
+                    resetRequired: msg.reset_required,
                     before: detailTarget.before,
                   });
                 } else if (!runtimeReleased) {
@@ -2353,28 +2386,93 @@ export default function App() {
                   runtimeReleased = true;
                 }
               }
+            };
+            if (msg.authoritative === false) {
+              if (msg.reset_required) {
+                recoverableReads.complete(retryKey);
+                const resetKey = [
+                  msg.session_id, msg.revision, msg.turn_id,
+                ].join("\u0000");
+                if (historyDetailResetAttemptsRef.current.has(resetKey)) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                const cancelledTargets =
+                  historyDetailRequestsRef.current.cancelTurn({
+                    sid: msg.session_id,
+                    revision: msg.revision,
+                    turnId: msg.turn_id,
+                  });
+                const activeTargets = activeDetailTargets([
+                  ...detailTargets,
+                  ...cancelledTargets,
+                ]);
+                if (activeTargets.length === 0) return;
+                const resetTargets: HistoryDetailRequestContext[] =
+                  activeTargets.map((target) => ({
+                    ...target,
+                    before: null,
+                  }));
+                const uniqueTargets = new Map<string,
+                  HistoryDetailRequestContext>();
+                for (const target of resetTargets) {
+                  const key = target.target === "browse"
+                    ? [target.target, target.scopeKey, target.viewId,
+                        target.windowEpoch].join("\u0000")
+                    : [target.target, target.scopeKey,
+                        target.autoLoad ? 1 : 0].join("\u0000");
+                  uniqueTargets.set(key, target);
+                }
+                const registrations = [...uniqueTargets.values()].map(
+                  (detailTarget) => ({
+                    detailTarget,
+                    registration:
+                      historyDetailRequestsRef.current.register(detailTarget),
+                  }),
+                ).filter(({ registration }) => registration.accepted);
+                if (registrations.length === 0) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                historyDetailResetAttemptsRef.current.add(resetKey);
+                if (historyDetailResetAttemptsRef.current.size > 256) {
+                  const oldest = historyDetailResetAttemptsRef.current
+                    .values().next().value;
+                  if (oldest) {
+                    historyDetailResetAttemptsRef.current.delete(oldest);
+                  }
+                }
+                if (registrations.some(
+                    ({ registration }) => registration.send)) {
+                  const target = registrations[0].detailTarget;
+                  const sent = ws.sendGetTurnDetail(
+                    msg.session_id, msg.turn_id, target.revision, null);
+                  if (!sent) {
+                    historyDetailResetAttemptsRef.current.delete(resetKey);
+                    for (const { detailTarget } of registrations) {
+                      historyDetailRequestsRef.current.cancel(detailTarget);
+                      dispatch({
+                        type: "history_detail_cancelled",
+                        context: detailTarget,
+                      });
+                    }
+                    return;
+                  }
+                }
+                for (const { detailTarget } of registrations) {
+                  dispatch({
+                    type: "history_detail_reset_requested",
+                    context: detailTarget,
+                  });
+                }
+                return;
+              }
+              releaseDetailFailure(detailTargets);
               recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current;
-                const activeTargets = detailTargets.filter((detailTarget) => {
-                  if (detailTarget.target === "browse") {
-                    const browse = current.historyBrowse;
-                    return !!browse
-                      && browse.scopeKey === detailTarget.scopeKey
-                      && browse.viewId === detailTarget.viewId
-                      && browse.revision === detailTarget.revision
-                      && browse.turns.some((turn) =>
-                        canonicalTurnId(turn) === detailTarget.turnId
-                        || turn.id === detailTarget.turnId);
-                  }
-                  const runtime = current.runtimes[msg.session_id];
-                  const turn = runtime?.turns.find(
-                    (item) => canonicalTurnId(item) === msg.turn_id
-                      || item.id === msg.turn_id);
-                  return !!turn && (!!detailTarget.before || !turn.detailLoaded)
-                    && runtime?.historyRevision === detailTarget.revision;
-                });
+                const activeTargets = activeDetailTargets(
+                  detailTargets, true);
                 if (activeTargets.length === 0) return;
                 const registrations = activeTargets.map((detailTarget) => ({
                   detailTarget,

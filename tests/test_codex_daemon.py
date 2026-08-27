@@ -17,6 +17,7 @@ from cc_remote.wrapper.codex_daemon import (
     CodexDaemonUpgradeRequired,
 )
 from cc_remote.wrapper.codex_handle import (
+    CodexDaemonProxyClosed,
     CodexHandle,
     CodexProxyProtocolError,
     _websocket_client_frame,
@@ -1018,6 +1019,68 @@ def test_proxy_protocol_error_invalidates_daemon_and_clears_live_state():
         assert manager.invalidations == 1
         assert handle.using_daemon_proxy is False
         assert handle._dead is True
+
+    asyncio.run(run())
+
+
+def test_proxy_close_surfaces_typed_incomplete_managed_boundary():
+    async def run():
+        manager = _Manager()
+        process = _Process(_Reader(_server_frame(
+            (1001).to_bytes(2, "big"), opcode=0x8)))
+        handle = CodexHandle(
+            _Cfg(), daemon_mode="auto", daemon_manager=manager)
+        handle.proc = process
+        handle._using_daemon_proxy = True
+        handle._daemon_proxy_established = True
+        handle._dead = False
+        handle.app_server_version = "0.149.0"
+        handle.thread_id = "managed-thread"
+        handle.turn_id = "managed-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        consumer = asyncio.create_task(
+            _collect_async(handle.receive_response()))
+        await handle._read_loop(process, handle._generation)
+        frames = await consumer
+
+        assert len(frames) == 1
+        assert isinstance(frames[0], CodexDaemonProxyClosed)
+        assert frames[0].app_server_version == "0.149.0"
+        assert frames[0].generation == 0
+        assert frames[0].close_kind == "eof"
+        assert handle.using_daemon_proxy is False
+
+    async def _collect_async(stream):
+        return [item async for item in stream]
+
+    asyncio.run(run())
+
+
+def test_proxy_close_never_replaces_buffered_native_terminal():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "terminal-thread"
+        handle.turn_id = "terminal-turn"
+        handle.turn_active = True
+        handle._open_managed_stream()
+        queue = handle._turn_q
+        assert queue is not None
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "terminal-thread",
+                "turn": {"id": "terminal-turn", "status": "completed"},
+            },
+        })
+
+        handle._force_turn_sentinel(queue, CodexDaemonProxyClosed(
+            "0.149.0", 1, close_kind="eof"))
+        frames = [item async for item in handle.receive_response()]
+
+        assert len(frames) == 1
+        assert frames[0]["method"] == "turn/completed"
 
     asyncio.run(run())
 

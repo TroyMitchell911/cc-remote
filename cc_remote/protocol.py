@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 39
+PROTOCOL_VERSION = 40
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -2207,6 +2207,10 @@ class TurnDetail(_Base):
     revision: WireId
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
+    # The requested opaque page no longer has its immutable backing snapshot.
+    # Browsers must restart this turn at before=None rather than retrying the
+    # same cursor or treating a silently substituted newest page as older.
+    reset_required: bool = False
     events: list[dict[str, Any]] = Field(default_factory=list)
     has_more: bool = False
     oldest_cursor: Optional[WireId] = None

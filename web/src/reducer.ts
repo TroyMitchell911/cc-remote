@@ -508,7 +508,8 @@ export type Action =
   | { type: "history_browse_newer_unavailable"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number }
   | { type: "history_browse_page_failed"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string }
   | { type: "history_browse_detail_requested"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; before?: string | null }
-  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; error?: string | null; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
+  | { type: "history_browse_detail"; sid: string; scopeKey: string; revision: string; viewId: string; windowEpoch: number; turnId: string; events: ServerEvent[]; error?: string | null; resetRequired?: boolean; before?: string | null; hasMore?: boolean; oldestCursor?: string | null; hasNewer?: boolean; newerCursor?: string | null }
+  | { type: "history_detail_reset_requested"; context: HistoryDetailRequestContext }
   | { type: "history_detail_cancelled"; context: HistoryDetailRequestContext }
   | { type: "return_to_latest"; sid: string }
   | { type: "hydrate_cache"; sid: string; turns: Turn[]; revision: string | null; generation?: string | null; control?: SessionControl | null; historyAtStart?: boolean }
@@ -2545,6 +2546,42 @@ export function reduce(state: AppState, action: Action): AppState {
             }
           : turn);
       }, true);
+    case "history_detail_reset_requested": {
+      const context = action.context;
+      if (context.target === "browse") {
+        const browse = state.historyBrowse;
+        if (!browse || state.focusedSid !== context.sid
+            || browse.sid !== context.sid
+            || browse.scopeKey !== context.scopeKey
+            || browse.revision !== context.revision
+            || browse.viewId !== context.viewId) return state;
+        const historyBrowse = markBrowseDetailLoading(
+          browse, context.turnId, true, {
+            expectedScopeKey: context.scopeKey,
+            expectedViewId: context.viewId,
+          }, undefined, null, {
+            before: null,
+            direction: "initial",
+          }, true);
+        return historyBrowse === browse ? state : { ...state, historyBrowse };
+      }
+      const runtime = state.runtimes[context.sid];
+      if (!runtime || runtime.historyRevision !== context.revision) return state;
+      return patch(state, context.sid, (rt) => {
+        rt.turns = rt.turns.map((turn) => (
+          turn.id === context.turnId
+            || canonicalTurnId(turn) === context.turnId)
+          ? {
+              ...turn,
+              detailLoading: true,
+              detailError: undefined,
+              detailRetryBefore: null,
+              detailRetryDirection: "initial" as const,
+              detailResetPending: true,
+            }
+          : turn);
+      }, true);
+    }
     case "begin_history_browse": {
       const runtime = state.runtimes[action.sid];
       if (!runtime || state.focusedSid !== action.sid
@@ -2742,22 +2779,32 @@ export function reduce(state: AppState, action: Action): AppState {
         canonicalTurnId(turn) === action.turnId
         || turn.id === action.turnId);
       if (!target || action.events.length === 0) {
+        const resetSucceeded = !!target
+          && !!target.detailResetPending
+          && action.before == null
+          && !action.error;
         const historyBrowse = markBrowseDetailLoading(
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
           }, false, action.error ?? null, {
-            before: target?.detailRetryBefore ?? action.before ?? null,
-            direction: target?.detailRetryDirection
-              ?? (action.before == null
-                ? "initial"
-                : action.before === target?.detailNewerCursor
-                  ? "newer" : "older"),
-          });
+            before: action.resetRequired
+              ? null : target?.detailRetryBefore ?? action.before ?? null,
+            direction: action.resetRequired
+              ? "initial"
+              : target?.detailRetryDirection
+                ?? (action.before == null
+                  ? "initial"
+                  : action.before === target?.detailNewerCursor
+                    ? "newer" : "older"),
+          }, action.resetRequired
+            ? true
+            : resetSucceeded ? false : target?.detailResetPending ?? false);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const installed = installTurnDetailProjectionPage(
-        target.detailProjection,
+        target.detailResetPending && action.before == null
+          ? undefined : target.detailProjection,
         {
           before: action.before,
           events: action.events,
@@ -2782,7 +2829,7 @@ export function reduce(state: AppState, action: Action): AppState {
                 ? "initial"
                 : action.before === target.detailNewerCursor
                   ? "newer" : "older"),
-          });
+          }, target.detailResetPending ?? false);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const historyBrowse = markBrowseDetail(
@@ -2810,7 +2857,7 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, context.turnId, false, {
             expectedScopeKey: context.scopeKey,
             expectedViewId: context.viewId,
-          }, false, undefined, null);
+          }, false, undefined, null, false);
         return historyBrowse === browse ? state : { ...state, historyBrowse };
       }
       const runtime = state.runtimes[context.sid];
@@ -2825,6 +2872,7 @@ export function reduce(state: AppState, action: Action): AppState {
               detailAutoLoad: false,
               detailRetryBefore: undefined,
               detailRetryDirection: undefined,
+              detailResetPending: false,
             }
           : turn);
       }, true);
@@ -4387,12 +4435,17 @@ function reduceEvent(
                 detailAutoLoad: false,
                 detailError: e.error ?? "详细过程暂时不可用，请重试",
                 detailRetryBefore:
-                  turn.detailRetryBefore ?? e.before ?? null,
-                detailRetryDirection: turn.detailRetryDirection
-                  ?? (e.before == null
-                    ? "initial"
-                    : e.before === turn.detailNewerCursor
-                      ? "newer" : "older"),
+                  e.reset_required
+                    ? null : turn.detailRetryBefore ?? e.before ?? null,
+                detailRetryDirection: e.reset_required
+                  ? "initial"
+                  : turn.detailRetryDirection
+                    ?? (e.before == null
+                      ? "initial"
+                      : e.before === turn.detailNewerCursor
+                        ? "newer" : "older"),
+                detailResetPending: e.reset_required
+                  ? true : turn.detailResetPending,
               }
             : turn);
         });
@@ -4413,6 +4466,7 @@ function reduceEvent(
                 detailError: undefined,
                 detailRetryBefore: undefined,
                 detailRetryDirection: undefined,
+                detailResetPending: false,
                 // An empty complete read can refine an opaque summary to an
                 // exact direct reply. It cannot revoke positive evidence from
                 // a previous page/live event in this revision: doing so makes
@@ -4433,7 +4487,8 @@ function reduceEvent(
         });
       }
       const installed = installTurnDetailProjectionPage(
-        target.detailProjection,
+        target.detailResetPending && e.before == null
+          ? undefined : target.detailProjection,
         {
           before: e.before,
           events: e.events as ServerEvent[],
@@ -4461,6 +4516,7 @@ function reduceEvent(
                     ? "initial"
                     : e.before === turn.detailNewerCursor
                       ? "newer" : "older"),
+                detailResetPending: turn.detailResetPending,
               }
             : turn);
         });

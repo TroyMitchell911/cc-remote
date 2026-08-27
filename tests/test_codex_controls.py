@@ -4046,6 +4046,66 @@ def test_codex_force_reconnect_preserves_live_thread_controls():
     asyncio.run(run())
 
 
+def test_codex_force_reconnect_restores_only_same_scope_explicit_effort():
+    async def reconnect_case(
+        *, resumed_model="gpt-test", resumed_cwd="/tmp/project",
+        resumed_effort=None,
+    ):
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "resume-thread"
+        handle.model = "gpt-test"
+        handle.effort = "max"
+        handle.applied_effort = "max"
+        handle.display_effort = "max"
+        handle._generation = 7
+
+        async def disconnect():
+            return None
+
+        async def connect(**_kwargs):
+            handle._generation += 1
+            handle.thread_id = "resume-thread"
+            handle.model = resumed_model
+            handle._cwd = resumed_cwd
+            handle.effort = resumed_effort
+            handle.applied_effort = resumed_effort
+            handle.display_effort = resumed_effort
+            handle.display_effort_model = (
+                resumed_model if resumed_effort else None)
+            handle.display_effort_cwd = (
+                os.path.realpath(resumed_cwd) if resumed_effort else None)
+            handle.display_effort_generation = (
+                handle._generation if resumed_effort else None)
+
+        handle.disconnect = disconnect
+        handle.connect = connect
+        await handle.force_reconnect(
+            "resume-thread", "/tmp/project", reason="daemon replaced")
+        return handle
+
+    async def run():
+        restored = await reconnect_case()
+        assert restored.effort == restored.applied_effort == "max"
+        assert restored.display_effort == "max"
+        assert restored.display_effort_model == "gpt-test"
+        assert restored.display_effort_cwd == os.path.realpath("/tmp/project")
+        assert restored.display_effort_generation == 8
+
+        authoritative = await reconnect_case(resumed_effort="high")
+        assert authoritative.effort == authoritative.applied_effort == "high"
+        assert authoritative.display_effort == "high"
+
+        changed_model = await reconnect_case(resumed_model="gpt-new")
+        assert changed_model.effort is None
+        assert changed_model.display_effort is None
+
+        changed_cwd = await reconnect_case(resumed_cwd="/tmp/other")
+        assert changed_cwd.effort is None
+        assert changed_cwd.display_effort is None
+
+    asyncio.run(run())
+
+
 def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         monkeypatch):
     async def run():

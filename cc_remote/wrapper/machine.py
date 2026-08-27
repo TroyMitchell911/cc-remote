@@ -206,8 +206,10 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    MaterializedTurnDetail,
     history_image_from_events,
     history_source_extends,
+    history_turn_snapshot_hash,
     materialize_history_turns,
 )
 from cc_remote.wrapper.claude_agents import (
@@ -228,11 +230,13 @@ from cc_remote.wrapper.stream import (
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexAppServerError, CodexHandle, CodexManagedOverflow,
+    CodexAppServerError, CodexDaemonProxyClosed, CodexHandle,
+    CodexManagedOverflow,
     CodexNoActiveTurnError, CodexNoActiveTurnFence,
     CodexSteerOutcomeUnknown,
     CodexSpontaneousClosed, CodexSpontaneousOverflow, CodexSteerFence,
     CodexSteerUserIdentityProof,
+    _restore_nullable_explicit_effort,
 )
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_lifecycle import CodexTerminalLedger
@@ -351,6 +355,7 @@ CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
 CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS = 1.0
 CODEX_EFFORT_RESOLVE_RETRY_SECONDS = 30.0
+CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS = 45.0
 _CLAUDE_OPUS_5_1M_ALIASES = frozenset({
     "opus",
     "opus[1m]",
@@ -818,6 +823,66 @@ def _turn_detail_page(
         str(boundaries[boundary_index - 1]) if has_newer else None
     )
     return page, has_more, oldest_cursor, has_newer, newer_cursor
+
+
+_TURN_DETAIL_SNAPSHOT_CURSOR_PREFIX = "td1"
+
+
+@dataclass(frozen=True)
+class _TurnDetailSnapshotCursor:
+    source_token: str
+    visible_turn_hash: str
+    indexed_turn_hash: str
+    before: str
+
+
+def _encode_turn_detail_snapshot_cursor(
+    *,
+    source_token: str,
+    visible_turn_id: str,
+    indexed_turn_id: str,
+    before: str | None,
+) -> str | None:
+    if before is None:
+        return None
+    cursor = ".".join((
+        _TURN_DETAIL_SNAPSHOT_CURSOR_PREFIX,
+        source_token,
+        history_turn_snapshot_hash(visible_turn_id),
+        history_turn_snapshot_hash(indexed_turn_id),
+        before,
+    ))
+    if len(cursor) > 128:
+        raise ValueError("turn detail snapshot cursor exceeds wire limit")
+    return cursor
+
+
+def _decode_turn_detail_snapshot_cursor(
+    value: str | None,
+) -> _TurnDetailSnapshotCursor | None:
+    if value is None or not value.startswith(
+            f"{_TURN_DETAIL_SNAPSHOT_CURSOR_PREFIX}."):
+        return None
+    parts = value.split(".")
+    if (
+        len(parts) != 5
+        or parts[0] != _TURN_DETAIL_SNAPSHOT_CURSOR_PREFIX
+        or len(parts[1]) != 64
+        or any(char not in "0123456789abcdef" for char in parts[1])
+        or len(parts[2]) != 16
+        or any(char not in "0123456789abcdef" for char in parts[2])
+        or len(parts[3]) != 16
+        or any(char not in "0123456789abcdef" for char in parts[3])
+        or not parts[4].isascii()
+        or not parts[4].isdigit()
+    ):
+        raise ValueError("invalid turn detail snapshot cursor")
+    return _TurnDetailSnapshotCursor(
+        source_token=parts[1],
+        visible_turn_hash=parts[2],
+        indexed_turn_hash=parts[3],
+        before=parts[4],
+    )
 
 
 def _render_history_image(
@@ -13525,6 +13590,7 @@ class WrapperMachine:
             events: list[dict] | None = None,
             *,
             error: str | None = None,
+            reset_required: bool = False,
             has_more: bool = False,
             oldest_cursor: str | None = None,
             has_newer: bool = False,
@@ -13536,6 +13602,7 @@ class WrapperMachine:
                 revision=revision,
                 authoritative=error is None,
                 error=error,
+                reset_required=reset_required,
                 events=events or [],
                 has_more=has_more,
                 oldest_cursor=oldest_cursor,
@@ -13554,6 +13621,7 @@ class WrapperMachine:
                 events=len(detail.events),
                 frame_bytes=frame_bytes,
                 authoritative=detail.authoritative,
+                reset_required=detail.reset_required,
                 has_more=detail.has_more,
                 has_newer=detail.has_newer,
                 client_id=client_id,
@@ -13572,9 +13640,105 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex")
             or watch.get("engine") == "codex"
         )
+        raw_before = getattr(cmd, "before", None)
+        try:
+            snapshot_cursor = _decode_turn_detail_snapshot_cursor(raw_before)
+        except ValueError:
+            return await send(
+                error="详细过程已更新，请重新加载该轮",
+                reset_required=True,
+            )
+        if snapshot_cursor is not None:
+            if (
+                not is_codex
+                or snapshot_cursor.visible_turn_hash
+                != history_turn_snapshot_hash(cmd.turn_id)
+                or self._history_index is None
+            ):
+                return await send(
+                    error="详细过程已更新，请重新加载该轮",
+                    reset_required=True,
+                )
+            snapshot_reader = getattr(
+                self._history_index, "get_turn_detail_by_snapshot", None)
+            snapshot = None
+            if callable(snapshot_reader):
+                try:
+                    snapshot = await asyncio.to_thread(
+                        snapshot_reader,
+                        sid,
+                        "codex",
+                        snapshot_cursor.source_token,
+                        snapshot_cursor.indexed_turn_hash,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "turn detail snapshot read failed",
+                        session_id=sid,
+                        turn_id=cmd.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    return await send(
+                        error="详细过程暂时不可用，请稍后重试")
+            if (
+                not isinstance(snapshot, MaterializedTurnDetail)
+                or snapshot.source_token != snapshot_cursor.source_token
+            ):
+                return await send(
+                    error="详细过程已更新，请重新加载该轮",
+                    reset_required=True,
+                )
+            snapshot_rows: list[dict] = list(snapshot.events)
+            if snapshot.turn_id != cmd.turn_id:
+                try:
+                    snapshot_rows = _rebind_turn_detail_visible_id(
+                        snapshot_rows,
+                        indexed_turn_id=snapshot.turn_id,
+                        visible_turn_id=cmd.turn_id,
+                    )
+                except ValueError:
+                    return await send(
+                        error="详细过程已更新，请重新加载该轮",
+                        reset_required=True,
+                    )
+            try:
+                page, has_more, oldest, has_newer, newer = _turn_detail_page(
+                    snapshot_rows,
+                    before=snapshot_cursor.before,
+                    limit=getattr(cmd, "limit", 192),
+                    max_bytes=min(
+                        8 * 1024 * 1024,
+                        max(512 * 1024, self.cfg.ws_max_size_bytes // 2),
+                    ),
+                )
+                oldest = _encode_turn_detail_snapshot_cursor(
+                    source_token=snapshot.source_token,
+                    visible_turn_id=cmd.turn_id,
+                    indexed_turn_id=snapshot.turn_id,
+                    before=oldest,
+                )
+                newer = _encode_turn_detail_snapshot_cursor(
+                    source_token=snapshot.source_token,
+                    visible_turn_id=cmd.turn_id,
+                    indexed_turn_id=snapshot.turn_id,
+                    before=newer,
+                )
+            except ValueError:
+                return await send(
+                    error="详细过程已更新，请重新加载该轮",
+                    reset_required=True,
+                )
+            return await send(
+                page,
+                has_more=has_more,
+                oldest_cursor=oldest,
+                has_newer=has_newer,
+                newer_cursor=newer,
+            )
         rows = None
         indexed_turn_id = cmd.turn_id
         fallback_official_rows = None
+        detail_snapshot: MaterializedTurnDetail | None = None
         if is_codex:
             fallback = None
             fallback_required = False
@@ -13687,10 +13851,13 @@ class WrapperMachine:
                     if fallback_required or official_rows is None:
                         return await send(
                             error="详细过程暂时不可用，请稍后重试")
-                    # A valid official full row still carries the final answer
-                    # and lifecycle. Degrade visibly instead of turning a
-                    # temporary local-index miss into an empty detail panel.
-                    rows = official_rows
+                    # The source-bound index may still contain this exact
+                    # browser-visible turn even when the official reader lost
+                    # its in-memory rollout segment locator. Probe it below
+                    # before degrading to the incomplete official projection.
+                    fallback_official_rows = official_rows
+                    indexed_turn_id = cmd.turn_id
+                    rows = None
 
         if rows is None and self._history_index is None:
             if fallback_official_rows is None:
@@ -13748,13 +13915,32 @@ class WrapperMachine:
                 else:
                     source = await asyncio.to_thread(
                         HistorySourceFingerprint.capture, source_path)
-                    rows = await asyncio.to_thread(
-                        self._history_index.get_turn_detail,
-                        sid,
-                        "codex" if is_codex else "claude",
-                        source,
-                        indexed_turn_id,
+                    snapshot_reader = getattr(
+                        self._history_index,
+                        "get_turn_detail_snapshot",
+                        None,
                     )
+                    if callable(snapshot_reader):
+                        detail_snapshot = await asyncio.to_thread(
+                            snapshot_reader,
+                            sid,
+                            "codex" if is_codex else "claude",
+                            source,
+                            indexed_turn_id,
+                        )
+                        rows = (
+                            list(detail_snapshot.events)
+                            if isinstance(detail_snapshot, MaterializedTurnDetail)
+                            else None
+                        )
+                    else:
+                        rows = await asyncio.to_thread(
+                            self._history_index.get_turn_detail,
+                            sid,
+                            "codex" if is_codex else "claude",
+                            source,
+                            indexed_turn_id,
+                        )
         except OSError:
             rows = None
         except Exception as exc:
@@ -13779,6 +13965,7 @@ class WrapperMachine:
             )
             rows = list(fallback_official_rows)
             indexed_turn_id = cmd.turn_id
+            detail_snapshot = None
         if rows is None:
             return await send(error="详细过程已过期，请刷新会话后重试")
         if is_codex and indexed_turn_id != cmd.turn_id:
@@ -13800,13 +13987,15 @@ class WrapperMachine:
                     return await send(
                         error="详细过程暂时不可用，请稍后重试")
                 rows = list(fallback_official_rows)
-        if is_codex:
+                indexed_turn_id = cmd.turn_id
+                detail_snapshot = None
+        if is_codex and detail_snapshot is None:
             rows = await self._supplement_codex_history_image_views(
                 sid, cmd.turn_id, rows)
         try:
             page, has_more, oldest, has_newer, newer = _turn_detail_page(
                 rows,
-                before=getattr(cmd, "before", None),
+                before=raw_before,
                 limit=getattr(cmd, "limit", 192),
                 max_bytes=min(
                     8 * 1024 * 1024,
@@ -13814,7 +14003,56 @@ class WrapperMachine:
                 ),
             )
         except ValueError:
-            return await send(error="详细过程分页位置已失效，请重新展开该轮")
+            # A legacy numeric cursor can predate a newer source-bound index
+            # row. If the official projection still understands that exact
+            # boundary, honor it; never disguise a newest page as the older
+            # response the browser correlated.
+            if detail_snapshot is not None and fallback_official_rows is not None:
+                try:
+                    official_rows = await self._supplement_codex_history_image_views(
+                        sid, cmd.turn_id, list(fallback_official_rows))
+                    page, has_more, oldest, has_newer, newer = (
+                        _turn_detail_page(
+                            official_rows,
+                            before=raw_before,
+                            limit=getattr(cmd, "limit", 192),
+                            max_bytes=min(
+                                8 * 1024 * 1024,
+                                max(
+                                    512 * 1024,
+                                    self.cfg.ws_max_size_bytes // 2,
+                                ),
+                            ),
+                        )
+                    )
+                    detail_snapshot = None
+                except ValueError:
+                    return await send(
+                        error="详细过程已更新，请重新加载该轮",
+                        reset_required=True,
+                    )
+            else:
+                return await send(
+                    error="详细过程已更新，请重新加载该轮",
+                    reset_required=True,
+                )
+        if (
+            is_codex
+            and detail_snapshot is not None
+            and detail_snapshot.source_token is not None
+        ):
+            oldest = _encode_turn_detail_snapshot_cursor(
+                source_token=detail_snapshot.source_token,
+                visible_turn_id=cmd.turn_id,
+                indexed_turn_id=detail_snapshot.turn_id,
+                before=oldest,
+            )
+            newer = _encode_turn_detail_snapshot_cursor(
+                source_token=detail_snapshot.source_token,
+                visible_turn_id=cmd.turn_id,
+                indexed_turn_id=detail_snapshot.turn_id,
+                before=newer,
+            )
         return await send(
             page,
             has_more=has_more,
@@ -28316,8 +28554,7 @@ class WrapperMachine:
                         )
                     ctx.cwd = effective_cwd
                     target_cwd = effective_cwd
-                if (resume_id and effort
-                        and not getattr(ctx.sdk, "effort", None)):
+                if resume_id and effort:
                     # Some app-server versions return reasoningEffort=null on
                     # thread/resume even though the rollout's last turn_context
                     # records the session's explicit selection.  Null means the
@@ -28326,20 +28563,13 @@ class WrapperMachine:
                     # refresh.  Restore only this session's already-clamped
                     # bounded rollout value, after connect has installed the
                     # authoritative model/cwd generation.
-                    ctx.sdk.effort = effort
-                    ctx.sdk.applied_effort = effort
-                    setattr(ctx.sdk, "display_effort", effort)
-                    setattr(ctx.sdk, "display_effort_model", ctx.sdk.model)
-                    setattr(
-                        ctx.sdk, "display_effort_cwd",
-                        os.path.realpath(
-                            getattr(ctx.sdk, "_cwd", None) or ctx.cwd),
+                    _restore_nullable_explicit_effort(
+                        ctx.sdk,
+                        effort,
+                        thread_id=resume_id,
+                        model=getattr(ctx.sdk, "model", None),
+                        cwd=getattr(ctx.sdk, "_cwd", None) or ctx.cwd,
                     )
-                    setattr(
-                        ctx.sdk, "display_effort_generation",
-                        getattr(ctx.sdk, "_generation", None),
-                    )
-                    setattr(ctx.sdk, "_display_effort_retry_at", None)
             else:
                 await ctx.sdk.connect(
                     resume_id=resume_id, cwd=target_cwd)
@@ -30373,6 +30603,24 @@ class WrapperMachine:
                     raise RuntimeError("cc stream ended without a ResultMessage")
 
                 if is_codex:
+                    if isinstance(msg, CodexDaemonProxyClosed):
+                        # The intentional account-switch hook is authoritative
+                        # even if its marker lands immediately after the proxy
+                        # EOF. Keep that existing continuation path; an
+                        # unmarked close is handled as a safe stop below.
+                        switch_state = (
+                            self._read_codex_restart_state_for_ctx(ctx)
+                            if is_codex_shared else None
+                        )
+                        if (
+                            switch_state is not None
+                            and ctx.codex_daemon_epoch
+                            and switch_state.epoch
+                                != ctx.codex_daemon_epoch
+                        ):
+                            msg = ("codex_account_switch", switch_state)
+                        else:
+                            raise msg
                     if (
                         isinstance(msg, tuple)
                         and len(msg) == 2
@@ -30535,6 +30783,77 @@ class WrapperMachine:
                     ),
                     msg_id=ctx.active_msg_id,
                 ))
+            await self._set_idle_after_managed_turn(ctx)
+        except CodexDaemonProxyClosed as exc:
+            # A shared daemon may be atomically replaced by Codex's official
+            # updater while a native turn is running. Never replay that prompt:
+            # already-run tools may be non-idempotent. Reconnect exactly once,
+            # only to restore the control plane for the next user action.
+            previous_version = exc.app_server_version
+            reconnected = False
+            try:
+                reconnected = await asyncio.wait_for(
+                    self._ensure_codex_daemon_generation(
+                        ctx,
+                        reason="recover after unexpected shared proxy close",
+                    ),
+                    timeout=CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Codex shared proxy recovery timed out",
+                    session_id=ctx.session_id,
+                )
+            except Exception as recovery_exc:
+                log.warning(
+                    "Codex shared proxy recovery failed",
+                    session_id=ctx.session_id,
+                    error_type=type(recovery_exc).__name__,
+                )
+
+            current_version = (
+                getattr(ctx.sdk, "app_server_version", None)
+                if reconnected else None
+            )
+            upgraded = bool(
+                exc.close_kind == "eof"
+                and previous_version
+                and isinstance(current_version, str)
+                and current_version
+                and current_version != previous_version
+            )
+            log.warning(
+                "Codex managed turn stopped after shared proxy close",
+                session_id=ctx.session_id,
+                close_kind=exc.close_kind,
+                reconnected=reconnected,
+                daemon_upgraded=upgraded,
+                previous_app_server_version=previous_version,
+                current_app_server_version=current_version,
+            )
+            if not reconnected:
+                route_sid = self._ctx_wire_sid(ctx) or ""
+                watch = self._watch.get(route_sid)
+                await self._set_session_control(
+                    ctx,
+                    control_mode="codex_shared",
+                    write_state="writable",
+                    terminal_attached=bool((watch or {}).get("holders")),
+                    reason="Codex 共享通道连接断开；下次操作会自动重试",
+                    can_takeover=False,
+                )
+            message = (
+                "Codex 已自动更新，当前回合在更新时中断；为避免重复执行工具，"
+                "本次任务未自动重试。请确认已有结果后重新发送。"
+                if upgraded else
+                "Codex 共享通道意外断开；为避免重复执行工具，本次任务未自动重试。"
+                "请确认已有结果后重新发送。"
+            )
+            await self._emit(ctx, Error(
+                code=ERR_CC_CRASH,
+                message=message,
+                msg_id=ctx.active_msg_id,
+            ))
             await self._set_idle_after_managed_turn(ctx)
         except asyncio.TimeoutError:
             log.error("drain timeout — interrupt did not yield a ResultMessage",

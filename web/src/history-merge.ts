@@ -1018,6 +1018,8 @@ function mergeTurn(
         && (hasLoadedDetailPayload || !hasDeferredTurnDetail(history))),
     detailLoading: live.detailLoading ?? history.detailLoading,
     detailError: live.detailError ?? history.detailError,
+    detailResetPending:
+      live.detailResetPending ?? history.detailResetPending,
     detailHasMore: detailProjection
       ? detailProjection.hasMore
       : live.detailHasMore ?? history.detailHasMore,
@@ -1104,6 +1106,7 @@ export function mergeAuthoritativeTurnDetail(
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: detail.detailProjection ?? summary.detailProjection,
     detailHasMore: detail.detailProjection
       ? detail.detailProjection.hasMore
@@ -1258,6 +1261,7 @@ export function installAuthoritativeTurnDetailPage(
     detailRetryBefore: incompleteUnknownProcess ? retryBefore : undefined,
     detailRetryDirection: incompleteUnknownProcess
       ? retryDirection : undefined,
+    detailResetPending: false,
     detailProjection,
     detailHasMore: hasMore,
     detailOldestCursor: oldestCursor,

@@ -16,6 +16,7 @@ from cc_remote.protocol import (
     UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
+from cc_remote.wrapper.codex_handle import CodexDaemonProxyClosed
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -155,6 +156,50 @@ class _EvictedDuringEffortPublishSdk(_InterruptedSharedSdk):
         self.live = False
 
 
+class _UnexpectedProxyCloseSdk(_SharedSdk):
+    shared_daemon_affinity = True
+
+    def __init__(
+        self,
+        *,
+        replacement_version: str,
+        close_kind: str = "eof",
+    ) -> None:
+        super().__init__()
+        self.live = True
+        self.app_server_version = "0.149.0"
+        self.replacement_version = replacement_version
+        self.close_kind = close_kind
+        self._generation = 3
+        self._thread_settings_revision = 1
+        self._cwd = "/tmp/cc-remote-test-cwd"
+        self.thread_id = "sid"
+
+    @property
+    def using_daemon_proxy(self) -> bool:
+        return self.live
+
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> str:
+        self.queries.append((prompt, images))
+        return "turn-before-proxy-close"
+
+    async def receive_response(self):
+        self.live = False
+        yield CodexDaemonProxyClosed(
+            self.app_server_version,
+            self._generation,
+            close_kind=self.close_kind,
+        )
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        self._generation += 1
+        self.app_server_version = self.replacement_version
+        self.live = True
+
+
 class _AccountSwitchSharedSdk(_SharedSdk):
     shared_daemon_affinity = True
 
@@ -227,6 +272,28 @@ class _AccountSwitchSharedSdk(_SharedSdk):
 
     async def get_goal(self):
         return None
+
+
+class _MarkerThenProxyCloseSdk(_AccountSwitchSharedSdk):
+    async def receive_response(self):
+        if self.readers == 0:
+            self.readers += 1
+            assert self.restart_path is not None
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="restarting",
+            )
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="ready",
+            )
+            yield CodexDaemonProxyClosed(
+                "0.149.0", 1, close_kind="eof")
+            return
+        async for message in super().receive_response():
+            yield message
 
 
 class _GoalAccountSwitchSharedSdk(_AccountSwitchSharedSdk):
@@ -1909,6 +1976,78 @@ def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
     asyncio.run(go())
 
 
+def test_unmarked_proxy_eof_after_daemon_upgrade_safe_stops_without_replay():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _UnexpectedProxyCloseSdk(
+            replacement_version="0.150.1")
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-upgrade-turn"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "unmarked"
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do one non-idempotent task"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.queries == [("do one non-idempotent task", [])]
+        assert ctx.state == "idle"
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].msg_id == "browser-upgrade-turn"
+        assert errors[0].message == (
+            "Codex 已自动更新，当前回合在更新时中断；为避免重复执行工具，"
+            "本次任务未自动重试。请确认已有结果后重新发送。"
+        )
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert ctx.sdk.effort == "high"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(go())
+
+
+def test_unmarked_proxy_close_without_version_change_reports_connection_loss():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _UnexpectedProxyCloseSdk(
+            replacement_version="0.149.0")
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-connection-turn"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "unmarked"
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do not replay me"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.queries == [("do not replay me", [])]
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "Codex 共享通道意外断开；为避免重复执行工具，本次任务未自动重试。"
+            "请确认已有结果后重新发送。"
+        )
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+
+    asyncio.run(go())
+
+
 def test_generation_reconnect_does_not_revive_evicted_context(monkeypatch):
     async def go() -> None:
         machine, _transport = _mk_machine()
@@ -2394,6 +2533,38 @@ def test_account_switch_continues_running_turn_before_queue_can_drain():
         )
 
     asyncio.run(asyncio.wait_for(go(), timeout=15.0))
+
+
+def test_account_switch_marker_wins_same_tick_proxy_close():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _MarkerThenProxyCloseSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "logical-turn-a"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        await machine._stamp_codex_daemon_epoch(ctx)
+
+        turn = asyncio.create_task(machine._run_turn(ctx, "task A"))
+        await asyncio.wait_for(ctx.sdk.continuation_started.wait(), timeout=2.0)
+
+        assert ctx.sdk.reconnects == 1
+        assert len(ctx.sdk.queries) == 2
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "success"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=5.0))
 
 
 def test_account_switch_resumes_usage_limited_goal_without_competing_query():

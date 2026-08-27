@@ -267,6 +267,7 @@ function projectTurnForCache(turn: Turn): Turn {
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: undefined,
     detailHasMore: false,
     detailOldestCursor: null,

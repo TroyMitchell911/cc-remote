@@ -169,6 +169,35 @@ class CodexProxyProtocolError(RuntimeError):
     """The local proxy stream violated its RFC 6455 boundary."""
 
 
+class CodexDaemonProxyClosed(RuntimeError):
+    """A shared app-server proxy closed without a native turn terminal.
+
+    This is an internal lifecycle signal, not an authoritative Codex terminal.
+    Machine uses the previous initialized app-server version only after one
+    bounded reconnect to distinguish an official daemon upgrade from an
+    ordinary transport interruption. Raw proxy/daemon diagnostics are never
+    carried to the browser.
+    """
+
+    __slots__ = ("app_server_version", "generation", "close_kind")
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+        *,
+        close_kind: str,
+    ) -> None:
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        self.close_kind = close_kind
+        super().__init__("Codex shared app-server proxy closed")
+
+
 class CodexAppServerError(RuntimeError):
     """Typed JSON-RPC error returned by the official Codex app-server."""
 
@@ -242,6 +271,53 @@ class CodexNoActiveTurnError(RuntimeError):
 
 class CodexSteerOutcomeUnknown(RuntimeError):
     """turn/steer was written but no authoritative response was observed."""
+
+
+def _restore_nullable_explicit_effort(
+    handle: Any,
+    effort: object,
+    *,
+    thread_id: object,
+    model: object,
+    cwd: object,
+) -> bool:
+    """Restore one previously confirmed explicit effort after nullable resume.
+
+    The new app-server's concrete value always wins. A nullable response may
+    reuse the old explicit value only when the native thread, model and cwd all
+    still match. Display projections and catalog/config defaults are never
+    accepted as restoration sources.
+    """
+    if (
+        not isinstance(effort, str)
+        or not effort.strip()
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(model, str)
+        or not model
+        or not isinstance(cwd, str)
+        or not cwd
+        or getattr(handle, "effort", None) is not None
+        or getattr(handle, "thread_id", None) != thread_id
+        or getattr(handle, "model", None) != model
+    ):
+        return False
+    current_cwd = getattr(handle, "_cwd", None) or getattr(handle, "cwd", None)
+    if not isinstance(current_cwd, str) or not current_cwd:
+        return False
+    expected_cwd = os.path.realpath(cwd)
+    if os.path.realpath(current_cwd) != expected_cwd:
+        return False
+
+    restored = effort.strip()[:64]
+    handle.effort = restored
+    handle.applied_effort = restored
+    handle.display_effort = restored
+    handle.display_effort_model = model
+    handle.display_effort_cwd = expected_cwd
+    handle.display_effort_generation = getattr(handle, "_generation", None)
+    handle._display_effort_retry_at = None
+    return True
 
 
 def _websocket_client_frame(
@@ -2706,6 +2782,10 @@ class CodexHandle:
                 if msg is None:      # sentinel pushed by the reader on turn/completed
                     break
                 yield msg
+                if isinstance(msg, CodexDaemonProxyClosed):
+                    # This is an incomplete transport boundary, never a native
+                    # turn terminal. Machine classifies it after reconnect.
+                    break
                 # The fail-fast managed bridge preserves terminal frames without
                 # spending a third queue slot on a sentinel. Legacy asyncio.Queue
                 # tests may still append one; it is harmlessly abandoned below.
@@ -3872,11 +3952,26 @@ class CodexHandle:
                               reason: str = "reconnect") -> None:
         log.warning("codex force-reconnect", reason=reason)
         target = resume_id or self.thread_id
+        previous_thread_id = self.thread_id
+        previous_model = self.model
+        previous_cwd = self._cwd
+        previous_effort = (
+            self.effort
+            if target is not None and target == previous_thread_id
+            else None
+        )
         await self.disconnect()
         await self.connect(
             resume_id=target,
             cwd=cwd or self._cwd,
             preserve_controls=True,
+        )
+        _restore_nullable_explicit_effort(
+            self,
+            previous_effort,
+            thread_id=previous_thread_id,
+            model=previous_model,
+            cwd=previous_cwd,
         )
 
     # --- live controls (persisted for this thread by app-server 0.144.1) ---
@@ -5592,11 +5687,17 @@ class CodexHandle:
                          generation: int) -> None:
         assert proc.stdout
         daemon_proxy = self._using_daemon_proxy
+        proxy_close: Optional[CodexDaemonProxyClosed] = None
         try:
             while True:
                 if daemon_proxy:
                     line = await self._proxy_read_message(proc)
                     if line is None:
+                        proxy_close = CodexDaemonProxyClosed(
+                            self.app_server_version,
+                            generation,
+                            close_kind="eof",
+                        )
                         break
                 else:
                     line = await proc.stdout.readline()
@@ -5632,6 +5733,16 @@ class CodexHandle:
         except Exception as e:
             log.warning("codex read loop ended", error=str(e))
             if daemon_proxy and generation == self._generation:
+                proxy_close = CodexDaemonProxyClosed(
+                    self.app_server_version,
+                    generation,
+                    close_kind=(
+                        "eof" if isinstance(e, EOFError) else "protocol"
+                    ),
+                )
+                if self._turn_q is not None:
+                    self._force_turn_sentinel(
+                        self._turn_q, proxy_close)
                 self.daemon_manager.invalidate()
                 await self.disconnect()
         finally:
@@ -5660,7 +5771,10 @@ class CodexHandle:
                     task.cancel()
                 # unblock any waiting turn/request
                 if self._turn_q is not None:
-                    self._force_turn_sentinel(self._turn_q)
+                    self._force_turn_sentinel(
+                        self._turn_q,
+                        proxy_close if daemon_proxy else None,
+                    )
                 self._managed_overflow = False
                 for fut in self._pending.values():
                     if not fut.done():
@@ -6425,7 +6539,7 @@ class CodexHandle:
                 self._active_stream_turn_ids.clear()
 
     @staticmethod
-    def _force_turn_sentinel(queue: Any) -> None:
+    def _force_turn_sentinel(queue: Any, item: object = None) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
         if isinstance(queue, _SpontaneousNotificationQueue):
             # The reserved end slot never competes with live frames. An existing
@@ -6433,22 +6547,22 @@ class CodexHandle:
             # the consumer after its retained live tail drains.
             if queue.has_turn_completed():
                 return
-            queue.put_end_nowait(None)
+            queue.put_end_nowait(item)
             return
         try:
-            offered = queue.put_nowait(None)
+            offered = queue.put_nowait(item)
             if offered is False:
                 clear = getattr(queue, "clear", None)
                 if clear is not None:
                     clear()
-                    queue.put_nowait(None)
+                    queue.put_nowait(item)
         except asyncio.QueueFull:
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
             try:
-                queue.put_nowait(None)
+                queue.put_nowait(item)
             except asyncio.QueueFull:
                 pass
 
