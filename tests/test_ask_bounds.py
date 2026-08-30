@@ -131,6 +131,7 @@ def test_machine_ask_identity_does_not_consume_a_wire_sequence():
 
         ask = transport.sent[-1]
         assert ask.type == "ask_user"
+        assert ask.allow_text is False
         assert ask.seq == 2
         assert ask.ask_id.startswith("ask-") and len(ask.ask_id) == 36
 
@@ -150,6 +151,40 @@ def test_machine_ask_identity_does_not_consume_a_wire_sequence():
         assert [frame.type for frame in replay[1:-1]] == [
             "ask_user", "ask_user_closed",
         ]
+
+    asyncio.run(run())
+
+
+def test_mcp_ask_accepts_custom_text_without_relaxing_other_asks():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid-1", "sid-1")
+        machine.sessions[ctx.key] = ctx
+
+        task = asyncio.create_task(machine._on_mcp_ask(
+            ctx,
+            "Choose",
+            [{"label": "A"}, {"label": "B"}],
+        ))
+        while not ctx.pending_asks:
+            await asyncio.sleep(0)
+
+        ask = next(
+            message for message in transport.sent
+            if message.type == "ask_user"
+        )
+        assert ask.allow_text is True
+        assert ctx.pending_ask_specs[ask.ask_id]["allow_text"] is True
+
+        result = await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=ask.ask_id,
+            answer="Custom direction",
+        ))
+        assert result is None
+        assert await task == "Custom direction"
+        assert transport.sent[-1].type == "ask_user_closed"
+        assert transport.sent[-1].reason == "answered"
 
     asyncio.run(run())
 

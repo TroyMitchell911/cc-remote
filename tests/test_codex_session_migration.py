@@ -25,6 +25,18 @@ from tests.test_codex_external import _RunTurnSdk
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
+@pytest.fixture(autouse=True)
+def _active_archive_state(monkeypatch):
+    async def active_session(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(
+        machine_module.WrapperMachine,
+        "_native_session_archived_state",
+        active_session,
+    )
+
+
 class _FakeCodexHandle:
     def __init__(self, *, fail_cwd: str | None = None):
         self.fail_cwd = fail_cwd
@@ -79,7 +91,7 @@ def _stub_migration_dependencies(monkeypatch, machine):
 
 
 def test_session_migration_protocol_roundtrips_as_control_frames():
-    assert PROTOCOL_VERSION == 40
+    assert PROTOCOL_VERSION == 41
     command = deserialize(serialize(_command("/tmp/new-cwd")))
     assert command.type == "migrate_session"
     assert command.session_id == "thread-1"
@@ -103,6 +115,35 @@ def test_session_migration_protocol_roundtrips_as_control_frames():
     assert invalidated.type == "artifact_invalidated"
     assert invalidated.reason == "session_migration"
     assert is_downstream(invalidated) is True
+
+
+def test_archived_session_rejects_migration_before_native_reload(
+    monkeypatch,
+    tmp_path,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        old_cwd = tmp_path / "old"
+        new_cwd = tmp_path / "new"
+        old_cwd.mkdir()
+        new_cwd.mkdir()
+        handle = _FakeCodexHandle()
+        _install_idle_codex(machine, old_cwd, handle)
+
+        async def archived(*_args, **_kwargs):
+            return True
+
+        monkeypatch.setattr(
+            machine, "_native_session_archived_state", archived)
+
+        result = await machine._handle_migrate_session(
+            _command(str(new_cwd)))
+
+        assert result.type == "error" and result.code == ERR_AUTH
+        assert "已归档" in result.message
+        assert handle.calls == []
+
+    asyncio.run(run())
 
 
 def test_directory_listing_echoes_its_command_id(tmp_path):

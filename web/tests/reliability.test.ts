@@ -1115,10 +1115,43 @@ assert.equal(HISTORY_INITIAL_PAGE, 4,
 assert.equal(HISTORY_MORE_PAGE, 12,
   "older history must be delivered in bounded follow-up pages");
 const historyBeforeResume = historyAppSource.match(
-  /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);\s*(?:ws\.|wsRef\.current(?:\?\.|\.))sendSwitchSession/g,
+  /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);[\s\S]{0,160}?(?:resumeListedSession|sendSwitchSession)/g,
 ) ?? [];
-assert.equal(historyBeforeResume.length, 3,
-  "every existing-session activation must request first paint before engine resume");
+assert.equal(historyBeforeResume.length, 4,
+  "every existing-session activation, including unarchive, must paint before resume");
+assert.match(historyAppSource,
+  /const resumeListedSession[\s\S]{0,420}session\.tag === "archived"[\s\S]{0,220}return;[\s\S]{0,180}sendSwitchSession/,
+  "opening archived history must not resume its native writer");
+assert.match(historyAppSource,
+  /const archivedBrowse = archivedBrowseRef\.current;[\s\S]{0,700}sendSwitchSession/,
+  "an authoritative unarchive must resume a focused read-only session");
+assert.match(historyAppSource,
+  /const archivedBrowse = focusedSession\?\.tag === "archived";/,
+  "the focused archived row must define one shared read-only boundary");
+assert.match(historyAppSource,
+  /focusedGoalScopeKey[\s\S]{0,120}\|\| archivedBrowse[\s\S]{0,500}sendGetGoalTo/,
+  "archived history must not auto-load live Goal state");
+assert.match(historyAppSource,
+  /const refreshStatus = useCallback[\s\S]{0,300}\?\.tag === "archived"[\s\S]{0,220}sendGetStatus/,
+  "archived history must not request live Codex status");
+assert.match(historyAppSource,
+  /!archivedBrowse && \(\s*<TerminalControl/,
+  "archived history must not expose terminal takeover controls");
+assert.match(historyAppSource,
+  /<GoalPanel[\s\S]{0,180}revealed=\{!archivedBrowse[\s\S]{0,100}open=\{!archivedBrowse/,
+  "archived history must hide Goal mutations while retaining history plans");
+assert.match(historyAppSource,
+  /const requestContext = \(\) => \{[\s\S]{0,120}archivedBrowseRef\.current === focusedSid/,
+  "archived history must not request live context state");
+assert.match(historyAppSource,
+  /const forkFromTurn = \(forkPointId: string\) => \{[\s\S]{0,180}archivedBrowseRef\.current === focusedSid/,
+  "a stale message action must not fork an archived session");
+assert.match(historyAppSource,
+  /onFork=\{!historyView\.recovering && !archivedBrowse[\s\S]{0,80}space === "code"/,
+  "archived history must not render message-level fork actions");
+assert.match(historyAppSource,
+  /current\.sessions\.find\([\s\S]{0,160}\?\.tag === "archived"\) return;[\s\S]{0,120}sendGetGoalTo/,
+  "a delayed Goal retry must stop after the session becomes archived");
 assert.match(historyAppSource,
   /if \(msg\.type === "session_list" && !ownership\) return;[\s\S]*historySessionListsRef/,
   "only an ownership-accepted SessionList may seed a Claude history cwd hint");
@@ -17704,8 +17737,8 @@ const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>[\s\S]{0,120}<GoalPanel/,
   "Goal lazy loading must keep a stable chip placeholder");
 assert.match(appSource,
-  /fallback=\{\(\(goalUi\?\.revealed && !completedGoalRetired\)[\s\S]{0,120}\|\| goalUi\?\.open \|\| planProgress\)[\s\S]{0,180}goal-suspense/,
-  "a remembered non-retired Goal or current Plan stays visible while its component chunk loads");
+  /fallback=\{\(\(!archivedBrowse[\s\S]{0,180}goalUi\?\.open\)\) \|\| planProgress\)[\s\S]{0,180}goal-suspense/,
+  "a live Goal or current Plan stays visible while its component chunk loads");
 assert.match(appSource, /externalPlanProgress=\{planProgress/,
   "the session strip must explicitly take ownership from the message row");
 assert.match(appSource,
@@ -17822,7 +17855,7 @@ assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
 assert.match(appSource, /sessionControlLocksInput\(rt\.control\)/,
   "Shift+Tab must not mutate controls while the authoritative session is read-only");
 assert.match(appSource,
-  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,300}sendGetContext\(\)[\s\S]{0,200}begin_context_request/,
+  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,520}sendContextRequestTo\(focusedSid, deferred\)/,
   "a focused session must prime its context ring after initial sync and reconnect");
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
@@ -17849,6 +17882,9 @@ const sidebarSource = readFileSync(
   resolve(process.cwd(), "src/components/SessionsSidebar.tsx"), "utf8");
 assert.doesNotMatch(sidebarSource, /onGrant|目录授权/);
 assert.match(sidebarSource,
+  /disabled=\{archiveBlocked\}[\s\S]{0,160}请停止当前任务并清空排队后再归档/,
+  "running Codex sessions must not expose an actionable archive command");
+assert.match(sidebarSource,
   /codexProfileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
   "Code, Work and different devices must not share one account filter");
 const newChatSource = readFileSync(
@@ -17865,6 +17901,17 @@ assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.match(composerSource,
+  /locked = offline \|\| !!controlUi\?\.locked \|\| p\.archived === true/,
+  "archived history must keep the composer read-only");
+assert.match(composerSource,
+  /loading=\{p\.engine === "codex" && p\.statusLoading\}[\s\S]{0,80}disabled=\{locked\}[\s\S]{0,100}if \(locked\) return/,
+  "a locked composer must not reopen live account controls");
+assert.match(composerSource,
+  /aria-label="上下文占用"[\s\S]{0,100}disabled=\{locked\}[\s\S]{0,100}if \(locked\) return/,
+  "a locked composer must not reopen or request live context");
+const contextPopoverSource = readFileSync(
+  resolve(process.cwd(), "src/components/ContextPopover.tsx"), "utf8");
 for (const [surface, source] of [
   ["session composer", composerSource],
   ["new chat", newChatSource],
@@ -17887,14 +17934,15 @@ assert.match(composerSource, /Artifacts · \{p\.workArtifactCount\}/);
 assert.doesNotMatch(composerSource, /交付物/);
 assert.doesNotMatch(composerSource, /项目与资料/);
 assert.match(composerSource, /工作设置/);
-assert.match(composerSource, /会话新增上下文/);
+assert.match(contextPopoverSource, /会话新增上下文/);
 assert.match(composerSource, /workContext\.sessionPercentage\.toFixed\(0\)/);
-assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
-  "Code must retain the engine-total context reading");
+assert.match(contextPopoverSource,
+  /usage\(p\.report\.total_tokens, p\.report\.percentage\)/,
+  "Code must render the last native engine-total context reading");
 assert.match(composerSource, /contextAvailable = p\.contextReport\?\.available !== false/,
   "an absent tokenUsage report must not be rendered as a real zero");
-assert.match(composerSource, /暂未收到可靠的上下文用量/,
-  "the engine-neutral context popover must explain the temporary unknown state");
+assert.match(contextPopoverSource, /正在读取真实上下文/,
+  "the context popover must explain that its native reading is still loading");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
 assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "选择模型"/,

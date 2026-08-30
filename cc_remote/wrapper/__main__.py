@@ -31,6 +31,11 @@ async def main() -> None:
     )
     machine = WrapperMachine(cfg, transport)
     try:
+        # The official Codex TUI can share a thread only when its durable
+        # app-server daemon already owns the control plane.  Prepare it before
+        # Relay startup so a terminal opened after this service cannot win a
+        # private-writer race and force Web into a read-only mirror.
+        await machine.prepare_codex_daemons()
         await machine.run()
     except KeyboardInterrupt:
         log.info("shutting down (keyboard interrupt)")

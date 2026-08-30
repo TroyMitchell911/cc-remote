@@ -4,6 +4,9 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v41。Claude 上下文的自动
+  读取不再发起可能阻塞的原生控制请求；用户显式执行 `/context` 时会优先读取精确
+  明细，若可选控制面超时则保留并明确标注最近一次缓存或最近一轮 token 总量。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v40。Codex 重型回合详情
   的每个分页 cursor 现在都绑定到不可变、源文件隔离的快照；即使数百 MiB 的
   rollout 仍在持续追加，下一页也不会失效或被静默替换成另一段内容。若这个有界

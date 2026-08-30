@@ -92,7 +92,11 @@ def _machine_with_sdk(sdk: object):
     async def ready(_ctx, **_kwargs):
         return None
 
+    async def no_external_owner(_sid):
+        return False
+
     machine._runtime_control_preflight = ready
+    machine._prime_claude_ownership = no_external_owner
     return machine, transport, ctx
 
 
@@ -220,7 +224,7 @@ def test_applied_autocompact_without_cache_reports_unavailable():
 
         async def get_context_usage(self):
             self.context_calls += 1
-            raise AssertionError("suppressed generation must not receive a probe")
+            raise AssertionError("cached-only publish must not receive a probe")
 
     async def run():
         sdk = ContextSdk()
@@ -409,17 +413,19 @@ def test_context_report_keeps_effective_threshold_separate_from_raw_window():
     async def run():
         machine, _transport, _ctx = _machine_with_sdk(ContextSdk())
 
-        report = await machine._handle_get_context(GetContext(sid=SESSION_ID))
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID, refresh=True))
 
         assert report.max_tokens == 200_000
         assert report.auto_compact_threshold_tokens == 200_000
         assert report.raw_max_tokens == 1_000_000
         assert report.is_auto_compact_enabled is True
+        assert report.source == "control"
 
     asyncio.run(run())
 
 
-def test_running_claude_context_report_uses_cache_without_control_rpc():
+def test_automatic_claude_context_report_uses_cache_without_control_rpc():
     class ContextSdk(_AutoCompactSdk):
         control_plane_failed = False
         context_probe_suppressed = False
@@ -443,19 +449,19 @@ def test_running_claude_context_report_uses_cache_without_control_rpc():
 
     async def run():
         sdk = ContextSdk()
-        machine, _transport, ctx = _machine_with_sdk(sdk)
-        ctx.state = "running"
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
 
         report = await machine._handle_get_context(GetContext(sid=SESSION_ID))
 
         assert report.total_tokens == 321
         assert report.percentage == 32.1
+        assert report.source == "cached_control"
         assert sdk.context_calls == 0
 
     asyncio.run(run())
 
 
-def test_quarantined_claude_context_without_cache_reports_unavailable():
+def test_automatic_claude_context_without_cache_reports_unavailable():
     class ContextSdk(_AutoCompactSdk):
         control_plane_failed = False
         context_probe_suppressed = True
@@ -464,7 +470,7 @@ def test_quarantined_claude_context_without_cache_reports_unavailable():
             return None
 
         async def get_context_usage(self):
-            raise AssertionError("quarantined Claude must not receive context RPC")
+            raise AssertionError("automatic read must not receive context RPC")
 
     async def run():
         machine, _transport, _ctx = _machine_with_sdk(ContextSdk())
@@ -478,10 +484,113 @@ def test_quarantined_claude_context_without_cache_reports_unavailable():
     asyncio.run(run())
 
 
-def test_context_control_timeout_is_routed_without_replacing_last_report():
+def test_busy_or_queued_claude_context_refresh_is_deferred():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+
+        async def get_context_usage(self):
+            raise AssertionError("busy Claude must not receive context RPC")
+
+    async def run():
+        machine, transport, ctx = _machine_with_sdk(ContextSdk())
+        ctx.state = "running"
+
+        running = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-running",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(running, Error)
+        assert running.code == "busy"
+        assert running.request_id == "context-running"
+        assert running.to == "browser-one"
+
+        ctx.state = "idle"
+        ctx.queued_queries.append(object())
+        queued = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-queued",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(queued, Error)
+        assert queued.code == "busy"
+        assert queued.request_id == "context-queued"
+        assert queued.to == "browser-one"
+        assert transport.sent[-2:] == [running, queued]
+
+    asyncio.run(run())
+
+
+def test_context_control_timeout_preserves_cache_but_returns_error():
     class ContextSdk(_AutoCompactSdk):
         control_plane_failed = False
         context_probe_suppressed = False
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+
+        def cached_context_usage(self):
+            return {
+                "totalTokens": 80_000,
+                "maxTokens": 500_000,
+                "percentage": 16.0,
+                "model": "claude-old-model",
+                "isAutoCompactEnabled": True,
+                "autoCompactThreshold": 400_000,
+                "rawMaxTokens": 1_000_000,
+                "categories": [{"name": "old", "tokens": 80_000}],
+            }
+
+        def cached_recent_context_usage(self):
+            return {
+                "totalTokens": 88_259,
+            }
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            raise TimeoutError("control request timed out")
+
+    async def run():
+        sdk = ContextSdk()
+        machine, transport, _ctx = _machine_with_sdk(sdk)
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-command",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, Error)
+        assert report.code == "internal"
+        assert report.request_id == "context-command"
+        assert report.to == "browser-one"
+        assert transport.sent[-1] == report
+        assert not any(
+            isinstance(item, ContextReport) for item in transport.sent
+        )
+        assert sdk.context_calls == 1
+        assert sdk.cached_context_usage()["totalTokens"] == 80_000
+        assert sdk.cached_recent_context_usage()["totalTokens"] == 88_259
+
+    asyncio.run(run())
+
+
+def test_context_control_timeout_without_cache_reports_error():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+        context_probe_suppressed = False
+
+        def cached_context_usage(self):
+            return None
+
+        def cached_recent_context_usage(self):
+            return None
 
         async def get_context_usage(self):
             raise TimeoutError("control request timed out")
@@ -491,17 +600,352 @@ def test_context_control_timeout_is_routed_without_replacing_last_report():
 
         report = await machine._handle_get_context(GetContext(
             sid=SESSION_ID,
+            refresh=True,
             cmd_id="context-command",
             client_id="browser-one",
         ))
 
         assert isinstance(report, Error)
+        assert report.code == "internal"
         assert report.request_id == "context-command"
         assert report.to == "browser-one"
         assert transport.sent[-1] == report
         assert not any(
-            isinstance(item, ContextReport) for item in transport.sent
-        )
+            isinstance(item, ContextReport) for item in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_malformed_context_control_response_is_not_reported_as_success():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+        context_probe_suppressed = False
+
+        def cached_context_usage(self):
+            return {"model": "glm-5.2"}
+
+        def cached_recent_context_usage(self):
+            return {"totalTokens": 123, "model": "glm-5.2"}
+
+        async def get_context_usage(self):
+            return {"model": "glm-5.2"}
+
+    async def run():
+        machine, transport, _ctx = _machine_with_sdk(ContextSdk())
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-malformed",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, Error)
+        assert report.code == "internal"
+        assert report.request_id == "context-malformed"
+        assert report.to == "browser-one"
+        assert not any(
+            isinstance(item, ContextReport) for item in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_poisoned_context_generation_reconnects_once_then_can_refresh():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+        context_probe_suppressed = False
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+
+        def cached_context_usage(self):
+            return None
+
+        def cached_recent_context_usage(self):
+            return None
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            if self.context_calls == 1:
+                self.control_plane_failed = True
+                raise Exception(
+                    "Control request timeout: get_context_usage")
+            return {
+                "totalTokens": 250_000,
+                "maxTokens": 500_000,
+                "percentage": 50.0,
+                "model": self.model,
+                "categories": [],
+            }
+
+        async def force_reconnect(self, **kwargs) -> None:
+            await super().force_reconnect(**kwargs)
+            self.control_plane_failed = False
+
+    async def run():
+        sdk = ContextSdk()
+        machine, transport, ctx = _machine_with_sdk(sdk)
+
+        failed = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-timeout",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(failed, Error)
+        assert failed.request_id == "context-timeout"
+        assert "安全恢复" in failed.message
+        assert len(sdk.reconnects) == 1
+        assert sdk.reconnects[0][2] == {
+            "resume_id": SESSION_ID,
+            "cwd": ctx.cwd,
+            "reason": "context control timeout",
+            "fork": False,
+        }
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-retry",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, ContextReport)
+        assert report.source == "control"
+        assert report.total_tokens == 250_000
+        assert report.max_tokens == 500_000
+        assert report.request_id == "context-retry"
+        assert len(sdk.reconnects) == 1
+        assert transport.sent[-2:] == [failed, report]
+
+    asyncio.run(run())
+
+
+def test_context_timeout_does_not_reconnect_over_autonomous_followup():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        def cached_context_usage(self):
+            return None
+
+        def cached_recent_context_usage(self):
+            return None
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            if self.context_calls == 1:
+                self.started.set()
+                await self.release.wait()
+                self.control_plane_failed = True
+                raise Exception(
+                    "Control request timeout: get_context_usage")
+            return {
+                "totalTokens": 275_000,
+                "maxTokens": 500_000,
+                "percentage": 55.0,
+                "model": self.model,
+                "categories": [],
+            }
+
+        async def force_reconnect(self, **kwargs) -> None:
+            await super().force_reconnect(**kwargs)
+            self.control_plane_failed = False
+
+    async def run():
+        sdk = ContextSdk()
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        request = asyncio.create_task(machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-race",
+            client_id="browser-one",
+        )))
+
+        await sdk.started.wait()
+        # This is the post-Result autonomous continuation which used to be
+        # erased by force_reconnect(), leaving state=running with no owner.
+        ctx.claude_background_followups["task-one:1"] = "active"
+        ctx.state = "running"
+        sdk.release.set()
+
+        failed = await request
+
+        assert isinstance(failed, Error)
+        assert failed.code == "busy"
+        assert sdk.reconnects == []
+        assert ctx.state == "running"
+        assert ctx.claude_background_followups == {"task-one:1": "active"}
+
+        # The real autonomous Result owns the release to idle. A later exact
+        # refresh can then replace the still-poisoned generation once and read
+        # the successor without manufacturing a running state.
+        ctx.claude_background_followups.clear()
+        await machine._settle_claude_lifecycle_if_quiescent(ctx)
+        assert ctx.state == "idle"
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-after-followup",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, ContextReport)
+        assert report.source == "control"
+        assert report.total_tokens == 275_000
+        assert len(sdk.reconnects) == 1
+        assert sdk.reconnects[0][2]["reason"] == "context control retry"
+
+    asyncio.run(run())
+
+
+def test_context_refresh_never_reconnects_external_claude_cli_owner():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = True
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+
+        def cached_context_usage(self):
+            return None
+
+        def cached_recent_context_usage(self):
+            return None
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            raise AssertionError("external owner must block the native RPC")
+
+    async def run():
+        sdk = ContextSdk()
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
+
+        async def external_owner(_sid):
+            return True
+
+        machine._prime_claude_ownership = external_owner
+
+        failed = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-external",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(failed, Error)
+        assert failed.code == "internal"
+        assert failed.request_id == "context-external"
+        assert sdk.context_calls == 0
+        assert sdk.reconnects == []
+        assert sdk.control_plane_failed is True
+
+    asyncio.run(run())
+
+
+def test_context_refresh_reloads_terminal_growth_before_native_read():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+
+        def cached_context_usage(self):
+            return None
+
+        def cached_recent_context_usage(self):
+            return None
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            return {
+                "totalTokens": 300_000,
+                "maxTokens": 500_000,
+                "percentage": 60.0,
+                "model": self.model,
+                "categories": [],
+            }
+
+    async def run():
+        sdk = ContextSdk()
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        ctx.needs_reload = True
+
+        report = await machine._handle_get_context(GetContext(
+            sid=SESSION_ID,
+            refresh=True,
+            cmd_id="context-after-cli",
+            client_id="browser-one",
+        ))
+
+        assert isinstance(report, ContextReport)
+        assert report.total_tokens == 300_000
+        assert report.source == "control"
+        assert sdk.context_calls == 1
+        assert len(sdk.reconnects) == 1
+        assert sdk.reconnects[0][2] == {
+            "resume_id": SESSION_ID,
+            "cwd": ctx.cwd,
+            "reason": "external transcript change before context",
+            "preserve_model": False,
+            "fork": False,
+        }
+        assert ctx.needs_reload is False
+
+    asyncio.run(run())
+
+
+def test_work_baseline_context_timeout_recovers_generation_once():
+    class ContextSdk(_AutoCompactSdk):
+        control_plane_failed = False
+
+        def __init__(self):
+            super().__init__()
+            self.context_calls = 0
+            self.work_context_baseline_tokens = None
+
+        async def get_context_usage(self):
+            self.context_calls += 1
+            if self.context_calls == 1:
+                self.control_plane_failed = True
+                raise Exception(
+                    "Control request timeout: get_context_usage")
+            return {"totalTokens": 25_500}
+
+        async def force_reconnect(self, **kwargs) -> None:
+            await super().force_reconnect(**kwargs)
+            self.control_plane_failed = False
+
+    async def run():
+        sdk = ContextSdk()
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        ctx.space = "work"
+        ctx.work_id = "work-one"
+        ctx.work_context_baseline_pending = True
+
+        await machine._refresh_pending_claude_work_baseline(ctx)
+
+        assert len(sdk.reconnects) == 1
+        assert sdk.reconnects[0][2]["reason"] == (
+            "Work baseline context timeout")
+        assert sdk.control_plane_failed is False
+        assert ctx.work_context_baseline_tokens is None
+
+        await machine._refresh_pending_claude_work_baseline(ctx)
+
+        assert len(sdk.reconnects) == 1
+        assert sdk.context_calls == 2
+        assert sdk.work_context_baseline_tokens == 25_500
+        assert ctx.work_context_baseline_tokens == 25_500
 
     asyncio.run(run())
 

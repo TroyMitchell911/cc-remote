@@ -25,6 +25,21 @@ from cc_remote.wrapper.codex_handle import (
 from cc_remote.wrapper.process_scan import ProcessIdentity
 
 
+_REAL_ENSURE_MANAGED_DAEMON_NOFILE = (
+    daemon_module._ensure_managed_daemon_nofile
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_managed_daemon_nofile_verification(monkeypatch):
+    """Lifecycle unit tests do not own a real detached daemon PID."""
+    monkeypatch.setattr(
+        daemon_module,
+        "_ensure_managed_daemon_nofile",
+        lambda *_args, **_kwargs: True,
+    )
+
+
 class _Cfg:
     cc_cwd = "/tmp"
     tool_result_max = 8000
@@ -89,6 +104,156 @@ class _Process:
 def _result(returncode: int, payload: dict | None = None):
     data = b"" if payload is None else daemon_module.json.dumps(payload).encode()
     return daemon_module._CommandResult(returncode, data, b"")
+
+
+def _private_stdio_argv(argv: list[str]) -> list[str]:
+    if os.name != "posix":
+        return argv
+    assert argv[:3] == [
+        handle_module.sys.executable,
+        handle_module._RLIMIT_EXEC,
+        str(handle_module._APP_SERVER_NOFILE_SOFT_LIMIT),
+    ]
+    return argv[3:]
+
+
+def test_daemon_lifecycle_child_raises_nofile_without_wrapping_reads(
+        monkeypatch):
+    captured: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        captured.append(tuple(argv))
+        return daemon_module.subprocess.CompletedProcess(
+            argv, 0, stdout=b"{}", stderr=b"")
+
+    monkeypatch.setattr(daemon_module.subprocess, "run", run)
+    env = {"PATH": "/usr/bin"}
+    daemon_module._run_command(
+        ("/usr/bin/codex", "app-server", "daemon", "start"),
+        env,
+        1.0,
+    )
+    daemon_module._run_command(
+        (
+            "/usr/bin/codex", "app-server", "daemon",
+            "enable-remote-control",
+        ),
+        env,
+        1.0,
+    )
+    daemon_module._run_command(
+        ("/usr/bin/codex", "app-server", "daemon", "version"),
+        env,
+        1.0,
+    )
+
+    if os.name == "posix":
+        assert captured[0][:3] == (
+            daemon_module.sys.executable,
+            daemon_module._RLIMIT_EXEC,
+            str(daemon_module._DAEMON_NOFILE_SOFT_LIMIT),
+        )
+        assert captured[0][3:] == (
+            "/usr/bin/codex", "app-server", "daemon", "start",
+        )
+        assert captured[1][:3] == captured[0][:3]
+        assert captured[1][3:] == (
+            "/usr/bin/codex", "app-server", "daemon",
+            "enable-remote-control",
+        )
+    else:
+        assert captured[0] == (
+            "/usr/bin/codex", "app-server", "daemon", "start",
+        )
+        assert captured[1] == (
+            "/usr/bin/codex", "app-server", "daemon",
+            "enable-remote-control",
+        )
+    assert captured[2] == (
+        "/usr/bin/codex", "app-server", "daemon", "version",
+    )
+
+
+def test_linux_managed_daemon_nofile_is_applied_to_exact_pid(
+        monkeypatch, tmp_path):
+    proc_root = tmp_path / "proc"
+    proc = proc_root / "4321"
+    proc.mkdir(parents=True)
+    binary = tmp_path / "codex"
+    binary.write_bytes(b"codex")
+    (proc / "exe").symlink_to(binary)
+    (proc / "cmdline").write_bytes(
+        f"{binary}\0app-server\0--remote-control\0".encode()
+    )
+    (proc / "stat").write_bytes(
+        b"4321 (codex) " + b" ".join(
+            [b"S", *([b"0"] * 18), b"123"]
+        )
+    )
+    daemon_root = tmp_path / "codex-home" / "app-server-daemon"
+    daemon_root.mkdir(parents=True)
+    (daemon_root / "app-server.pid").write_text('{"pid":4321}')
+    calls: list[tuple] = []
+    limit = [1024, 524288]
+
+    def prlimit(pid, which, value=None):
+        calls.append((pid, which, value))
+        if value is not None:
+            limit[:] = value
+        return tuple(limit)
+
+    monkeypatch.setattr(daemon_module.sys, "platform", "linux")
+    monkeypatch.setattr(daemon_module, "_PROC_ROOT", proc_root)
+    monkeypatch.setattr(
+        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+    monkeypatch.setattr(
+        daemon_module.resource, "prlimit", prlimit, raising=False)
+
+    assert _REAL_ENSURE_MANAGED_DAEMON_NOFILE(
+        str(binary),
+        {"CODEX_HOME": str(tmp_path / "codex-home")},
+        {"managedCodexPath": str(binary)},
+    ) is True
+    assert calls[1][2] == (daemon_module._DAEMON_NOFILE_SOFT_LIMIT, 524288)
+    assert calls[-1][2] is None
+
+
+def test_linux_managed_daemon_nofile_fails_closed_on_low_hard_limit(
+        monkeypatch, tmp_path):
+    proc_root = tmp_path / "proc"
+    proc = proc_root / "4321"
+    proc.mkdir(parents=True)
+    binary = tmp_path / "codex"
+    binary.write_bytes(b"codex")
+    (proc / "exe").symlink_to(binary)
+    (proc / "cmdline").write_bytes(
+        f"{binary}\0app-server\0--remote-control\0".encode()
+    )
+    (proc / "stat").write_bytes(
+        b"4321 (codex) " + b" ".join(
+            [b"S", *([b"0"] * 18), b"123"]
+        )
+    )
+    daemon_root = tmp_path / "codex-home" / "app-server-daemon"
+    daemon_root.mkdir(parents=True)
+    (daemon_root / "app-server.pid").write_text('{"pid":4321}')
+
+    monkeypatch.setattr(daemon_module.sys, "platform", "linux")
+    monkeypatch.setattr(daemon_module, "_PROC_ROOT", proc_root)
+    monkeypatch.setattr(
+        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+    monkeypatch.setattr(
+        daemon_module.resource,
+        "prlimit",
+        lambda *_args: (1024, 2048),
+        raising=False,
+    )
+
+    assert _REAL_ENSURE_MANAGED_DAEMON_NOFILE(
+        str(binary),
+        {"CODEX_HOME": str(tmp_path / "codex-home")},
+        {"managedCodexPath": str(binary)},
+    ) is False
 
 
 def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):
@@ -1102,7 +1267,7 @@ def test_code_daemon_unavailable_falls_back_and_work_never_probes(monkeypatch):
             await CodexHandle(
                 _Cfg(), work_mode=work_mode, daemon_manager=manager,
             ).connect()
-        assert captured[0][:3] == [
+        assert _private_stdio_argv(captured[0])[:3] == [
             "/usr/bin/codex", "app-server", "--stdio"]
         assert manager.proxy_calls == (0 if work_mode else 1)
 
@@ -1137,7 +1302,7 @@ def test_oversized_resume_prefers_shared_daemon_before_newer_private_core(
         assert spawned[0][:3] == [
             "/managed/codex", "app-server", "proxy",
         ]
-        assert spawned[1][:3] == [
+        assert _private_stdio_argv(spawned[1])[:3] == [
             "/Applications/Codex.app/Resources/codex",
             "app-server", "--stdio",
         ]
@@ -1177,7 +1342,7 @@ def test_oversized_desktop_openai_resume_prefers_shared_daemon_then_http_stdio(
         assert spawned[0][:3] == [
             "/managed/codex", "app-server", "proxy",
         ]
-        argv = spawned[1]
+        argv = _private_stdio_argv(spawned[1])
         assert argv[:3] == [
             "/managed/codex", "app-server", "--stdio",
         ]
@@ -1259,9 +1424,9 @@ def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
         handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
         await handle.connect(cwd="/tmp")
 
-        assert spawned == [
-            ["/usr/bin/codex", "app-server", "proxy"],
-            ["/usr/bin/codex", "app-server", "--stdio"],
+        assert spawned[0] == ["/usr/bin/codex", "app-server", "proxy"]
+        assert _private_stdio_argv(spawned[1]) == [
+            "/usr/bin/codex", "app-server", "--stdio",
         ]
         assert handle.using_daemon_proxy is False
         assert manager.invalidations == 1

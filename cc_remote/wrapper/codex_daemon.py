@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import resource
 import signal
 import shutil
 import stat
@@ -37,6 +38,12 @@ _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
 _DAEMON_UPGRADE_SETTLE_TIMEOUT = 5.0
 _DAEMON_UPGRADE_POLL_INTERVAL = 0.1
+_DAEMON_NOFILE_SOFT_LIMIT = 4096
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
+_PROC_ROOT = Path("/proc")
+_HIGH_NOFILE_DAEMON_OPERATIONS = frozenset({
+    "bootstrap", "enable-remote-control", "restart", "start",
+})
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -57,6 +64,7 @@ def codex_daemon_mode(value: Optional[str] = None) -> str:
 class CodexDaemonInfo:
     socket_path: Optional[str]
     verified_remote_control: bool = False
+    nofile_verified: bool = False
 
 
 class CodexDaemonUpgradeRequired(RuntimeError):
@@ -78,9 +86,25 @@ def _run_command(
     argv: tuple[str, ...], env: Mapping[str, str], timeout: float,
 ) -> _CommandResult:
     """Blocking subprocess boundary, kept separate for deterministic tests."""
+    command_argv = argv
+    if os.name == "posix" and any(
+        argv[index:index + 2] == ("app-server", "daemon")
+        and argv[index + 2] in _HIGH_NOFILE_DAEMON_OPERATIONS
+        for index in range(max(0, len(argv) - 2))
+    ):
+        # The official lifecycle command launches the durable daemon.  Its
+        # resource limits are inherited at that boundary, so raising only this
+        # short-lived child also raises the managed daemon without changing the
+        # wrapper or unrelated user processes.
+        command_argv = (
+            sys.executable,
+            _RLIMIT_EXEC,
+            str(_DAEMON_NOFILE_SOFT_LIMIT),
+            *argv,
+        )
     try:
         result = subprocess.run(
-            argv,
+            command_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -301,6 +325,90 @@ def _managed_pid(path: Path) -> Optional[int]:
     payload = _json_object(data)
     pid = payload.get("pid") if payload is not None else None
     return pid if isinstance(pid, int) and pid > 1 else None
+
+
+def _linux_process_start_ticks(pid: int) -> Optional[int]:
+    """Return one stable Linux process-generation token."""
+    try:
+        raw = (_PROC_ROOT / str(pid) / "stat").read_bytes()
+        end = raw.rfind(b") ")
+        if end < 0:
+            return None
+        fields = raw[end + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ensure_managed_daemon_nofile(
+    codex_bin: str,
+    env: Mapping[str, str],
+    lifecycle: Mapping[str, Any],
+) -> Optional[bool]:
+    """Raise and verify the actual managed Linux daemon's file limit.
+
+    The official lifecycle client can hand the detached process to the user's
+    systemd manager, which may replace the caller's inherited soft limit. A
+    high-limit launcher alone is therefore not evidence on Linux. Resolve the
+    exact same-user PID record, validate its executable/argv and process
+    generation, apply ``prlimit`` to that PID, then read it back.
+
+    ``None`` means this platform has no supported cross-process verification;
+    lifecycle commands still run through ``rlimit_exec`` so Darwin descendants
+    inherit the requested limit. ``False`` is a Linux verification failure and
+    callers must not advertise the managed daemon as ready.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    prlimit = getattr(resource, "prlimit", None)
+    if prlimit is None:
+        return False
+    codex_home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    daemon_root = Path(os.path.realpath(os.path.expanduser(codex_home))) / (
+        "app-server-daemon"
+    )
+    pid = _managed_pid(daemon_root / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return False
+    proc_root = _PROC_ROOT / str(pid)
+    before = _linux_process_start_ticks(pid)
+    if before is None:
+        return False
+    expected_path = _text(lifecycle.get("managedCodexPath")) or codex_bin
+    try:
+        executable = os.path.realpath(os.readlink(proc_root / "exe"))
+        expected_executable = os.path.realpath(expected_path)
+        raw_cmdline = (proc_root / "cmdline").read_bytes()
+    except OSError:
+        return False
+    argv = tuple(value for value in raw_cmdline.split(b"\0") if value)
+    if (
+        executable != expected_executable
+        or b"app-server" not in argv
+        or b"--remote-control" not in argv
+    ):
+        return False
+    try:
+        soft, hard = prlimit(pid, resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < _DAEMON_NOFILE_SOFT_LIMIT:
+            return False
+        if soft != resource.RLIM_INFINITY and soft < _DAEMON_NOFILE_SOFT_LIMIT:
+            prlimit(
+                pid,
+                resource.RLIMIT_NOFILE,
+                (_DAEMON_NOFILE_SOFT_LIMIT, hard),
+            )
+        verified_soft, _verified_hard = prlimit(pid, resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return False
+    after = _linux_process_start_ticks(pid)
+    return bool(
+        after == before
+        and (
+            verified_soft == resource.RLIM_INFINITY
+            or verified_soft >= _DAEMON_NOFILE_SOFT_LIMIT
+        )
+    )
 
 
 def _darwin_process_state(pid: int) -> Optional[str]:
@@ -781,6 +889,27 @@ class CodexDaemonManager:
                 log.warning(
                     "Codex daemon did not confirm remote control; using stdio")
                 return None
+            nofile_verified = await asyncio.to_thread(
+                _ensure_managed_daemon_nofile,
+                codex_bin,
+                env,
+                verified,
+            )
+            if nofile_verified is False:
+                self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon file limit could not be "
+                        "verified"
+                    )
+                log.warning(
+                    "Codex daemon file limit unavailable; using stdio")
+                return None
+            info = CodexDaemonInfo(
+                socket_path=info.socket_path,
+                verified_remote_control=info.verified_remote_control,
+                nofile_verified=nofile_verified is True,
+            )
             self._ready_identity = identity
             self._ready = info
             return info

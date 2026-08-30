@@ -1177,6 +1177,14 @@ def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
         path = tmp_path / "session.jsonl"
         path.write_bytes(b"")
         ctx = _mk_ctx("sid", "sid")
+        invalidations = 0
+
+        def invalidate_context_usage_cache():
+            nonlocal invalidations
+            invalidations += 1
+
+        ctx.sdk = SimpleNamespace(
+            invalidate_context_usage_cache=invalidate_context_usage_cache)
         # Recreate the removed legacy grace marker: even if a future change
         # restores it, recent turn completion must not hide unknown growth.
         ctx.last_turn_end = time.time()
@@ -1195,6 +1203,7 @@ def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
         # read-only; it must still reload the externally-advanced transcript.
         assert machine._is_external("sid") is False
         assert ctx.needs_reload is True
+        assert invalidations == 1
 
     asyncio.run(go())
 

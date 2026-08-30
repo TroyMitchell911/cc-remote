@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -18,11 +19,17 @@ from claude_agent_sdk import (
     __version__ as SDK_VERSION,
 )
 from claude_agent_sdk._internal.message_parser import parse_message as _parse_sdk_message
-from claude_agent_sdk.types import ResultMessage, SystemMessage, UserMessage
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    UserMessage,
+)
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
+from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
 from cc_remote.wrapper.child_env import child_env_tombstones
 from cc_remote.wrapper.claude_rewind import (
     ClaudeConversationRewindCapability,
@@ -38,8 +45,10 @@ from cc_remote.wrapper.claude_runtime import inspect_claude_runtime
 from cc_remote.wrapper.claude_controls import (
     claude_auto_compact_cli_value,
     valid_claude_auto_compact,
+    valid_claude_model,
 )
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
+from cc_remote.wrapper.work_context import claude_recent_context_usage
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
     active_goal_from_message,
@@ -55,7 +64,8 @@ CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
 CLAUDE_DEFAULT_EFFORT = "max"
 CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024
 _CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
-_CONTEXT_CONTROL_TIMEOUT = 5.0
+_CONTEXT_CONTROL_TIMEOUT = 15.0
+_CONTEXT_STARTUP_TIMEOUT = 5.0
 
 # Work keeps the file primitives needed for documents and other deliverables,
 # plus first-party web research.  Deliberately omit Agent/Task, Skill,
@@ -178,11 +188,18 @@ class SdkHandle:
         # SDK. The current child is therefore unsafe to reuse even if its
         # process and stdout reader still look alive.
         self.control_plane_failed = False
-        # A replacement generation created after such a timeout deliberately
-        # skips context probing until one real successful ResultMessage proves
-        # that its turn path is healthy.
+        # Compatibility/public state for adapters which expose whether context
+        # inspection is temporarily unavailable. A timed-out generation is now
+        # replaced instead of quarantining its successor until another model
+        # turn: the replacement skips only its eager startup probe and is safe
+        # for an explicit user read immediately.
         self.context_probe_suppressed = False
         self._last_context_usage: dict[str, Any] | None = None
+        # Unlike the rich control response, the latest main-chain assistant
+        # usage is session/transcript state and remains valid across a child
+        # reconnect.  It keeps the UI useful when the optional control request
+        # is quarantined or unavailable.
+        self._last_recent_context_usage: dict[str, Any] | None = None
         self._conversation_rewind_probe_lock = asyncio.Lock()
         self._conversation_rewind_capability: (
             ClaudeConversationRewindCapability | None
@@ -266,8 +283,9 @@ class SdkHandle:
                  model_override: str | None = None) -> ClaudeAgentOptions:
         code_prompt_append = (
             "You have two MCP tools on the cc-remote-ask server:\n"
-            "- `ask_user(question, options)`: ask the user a multiple-choice clarifying "
-            "question (instead of plain text). Blocks until they answer.\n"
+            "- `ask_user(question, options)`: ask the user a clarifying question with "
+            "suggested choices and a custom-text fallback (instead of plain text). "
+            "Blocks until they answer.\n"
             "- `set_mode(mode)`: switch cc's permission mode yourself, in the middle of a "
             "turn. When the user expresses intent — 'plan first' / 'let's plan this' -> "
             "set_mode('plan'); 'just do it' / 'go ahead' -> set_mode('bypassPermissions') "
@@ -381,22 +399,32 @@ class SdkHandle:
         self.client = ClaudeSDKClient(options=opts)
         self._conversation_rewind_capability = None
         await self.client.connect()
-        # Context usage belongs to one concrete Claude child generation.  A
-        # reconnect can change the effective autocompact window, model, or
-        # transcript projection; retaining the prior child's reading makes the
-        # Web UI report (for example) 500k after the new child was launched with
-        # ``--autocompact 400000``.  Clear it before the new control probe.  If
-        # that probe is deliberately suppressed after an earlier timeout, the
-        # machine will report usage as unavailable instead of serving stale
-        # numbers until a successful turn makes probing safe again.
+        if fork:
+            # A fork creates a new native conversation even though this handle
+            # may be reused while a private BTW id is still being captured.
+            self.invalidate_context_usage_cache()
+        # The rich reading belongs to one concrete Claude child generation: a
+        # reconnect can change effective autocompact capacity or model state.
+        # The recent assistant total is conversation state and survives an
+        # ordinary same-session reconnect; explicit transcript mutations and
+        # fresh forks invalidate it through invalidate_context_usage_cache().
         self._last_context_usage = None
         self.effective_auto_compact_threshold_tokens = None
         self.raw_context_max_tokens = None
         self.control_plane_failed = False
-        self.context_probe_suppressed = bool(_suppress_context_probe)
-        if not _suppress_context_probe:
+        self.context_probe_suppressed = False
+        # Resuming an old/large transcript can spend longer rebuilding context
+        # than the bounded control timeout. Never make that optional metadata
+        # read part of ordinary resume/reconnect readiness. A genuinely fresh
+        # non-forked session has no historical rebuild and still benefits from
+        # learning its provider-selected model and (for Work) startup baseline.
+        eager_context_probe = bool(
+            not _suppress_context_probe and resume_id is None and not fork
+        )
+        if eager_context_probe:
             try:
-                usage = await self._read_context_usage_control()
+                usage = await self._read_context_usage_control(
+                    timeout=_CONTEXT_STARTUP_TIMEOUT)
             except Exception as exc:
                 if _is_control_request_timeout(
                     exc, subtype="get_context_usage"
@@ -404,10 +432,9 @@ class SdkHandle:
                     # The SDK forgets its waiter on timeout but sends no cancel
                     # frame to Claude Code. Destroy this generation immediately;
                     # otherwise its still-blocked control loop also swallows the
-                    # first query and interrupt. The replacement must not repeat
-                    # the same eager probe before it has completed a real turn.
+                    # first query and interrupt. The replacement skips only this
+                    # eager read and is immediately safe for normal traffic.
                     self.control_plane_failed = True
-                    self.context_probe_suppressed = True
                     log.warning(
                         "Claude startup context probe timed out; replacing child"
                     )
@@ -456,7 +483,9 @@ class SdkHandle:
                  context_probe_suppressed=self.context_probe_suppressed,
                  sdk_version=SDK_VERSION)
 
-    async def _read_context_usage_control(self) -> dict:
+    async def _read_context_usage_control(
+        self, *, timeout: float = _CONTEXT_CONTROL_TIMEOUT,
+    ) -> dict:
         """Issue one bounded read on the pinned SDK control protocol."""
         async with self._control_request_lock:
             if self.control_plane_failed:
@@ -474,19 +503,54 @@ class SdkHandle:
             try:
                 usage = await send_control(
                     {"subtype": "get_context_usage"},
-                    timeout=_CONTEXT_CONTROL_TIMEOUT,
+                    timeout=timeout,
                 )
             except Exception as exc:
                 if _is_control_request_timeout(
                     exc, subtype="get_context_usage"
                 ):
                     self.control_plane_failed = True
-                    self.context_probe_suppressed = True
                     self._conversation_rewind_capability = None
                 raise
             if not isinstance(usage, dict):
                 return {}
             return usage
+
+    @asynccontextmanager
+    async def context_recovery_barrier(self):
+        """Freeze old-generation background routing during timeout recovery.
+
+        A ``get_context_usage`` timeout can race an autonomous task notification
+        on the same Claude stream.  The machine must not inspect an idle-looking
+        ``SessionContext`` and then disconnect a generation whose background
+        callback has already been queued but has not yet updated that context.
+
+        Holding the route lock prevents the old message pump from enqueueing a
+        new callback between the machine's final lifecycle check and
+        ``force_reconnect()``.  Do not wait for callbacks here: a Result callback
+        may legitimately be waiting for the machine's query lock.  Instead yield
+        whether every already-routed callback has completed; a false value tells
+        the caller to leave the poisoned generation in place until its real
+        lifecycle boundary settles.
+        """
+        route_lock = self._message_route_lock
+        acquired = False
+        try:
+            # Never wait behind the pump while the machine owns query_lock: a
+            # background Result callback may be waiting for that same lock. A
+            # short failed acquisition is itself proof that this generation is
+            # not quiescent enough to reconnect from the metadata path.
+            await asyncio.wait_for(
+                route_lock.acquire(), timeout=0.05)
+            acquired = True
+        except asyncio.TimeoutError:
+            yield False
+            return
+        try:
+            yield self._background_callbacks_pending == 0
+        finally:
+            if acquired:
+                route_lock.release()
 
     def _record_context_usage(
         self,
@@ -497,10 +561,19 @@ class SdkHandle:
     ) -> None:
         """Cache one successful reading and update generation metadata."""
         self._last_context_usage = dict(usage)
+        total_tokens = usage.get("totalTokens")
+        if (isinstance(total_tokens, int)
+                and not isinstance(total_tokens, bool)
+                and 0 <= total_tokens <= MAX_SAFE_WIRE_INTEGER):
+            # Only a semantically usable exact response supersedes the latest
+            # live/transcript fallback. A malformed successful control envelope
+            # must not erase the last truthful reading.
+            self._last_recent_context_usage = None
         if update_model:
             model = usage.get("model") if isinstance(usage, dict) else None
-            if isinstance(model, str) and 0 < len(model.strip()) <= 256:
-                self.model = model.strip()
+            selected_model = valid_claude_model(model)
+            if selected_model is not None:
+                self.model = selected_model
         auto_threshold = usage.get("autoCompactThreshold")
         self.effective_auto_compact_threshold_tokens = (
             auto_threshold
@@ -528,6 +601,40 @@ class SdkHandle:
         if self._last_context_usage is None:
             return None
         return dict(self._last_context_usage)
+
+    def invalidate_context_usage_cache(self) -> None:
+        """Discard readings after the native transcript changes identity/depth.
+
+        Ordinary same-session child reconnects deliberately keep the latest
+        assistant total. External appends, rewinds and a fresh fork do not: in
+        those cases the machine calls this at the mutation boundary so the next
+        cache-only read must recover from the current transcript.
+        """
+        self._last_context_usage = None
+        self._last_recent_context_usage = None
+        self.effective_auto_compact_threshold_tokens = None
+        self.raw_context_max_tokens = None
+
+    def _observe_recent_context_usage(self, message: Any) -> None:
+        if (not isinstance(message, AssistantMessage)
+                or message.parent_tool_use_id is not None):
+            return
+        recovered = claude_recent_context_usage(message.usage)
+        if recovered is not None:
+            self._last_recent_context_usage = recovered
+
+    def remember_recent_context_usage(self, usage: dict[str, Any]) -> None:
+        """Seed a source-validated transcript fallback after cold resume."""
+        total = usage.get("totalTokens") if isinstance(usage, dict) else None
+        if (not isinstance(total, int) or isinstance(total, bool)
+                or total <= 0 or total > MAX_SAFE_WIRE_INTEGER):
+            return
+        self._last_recent_context_usage = dict(usage)
+
+    def cached_recent_context_usage(self) -> dict | None:
+        if self._last_recent_context_usage is None:
+            return None
+        return dict(self._last_recent_context_usage)
 
     def _activate_pending_turn_route(self) -> None:
         """Bind post-Result background frames to the submitted browser turn."""
@@ -618,9 +725,17 @@ class SdkHandle:
     async def set_model(self, model: str) -> None:
         """Switch the model for the live cc subprocess (takes effect next query,
         no reconnect)."""
-        assert self.client is not None
-        await self.client.set_model(model)
-        self.model = model
+        async with self._control_request_lock:
+            assert self.client is not None
+            previous_model = self.model
+            await self.client.set_model(model)
+            if previous_model != model:
+                # Context tokenization, capacity and category composition are
+                # model-specific. Serialize this boundary with an in-flight
+                # get_context_usage request, then discard every reading from
+                # the previous model only after Claude confirms the switch.
+                self.invalidate_context_usage_cache()
+            self.model = model
         log.info("model set", model=model)
 
     async def set_permission_mode(self, mode: str) -> None:
@@ -644,12 +759,8 @@ class SdkHandle:
 
     async def get_context_usage(self) -> dict:
         """Return the cc session's context window usage (matches CLI /context)."""
-        if self.context_probe_suppressed:
-            raise RuntimeError(
-                "Claude context probe is suppressed until a successful turn"
-            )
         usage = await self._read_context_usage_control()
-        self._record_context_usage(usage)
+        self._record_context_usage(usage, update_model=True)
         return usage
 
     async def rewind_files(self, user_message_id: str) -> None:
@@ -829,15 +940,15 @@ class SdkHandle:
         preserves the same baseline that Claude's in-memory activeGoal tracks.
         """
         tokens_at_start = None
-        try:
-            usage = await self.get_context_usage()
-            value = usage.get("totalTokens") if isinstance(usage, dict) else None
-            if isinstance(value, int) and not isinstance(value, bool):
-                tokens_at_start = max(0, value)
-        except Exception as exc:
-            # Goal execution must not fail just because the optional baseline
-            # control request is unavailable on an older CLI.
-            log.warning("goal context baseline unavailable", error=str(exc))
+        # Goal creation is not a user request to inspect /context. Reuse the
+        # newest local reading so this optional accounting baseline can never
+        # put a slow resumed conversation's control generation at risk.
+        usage = self.cached_context_usage()
+        if usage is None:
+            usage = self.cached_recent_context_usage()
+        value = usage.get("totalTokens") if isinstance(usage, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            tokens_at_start = max(0, value)
         self.goal_session_id = thread_id
         self.goal = make_claude_goal(
             thread_id, objective, tokens_at_start=tokens_at_start)
@@ -908,6 +1019,7 @@ class SdkHandle:
             message = self._parse_compat_message(data)
             if message is None:
                 continue
+            self._observe_recent_context_usage(message)
             if (isinstance(message, ResultMessage)
                     and not bool(getattr(message, "is_error", False))):
                 # A complete successful turn proves that a no-probe replacement
@@ -961,6 +1073,7 @@ class SdkHandle:
                 message = self._parse_compat_message(data) if parse_raw else data
                 if message is None:
                     continue
+                self._observe_recent_context_usage(message)
                 if (isinstance(message, ResultMessage)
                         and not bool(getattr(message, "is_error", False))):
                     self.context_probe_suppressed = False
@@ -1201,9 +1314,6 @@ class SdkHandle:
         apply a spawn-time option change (e.g. effort) to a live session."""
         async with self._permission_reconnect_lock:
             log.warning("force-reconnecting SDK client", reason=reason)
-            suppress_context_probe = bool(
-                self.control_plane_failed or self.context_probe_suppressed
-            )
             try:
                 await self.disconnect()
             except Exception as e:
@@ -1216,4 +1326,7 @@ class SdkHandle:
             await self.connect(
                 resume_id=resume_id, cwd=cwd,
                 model_override=model_override, fork=fork,
-                _suppress_context_probe=suppress_context_probe)
+                # A reconnect is never a fresh-session metadata boundary. It
+                # must become query-ready without synchronously rebuilding
+                # /context, including after a poisoned control generation.
+                _suppress_context_probe=True)

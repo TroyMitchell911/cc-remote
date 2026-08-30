@@ -405,7 +405,10 @@ export interface WebSearch extends Base {
   type: "web_search";
   mode: CodexWebSearchMode;
 }
-export interface GetContext extends Base { type: "get_context" }
+export interface GetContext extends Base {
+  type: "get_context";
+  refresh?: boolean;
+}
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: DiffTheme }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string; request_id?: string }
 export interface GetFilePreview extends Base { type: "get_file_preview"; path: string; request_id: string }
@@ -582,11 +585,15 @@ export interface RateLimitUpdate extends Base {
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
   type: "context_report";
+  /** GetContext command id; omitted for wrapper-owned internal refreshes. */
+  request_id?: string | null;
   total_tokens: number;
   max_tokens: number;
   percentage: number;
   /** False when the engine has not emitted an authoritative tokenUsage yet. */
   available?: boolean | null;
+  /** Provenance of a Claude context reading; omitted means exact/control. */
+  source?: "control" | "cached_control" | "recent_turn" | null;
   /** Work-only conversation growth after the fresh-session startup baseline. */
   session_tokens?: number | null;
   /** Work-only startup zero point; raw total_tokens remains authoritative. */
@@ -609,7 +616,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 40;
+export const PROTOCOL_VERSION = 41;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

@@ -8,6 +8,8 @@ import {
   visibleDirectorySessions,
 } from "../session-order";
 import {
+  canDeleteSidebarSession,
+  isSessionArchiveBlockedByState,
   isSessionMigrationBlockedByState,
   isWorktreeForkBlockedByState,
   sessionMenuCapabilities,
@@ -283,6 +285,8 @@ export function SessionsSidebar({ open, engine, space,
       : completion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
     const migrationBlocked = isSessionMigrationBlockedByState(st);
+    const archiveBlocked = !isArchived && engine === "codex"
+      && isSessionArchiveBlockedByState(st);
     const profilePresentation = profilePresentationFor(s);
     return (
       <div
@@ -353,9 +357,13 @@ export function SessionsSidebar({ open, engine, space,
             {capabilities.archive && (isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
-              <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>
+              <button onClick={() => doArchive(s, true)} disabled={archiveBlocked}
+                title={archiveBlocked ? "请停止当前任务并清空排队后再归档" : "归档会话"}>
+                <Icon name="archive" size={15} />归档
+              </button>
             ))}
-            {capabilities.delete && (
+            {capabilities.delete
+                && canDeleteSidebarSession(engine, space, isArchived) && (
               <button className="danger" onClick={() => doDelete(s)}>
                 <Icon name="trash" size={15} />{space === "work" ? "删除工作" : "删除会话"}
               </button>

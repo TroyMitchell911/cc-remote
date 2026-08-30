@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 40
+PROTOCOL_VERSION = 41
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -1722,12 +1722,20 @@ class WebSearch(_Base):
 class GetContext(_Command):
     """client -> wrapper: request current context window usage."""
     type: Literal["get_context"] = "get_context"
+    # Automatic focus/TurnEnd reads stay cache-only so an optional Claude
+    # control request can never block the next prompt. User-opened /context
+    # explicitly asks for a fresh native breakdown.
+    refresh: bool = False
 
 
 class ContextReport(_Base):
     """wrapper -> client: context window usage (one-shot response to GetContext,
     like SessionList — not buffered)."""
     type: Literal["context_report"] = "context_report"
+    # Correlate one-shot reports with their GetContext command. Internal
+    # wrapper-owned refreshes omit this field; browsers may still consume their
+    # value but must not let them settle a newer explicit request.
+    request_id: Optional[WireId] = None
     total_tokens: int
     max_tokens: int
     percentage: float
@@ -1736,6 +1744,12 @@ class ContextReport(_Base):
     # unavailable instead of presenting a fabricated 0% to the user.  ``None``
     # is omitted so older Code reports retain their exact historical shape.
     available: Optional[bool] = None
+    # Claude may fall back to the most recent exact control response or the
+    # newest main-chain assistant usage. Omitted reports retain the historical
+    # exact/control meaning (including all Codex reports).
+    source: Optional[
+        Literal["control", "cached_control", "recent_turn"]
+    ] = None
     # Work reports keep the engine's real context usage above for honest
     # remaining-capacity calculations, while exposing the fresh-session startup
     # zero point separately so Work shows later conversation growth.

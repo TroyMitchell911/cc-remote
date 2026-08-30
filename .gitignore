@@ -8,3 +8,4 @@ web/dist/
 web/test-results/
 .vite/
 *.log
+.codex-deploy/

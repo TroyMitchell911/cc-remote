@@ -417,6 +417,98 @@ def test_codex_delete_thread_uses_loaded_app_server_connection():
     asyncio.run(run())
 
 
+def test_codex_archive_thread_uses_loaded_owner_and_collects_descendants():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "child-1"},
+            })
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "thread-1"},
+            })
+            return {}
+
+        handle._request = request
+
+        archived = await handle.archive_thread("thread-1")
+
+        assert requests == [(
+            "thread/archive",
+            {"threadId": "thread-1"},
+        )]
+        assert archived == ("child-1", "thread-1")
+        assert handle.thread_id is None
+        assert handle._capture_thread_archived_notification({
+            "method": "thread/archived",
+            "params": {"threadId": "unrelated"},
+        }) is False
+
+    asyncio.run(run())
+
+
+def test_codex_archive_thread_rejects_wrong_or_active_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid archive must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(ValueError, match="does not match"):
+            await handle.archive_thread("thread-2")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="turn is active"):
+            await handle.archive_thread("thread-1")
+
+    asyncio.run(run())
+
+
+def test_codex_control_connection_unarchives_and_renames_without_resume():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._control_only_connection = True
+        handle._using_daemon_proxy = True
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._dead = False
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if method == "thread/unarchive":
+                return {"thread": {"id": params["threadId"], "name": "old"}}
+            return {}
+
+        handle._request = request
+
+        await handle.set_thread_name("thread-1", "new")
+        restored = await handle.unarchive_thread("thread-1")
+
+        assert restored == {"id": "thread-1", "name": "old"}
+        assert requests == [
+            (
+                "thread/name/set",
+                {"threadId": "thread-1", "name": "new"},
+            ),
+            (
+                "thread/unarchive",
+                {"threadId": "thread-1"},
+            ),
+        ]
+        assert handle.thread_id is None
+
+    asyncio.run(run())
+
+
 def test_codex_read_thread_parent_uses_exact_loaded_thread_metadata():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -511,6 +603,31 @@ def test_codex_delete_catalog_pages_active_and_archived_threads():
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
             },
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_loaded_thread_catalog_is_bounded_and_paginated():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if params.get("cursor") == "next":
+                return {"data": ["thread-2"], "nextCursor": None}
+            return {"data": ["thread-1"], "nextCursor": "next"}
+
+        handle._request = request
+
+        assert await handle.list_loaded_thread_ids() == (
+            "thread-1",
+            "thread-2",
+        )
+        assert requests == [
+            ("thread/loaded/list", {"limit": 100}),
+            ("thread/loaded/list", {"limit": 100, "cursor": "next"}),
         ]
 
     asyncio.run(run())
@@ -4124,7 +4241,16 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         with pytest.raises(RuntimeError, match="captured work profile"):
             await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
 
-        assert spawned[:3] == ["/usr/bin/codex", "app-server", "--stdio"]
+        stdio_index = spawned.index("/usr/bin/codex")
+        assert spawned[stdio_index:stdio_index + 3] == [
+            "/usr/bin/codex", "app-server", "--stdio",
+        ]
+        if os.name == "posix":
+            assert spawned[:3] == [
+                codex_handle_module.sys.executable,
+                codex_handle_module._RLIMIT_EXEC,
+                str(codex_handle_module._APP_SERVER_NOFILE_SOFT_LIMIT),
+            ]
         overrides = [
             spawned[index + 1]
             for index, value in enumerate(spawned[:-1])
@@ -7625,12 +7751,58 @@ def test_fast_accepts_app_server_priority_normalization():
 
 def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sessions(
         monkeypatch):
+    class OwnerSdk(_ControlSdk):
+        def __init__(self):
+            super().__init__()
+            self.thread_id = "codex-id"
+            self.turn_active = False
+            self.turn_start_pending = False
+            self.using_daemon_proxy = True
+            self.shared_daemon_affinity = True
+            self.daemon_mode = "auto"
+            self.calls = []
+            self.thread_archive_notifications_overflowed = False
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def list_thread_delete_candidates(self):
+            return (("codex-id", False),)
+
+        async def read_thread_parent(self, _thread_id):
+            return None
+
+        async def archive_thread(self, thread_id):
+            self.calls.append(("archive", thread_id))
+            self.thread_id = None
+            return (thread_id,)
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+            await super().disconnect()
+
+    class ColdOwner:
+        def __init__(self):
+            self.calls = []
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def unarchive_thread(self, thread_id):
+            self.calls.append(("unarchive", thread_id))
+            return {"id": thread_id}
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+
     async def run():
         machine, transport = _mk_machine()
-        ctx = _control_ctx("codex-id", "codex")
+        owner = OwnerSdk()
+        ctx = _control_ctx("codex-id", "codex", owner)
         machine.sessions = {"codex-id": ctx}
         rpc_calls = []
         refreshes = []
+        cold_owners = []
 
         async def rpc(method, params, cwd=None):
             rpc_calls.append((method, params, cwd))
@@ -7646,6 +7818,47 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         monkeypatch.setattr(machine_module, "rename_session", claude_only)
         monkeypatch.setattr(machine_module, "tag_session", claude_only)
         machine._list_codex_sessions = refresh
+
+        async def runtime_preflight(*_args, **_kwargs):
+            return None
+
+        async def no_external_owner(_sid):
+            return False
+
+        async def cold_control(_sid):
+            control = ColdOwner()
+            cold_owners.append(control)
+            return control
+
+        machine._runtime_control_preflight = runtime_preflight
+        machine._codex_delete_external_owner = no_external_owner
+        machine._codex_shared_control_for_wire = cold_control
+
+        async def exact_archive_states(_profile, native_sids):
+            return {
+                native_sid: (
+                    native_sid == "cold-codex-id"
+                    or ("archive", native_sid) in owner.calls
+                )
+                for native_sid in native_sids
+            }
+
+        machine._codex_exact_archive_states = exact_archive_states
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_parent_maps",
+            lambda **_kwargs: ({}, {}),
+        )
+        local_rollout = str(
+            machine._codex_profile().home
+            / "sessions"
+            / "rollout-codex-id.jsonl"
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_rollout_record",
+            lambda _sid, **_kwargs: (local_rollout, False),
+        )
 
         rename_hot = SimpleNamespace(session_id="codex-id", title="new")
         archive_hot = SimpleNamespace(session_id="codex-id", archived=True)
@@ -7667,16 +7880,22 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         await machine._handle_rename_session(rename_cold)
         await machine._handle_archive_session(unarchive_cold)
 
-        assert rpc_calls == [
-            ("thread/name/set", {"threadId": "codex-id", "name": "new"}, None),
-            ("thread/archive", {"threadId": "codex-id"}, None),
-            (
-                "thread/name/set",
-                {"threadId": "cold-codex-id", "name": "cold new"},
-                None,
-            ),
-            ("thread/unarchive", {"threadId": "cold-codex-id"}, None),
+        assert owner.calls == [
+            ("rename", "codex-id", "new"),
+            ("archive", "codex-id"),
+            ("disconnect",),
         ]
+        assert [control.calls for control in cold_owners] == [
+            [
+                ("rename", "cold-codex-id", "cold new"),
+                ("disconnect",),
+            ],
+            [
+                ("unarchive", "cold-codex-id"),
+                ("disconnect",),
+            ],
+        ]
+        assert rpc_calls == []
         assert refreshes == [rename_hot, archive_hot, rename_cold, unarchive_cold]
         assert not [message for message in transport.sent if message.type == "error"]
 

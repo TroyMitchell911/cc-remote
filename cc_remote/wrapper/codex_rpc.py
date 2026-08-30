@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
+import sys
 from typing import Any, Optional
 
 from cc_remote import __version__
@@ -15,6 +17,8 @@ from cc_remote.wrapper.codex_runtime import (
 
 _RPC_TIMEOUT = 30.0
 _STREAM_LIMIT = 16 * 1024 * 1024
+_NOFILE_SOFT_MAX = 65_536
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
 
 
 def _child_env(bin_path: str, codex_home: Optional[str]) -> dict[str, str]:
@@ -83,6 +87,8 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
 async def codex_rpc(
     method: str, params: Optional[dict[str, Any]], cwd: Optional[str] = None,
     codex_home: Optional[str] = None,
+    *,
+    nofile_soft_limit: Optional[int] = None,
 ) -> Any:
     """Initialize one app-server, issue one request, then always reap it.
 
@@ -95,13 +101,27 @@ async def codex_rpc(
         raise ValueError("codex RPC method must be a non-empty string")
     if params is not None and not isinstance(params, dict):
         raise TypeError("codex RPC params must be a dict or None")
+    if nofile_soft_limit is not None and (
+        not isinstance(nofile_soft_limit, int)
+        or isinstance(nofile_soft_limit, bool)
+        or nofile_soft_limit < 1
+        or nofile_soft_limit > _NOFILE_SOFT_MAX
+        or os.name != "posix"
+    ):
+        raise ValueError("invalid POSIX Codex RPC nofile limit")
 
     bin_path = await asyncio.to_thread(_resolve_codex_bin)
     workdir = os.path.realpath(os.path.expanduser(cwd or "~"))
+    app_server_argv = (bin_path, "app-server", "--stdio")
+    if nofile_soft_limit is not None:
+        app_server_argv = (
+            sys.executable,
+            _RLIMIT_EXEC,
+            str(nofile_soft_limit),
+            *app_server_argv,
+        )
     proc = await asyncio.create_subprocess_exec(
-        bin_path,
-        "app-server",
-        "--stdio",
+        *app_server_argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

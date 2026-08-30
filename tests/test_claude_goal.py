@@ -165,9 +165,11 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
         handle = SdkHandle(SimpleNamespace())
 
         async def context_usage():
-            return {"totalTokens": 123}
+            raise AssertionError(
+                "Goal creation must not issue a native Context RPC")
 
         handle.get_context_usage = context_usage
+        handle._record_context_usage({"totalTokens": 123})
         ctx.sdk = handle
         machine.sessions[ctx.key] = ctx
         queries = []

@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v41. Automatic
+  Claude context reads no longer issue a blocking native control request;
+  explicit `/context` reads prefer the exact native breakdown and otherwise
+  retain a visibly labelled cached or recent-turn token total when that
+  optional control plane times out.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v40. Codex
   heavyweight turn-detail pagination now binds every cursor to an immutable,
   source-scoped snapshot, so an actively growing multi-hundred-MiB rollout

@@ -55,6 +55,7 @@ import {
 } from "../auto-compact";
 
 const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
+const ContextPopover = lazy(() => import("./ContextPopover"));
 
 interface Props {
   draftKey: string;
@@ -89,6 +90,7 @@ interface Props {
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
   engine?: "claude" | "codex";
+  archived?: boolean;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -127,6 +129,9 @@ interface Props {
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
+  contextExactReport?: ContextReport | null;
+  contextLoading?: boolean;
+  contextDeferred?: boolean;
   contextError?: string | null;
   statusReport?: StatusReport | null;
   rateLimits?: StatusRateLimit[];
@@ -268,7 +273,7 @@ export function Composer(p: Props) {
       ) : null;
   const controlUi = p.control ? presentSessionControl(p.control) : legacyControl;
   // The connection and authoritative write state independently gate input.
-  const locked = offline || !!controlUi?.locked;
+  const locked = offline || !!controlUi?.locked || p.archived === true;
   const externalClaudeOwner = p.engine === "claude"
     ? (p.control?.control_mode === "external_cli" ? "外部 CLI"
       : p.control?.control_mode === "agent_view" ? "Agent View"
@@ -707,8 +712,17 @@ export function Composer(p: Props) {
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
   const workSurface = p.surface === "work";
   const contextAvailable = p.contextReport?.available !== false;
-  const workContext = workSurface && p.contextReport && contextAvailable
-    ? workContextMetrics(p.contextReport)
+  const currentContextExact = !!p.contextReport && contextAvailable
+    && p.contextReport.source !== "recent_turn";
+  const lastExactContextReport = currentContextExact
+    ? p.contextReport : p.contextExactReport ?? null;
+  const exactContextReport = lastExactContextReport?.available !== false
+    ? lastExactContextReport : null;
+  const contextHasCapacity = (exactContextReport?.max_tokens ?? 0) > 0;
+  const contextRingHasCapacity = contextAvailable
+    && (p.contextReport?.max_tokens ?? 0) > 0;
+  const workContext = workSurface && exactContextReport
+    ? workContextMetrics(exactContextReport)
     : null;
   const autoCompactSelection = normalizeAutoCompactSelection(
     p.autoCompact?.mode ?? "inherit",
@@ -760,6 +774,7 @@ export function Composer(p: Props) {
       value={input}
       placeholder={importing ? "正在安全导入附件…"
         : offline ? "机器离线 — 等待重连…"
+        : p.archived ? "会话已归档 — 取消归档后可继续对话"
         : (controlUi?.placeholder
           ?? (busy && (p.engine ?? "claude") === "codex"
             ? "输入以引导当前任务，或选择排队…"
@@ -942,39 +957,25 @@ export function Composer(p: Props) {
                   </button>
                   <button type="button" aria-expanded={ctxOpen}
                     onClick={() => {
-                      p.onContext();
+                      if (!ctxOpen) p.onContext();
                       setUsageOpen(false);
                       setAutoCompactOpen(false);
                       setCtxOpen((o) => !o);
                     }}>
-                    <span>会话上下文</span><b>{p.contextReport?.available === false
-                      ? "暂不可用"
-                      : workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
+                    <span>会话上下文</span><b>{workContext && contextHasCapacity
+                        ? `${workContext.sessionPercentage.toFixed(0)}%`
+                        : workContext
+                          ? `${workContext.sessionTokens.toLocaleString()} tokens`
+                          : "查看"}</b>
                   </button>
                   {ctxOpen && (
-                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
-                      {p.contextReport?.available === false ? (
-                        <div className="ctx-pop-loading">暂未收到可靠的上下文用量；完成一次模型回合后更新。</div>
-                      ) : p.contextReport && workContext ? (
-                        <>
-                          <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
-                            <span className="ctx-pop-nums">{workContext.sessionTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.sessionPercentage.toFixed(0)}%)</span>
-                          </div>
-                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(workContext.sessionPercentage, 100)}%` }} /></div>
-                          {workContext.hasBreakdown && (
-                            <div className="work-ctx-details">
-                              <div className="ctx-pop-row"><span>真实总占用</span>
-                                <span className="ctx-pop-nums">{workContext.totalTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.totalPercentage.toFixed(0)}%)</span>
-                              </div>
-                              <div className="ctx-pop-row"><span>Work 启动基线</span>
-                                <span className="ctx-pop-nums">{workContext.fixedTokens.toLocaleString()}</span>
-                              </div>
-                            </div>
-                          )}
-                          <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                        </>
-                      ) : <div className="ctx-pop-loading">读取上下文占用…</div>}
-                    </div>
+                    <Suspense fallback={<div className="ctx-pop work-ctx-pop">
+                      <div className="ctx-pop-loading">正在读取真实上下文…</div>
+                    </div>}>
+                      <ContextPopover report={exactContextReport}
+                        loading={p.contextLoading} deferred={p.contextDeferred}
+                        error={p.contextError} work={workContext} />
+                    </Suspense>
                   )}
                   {p.engine === "claude" && autoCompactOpen && (
                     <div className="ctx-pop work-ctx-pop auto-compact-pop"
@@ -1061,7 +1062,9 @@ export function Composer(p: Props) {
                 rateLimits={p.rateLimits}
                 error={p.engine === "codex" ? p.statusError : null}
                 loading={p.engine === "codex" && p.statusLoading}
+                disabled={locked}
                 onToggle={() => {
+                  if (locked) return;
                   const opening = !usageOpen;
                   setCtxOpen(false);
                   setAutoCompactOpen(false);
@@ -1077,12 +1080,15 @@ export function Composer(p: Props) {
               />
             )}
             <button
-              className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
+              className={"hint-ring"
+                + (contextAvailable ? "" : " unavailable")}
               aria-expanded={ctxOpen}
               aria-label="上下文占用"
               title="上下文占用"
+              disabled={locked}
               onClick={() => {
-                p.onContext();
+                if (locked) return;
+                if (!ctxOpen) p.onContext();
                 setUsageOpen(false);
                 setAutoCompactOpen(false);
                 setCtxOpen((o) => !o);
@@ -1095,43 +1101,20 @@ export function Composer(p: Props) {
                   cx="18" cy="18" r="15"
                   strokeDasharray="94.25"
                   strokeDashoffset={94.25 * (1 - Math.min(
-                    contextAvailable ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
+                    contextRingHasCapacity
+                      ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
                   transform="rotate(-90 18 18)"
                 />
               </svg>
             </button>
             {ctxOpen && (
-              <div className="ctx-pop" role="dialog" aria-label="上下文占用">
-                {p.contextError ? (
-                  <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
-                ) : p.contextReport?.available === false ? (
-                  <div className="ctx-pop-loading">暂未收到可靠的上下文用量；完成一次模型回合后会自动更新。上下文仍由当前引擎原生管理。</div>
-                ) : p.contextReport ? (
-                  <>
-                    <div className="ctx-pop-row">
-                      <span>上下文窗口</span>
-                      <span className="ctx-pop-nums">
-                        {p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({p.contextReport.percentage.toFixed(0)}%)
-                      </span>
-                    </div>
-                    <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
-                    {p.contextReport.categories.length > 0 && (
-                      <div className="ctx-pop-cats">
-                        {p.contextReport.categories.map((c, i) => (
-                          <div className="ctx-pop-cat" key={i}>
-                            <span className="ctx-cat-dot" style={{ background: c.color }} />
-                            <span className="ctx-pop-cat-name">{c.name}</span>
-                            <span className="ctx-pop-cat-tok">{c.tokens.toLocaleString()}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                  </>
-                ) : (
-                  <div className="ctx-pop-loading">读取上下文占用…</div>
-                )}
-              </div>
+              <Suspense fallback={<div className="ctx-pop">
+                <div className="ctx-pop-loading">正在读取真实上下文…</div>
+              </div>}>
+                <ContextPopover report={exactContextReport}
+                  loading={p.contextLoading} deferred={p.contextDeferred}
+                  error={p.contextError} />
+              </Suspense>
             )}
             {p.engine === "claude" && autoCompactOpen && (
               <div className="ctx-pop auto-compact-pop" role="dialog"

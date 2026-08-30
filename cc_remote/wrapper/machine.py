@@ -168,6 +168,7 @@ from cc_remote.wrapper.codex_daemon import (
     CodexDaemonManager,
     CodexProfileDaemonUnavailable,
 )
+from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.claude_broker import BrokerClient, BrokerClientError
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from cc_remote.wrapper.claude_broker_history import (
@@ -230,7 +231,8 @@ from cc_remote.wrapper.stream import (
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexAppServerError, CodexDaemonProxyClosed, CodexHandle,
+    CodexAppServerError, CodexArchiveOutcomeUnknown,
+    CodexDaemonProxyClosed, CodexHandle,
     CodexManagedOverflow,
     CodexNoActiveTurnError, CodexNoActiveTurnFence,
     CodexSteerOutcomeUnknown,
@@ -281,7 +283,8 @@ from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_exact_catalog_rows, codex_session_cwd,
     codex_rollout_path, codex_model, codex_effort, codex_session_settings,
     codex_session_presence, codex_current_provider,
-    codex_thread_catalog_row,
+    codex_thread_archive_states, codex_thread_catalog_row,
+    codex_thread_parent_maps, codex_thread_rollout_record,
 )
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
@@ -302,6 +305,7 @@ from cc_remote.wrapper.git_diff import (
 )
 from cc_remote.wrapper.source_fetch import capture_public_source
 from cc_remote.wrapper.work_context import (
+    recover_claude_context_usage,
     recover_work_context_baseline,
     work_context_metrics,
 )
@@ -316,6 +320,10 @@ from cc_remote.wrapper.codex_checkpoints import (
 from cc_remote.wrapper.codex_forks import (
     CodexForkJournal, ForkJournalError, find_rollout_fork,
     fork_thread_source, rollout_fork_meta,
+)
+from cc_remote.wrapper.codex_archives import (
+    CodexArchiveJournal,
+    CodexArchiveJournalError,
 )
 from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournal, ClaudeForkJournalError, claude_fork_marker,
@@ -415,6 +423,18 @@ def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
     return model
 
 
+def _has_claude_context_total(usage: object) -> bool:
+    """Accept only exact readings that can paint a truthful token total."""
+    if not isinstance(usage, dict):
+        return False
+    total = usage.get("totalTokens")
+    return (
+        isinstance(total, int)
+        and not isinstance(total, bool)
+        and 0 <= total <= MAX_SAFE_WIRE_INTEGER
+    )
+
+
 CODEX_ACCOUNT_SWITCH_CONTINUATION = """\
 <codex_internal_context source="cc_remote_account_switch">
 The previous turn was interrupted only because the authenticated Codex account
@@ -424,6 +444,7 @@ switch unless it prevents completion.
 </codex_internal_context>"""
 _CODEX_DAEMON_UNMARKED_EPOCH = "unmarked"
 _CODEX_DELETE_ANCESTRY_LIMIT = 256
+_CODEX_ARCHIVE_NOFILE_SOFT_LIMIT = 4096
 
 
 def _codex_fast_on(value: Optional[str]) -> bool:
@@ -1381,6 +1402,19 @@ class _CodexDeleteRejection:
     outcome: Literal["failed", "unknown"]
 
 
+@dataclass(frozen=True)
+class _CodexForkDescendantBlock:
+    """An ordinary fork must be deleted before its history parent."""
+
+    sid: str
+
+
+@dataclass(frozen=True)
+class _CodexArchiveRejection:
+    error: Error
+    outcome: Literal["failed", "unknown"]
+
+
 class _CodexOfficialProjectionIncomplete(RuntimeError):
     """A stable rollout proves that the official newest page omitted turns."""
 
@@ -2094,6 +2128,30 @@ class WrapperMachine:
         self._uncertain_codex_forks: OrderedDict[str, Optional[str]] = OrderedDict()
         self._codex_fork_tasks: dict[str, asyncio.Task] = {}
         self._codex_fork_locks: dict[str, asyncio.Lock] = {}
+        try:
+            self._codex_archives: CodexArchiveJournal | None = (
+                CodexArchiveJournal(self.cfg.state_dir)
+            )
+        except CodexArchiveJournalError:
+            # A damaged no-replay fence must disable Codex archive mutation,
+            # not silently reopen the crash window for reliable retries.
+            self._codex_archives = None
+            log.exception("Codex archive journal unavailable")
+        self._codex_archive_tasks: dict[
+            tuple[str, str], asyncio.Task
+        ] = {}
+        # Archive operates on an entire native fork tree. Serialize every
+        # archive/fork/migration mutation within one engine account so a fork
+        # cannot materialize below a descendant after archive preflight but
+        # before the native tree mutation. The scope count is bounded by the
+        # configured Codex profiles plus Claude's single local catalog.
+        self._conversation_tree_mutation_locks: dict[str, asyncio.Lock] = {
+            "claude": asyncio.Lock(),
+            **{
+                f"codex:{profile.id}": asyncio.Lock()
+                for profile in self._codex_profiles
+            },
+        }
         # Claude's SDK chooses the child id itself. A separate durable journal
         # plus an atomically-written temporary title marker closes the crash
         # window between ``fork_session`` creating the transcript and the
@@ -2467,6 +2525,28 @@ class WrapperMachine:
         profile_id = profile.id if isinstance(profile, CodexProfile) else profile
         return self._codex_profiles.wire_session_id(profile_id, native_sid)
 
+    def _conversation_tree_mutation_lock(
+        self,
+        engine: str,
+        wire_sid: str,
+    ) -> asyncio.Lock:
+        """Return the bounded catalog lane covering a native fork tree."""
+        scope = "claude"
+        if engine == "codex":
+            try:
+                profile, _native_sid = self._codex_target(wire_sid)
+                scope = f"codex:{profile.id}"
+            except ValueError:
+                # Invalid routes are rejected inside the lane. Keeping one
+                # bounded fallback prevents attacker-controlled ids from
+                # growing a lock map.
+                scope = "codex:invalid"
+        lock = self._conversation_tree_mutation_locks.get(scope)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_tree_mutation_locks[scope] = lock
+        return lock
+
     def _work_session_identity(
         self, engine: str, wire_sid: str,
     ) -> tuple[str, str | None]:
@@ -2589,12 +2669,15 @@ class WrapperMachine:
         params: Optional[dict],
         *,
         cwd: Optional[str] = None,
+        nofile_soft_limit: Optional[int] = None,
     ):
         home = self._codex_home(profile)
-        if home is None:
-            return await codex_rpc(method, params, cwd)
-        return await codex_rpc(
-            method, params, cwd, codex_home=home)
+        rpc_kwargs = {}
+        if home is not None:
+            rpc_kwargs["codex_home"] = home
+        if nofile_soft_limit is not None:
+            rpc_kwargs["nofile_soft_limit"] = nofile_soft_limit
+        return await codex_rpc(method, params, cwd, **rpc_kwargs)
 
     async def _codex_rpc_for_wire(
         self,
@@ -2603,13 +2686,78 @@ class WrapperMachine:
         params: Optional[dict] = None,
         *,
         cwd: Optional[str] = None,
+        nofile_soft_limit: Optional[int] = None,
     ):
         profile, native_sid = self._codex_target(wire_sid)
         routed = dict(params or {})
         if "threadId" in routed:
             routed["threadId"] = native_sid
+        if nofile_soft_limit is None:
+            return await self._codex_rpc_for_profile(
+                profile,
+                method,
+                routed,
+                cwd=cwd,
+            )
         return await self._codex_rpc_for_profile(
-            profile, method, routed, cwd=cwd)
+            profile,
+            method,
+            routed,
+            cwd=cwd,
+            nofile_soft_limit=nofile_soft_limit,
+        )
+
+    async def _codex_shared_control_for_wire(
+        self,
+        wire_sid: str,
+    ) -> CodexHandle:
+        """Open an unbound control client on the thread owner's daemon.
+
+        Metadata mutations must share the daemon which may already own a
+        thread writer. Starting another stdio app-server for a hot thread is
+        rejected by Codex as ``already has an active writer``.
+        """
+        profile, _native_sid = self._codex_target(wire_sid)
+        try:
+            native_cwd = await asyncio.to_thread(
+                self._codex_cwd_for_wire,
+                wire_sid,
+            )
+        except (OSError, ValueError):
+            native_cwd = None
+        target_cwd = next((
+            os.path.realpath(candidate)
+            for candidate in (
+                native_cwd,
+                self.cfg.cc_cwd,
+                str(profile.home),
+            )
+            if isinstance(candidate, str) and os.path.isdir(candidate)
+        ), None)
+        if target_cwd is None:
+            raise RuntimeError("no existing cwd for Codex control connection")
+        handle_kwargs = {
+            "cwd": target_cwd,
+            "daemon_mode": getattr(
+                self.cfg,
+                "codex_daemon_mode",
+                "auto",
+            ),
+            "daemon_manager": self._codex_daemon_for_profile(profile),
+        }
+        codex_home = self._codex_home(profile)
+        if codex_home is not None:
+            handle_kwargs["codex_home"] = codex_home
+        handle = CodexHandle(self.cfg, **handle_kwargs)
+        try:
+            await handle.connect(cwd=target_cwd, control_only=True)
+        except BaseException:
+            try:
+                await handle.disconnect()
+            except Exception:
+                pass
+            raise
+        return handle
 
     @classmethod
     def _clean_notification_title(cls, value: object) -> Optional[str]:
@@ -5775,11 +5923,10 @@ class WrapperMachine:
         ctx.auto_compact_error = None
         await self._persist_claude_session_controls(ctx)
         event, _ = await self._publish_claude_auto_compact(ctx, force=True)
-        # force_reconnect() either captured context usage from this exact child
-        # generation or deliberately suppressed the probe.  Publish that state
-        # immediately after AutoCompact so the browser cannot remain stuck with
-        # its invalidated prior-generation report.  Cached-only mode must never
-        # issue a second synchronous control RPC against the fresh child.
+        # force_reconnect() deliberately skips optional Context inspection.
+        # Publish the new generation's cache-only state immediately so the
+        # browser cannot retain the invalidated prior-generation capacity. This
+        # path must never issue a synchronous RPC against the fresh child.
         await self._handle_get_context_locked(
             ctx, None, prefer_cached_claude=True)
         return event, True
@@ -6073,6 +6220,7 @@ class WrapperMachine:
             ctx.sdk.model = model
         if effort:
             ctx.sdk.effort = effort
+        self._invalidate_claude_context_usage(ctx)
         ctx.needs_reload = True
         try:
             await ctx.sdk.force_reconnect(
@@ -6919,6 +7067,59 @@ class WrapperMachine:
 
     # ---- lifecycle ----
 
+    async def prepare_codex_daemons(self) -> None:
+        """Start every Code shared daemon before native terminals can race it.
+
+        A native Codex TUI that opens a thread before its profile daemon exists
+        becomes that thread's private active writer.  The official app-server
+        then rejects Remote's later ``thread/resume`` instead of migrating the
+        live writer.  Prewarming at wrapper process startup makes the durable
+        shared control plane available before the normal terminal workflow.
+
+        Codex remains an optional engine.  One unavailable binary/profile is
+        logged independently and must not prevent Relay or Claude startup.
+        """
+        if getattr(self.cfg, "codex_daemon_mode", "auto") != "auto":
+            return
+        try:
+            codex_bin = await asyncio.to_thread(resolve_codex_bin)
+        except Exception as exc:
+            log.warning(
+                "Codex shared daemon prewarm unavailable",
+                error_type=type(exc).__name__,
+            )
+            return
+
+        async def prepare(profile: CodexProfile) -> None:
+            try:
+                info = await self._codex_daemon_for_profile(
+                    profile).ensure_started(
+                        codex_bin,
+                        codex_env(codex_bin, self._codex_home(profile)),
+                    )
+            except Exception as exc:
+                log.warning(
+                    "Codex profile shared daemon prewarm failed",
+                    profile_id=profile.id,
+                    error_type=type(exc).__name__,
+                )
+                return
+            if info is None:
+                log.warning(
+                    "Codex profile shared daemon prewarm unavailable",
+                    profile_id=profile.id,
+                )
+                return
+            log.info(
+                "Codex profile shared daemon ready",
+                profile_id=profile.id,
+                remote_control=info.verified_remote_control,
+            )
+
+        await asyncio.gather(*(
+            prepare(profile) for profile in self._codex_profiles
+        ))
+
     async def run(self) -> None:
         self._cleanup_tmp()
         await asyncio.to_thread(self._work.initialize)
@@ -7085,6 +7286,7 @@ class WrapperMachine:
             fork_tasks = [
                 *self._codex_fork_tasks.values(),
                 *self._claude_fork_tasks.values(),
+                *self._codex_archive_tasks.values(),
             ]
             for task in fork_tasks:
                 task.cancel()
@@ -7092,6 +7294,7 @@ class WrapperMachine:
                 await asyncio.gather(*fork_tasks, return_exceptions=True)
             self._codex_fork_tasks.clear()
             self._claude_fork_tasks.clear()
+            self._codex_archive_tasks.clear()
             if self._work_schedule_task:
                 self._work_schedule_task.cancel()
                 await asyncio.gather(
@@ -11214,6 +11417,10 @@ class WrapperMachine:
         if external_growth and ctx is not None:
             w["external_ts"] = now
             ctx.external_ts = now
+            # Both caches describe the source before this external append. A
+            # focus read can beat the ownership handoff reconnect, so invalidate
+            # at observation time rather than waiting for the next Query.
+            self._invalidate_claude_context_usage(ctx)
             ctx.needs_reload = True
 
         is_external = self._is_external(sid)
@@ -16047,7 +16254,20 @@ class WrapperMachine:
                     ctx, action="切换模型")
                 if control_error is not None:
                     return control_error
-            await ctx.sdk.set_model(cmd.model)
+            if ctx.engine == "claude":
+                # GetContext holds query_lock through its ContextReport emit.
+                # Keep the native model mutation in that same ordering lane so
+                # an old-model report cannot be delayed in _emit(), arrive
+                # after Model, and repaint the browser with stale capacity or
+                # category data. The SDK's control lock separately protects
+                # the native RPC/cache boundary; both layers are required.
+                async with ctx.query_lock:
+                    if not self._is_resident_context(ctx):
+                        return await self._missing_session_error(
+                            cmd, "切换模型")
+                    await ctx.sdk.set_model(cmd.model)
+            else:
+                await ctx.sdk.set_model(cmd.model)
             await self._refresh_pending_claude_work_baseline(ctx)
             await self._persist_claude_session_controls(ctx)
             if ctx.engine == "codex":
@@ -17174,23 +17394,42 @@ class WrapperMachine:
         if (ctx.engine != "claude" or ctx.space != "work"
                 or not ctx.work_context_baseline_pending):
             return
-        if ctx.state != "idle" or self._claude_has_background_work(ctx):
-            # Context inspection is a synchronous CLI control request. Never
-            # inject it into an active/autonomous turn merely to improve Work's
-            # optional presentation baseline.
-            return
-        try:
-            usage = await ctx.sdk.get_context_usage()
-        except Exception:
-            log.warning(
-                "fresh Claude Work baseline refresh unavailable",
-                work_id=ctx.work_id,
-            )
-            return
+        async with ctx.query_lock:
+            readiness = await self._claude_context_refresh_readiness(ctx)
+            if readiness != "ready":
+                # Context inspection is a synchronous CLI control request.
+                # Never inject it into an active/autonomous or externally-owned
+                # turn merely to improve Work's optional presentation baseline.
+                return
+            sdk = ctx.sdk
+            client = getattr(sdk, "client", None)
+            if getattr(sdk, "control_plane_failed", False):
+                await self._recover_poisoned_claude_context_control(
+                    ctx,
+                    reason="Work baseline context timeout",
+                    expected_sdk=sdk,
+                    expected_client=client,
+                )
+                return
+            try:
+                usage = await sdk.get_context_usage()
+            except Exception:
+                if getattr(sdk, "control_plane_failed", False):
+                    await self._recover_poisoned_claude_context_control(
+                        ctx,
+                        reason="Work baseline context timeout",
+                        expected_sdk=sdk,
+                        expected_client=client,
+                    )
+                log.warning(
+                    "fresh Claude Work baseline refresh unavailable",
+                    work_id=ctx.work_id,
+                )
+                return
         refreshed = usage.get("totalTokens")
         if (isinstance(refreshed, int) and not isinstance(refreshed, bool)
                 and refreshed >= 0):
-            ctx.sdk.work_context_baseline_tokens = refreshed
+            sdk.work_context_baseline_tokens = refreshed
             ctx.work_context_baseline_tokens = refreshed
 
     async def _handle_get_context(self, cmd):
@@ -17206,14 +17445,232 @@ class WrapperMachine:
             return await self._handle_get_context_locked(ctx, cmd)
 
     @staticmethod
-    def _unavailable_context_report(ctx: SessionContext) -> ContextReport:
+    def _claude_context_model(
+        ctx: SessionContext,
+        usage: object = None,
+    ) -> Optional[str]:
+        """Return only a user-facing Claude alias, never a proxy upstream id."""
+        usage_model = usage.get("model") if isinstance(usage, dict) else None
+        for candidate in (
+            getattr(ctx.sdk, "model", None),
+            ctx.announced_model,
+            usage_model,
+        ):
+            model = valid_claude_model(candidate)
+            if model is not None:
+                return model
+        return None
+
+    @staticmethod
+    def _invalidate_claude_context_usage(ctx: SessionContext) -> None:
+        invalidate = getattr(
+            ctx.sdk, "invalidate_context_usage_cache", None)
+        if callable(invalidate):
+            invalidate()
+
+    @classmethod
+    def _claude_context_work_active(cls, ctx: SessionContext) -> bool:
+        """Whether a native Context control must yield to real session work."""
+        managed = ctx.turn_task
+        return bool(
+            ctx.state != "idle"
+            or (managed is not None and not managed.done())
+            or cls._claude_has_background_work(ctx)
+            or ctx.queued_queries
+            or ctx.queued_query_starting_msg_id is not None
+            or cls._query_queue_task_active(ctx)
+            or ctx.claude_write_active
+        )
+
+    async def _claude_context_refresh_readiness(
+        self,
+        ctx: SessionContext,
+        *,
+        expected_sdk=None,
+        expected_client=None,
+        adopt_broker: bool = True,
+    ) -> Literal["ready", "busy", "external", "stale", "changed"]:
+        """Re-bind a Context read to the exact current Claude writer.
+
+        Context is presentation metadata, not permission to create a second
+        transcript writer.  Prefer the cooperative Claude broker when present;
+        otherwise close the process-watcher interval immediately before the
+        native RPC.  ``expected_*`` turns the same check into a generation fence
+        for timeout recovery.
+        """
+        if expected_sdk is not None and ctx.sdk is not expected_sdk:
+            return "changed"
+        if self._claude_context_work_active(ctx):
+            return "busy"
+
+        if (adopt_broker and ctx.engine == "claude" and ctx.space == "code"
+                and not getattr(ctx.sdk, "is_claude_broker", False)):
+            await self._adopt_claude_broker_handle(ctx)
+            if expected_sdk is not None and ctx.sdk is not expected_sdk:
+                return "changed"
+            if self._claude_context_work_active(ctx):
+                return "busy"
+
+        if getattr(ctx.sdk, "is_claude_broker", False):
+            return "ready"
+
+        route_sid = self._ctx_wire_sid(ctx)
+        if route_sid:
+            self._watch_session(route_sid)
+            external = await self._prime_claude_ownership(route_sid)
+            if expected_sdk is not None and ctx.sdk is not expected_sdk:
+                return "changed"
+            if (expected_sdk is not None
+                    and getattr(ctx.sdk, "client", None) is not expected_client):
+                return "changed"
+            if self._claude_context_work_active(ctx):
+                return "busy"
+            if external:
+                return "external"
+
+        # A failed ownership scan and a proven native CLI owner both project a
+        # non-writable control state.  Never revive an SDK writer through that
+        # fail-closed boundary merely to paint Context metadata.
+        if ctx.write_state != "writable":
+            return "external"
+        if ctx.needs_reload:
+            return "stale"
+        return "ready"
+
+    async def _reload_stale_claude_context_control(
+        self,
+        ctx: SessionContext,
+        *,
+        expected_sdk,
+        expected_client,
+    ) -> bool:
+        """Resume external transcript growth without crossing a new owner."""
+        if (ctx.sdk is not expected_sdk
+                or getattr(ctx.sdk, "client", None) is not expected_client
+                or getattr(ctx.sdk, "is_claude_broker", False)
+                or not ctx.needs_reload):
+            return False
+        readiness = await self._claude_context_refresh_readiness(
+            ctx,
+            expected_sdk=expected_sdk,
+            expected_client=expected_client,
+        )
+        if readiness != "stale":
+            return False
+
+        async def reconnect_if_still_stale() -> bool:
+            if (ctx.sdk is not expected_sdk
+                    or getattr(ctx.sdk, "client", None) is not expected_client
+                    or not ctx.needs_reload
+                    or self._claude_context_work_active(ctx)
+                    or ctx.write_state != "writable"):
+                return False
+            resume_id, fork = self._claude_reconnect_identity(ctx)
+            # Clear first so a watcher append during reconnect can reassert the
+            # stale bit without being overwritten after the await.
+            ctx.needs_reload = False
+            try:
+                await expected_sdk.force_reconnect(
+                    resume_id=resume_id,
+                    cwd=ctx.cwd,
+                    reason="external transcript change before context",
+                    preserve_model=False,
+                    fork=fork,
+                )
+            except Exception as reconnect_exc:
+                ctx.needs_reload = True
+                log.warning(
+                    "Claude context stale-generation reload failed",
+                    session_id=ctx.session_id,
+                    error_type=type(reconnect_exc).__name__,
+                )
+                return False
+            return True
+
+        barrier = getattr(expected_sdk, "context_recovery_barrier", None)
+        if callable(barrier):
+            async with barrier() as callbacks_quiescent:
+                if not callbacks_quiescent:
+                    return False
+                return await reconnect_if_still_stale()
+        return await reconnect_if_still_stale()
+
+    async def _recover_poisoned_claude_context_control(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+        expected_sdk=None,
+        expected_client=None,
+    ) -> bool:
+        """Replace one poisoned generation only across a quiescent owner fence."""
+        sdk = ctx.sdk
+        if expected_sdk is None:
+            expected_sdk = sdk
+            expected_client = getattr(sdk, "client", None)
+        if (sdk is not expected_sdk
+                or getattr(sdk, "client", None) is not expected_client
+                or not getattr(sdk, "control_plane_failed", False)
+                or getattr(sdk, "is_claude_broker", False)):
+            return False
+        readiness = await self._claude_context_refresh_readiness(
+            ctx,
+            expected_sdk=expected_sdk,
+            expected_client=expected_client,
+        )
+        if readiness != "ready":
+            return False
+
+        async def reconnect_if_still_quiescent() -> bool:
+            if (ctx.sdk is not expected_sdk
+                    or getattr(ctx.sdk, "client", None) is not expected_client
+                    or not getattr(ctx.sdk, "control_plane_failed", False)
+                    or self._claude_context_work_active(ctx)
+                    or ctx.write_state != "writable"):
+                return False
+            resume_id, fork = self._claude_reconnect_identity(ctx)
+            try:
+                await expected_sdk.force_reconnect(
+                    resume_id=resume_id,
+                    cwd=ctx.cwd,
+                    reason=reason,
+                    fork=fork,
+                )
+            except Exception as reconnect_exc:
+                log.warning(
+                    "Claude context timeout recovery failed",
+                    session_id=ctx.session_id,
+                    error_type=type(reconnect_exc).__name__,
+                )
+                return False
+            return True
+
+        barrier = getattr(expected_sdk, "context_recovery_barrier", None)
+        if callable(barrier):
+            async with barrier() as callbacks_quiescent:
+                if not callbacks_quiescent:
+                    return False
+                return await reconnect_if_still_quiescent()
+
+        # Narrow adapters used by tests or alternate engines have no background
+        # message pump.  The generation/owner/lifecycle checks above are their
+        # complete recovery boundary.
+        return await reconnect_if_still_quiescent()
+
+    @classmethod
+    def _unavailable_context_report(
+        cls,
+        ctx: SessionContext,
+        cmd=None,
+    ) -> ContextReport:
         """Describe a generation whose control plane is unsafe to query now."""
         return ContextReport(
+            request_id=getattr(cmd, "cmd_id", None),
             total_tokens=0,
             max_tokens=0,
             percentage=0.0,
             available=False,
-            model=getattr(ctx.sdk, "model", None),
+            model=cls._claude_context_model(ctx),
             is_auto_compact_enabled=None,
             auto_compact_threshold_tokens=getattr(
                 ctx.sdk,
@@ -17232,28 +17689,196 @@ class WrapperMachine:
         prefer_cached_claude: bool = False,
     ):
         try:
-            use_cached_claude_usage = bool(
-                ctx.engine == "claude"
-                and not getattr(ctx.sdk, "is_claude_broker", False)
-                and (
-                    prefer_cached_claude
-                    or ctx.state != "idle"
-                    or self._claude_has_background_work(ctx)
-                    or getattr(ctx.sdk, "control_plane_failed", False)
-                    or getattr(ctx.sdk, "context_probe_suppressed", False)
+            context_source: Literal[
+                "control", "cached_control", "recent_turn"
+            ] | None = None
+            if ctx.engine == "claude":
+                cached_reader = getattr(ctx.sdk, "cached_context_usage", None)
+                exact = cached_reader() if callable(cached_reader) else None
+                if not _has_claude_context_total(exact):
+                    exact = None
+
+                recent_reader = getattr(
+                    ctx.sdk, "cached_recent_context_usage", None)
+                recent = recent_reader() if callable(recent_reader) else None
+                if (not _has_claude_context_total(recent)
+                        or recent.get("totalTokens") == 0):
+                    recent = None
+                # A successful generation probe is newer than the transcript
+                # it resumed. Read disk only when no exact/live cache exists.
+                if recent is None and exact is None and ctx.session_id:
+                    recent = await asyncio.to_thread(
+                        recover_claude_context_usage, ctx.session_id)
+                    remember = getattr(
+                        ctx.sdk, "remember_recent_context_usage", None)
+                    if isinstance(recent, dict) and callable(remember):
+                        remember(recent)
+
+                refresh = bool(
+                    getattr(cmd, "refresh", False)
+                    and not prefer_cached_claude
                 )
-            )
-            if use_cached_claude_usage:
-                cached = getattr(ctx.sdk, "cached_context_usage", None)
-                usage = cached() if callable(cached) else None
-                if not isinstance(usage, dict):
-                    # Do not send a control request while a turn/background
-                    # continuation owns the Claude child, or while this
-                    # generation is intentionally quarantined. An unavailable
-                    # reading is safer than blocking its sole control loop.
-                    event = self._unavailable_context_report(ctx)
-                    await self._emit(ctx, event)
-                    return event
+                refresh_readiness: Literal[
+                    "ready", "busy", "external", "stale", "changed"
+                ] = "ready"
+                if refresh:
+                    refresh_readiness = await (
+                        self._claude_context_refresh_readiness(ctx)
+                    )
+                    if refresh_readiness == "stale":
+                        stale_sdk = ctx.sdk
+                        stale_client = getattr(stale_sdk, "client", None)
+                        reloaded = await (
+                            self._reload_stale_claude_context_control(
+                                ctx,
+                                expected_sdk=stale_sdk,
+                                expected_client=stale_client,
+                            )
+                        )
+                        if reloaded:
+                            refresh_readiness = await (
+                                self._claude_context_refresh_readiness(ctx)
+                            )
+                        elif self._claude_context_work_active(ctx):
+                            refresh_readiness = "busy"
+                        else:
+                            refresh_readiness = "changed"
+                    if (refresh_readiness == "ready"
+                            and getattr(
+                                ctx.sdk, "control_plane_failed", False)):
+                        poisoned_sdk = ctx.sdk
+                        poisoned_client = getattr(poisoned_sdk, "client", None)
+                        recovered = await (
+                            self._recover_poisoned_claude_context_control(
+                                ctx,
+                                reason="context control retry",
+                                expected_sdk=poisoned_sdk,
+                                expected_client=poisoned_client,
+                            )
+                        )
+                        if not recovered:
+                            refresh_readiness = (
+                                "busy"
+                                if self._claude_context_work_active(ctx)
+                                else "changed"
+                            )
+                if refresh and refresh_readiness != "ready":
+                    blocked = refresh_readiness == "busy"
+                    error = Error(
+                        code=ERR_BUSY if blocked else ERR_INTERNAL,
+                        message=(
+                            "会话正在工作，将在空闲后读取上下文。"
+                            if blocked else
+                            (
+                                "会话正由本机 Claude 终端使用，无法从 Remote "
+                                "读取真实上下文。"
+                                if refresh_readiness == "external" else
+                                "Claude 上下文控制通道正在恢复，请稍后重试。"
+                            )
+                        ),
+                        request_id=getattr(cmd, "cmd_id", None),
+                        to=getattr(cmd, "client_id", None),
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                if refresh:
+                    context_sdk = ctx.sdk
+                    context_client = getattr(context_sdk, "client", None)
+                    try:
+                        refreshed_usage = await context_sdk.get_context_usage()
+                        if not _has_claude_context_total(refreshed_usage):
+                            raise ValueError(
+                                "Claude context response omitted a valid total"
+                            )
+                    except Exception as exc:
+                        # The SDK removes only its local waiter on timeout; the
+                        # old Claude child may still be processing the request.
+                        # Replace that exact generation before releasing the
+                        # query lock so no later prompt can enter it. The new
+                        # generation deliberately performs no startup probe.
+                        poisoned = bool(
+                            ctx.sdk is context_sdk
+                            and getattr(context_sdk, "client", None)
+                                is context_client
+                            and getattr(
+                                context_sdk, "control_plane_failed", False)
+                        )
+                        log.exception(
+                            "explicit get_context_usage failed",
+                            error=str(exc),
+                            session_id=ctx.session_id,
+                        )
+                        recovered = not poisoned
+                        if poisoned:
+                            recovered = await (
+                                self._recover_poisoned_claude_context_control(
+                                    ctx,
+                                    reason="context control timeout",
+                                    expected_sdk=context_sdk,
+                                    expected_client=context_client,
+                                )
+                            )
+                        work_claimed = self._claude_context_work_active(ctx)
+                        error = Error(
+                            code=ERR_BUSY if work_claimed else ERR_INTERNAL,
+                            message=(
+                                "Claude 已开始处理后台任务结果，将在空闲后重试。"
+                                if work_claimed else
+                                "上下文读取超时，Claude 会话已安全恢复，请重试。"
+                                if poisoned and recovered else
+                                "上下文读取暂不可用，请稍后重试。"
+                            ),
+                            request_id=getattr(cmd, "cmd_id", None),
+                            to=getattr(cmd, "client_id", None),
+                        )
+                        await self._emit(ctx, error)
+                        return error
+                    else:
+                        context_source = "control"
+                        exact = refreshed_usage
+                        usage = refreshed_usage
+                        recent = None
+
+                if context_source != "control":
+                    if recent is not None:
+                        usage = dict(recent)
+                        # Capacity and model metadata remain useful only when
+                        # they came from this still-live generation. Categories
+                        # describe an older exact composition, so never combine
+                        # them with a newer recent-turn total.
+                        if exact is not None:
+                            for key in (
+                                "maxTokens", "rawMaxTokens",
+                                "autoCompactThreshold",
+                            ):
+                                value = exact.get(key)
+                                if (isinstance(value, int)
+                                        and not isinstance(value, bool)
+                                        and 0 <= value <= MAX_SAFE_WIRE_INTEGER):
+                                    usage[key] = value
+                            auto_enabled = exact.get("isAutoCompactEnabled")
+                            if isinstance(auto_enabled, bool):
+                                usage["isAutoCompactEnabled"] = auto_enabled
+                        usage["categories"] = []
+                        raw_total = usage.get("totalTokens")
+                        raw_max = usage.get("maxTokens")
+                        usage["percentage"] = (
+                            raw_total / raw_max * 100.0
+                            if (isinstance(raw_total, int)
+                                and not isinstance(raw_total, bool)
+                                and isinstance(raw_max, int)
+                                and not isinstance(raw_max, bool)
+                                and raw_max > 0)
+                            else 0.0
+                        )
+                        context_source = "recent_turn"
+                    elif exact is not None:
+                        usage = exact
+                        context_source = "cached_control"
+                    else:
+                        event = self._unavailable_context_report(ctx, cmd)
+                        await self._emit(ctx, event)
+                        return event
             else:
                 usage = await ctx.sdk.get_context_usage()
             work_fields: dict[str, int | float] = {}
@@ -17296,6 +17921,7 @@ class WrapperMachine:
                     else 0
                 )
                 event = ContextReport(
+                    request_id=getattr(cmd, "cmd_id", None),
                     total_tokens=used, max_tokens=win,
                     percentage=(used / win * 100.0) if win else 0.0,
                     available=False if not available else None,
@@ -17318,10 +17944,12 @@ class WrapperMachine:
                 and raw_physical_max >= 0 else None
             )
             event = ContextReport(
+                request_id=getattr(cmd, "cmd_id", None),
                 total_tokens=usage.get("totalTokens", 0),
                 max_tokens=usage.get("maxTokens", 0),
                 percentage=usage.get("percentage", 0.0),
-                model=usage.get("model"),
+                source=context_source,
+                model=self._claude_context_model(ctx, usage),
                 is_auto_compact_enabled=usage.get("isAutoCompactEnabled"),
                 auto_compact_threshold_tokens=auto_threshold,
                 raw_max_tokens=physical_max,
@@ -17332,6 +17960,10 @@ class WrapperMachine:
             return event
         except Exception as e:
             log.exception("get_context_usage failed", error=str(e))
+            if ctx.engine == "claude":
+                event = self._unavailable_context_report(ctx, cmd)
+                await self._emit(ctx, event)
+                return event
             # Preserve the last valid reading in every browser. The requester
             # tracks this automatic post-TurnEnd probe by cmd_id, so a routed
             # failure closes only that context control and cannot become a
@@ -20086,9 +20718,14 @@ class WrapperMachine:
         question: str,
         options: list[dict[str, str]],
     ) -> str:
-        """Keep the in-process MCP tool's historical textual timeout contract."""
+        """Keep the MCP tool's textual result and allow a custom answer."""
         try:
-            answer = await self._on_ask(ctx, question, options)
+            answer = await self._on_ask(
+                ctx,
+                question,
+                options,
+                allow_text=True,
+            )
         except AskTimeout:
             return "(用户未回答，已超时)"
         except (AskCancelled, AskSuperseded):
@@ -22979,6 +23616,198 @@ class WrapperMachine:
             await self._invalidate_session_list(engine, "work")
         return tuple(cached_responses)
 
+    async def _rename_codex_session_owner(
+        self,
+        cmd,
+        sid: str,
+        native_sid: str,
+    ) -> Error | None:
+        """Rename through the resident writer or its shared daemon."""
+        profile, _resolved_native_sid = self._codex_target(sid)
+        ctx = self._ctx_for(sid)
+        if (
+            ctx is not None
+            and ctx.engine == "codex"
+            and self._codex_profile_for_ctx(ctx).id == profile.id
+            and self._codex_context_native_thread_id(ctx, profile)
+            == native_sid
+        ):
+            async with ctx.query_lock:
+                if ctx.space == "code":
+                    control_error = await self._runtime_control_preflight(
+                        ctx,
+                        action="重命名会话",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        client_id=getattr(cmd, "client_id", None),
+                    )
+                    if control_error is not None:
+                        return control_error
+                await ctx.sdk.set_thread_name(native_sid, cmd.title)
+            return None
+
+        control: CodexHandle | None = None
+        try:
+            control = await self._codex_shared_control_for_wire(sid)
+        except Exception as exc:
+            log.warning(
+                "Codex shared rename control unavailable; using one-shot RPC",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            await self._codex_rpc_for_wire(sid, "thread/name/set", {
+                "threadId": sid,
+                "name": cmd.title,
+            })
+            return None
+        try:
+            await control.set_thread_name(native_sid, cmd.title)
+        except Exception:
+            # Renaming is idempotent. If the proxy vanished at the response
+            # boundary, the compatibility path may safely repeat the same
+            # exact title without creating another model writer.
+            await self._codex_rpc_for_wire(sid, "thread/name/set", {
+                "threadId": sid,
+                "name": cmd.title,
+            })
+        finally:
+            try:
+                await control.disconnect()
+            except Exception as exc:
+                log.warning(
+                    "Codex rename control cleanup failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+        return None
+
+    async def _unarchive_codex_session_owner(
+        self,
+        cmd,
+        sid: str,
+        native_sid: str,
+    ) -> None:
+        """Unarchive without resuming the thread's model context."""
+        profile, _resolved_native_sid = self._codex_target(sid)
+        archived_state = await self._reconcile_codex_archive_state(
+            profile,
+            native_sid,
+            archived=False,
+            settle=False,
+        )
+        if archived_state is False:
+            return
+        ctx = self._ctx_for(sid)
+        if (
+            ctx is not None
+            and ctx.engine == "codex"
+            and self._codex_profile_for_ctx(ctx).id == profile.id
+            and self._codex_context_native_thread_id(ctx, profile)
+            == native_sid
+        ):
+            async with ctx.query_lock:
+                await ctx.sdk.unarchive_thread(native_sid)
+            return
+
+        control: CodexHandle | None = None
+        try:
+            control = await self._codex_shared_control_for_wire(sid)
+        except Exception as exc:
+            log.warning(
+                "Codex shared unarchive control unavailable; using one-shot RPC",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            await self._codex_rpc_for_wire(
+                sid,
+                "thread/unarchive",
+                {"threadId": sid},
+            )
+            return
+        try:
+            await control.unarchive_thread(native_sid)
+        except Exception as exc:
+            archived_state = await self._reconcile_codex_archive_state(
+                profile,
+                native_sid,
+                archived=False,
+                settle=not isinstance(exc, CodexAppServerError),
+            )
+            if archived_state is not False:
+                raise
+        finally:
+            try:
+                await control.disconnect()
+            except Exception as exc:
+                log.warning(
+                    "Codex unarchive control cleanup failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _update_codex_work_archive_projection(
+        self,
+        wire_sids: tuple[str, ...] | list[str],
+        archived: bool,
+    ) -> None:
+        """Mirror confirmed native archive state into private Work metadata."""
+        store = self._work.for_engine("codex")
+        for wire_sid in wire_sids:
+            try:
+                profile, native_sid = self._codex_target(wire_sid)
+            except ValueError:
+                continue
+            record = await asyncio.to_thread(
+                store.get_by_session,
+                native_sid,
+                codex_profile_id=profile.id,
+            )
+            if record is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    store.update_archived,
+                    native_sid,
+                    archived,
+                    codex_profile_id=profile.id,
+                )
+            except Exception as exc:
+                # Native state already committed. A projection write failure
+                # must not make the UI retry a non-idempotent archive request.
+                log.warning(
+                    "Codex Work archive projection update failed",
+                    session_id=wire_sid,
+                    archived=archived,
+                    error_type=type(exc).__name__,
+                )
+
+    async def _sync_codex_work_archive_projection(
+        self,
+        profile: CodexProfile,
+        native_sids: tuple[str, ...] | list[str],
+        *,
+        states: dict[str, bool] | None = None,
+    ) -> None:
+        """Project only the current authoritative native archive bits."""
+        ordered_sids = tuple(dict.fromkeys(native_sids))
+        if states is None:
+            states = await self._codex_exact_archive_states(
+                profile,
+                list(ordered_sids),
+            )
+        if states is None:
+            return
+        for archived in (False, True):
+            wire_sids = [
+                self._codex_wire_sid(profile, native_sid)
+                for native_sid in ordered_sids
+                if states.get(native_sid) is archived
+            ]
+            if wire_sids:
+                await self._update_codex_work_archive_projection(
+                    wire_sids,
+                    archived,
+                )
+
     async def _handle_rename_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         is_codex = await self._is_codex_session(sid)
@@ -23015,9 +23844,14 @@ class WrapperMachine:
         if is_codex:
             self._invalidate_codex_session_catalog()
             try:
-                await self._codex_rpc_for_wire(sid, "thread/name/set", {
-                    "threadId": sid, "name": cmd.title,
-                })
+                control_error = await self._rename_codex_session_owner(
+                    cmd,
+                    sid,
+                    native_sid,
+                )
+                if control_error is not None:
+                    listing = await self._list_codex_sessions(cmd)
+                    return control_error, listing
                 await asyncio.to_thread(
                     self._codex_forks.set_title, sid, cmd.title)
                 if work_record is not None:
@@ -23059,7 +23893,205 @@ class WrapperMachine:
             await self._emit_to_sid(sid, error)
             return error
 
+    async def _replay_codex_archive_command(
+        self,
+        cmd,
+        sid: str,
+        profile: CodexProfile,
+        native_sid: str,
+    ) -> tuple[bool, object]:
+        """Resolve one durable reliable-command entry without replaying RPC."""
+        client_id = getattr(cmd, "client_id", None)
+        cmd_id = getattr(cmd, "cmd_id", None)
+        if not client_id or not cmd_id:
+            return False, None
+        journal = self._codex_archives
+        if journal is None:
+            error = Error(
+                code=ERR_INTERNAL,
+                message="归档可靠性存储不可用，未执行归档",
+                request_id=cmd_id,
+                to=client_id,
+            )
+            await self._emit_to_sid(sid, error)
+            return True, (error, await self._list_codex_sessions(cmd))
+        try:
+            entry = await asyncio.to_thread(
+                journal.get, client_id, cmd_id,
+            )
+        except CodexArchiveJournalError:
+            log.exception("Codex archive journal read failed")
+            error = Error(
+                code=ERR_INTERNAL,
+                message="无法确认归档请求状态，未重复执行",
+                request_id=cmd_id,
+                to=client_id,
+            )
+            await self._emit_to_sid(sid, error)
+            return True, (error, await self._list_codex_sessions(cmd))
+        if entry is None:
+            return False, None
+        if (
+            entry.get("profile_id") != profile.id
+            or entry.get("root_thread_id") != native_sid
+        ):
+            error = Error(
+                code=ERR_AUTH,
+                message="归档命令标识已用于其他会话",
+                request_id=cmd_id,
+                to=client_id,
+            )
+            await self._emit_to_sid(sid, error)
+            return True, (error, await self._list_codex_sessions(cmd))
+
+        status = entry.get("status")
+        native_ids = tuple(entry.get("native_ids") or ())
+        confirmed_archived_ids: tuple[str, ...] = ()
+        if status in {"intent", "submitted", "unknown"}:
+            states = await self._settle_codex_archive_states(
+                profile,
+                native_ids,
+                expected={native_sid: True},
+                settle=status != "intent",
+                allow_missing=True,
+            )
+            if states is not None and states.get(native_sid) is True:
+                confirmed_archived_ids = tuple(
+                    value for value in native_ids
+                    if states.get(value) is True
+                )
+                try:
+                    entry = await asyncio.to_thread(
+                        journal.complete,
+                        client_id,
+                        cmd_id,
+                        confirmed_archived_ids,
+                    )
+                except CodexArchiveJournalError:
+                    log.exception("Codex archive completion journal failed")
+                status = "complete"
+            elif status == "intent":
+                # The durable no-replay boundary has not been crossed. A fresh
+                # preflight must still reproduce the exact journaled snapshot
+                # before claim_submission permits the one native write.
+                return False, None
+        if status == "complete":
+            self._invalidate_codex_session_catalog()
+            # A reliable-command replay proves only that the historical
+            # archive request completed.  The user may have unarchived the
+            # thread since then, so refresh the Work projection from current
+            # native state instead of replaying the old archived bit.
+            await self._sync_codex_work_archive_projection(
+                profile,
+                native_ids,
+            )
+            return True, await self._list_codex_sessions(cmd)
+        if status == "rejected":
+            error = Error(
+                code=entry.get("error_code") or ERR_INTERNAL,
+                message=entry.get("error_message") or "会话归档未完成",
+                request_id=cmd_id,
+                to=client_id,
+            )
+        else:
+            error = Error(
+                code=ERR_INTERNAL,
+                message=(
+                    "会话归档结果仍在确认中，请稍后刷新；"
+                    "未自动重试或回滚"
+                ),
+                request_id=cmd_id,
+                to=client_id,
+            )
+        await self._emit_to_sid(sid, error)
+        return True, (error, await self._list_codex_sessions(cmd))
+
+    def _ensure_codex_archive_reconciler(
+        self,
+        cmd,
+        profile: CodexProfile,
+        root_native_sid: str,
+        native_ids: tuple[str, ...],
+    ) -> None:
+        """Poll only authoritative state after an outcome-unknown archive."""
+        client_id = getattr(cmd, "client_id", None)
+        cmd_id = getattr(cmd, "cmd_id", None)
+        if (
+            not client_id
+            or not cmd_id
+            or self._codex_archives is None
+            or not native_ids
+        ):
+            return
+        key = (client_id, cmd_id)
+        current = self._codex_archive_tasks.get(key)
+        if current is not None and not current.done():
+            return
+
+        async def reconcile() -> None:
+            try:
+                for delay in (0.25, 0.75, 2.0, 5.0):
+                    await asyncio.sleep(delay)
+                    states = await self._codex_exact_archive_states(
+                        profile,
+                        list(native_ids),
+                    )
+                    if (
+                        states is None
+                        or states.get(root_native_sid) is not True
+                    ):
+                        continue
+                    archived_ids = tuple(
+                        value for value in native_ids
+                        if states.get(value) is True
+                    )
+                    journal = self._codex_archives
+                    if journal is None:
+                        return
+                    try:
+                        await asyncio.to_thread(
+                            journal.complete,
+                            client_id,
+                            cmd_id,
+                            archived_ids,
+                        )
+                    except CodexArchiveJournalError:
+                        log.exception(
+                            "Codex archive background journal failed")
+                        return
+                    self._invalidate_codex_session_catalog()
+                    await self._sync_codex_work_archive_projection(
+                        profile,
+                        native_ids,
+                        states=states,
+                    )
+                    try:
+                        await self._invalidate_session_list(
+                            "codex", getattr(cmd, "space", "code"))
+                    except Exception as exc:
+                        log.warning(
+                            "Codex archive reconciliation invalidation failed",
+                            error_type=type(exc).__name__,
+                        )
+                    return
+            finally:
+                task = asyncio.current_task()
+                if self._codex_archive_tasks.get(key) is task:
+                    self._codex_archive_tasks.pop(key, None)
+
+        self._codex_archive_tasks[key] = asyncio.create_task(
+            reconcile(),
+            name=f"codex-archive-reconcile-{cmd_id}",
+        )
+
     async def _handle_archive_session(self, cmd) -> None:
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        async with self._conversation_tree_mutation_lock(engine, sid):
+            return await self._handle_archive_session_locked(cmd)
+
+    async def _handle_archive_session_locked(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
@@ -23093,31 +24125,167 @@ class WrapperMachine:
             await self._emit_to_sid(sid, error)
             return error
         if is_codex:
+            if cmd.archived:
+                handled, replay = await self._replay_codex_archive_command(
+                    cmd,
+                    sid,
+                    _profile,
+                    native_sid,
+                )
+                if handled:
+                    return replay
             self._invalidate_codex_session_catalog()
-            method = "thread/archive" if cmd.archived else "thread/unarchive"
+            if not cmd.archived:
+                try:
+                    await self._unarchive_codex_session_owner(
+                        cmd,
+                        sid,
+                        native_sid,
+                    )
+                    await self._update_codex_work_archive_projection(
+                        [sid],
+                        False,
+                    )
+                    log.info(
+                        "codex session archive toggled",
+                        session_id=sid,
+                        archived=False,
+                    )
+                    return await self._list_codex_sessions(cmd)
+                except Exception as e:
+                    log.exception(
+                        "codex unarchive_session failed",
+                        error=str(e),
+                    )
+                    error = Error(
+                        code=ERR_INTERNAL,
+                        message="会话取消归档未完成，请重试。",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        to=getattr(cmd, "client_id", None),
+                    )
+                    await self._emit_to_sid(sid, error)
+                    listing = await self._list_codex_sessions(cmd)
+                    return error, listing
+
+            ctx = self._ctx_for(sid)
+            if (
+                ctx is not None
+                and (
+                    ctx.engine != "codex"
+                    or self._codex_profile_for_ctx(ctx).id != _profile.id
+                    or self._codex_context_native_thread_id(ctx, _profile)
+                    != native_sid
+                )
+            ):
+                ctx = None
+            transient_ctx = False
+            if ctx is None:
+                # A copied CODEX_HOME can retain absolute catalog paths into its
+                # former home.  Reject that stale ownership record before even
+                # opening a shared control connection: the stdio fallback below
+                # binds with thread/resume, which is already a native side effect.
+                if requested_space == "code":
+                    home = self._codex_home(_profile)
+                    rollout_record = await asyncio.to_thread(
+                        codex_thread_rollout_record,
+                        native_sid,
+                        **({} if home is None else {"codex_home": home}),
+                    )
+                    if rollout_record is None:
+                        error = await self._send_code_delete_error(
+                            cmd,
+                            sid,
+                            ERR_INTERNAL,
+                            "无法确认 Codex 会话目录记录，未执行归档",
+                        )
+                        listing = await self._list_codex_sessions(cmd)
+                        return error, listing
+                    catalog_rollout_path, catalog_archived = rollout_record
+                    if not self._codex_catalog_rollout_is_profile_local(
+                        _profile,
+                        catalog_rollout_path,
+                        archived=catalog_archived,
+                    ):
+                        log.error(
+                            "Codex profile catalog rollout escaped CODEX_HOME",
+                            profile_id=_profile.id,
+                            session_id=native_sid,
+                        )
+                        error = await self._send_code_delete_error(
+                            cmd,
+                            sid,
+                            ERR_INTERNAL,
+                            "Codex CODEX_HOME 迁移不完整：会话目录仍指向"
+                            "账号目录外；未执行归档",
+                        )
+                        listing = await self._list_codex_sessions(cmd)
+                        return error, listing
+                ctx_or_error = await self._cold_codex_delete_context(
+                    cmd,
+                    sid,
+                    native_sid,
+                    action="归档",
+                )
+                if isinstance(ctx_or_error, Error):
+                    listing = await self._list_codex_sessions(cmd)
+                    return ctx_or_error, listing
+                ctx = ctx_or_error
+                transient_ctx = True
+            archive_result: _CodexArchiveRejection | tuple[str, ...]
             try:
-                await self._codex_rpc_for_wire(
-                    sid, method, {"threadId": sid})
-                if work_record is not None:
-                    await asyncio.to_thread(
-                        self._work.for_engine(engine).update_archived,
-                        native_sid, cmd.archived,
-                        codex_profile_id=codex_profile_id)
-                log.info("codex session archive toggled", session_id=sid,
-                         archived=cmd.archived)
-                return await self._list_codex_sessions(cmd)
+                try:
+                    rollout_path = await asyncio.to_thread(
+                        self._codex_rollout_for_wire,
+                        sid,
+                    )
+                except (OSError, ValueError):
+                    rollout_path = None
+                archive_result = await self._archive_loaded_codex_thread(
+                    cmd,
+                    sid,
+                    native_sid,
+                    ctx,
+                    rollout_path=rollout_path,
+                    transient=transient_ctx,
+                )
             except Exception as e:
-                log.exception("codex archive_session failed", error=str(e))
+                log.exception(
+                    "codex archive_session failed",
+                    error=str(e),
+                )
                 error = Error(
-                    code=ERR_INTERNAL, message="会话归档未完成，请重试。",
+                    code=ERR_INTERNAL,
+                    message="会话归档未完成，请重试。",
                     request_id=getattr(cmd, "cmd_id", None),
-                    to=getattr(cmd, "client_id", None))
+                    to=getattr(cmd, "client_id", None),
+                )
                 await self._emit_to_sid(sid, error)
-                # The UI waits for this authoritative result instead of moving
-                # the card optimistically. It also reconciles a timeout where the
-                # app-server committed the mutation but its response was lost.
                 listing = await self._list_codex_sessions(cmd)
                 return error, listing
+            finally:
+                if transient_ctx:
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "cold Codex archive control cleanup failed",
+                            session_id=sid,
+                            error_type=type(exc).__name__,
+                        )
+            if isinstance(archive_result, _CodexArchiveRejection):
+                listing = await self._list_codex_sessions(cmd)
+                return archive_result.error, listing
+            await self._update_codex_work_archive_projection(
+                archive_result,
+                True,
+            )
+            log.info(
+                "codex session archive toggled",
+                session_id=sid,
+                archived=True,
+                archived_count=len(archive_result),
+            )
+            return await self._list_codex_sessions(cmd)
         try:
             tag = "archived" if cmd.archived else None
             await asyncio.to_thread(tag_session, sid, tag)
@@ -23333,6 +24501,16 @@ class WrapperMachine:
         await self._handle_list_sessions(cmd)
         log.info("Work session deleted", engine=engine, session_id=sid)
 
+    def _session_has_deferred_query_ownership(
+        self,
+        ctx: SessionContext,
+    ) -> bool:
+        return bool(
+            ctx.queued_queries
+            or ctx.queued_query_starting_msg_id
+            or self._query_queue_task_active(ctx)
+        )
+
     def _session_delete_busy(self, ctx: SessionContext) -> bool:
         active = any(
             task is not None and not task.done()
@@ -23341,9 +24519,7 @@ class WrapperMachine:
         return bool(
             ctx.state != "idle"
             or active
-            or ctx.queued_queries
-            or ctx.queued_query_starting_msg_id
-            or self._query_queue_task_active(ctx)
+            or self._session_has_deferred_query_ownership(ctx)
             or getattr(ctx.sdk, "turn_active", False)
             or getattr(ctx.sdk, "turn_start_pending", False)
         )
@@ -23368,19 +24544,19 @@ class WrapperMachine:
             return candidate
         return None
 
-    async def _codex_thread_descends_from(
+    async def _codex_thread_descendant_depth(
         self,
         sdk: CodexHandle,
         thread_id: str,
         ancestor_id: str,
         parent_cache: dict[str, str | None],
-    ) -> bool:
+    ) -> int | None:
         """Follow exact loaded-thread metadata to one requested ancestor."""
         current = thread_id
         seen: set[str] = set()
-        for _depth in range(_CODEX_DELETE_ANCESTRY_LIMIT):
+        for depth in range(_CODEX_DELETE_ANCESTRY_LIMIT):
             if current == ancestor_id:
-                return True
+                return depth
             if current in seen:
                 raise RuntimeError("Codex fork ancestry contains a cycle")
             seen.add(current)
@@ -23391,21 +24567,95 @@ class WrapperMachine:
                     )
                 except (CodexAppServerError, CodexRpcRejected) as exc:
                     if self._codex_thread_not_loaded(exc, current):
-                        return False
+                        return None
                     raise
             parent = parent_cache[current]
             if parent is None:
-                return False
+                return None
             current = parent
         raise RuntimeError("Codex fork ancestry exceeds the safety limit")
+
+    async def _cold_codex_delete_blocked_many(
+        self,
+        candidates: dict[str, str | None],
+        *,
+        own_handle: CodexHandle,
+    ) -> str | None:
+        """Close ownership for many cold descendants with one process scan."""
+        def seed_tail_state() -> dict[str, tuple[str, set[str]]]:
+            seeded: dict[str, tuple[str, set[str]]] = {}
+            for candidate_sid, rollout_path in candidates.items():
+                if not rollout_path:
+                    continue
+                try:
+                    size = os.stat(rollout_path).st_size
+                except OSError:
+                    continue
+                active_turns, _partial = self._codex_tail_state(
+                    rollout_path,
+                    size,
+                )
+                seeded[candidate_sid] = (rollout_path, active_turns)
+            return seeded
+
+        seeded = await asyncio.to_thread(seed_tail_state)
+        if not seeded:
+            return None
+        paths = {
+            candidate_sid: rollout_path
+            for candidate_sid, (rollout_path, _active) in seeded.items()
+        }
+        async with self._codex_watch_lock:
+            scan = await self._probe_codex_holders(
+                paths,
+                extra_handles=(own_handle,),
+            )
+            for candidate_sid in sorted(seeded):
+                _rollout_path, active_turns = seeded[candidate_sid]
+                ephemeral_watch = {
+                    "active_external_turns": {
+                        turn_id: time.time()
+                        for turn_id in active_turns
+                    },
+                    "seeded_external_turns": set(active_turns),
+                    "preserve_seeded_without_holder": True,
+                    "takeover_holders": set(),
+                    "takeover_interactive_holders": set(),
+                }
+                self._codex_holder_sets(
+                    ephemeral_watch,
+                    scan,
+                    candidate_sid,
+                )
+                if (
+                    not self._codex_scan_complete_for_sid(
+                        scan,
+                        candidate_sid,
+                    )
+                    or ephemeral_watch["active_external_turns"]
+                ):
+                    return candidate_sid
+        return None
 
     async def _preflight_codex_delete_descendants(
         self,
         ctx: SessionContext,
         native_sid: str,
         residents: tuple[SessionContext, ...],
-    ) -> tuple[SessionContext | str | None, tuple[str, ...]]:
-        """Collect recursive-delete descendants and find protected work."""
+        *,
+        protect_descendants: bool = True,
+    ) -> tuple[
+        SessionContext | str | _CodexForkDescendantBlock | None,
+        tuple[str, ...],
+    ]:
+        """Collect descendants and optionally reject their protected work.
+
+        Native ``thread/delete`` is an all-descendant destructive mutation and
+        therefore requires the default protection. ``thread/archive`` is
+        explicitly best-effort for descendants: an active child is left active
+        while the root can still be archived, so archive callers opt out after
+        the complete bounded ancestry has been collected.
+        """
         profile = self._codex_profile_for_ctx(ctx)
         parent_cache: dict[str, str | None] = {}
         resident_by_native: dict[str, SessionContext] = {}
@@ -23443,24 +24693,156 @@ class WrapperMachine:
             # potentially stale snapshot here.
             candidate_activity.setdefault(candidate_native_sid, False)
 
+        home = self._codex_home(profile)
+        parent_projection = await asyncio.to_thread(
+            codex_thread_parent_maps,
+            **({} if home is None else {"codex_home": home}),
+        )
+        if parent_projection is None:
+            raise RuntimeError("Codex descendant catalog is unavailable")
+        storage_parents, ordinary_fork_parents = parent_projection
+        try:
+            journal_children = self._codex_forks.completed_children()
+        except ForkJournalError as exc:
+            raise RuntimeError(
+                "Codex fork journal is unavailable"
+            ) from exc
+        for entry in journal_children:
+            child_wire_sid = entry.get("session_id")
+            parent_wire_sid = entry.get("parent_session_id")
+            if (
+                not isinstance(child_wire_sid, str)
+                or not isinstance(parent_wire_sid, str)
+            ):
+                raise RuntimeError("Codex fork journal edge is invalid")
+            try:
+                child_profile, child_native_sid = self._codex_target(
+                    child_wire_sid
+                )
+                parent_profile, parent_native_sid = self._codex_target(
+                    parent_wire_sid
+                )
+            except ValueError as exc:
+                raise RuntimeError("Codex fork journal edge is invalid") from exc
+            if child_profile.id != parent_profile.id:
+                raise RuntimeError("Codex fork journal crosses profiles")
+            if child_profile.id != profile.id:
+                continue
+            if child_native_sid == parent_native_sid:
+                raise RuntimeError("Codex fork ancestry contains a cycle")
+            existing_parent = storage_parents.get(child_native_sid)
+            if (
+                existing_parent is not None
+                and existing_parent != parent_native_sid
+            ):
+                raise RuntimeError("Codex fork ancestry is inconsistent")
+            # A live journal entry is useful for app-server list omissions, but
+            # it may not resurrect a child absent from both the exact catalog
+            # projection and the native list/activity inventory.
+            if (
+                existing_parent is not None
+                or child_native_sid in candidate_activity
+            ):
+                storage_parents[child_native_sid] = parent_native_sid
+                ordinary_fork_parents[child_native_sid] = parent_native_sid
+                candidate_activity.setdefault(child_native_sid, False)
+        parent_cache.update(storage_parents)
+
+        descendant_depths: dict[str, int] = {}
         for candidate_native_sid in sorted(candidate_activity):
             if candidate_native_sid == native_sid:
                 if candidate_activity[candidate_native_sid]:
                     return candidate_native_sid, tuple(descendant_sids)
                 continue
-            is_descendant = await self._codex_thread_descends_from(
+            depth = await self._codex_thread_descendant_depth(
                 ctx.sdk,
                 candidate_native_sid,
                 native_sid,
                 parent_cache,
             )
-            if not is_descendant:
+            if depth is None:
                 continue
+            descendant_depths[candidate_native_sid] = depth
+            # The exact reconciliation budget includes the root, so at most
+            # MAX-1 descendants may cross the native mutation boundary.
+            if len(descendant_depths) >= CODEX_EXACT_CATALOG_MAX_IDS:
+                raise RuntimeError(
+                    "Codex descendant catalog exceeds the safety limit"
+                )
+
+        children_by_parent: dict[str, list[str]] = {}
+        for child_native_sid, parent_native_sid in storage_parents.items():
+            children_by_parent.setdefault(parent_native_sid, []).append(
+                child_native_sid
+            )
+        stack = [(native_sid, 0), *descendant_depths.items()]
+        while stack:
+            parent_native_sid, parent_depth = stack.pop()
+            for child_native_sid in children_by_parent.get(
+                parent_native_sid,
+                (),
+            ):
+                child_depth = parent_depth + 1
+                previous_depth = descendant_depths.get(child_native_sid)
+                if previous_depth is not None:
+                    if previous_depth != child_depth:
+                        raise RuntimeError(
+                            "Codex fork ancestry is inconsistent"
+                        )
+                    continue
+                if child_native_sid == native_sid:
+                    raise RuntimeError("Codex fork ancestry contains a cycle")
+                descendant_depths[child_native_sid] = child_depth
+                candidate_activity.setdefault(child_native_sid, False)
+                stack.append((child_native_sid, child_depth))
+                if len(descendant_depths) >= CODEX_EXACT_CATALOG_MAX_IDS:
+                    raise RuntimeError(
+                        "Codex descendant catalog exceeds the safety limit"
+                    )
+
+        ordered_descendants = sorted(
+            descendant_depths,
+            key=lambda candidate_native_sid: (
+                -descendant_depths[candidate_native_sid],
+                candidate_native_sid,
+            ),
+        )
+        descendant_sids = [
+            self._codex_wire_sid(profile, candidate_native_sid)
+            for candidate_native_sid in ordered_descendants
+        ]
+        if protect_descendants:
+            fork_blocker = next((
+                candidate_native_sid
+                for candidate_native_sid in ordered_descendants
+                if candidate_native_sid in ordinary_fork_parents
+            ), None)
+            if fork_blocker is not None:
+                return (
+                    _CodexForkDescendantBlock(
+                        self._codex_wire_sid(profile, fork_blocker)
+                    ),
+                    tuple(descendant_sids),
+                )
+        if not protect_descendants:
+            # Native archive may leave an actively running child alone, but a
+            # wrapper-owned deferred Query is not native state and would be
+            # silently discarded if that child happens to archive.  Preserve
+            # those payloads even in best-effort archive mode.
+            for candidate_native_sid in ordered_descendants:
+                candidate = resident_by_native.get(candidate_native_sid)
+                if (
+                    candidate is not None
+                    and self._session_has_deferred_query_ownership(candidate)
+                ):
+                    return candidate, tuple(descendant_sids)
+            return None, tuple(descendant_sids)
+        cold_candidates: dict[str, str | None] = {}
+        for candidate_native_sid in ordered_descendants:
             candidate_sid = self._codex_wire_sid(
                 profile,
                 candidate_native_sid,
             )
-            descendant_sids.append(candidate_sid)
             candidate = resident_by_native.get(candidate_native_sid)
             if candidate is not None:
                 if (
@@ -23476,16 +24858,29 @@ class WrapperMachine:
                 continue
             if candidate_activity[candidate_native_sid]:
                 return candidate_sid, tuple(descendant_sids)
+            if candidate_sid in self._watch:
+                try:
+                    rollout_path = self._codex_rollout_for_wire(candidate_sid)
+                except (OSError, ValueError):
+                    rollout_path = None
+                if await self._cold_codex_delete_blocked(
+                    candidate_sid,
+                    rollout_path,
+                    own_handle=ctx.sdk,
+                ):
+                    return candidate_sid, tuple(descendant_sids)
+                continue
             try:
                 rollout_path = self._codex_rollout_for_wire(candidate_sid)
             except (OSError, ValueError):
                 rollout_path = None
-            if await self._cold_codex_delete_blocked(
-                candidate_sid,
-                rollout_path,
-                own_handle=ctx.sdk,
-            ):
-                return candidate_sid, tuple(descendant_sids)
+            cold_candidates[candidate_sid] = rollout_path
+        blocked_sid = await self._cold_codex_delete_blocked_many(
+            cold_candidates,
+            own_handle=ctx.sdk,
+        )
+        if blocked_sid is not None:
+            return blocked_sid, tuple(descendant_sids)
         return None, tuple(descendant_sids)
 
     async def _codex_delete_external_owner(self, sid: str) -> bool:
@@ -23527,6 +24922,7 @@ class WrapperMachine:
             code=code,
             message=message,
             sid=sid,
+            request_id=getattr(cmd, "cmd_id", None),
             to=getattr(cmd, "client_id", None),
         )
         await self.transport.send(error)
@@ -23564,13 +24960,35 @@ class WrapperMachine:
             and exc.message.endswith(f"thread not loaded: {native_sid}")
         )
 
+    @staticmethod
+    def _codex_archive_error_reason(exc: Exception | None) -> str:
+        """Return a bounded, path-free native archive diagnostic class."""
+        if exc is None:
+            return "root_not_archived"
+        message = getattr(exc, "message", "")
+        text = message.lower() if isinstance(message, str) else ""
+        if "active writer" in text:
+            return "active_writer"
+        if "must be in sessions directory" in text:
+            return "rollout_outside_profile"
+        if isinstance(
+            exc,
+            (CodexArchiveOutcomeUnknown, CodexRpcOutcomeUnknown),
+        ):
+            return "outcome_unknown"
+        if isinstance(exc, (CodexAppServerError, CodexRpcRejected)):
+            return "native_rejected"
+        return "transport_or_runtime"
+
     async def _cold_codex_delete_context(
         self,
         cmd,
         sid: str,
         native_sid: str,
+        *,
+        action: Literal["删除", "归档"] = "删除",
     ) -> SessionContext | Error:
-        """Open a non-resident control connection for one cold deletion."""
+        """Open a non-resident owner connection for a cold mutation."""
         try:
             profile, resolved_native_sid = self._codex_target(sid)
         except ValueError:
@@ -23611,7 +25029,7 @@ class WrapperMachine:
                 cmd,
                 sid,
                 ERR_INVALID_CWD,
-                "没有可用目录连接 Codex，无法删除会话",
+                f"没有可用目录连接 Codex，无法{action}会话",
             )
 
         handle_kwargs = {
@@ -23628,7 +25046,17 @@ class WrapperMachine:
             handle_kwargs["codex_home"] = codex_home
         sdk = CodexHandle(self.cfg, **handle_kwargs)
         try:
-            if sdk.daemon_mode == "auto":
+            if action == "删除":
+                if sdk.daemon_mode != "auto":
+                    raise RuntimeError(
+                        "archived deletion requires shared control"
+                    )
+                # An archived thread must never be resumed merely to delete it:
+                # resume can move its rollout back to the active store before
+                # thread/delete validates the archive lifecycle. Use only the
+                # unbound shared owner and fail closed if it is unavailable.
+                await sdk.connect(cwd=target_cwd, control_only=True)
+            elif sdk.daemon_mode == "auto":
                 try:
                     await sdk.connect(cwd=target_cwd, control_only=True)
                 except Exception as proxy_exc:
@@ -23637,9 +25065,10 @@ class WrapperMachine:
                     except Exception:
                         pass
                     log.warning(
-                        "cold Codex shared delete connection failed; "
+                        "cold Codex shared mutation connection failed; "
                         "using stdio",
                         session_id=sid,
+                        action=action,
                         error_type=type(proxy_exc).__name__,
                     )
                     fallback_kwargs = dict(handle_kwargs)
@@ -23658,15 +25087,16 @@ class WrapperMachine:
             except Exception:
                 pass
             log.warning(
-                "cold Codex delete control connection failed",
+                "cold Codex mutation control connection failed",
                 session_id=sid,
+                action=action,
                 error_type=type(exc).__name__,
             )
             return await self._send_code_delete_error(
                 cmd,
                 sid,
                 ERR_NOT_RUNNING,
-                "Codex 删除通道连接失败，请稍后重试",
+                f"Codex {action}通道连接失败，请稍后重试",
             )
         ctx = SessionContext(
             session_id=native_sid,
@@ -23681,7 +25111,8 @@ class WrapperMachine:
             space="code",
         )
         # This transient context never owns a checkpoint object. Confirmed
-        # cold deletion cleans persistent repository buckets by session id.
+        # cold deletion cleans persistent repository buckets by session id;
+        # archive deliberately preserves them for a later unarchive.
         ctx.codex_checkpoint = False
         return ctx
 
@@ -23734,57 +25165,93 @@ class WrapperMachine:
         rollout_path: str | None,
         *,
         own_handle: CodexHandle,
+        additional_rollout_paths: tuple[str, ...] = (),
     ) -> bool:
         """Check cold shared ownership without registering a resident watch."""
         watch = self._watch.get(sid)
+        watched_path: str | None = None
         if watch is not None and watch.get("engine") == "codex":
-            await self._prime_codex_ownership(
+            external = await self._prime_codex_ownership(
                 sid,
                 extra_handles=(own_handle,),
             )
-            return bool(
-                not watch.get("scan_complete", False)
+            watch = self._watch.get(sid)
+            if watch is None or watch.get("engine") != "codex":
+                return True
+            if bool(
+                external
+                or not watch.get("scan_complete", False)
                 or watch.get("active_external_turns")
-            )
-        if not rollout_path:
-            return False
-        try:
-            stat_result = await asyncio.to_thread(os.stat, rollout_path)
-        except OSError:
-            return False
-        active_turns, _partial = self._codex_tail_state(
-            rollout_path,
-            stat_result.st_size,
-        )
-        ephemeral_watch = {
-            "active_external_turns": {
-                turn_id: time.time()
-                for turn_id in active_turns
-            },
-            "seeded_external_turns": set(active_turns),
-            # A private Codex App turn can write through short-lived opens and
-            # expose no stable holder. A destructive one-shot probe must keep
-            # its active tail marker; a later retry can observe the terminal,
-            # while a normal watch can retire a proven crashed orphan by TTL.
-            "preserve_seeded_without_holder": True,
-            "takeover_holders": set(),
-            "takeover_interactive_holders": set(),
+            ):
+                return True
+            raw_watched_path = watch.get("path")
+            if isinstance(raw_watched_path, str) and raw_watched_path:
+                watched_path = os.path.realpath(raw_watched_path)
+
+        strict_paths = {
+            os.path.realpath(path)
+            for path in additional_rollout_paths
+            if isinstance(path, str) and path
         }
-        async with self._codex_watch_lock:
-            scan = await self._probe_codex_holders(
-                {sid: rollout_path},
-                extra_handles=(own_handle,),
+        paths: list[str] = []
+        seen_paths: set[str] = set()
+        for candidate in (rollout_path, *additional_rollout_paths):
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            resolved = os.path.realpath(candidate)
+            if resolved == watched_path or resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            paths.append(resolved)
+
+        for path in paths:
+            try:
+                stat_result = await asyncio.to_thread(os.stat, path)
+            except OSError:
+                continue
+            active_turns, _partial = self._codex_tail_state(
+                path,
+                stat_result.st_size,
             )
-            self._codex_holder_sets(
-                ephemeral_watch,
-                scan,
-                sid,
-            )
-            scan_complete = self._codex_scan_complete_for_sid(scan, sid)
-        return bool(
-            not scan_complete
-            or ephemeral_watch["active_external_turns"]
-        )
+            ephemeral_watch = {
+                "active_external_turns": {
+                    turn_id: time.time()
+                    for turn_id in active_turns
+                },
+                "seeded_external_turns": set(active_turns),
+                # A private Codex App turn can write through short-lived opens
+                # and expose no stable holder. A destructive one-shot probe
+                # must keep its active tail marker; a later retry can observe
+                # the terminal, while a normal watch can retire a proven
+                # crashed orphan by TTL.
+                "preserve_seeded_without_holder": True,
+                "takeover_holders": set(),
+                "takeover_interactive_holders": set(),
+            }
+            async with self._codex_watch_lock:
+                scan = await self._probe_codex_holders(
+                    {sid: path},
+                    extra_handles=(own_handle,),
+                )
+                _interactive, writers, _private = self._codex_holder_sets(
+                    ephemeral_watch,
+                    scan,
+                    sid,
+                )
+                scan_complete = self._codex_scan_complete_for_sid(
+                    scan,
+                    sid,
+                )
+            if (
+                not scan_complete
+                or ephemeral_watch["active_external_turns"]
+                # A foreign profile can keep the old copied-catalog source
+                # open while idle. Rebinding away from that inode is safe only
+                # after every writer has released it.
+                or (path in strict_paths and writers)
+            ):
+                return True
+        return False
 
     async def _reconcile_loaded_codex_delete(
         self,
@@ -24023,6 +25490,15 @@ class WrapperMachine:
                         "无法确认派生会话状态，未执行删除",
                     )
                 if busy_descendant is not None:
+                    if isinstance(
+                        busy_descendant,
+                        _CodexForkDescendantBlock,
+                    ):
+                        return await reject(
+                            ERR_BUSY,
+                            "该会话仍有派生会话；请先从最深层派生会话开始"
+                            "删除，再删除父会话",
+                        )
                     return await reject(
                         ERR_BUSY,
                         "派生会话仍在运行、排队或由其他 Codex 客户端使用",
@@ -24145,10 +25621,928 @@ class WrapperMachine:
                     )
         return tuple(deleted_sids)
 
+    async def _codex_exact_archive_states(
+        self,
+        profile: CodexProfile,
+        native_sids: tuple[str, ...] | list[str],
+    ) -> dict[str, bool] | None:
+        """Read exact archived flags without interpreting absence as active."""
+        home = self._codex_home(profile)
+        return await asyncio.to_thread(
+            codex_thread_archive_states,
+            native_sids,
+            **({} if home is None else {"codex_home": home}),
+        )
+
+    async def _native_session_archived_state(
+        self,
+        engine: str,
+        wire_sid: str,
+    ) -> bool | None:
+        """Read the engine-owned archive bit before a content mutation.
+
+        ``None`` is deliberately not treated as active. Forking or migrating
+        while the authoritative state is unreadable would reopen the archived
+        read-only boundary for forged/stale browser commands.
+        """
+        if engine == "codex":
+            try:
+                profile, native_sid = self._codex_target(wire_sid)
+            except ValueError:
+                return None
+            states = await self._codex_exact_archive_states(
+                profile,
+                (native_sid,),
+            )
+            if states is None or set(states) != {native_sid}:
+                return None
+            return states[native_sid]
+        try:
+            info = await asyncio.to_thread(get_session_info, wire_sid)
+        except Exception as exc:
+            log.warning(
+                "Claude archive state lookup failed",
+                session_id=wire_sid,
+                error_type=type(exc).__name__,
+            )
+            return None
+        if info is None:
+            return None
+        return getattr(info, "tag", None) == "archived"
+
+    async def _reconcile_codex_archive_state(
+        self,
+        profile: CodexProfile,
+        native_sid: str,
+        *,
+        archived: bool,
+        settle: bool,
+    ) -> bool | None:
+        """Resolve a possibly lost archive response after a bounded settle."""
+        states = await self._settle_codex_archive_states(
+            profile,
+            (native_sid,),
+            expected={native_sid: archived},
+            settle=settle,
+        )
+        return None if states is None else states[native_sid]
+
+    async def _settle_codex_archive_states(
+        self,
+        profile: CodexProfile,
+        native_sids: tuple[str, ...] | list[str],
+        *,
+        expected: dict[str, bool] | None,
+        settle: bool,
+        allow_missing: bool = False,
+    ) -> dict[str, bool] | None:
+        """Read a bounded tree, optionally allowing missing descendants.
+
+        The requested root remains mandatory whenever ``expected`` names it.
+        Missing descendants are permitted only after a best-effort native
+        archive boundary, where another owner may independently remove them.
+        """
+        ordered_sids = tuple(dict.fromkeys(native_sids))
+        expected_ids = set(ordered_sids)
+        if (
+            not ordered_sids
+            or len(ordered_sids) > CODEX_EXACT_CATALOG_MAX_IDS
+            or (
+                expected is not None
+                and not set(expected).issubset(expected_ids)
+            )
+        ):
+            return None
+        latest: dict[str, bool] | None = None
+        # A transport can disappear while the app-server still finishes a
+        # filesystem mutation.  Sample across a bounded 1.5-second window
+        # before treating a non-target state as stable enough to roll back.
+        delays = (0.0, 0.1, 0.4, 1.0) if settle else (0.0,)
+        for delay in delays:
+            if delay:
+                await asyncio.sleep(delay)
+            states = await self._codex_exact_archive_states(
+                profile,
+                list(ordered_sids),
+            )
+            if states is None:
+                continue
+            if allow_missing:
+                required_ids = set(expected or {})
+                if not required_ids.issubset(states):
+                    continue
+            elif set(states) != expected_ids:
+                continue
+            latest = {
+                native_id: states[native_id]
+                for native_id in ordered_sids
+                if native_id in states
+            }
+            if expected is None or all(
+                latest[native_id] is archived
+                for native_id, archived in expected.items()
+            ):
+                return latest
+        return latest
+
+    async def _retire_uncertain_codex_archive_contexts(
+        self,
+        ctx: SessionContext,
+        sid: str,
+        profile: CodexProfile,
+        descendant_sids: tuple[str, ...],
+    ) -> None:
+        """Drop every resident whose archive boundary could be ambiguous."""
+        candidate_sids = {sid, *descendant_sids}
+        uncertain_contexts: list[SessionContext] = []
+        uncertain_ids: set[int] = set()
+        uncertain_keys: set[str] = set()
+        for key, candidate in tuple(self.sessions.items()):
+            if (
+                candidate.engine != "codex"
+                or self._codex_profile_for_ctx(candidate).id != profile.id
+            ):
+                continue
+            identities = {self._ctx_wire_sid(candidate)}
+            candidate_native_sid = self._codex_context_native_thread_id(
+                candidate,
+                profile,
+            )
+            if candidate_native_sid is not None:
+                identities.add(self._codex_wire_sid(
+                    profile,
+                    candidate_native_sid,
+                ))
+            if candidate_sids.isdisjoint(identities):
+                continue
+            self.sessions.pop(key, None)
+            uncertain_keys.add(key)
+            if id(candidate) not in uncertain_ids:
+                uncertain_ids.add(id(candidate))
+                uncertain_contexts.append(candidate)
+        for candidate in uncertain_contexts:
+            try:
+                await candidate.sdk.disconnect()
+            except Exception as exc:
+                log.warning(
+                    "uncertain Codex archive disconnect failed",
+                    session_id=self._ctx_wire_sid(candidate),
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                await self._cleanup_codex_steer_attachments(candidate)
+            self._purge_preview_image_snapshots(
+                candidate.preview_snapshot_token,
+            )
+        for candidate_sid in candidate_sids:
+            self._watch.pop(candidate_sid, None)
+            self._codex_sidebar_watches.pop(candidate_sid, None)
+        if self.focused_sid in candidate_sids | uncertain_keys | {ctx.key}:
+            self.focused_sid = None
+
+    async def _reconcile_loaded_codex_archive(
+        self,
+        ctx: SessionContext,
+        sid: str,
+        profile: CodexProfile,
+        preflight_descendant_sids: tuple[str, ...],
+        archived_native_ids: tuple[str, ...] | list[str],
+    ) -> tuple[list[str], list[SessionContext]]:
+        """Evict only the root and descendants proven archived."""
+        self._invalidate_codex_session_catalog()
+        confirmed_sids: list[str] = []
+        confirmed_set: set[str] = set()
+        for archived_native_sid in archived_native_ids:
+            if not isinstance(archived_native_sid, str):
+                continue
+            try:
+                archived_sid = self._codex_wire_sid(
+                    profile,
+                    archived_native_sid,
+                )
+            except ValueError:
+                continue
+            if archived_sid not in confirmed_set:
+                confirmed_sids.append(archived_sid)
+                confirmed_set.add(archived_sid)
+        expected_sids = {sid, *preflight_descendant_sids}
+        if sid not in confirmed_set or not confirmed_set.issubset(
+            expected_sids
+        ):
+            raise RuntimeError(
+                "verified Codex archive result is outside preflight tree"
+            )
+
+        archived_contexts: list[SessionContext] = []
+        archived_context_ids: set[int] = set()
+        for candidate in tuple(self.sessions.values()):
+            if (
+                candidate.engine != "codex"
+                or self._codex_profile_for_ctx(candidate).id != profile.id
+            ):
+                continue
+            candidate_sids: set[str] = set()
+            route_sid = self._ctx_wire_sid(candidate)
+            if route_sid is not None:
+                candidate_sids.add(route_sid)
+            candidate_native_sid = self._codex_context_native_thread_id(
+                candidate,
+                profile,
+            )
+            if candidate_native_sid is not None:
+                candidate_sids.add(self._codex_wire_sid(
+                    profile,
+                    candidate_native_sid,
+                ))
+            identity = id(candidate)
+            if (
+                candidate_sids.isdisjoint(confirmed_set)
+                or identity in archived_context_ids
+            ):
+                continue
+            archived_context_ids.add(identity)
+            archived_contexts.append(candidate)
+        for key, candidate in tuple(self.sessions.items()):
+            if id(candidate) in archived_context_ids:
+                self.sessions.pop(key, None)
+        return confirmed_sids, archived_contexts
+
+    @staticmethod
+    def _codex_catalog_rollout_is_profile_local(
+        profile: CodexProfile,
+        rollout_path: str,
+        *,
+        archived: bool = False,
+    ) -> bool:
+        if not os.path.isabs(os.path.expanduser(rollout_path)):
+            return False
+        profile_sessions_root = os.path.realpath(
+            profile.home / (
+                "archived_sessions" if archived else "sessions"
+            )
+        )
+        resolved = os.path.realpath(os.path.expanduser(rollout_path))
+        try:
+            return os.path.commonpath((
+                profile_sessions_root,
+                resolved,
+            )) == profile_sessions_root
+        except ValueError:
+            return False
+
+    async def _archive_loaded_codex_thread(
+        self,
+        cmd,
+        sid: str,
+        native_sid: str,
+        ctx: SessionContext,
+        *,
+        rollout_path: str | None,
+        transient: bool = False,
+    ) -> _CodexArchiveRejection | tuple[str, ...]:
+        """Archive a loaded Codex thread through its current writer owner."""
+        async def reject(
+            code: str,
+            message: str,
+            *,
+            outcome: Literal["failed", "unknown"] = "failed",
+        ) -> _CodexArchiveRejection:
+            return _CodexArchiveRejection(
+                error=await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    code,
+                    message,
+                ),
+                outcome=outcome,
+            )
+
+        async with ctx.query_lock:
+            if self._session_delete_busy(ctx):
+                return await reject(
+                    ERR_BUSY,
+                    "会话仍在运行或有排队消息，请先停止并取消排队后再归档",
+                )
+            profile = self._codex_profile_for_ctx(ctx)
+            catalog_rollout_path: str | None = None
+            catalog_archived = False
+            catalog_is_profile_local = True
+            if ctx.space == "code":
+                home = self._codex_home(profile)
+                rollout_record = await asyncio.to_thread(
+                    codex_thread_rollout_record,
+                    native_sid,
+                    **({} if home is None else {"codex_home": home}),
+                )
+                if rollout_record is None:
+                    return await reject(
+                        ERR_INTERNAL,
+                        "无法确认 Codex 会话目录记录，未执行归档",
+                    )
+                catalog_rollout_path, catalog_archived = rollout_record
+                catalog_is_profile_local = (
+                    self._codex_catalog_rollout_is_profile_local(
+                        profile,
+                        catalog_rollout_path,
+                        archived=catalog_archived,
+                    )
+                )
+                if not catalog_is_profile_local:
+                    log.error(
+                        "Codex profile catalog rollout escaped CODEX_HOME",
+                        profile_id=profile.id,
+                        session_id=native_sid,
+                    )
+                    return await reject(
+                        ERR_INTERNAL,
+                        "Codex CODEX_HOME 迁移不完整：会话目录仍指向"
+                        "账号目录外；未执行归档",
+                    )
+                catalog_resolved = os.path.realpath(
+                    os.path.expanduser(catalog_rollout_path)
+                )
+                additional_paths = ()
+                if (
+                    rollout_path
+                    and catalog_resolved
+                    != os.path.realpath(rollout_path)
+                ):
+                    additional_paths = (catalog_rollout_path,)
+
+                if transient:
+                    if (
+                        ctx.sdk.daemon_mode == "auto"
+                        and not self._codex_shared_live(ctx)
+                    ):
+                        return await reject(
+                            ERR_NOT_RUNNING,
+                            "Codex 共享归档通道不可用，请重试",
+                        )
+                    if catalog_archived:
+                        external_owner = False
+                    else:
+                        external_owner = await self._cold_codex_delete_blocked(
+                            sid,
+                            rollout_path,
+                            own_handle=ctx.sdk,
+                            additional_rollout_paths=additional_paths,
+                        )
+                else:
+                    control_error = await self._runtime_control_preflight(
+                        ctx,
+                        action="归档会话",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        client_id=getattr(cmd, "client_id", None),
+                    )
+                    if control_error is not None:
+                        return _CodexArchiveRejection(
+                            error=control_error,
+                            outcome="failed",
+                        )
+                    external_owner = await self._codex_delete_external_owner(
+                        sid
+                    )
+                    if (
+                        not external_owner
+                        and not catalog_archived
+                        and additional_paths
+                    ):
+                        external_owner = await (
+                            self._cold_codex_delete_blocked(
+                                sid,
+                                rollout_path,
+                                own_handle=ctx.sdk,
+                                additional_rollout_paths=additional_paths,
+                            )
+                        )
+                if external_owner:
+                    return await reject(
+                        ERR_BUSY,
+                        "会话正由 Codex App 或原生客户端使用，无法归档",
+                    )
+            if self._session_delete_busy(ctx):
+                return await reject(
+                    ERR_BUSY,
+                    "会话状态已变化，请等待当前回合结束后再归档",
+                )
+            resident_candidates: list[SessionContext] = []
+            resident_candidate_ids: set[int] = set()
+            for candidate in sorted(
+                tuple(self.sessions.values()),
+                key=lambda value: value.key or "",
+            ):
+                if (
+                    candidate is ctx
+                    or id(candidate) in resident_candidate_ids
+                    or candidate.engine != "codex"
+                    or self._codex_profile_for_ctx(candidate).id != profile.id
+                    or not self._is_resident_context(candidate)
+                ):
+                    continue
+                resident_candidate_ids.add(id(candidate))
+                resident_candidates.append(candidate)
+            async with AsyncExitStack() as resident_locks:
+                await resident_locks.enter_async_context(
+                    ctx.queued_query_lock
+                )
+                prelocked_queue_ids: set[int] = set()
+                # Keep browser immediate/queue commands from crossing ancestry
+                # preflight, native archive, or a required profile-daemon
+                # restart. Running descendants are still permitted: their turn
+                # tasks do not retain query_lock across the native turn.
+                for candidate in resident_candidates:
+                    await resident_locks.enter_async_context(
+                        candidate.query_lock
+                    )
+                    await resident_locks.enter_async_context(
+                        candidate.queued_query_lock
+                    )
+                    prelocked_queue_ids.add(id(candidate))
+                if self._session_delete_busy(ctx):
+                    return await reject(
+                        ERR_BUSY,
+                        "会话状态已变化，请等待当前回合结束后再归档",
+                    )
+                try:
+                    (
+                        busy_descendant,
+                        preflight_descendant_sids,
+                    ) = await self._preflight_codex_delete_descendants(
+                        ctx,
+                        native_sid,
+                        tuple(resident_candidates),
+                        protect_descendants=False,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Codex descendant archive preflight failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    return await reject(
+                        ERR_INTERNAL,
+                        "无法确认派生会话状态，未执行归档",
+                    )
+                # The root itself can still be reported busy by the shared
+                # app-server inventory. Descendant activity is intentionally
+                # ignored above because native archive is best-effort for
+                # descendants and must not prevent the root from succeeding.
+                if busy_descendant is not None:
+                    return await reject(
+                        ERR_BUSY,
+                        "会话仍在运行或由其他 Codex 客户端使用",
+                    )
+
+                descendant_sid_set = set(preflight_descendant_sids)
+                locked_descendant_ids: set[int] = set()
+                locked_descendants: list[SessionContext] = []
+                for candidate in resident_candidates:
+                    candidate_native_sid = (
+                        self._codex_context_native_thread_id(
+                            candidate,
+                            profile,
+                        )
+                    )
+                    if candidate_native_sid is None:
+                        continue
+                    candidate_sid = self._codex_wire_sid(
+                        profile,
+                        candidate_native_sid,
+                    )
+                    if (
+                        candidate_sid not in descendant_sid_set
+                        or id(candidate) in locked_descendant_ids
+                    ):
+                        continue
+                    locked_descendant_ids.add(id(candidate))
+                    locked_descendants.append(candidate)
+                locked_descendants.sort(
+                    key=lambda candidate: candidate.key or ""
+                )
+                for candidate in locked_descendants:
+                    if id(candidate) not in prelocked_queue_ids:
+                        await resident_locks.enter_async_context(
+                            candidate.queued_query_lock
+                        )
+                # Close the check/submit race: queue/replace may have acquired
+                # ownership after ancestry collection but before its queue lock
+                # was fenced.  Keep every descendant queue lock through native
+                # reconciliation and resident eviction.
+                queued_descendant = next((
+                    candidate
+                    for candidate in locked_descendants
+                    if self._session_has_deferred_query_ownership(candidate)
+                ), None)
+                if queued_descendant is not None:
+                    return await reject(
+                        ERR_BUSY,
+                        "派生会话有排队消息，请先取消排队后再归档",
+                    )
+
+                candidate_native_sids = [native_sid]
+                for candidate_sid in preflight_descendant_sids:
+                    try:
+                        candidate_profile, candidate_native_sid = (
+                            self._codex_target(candidate_sid)
+                        )
+                    except ValueError:
+                        return await reject(
+                            ERR_INTERNAL,
+                            "派生会话标识无效，未执行归档",
+                        )
+                    if candidate_profile.id != profile.id:
+                        return await reject(
+                            ERR_INTERNAL,
+                            "派生会话账号不一致，未执行归档",
+                        )
+                    if candidate_native_sid not in candidate_native_sids:
+                        candidate_native_sids.append(candidate_native_sid)
+                if len(candidate_native_sids) > CODEX_EXACT_CATALOG_MAX_IDS:
+                    return await reject(
+                        ERR_INTERNAL,
+                        "派生会话数量超过安全上限，未执行归档",
+                    )
+
+                archive_snapshot = await self._settle_codex_archive_states(
+                    profile,
+                    candidate_native_sids,
+                    expected=None,
+                    settle=False,
+                )
+                if archive_snapshot is None:
+                    return await reject(
+                        ERR_INTERNAL,
+                        "无法确认完整归档树，未执行归档",
+                    )
+                if archive_snapshot[native_sid] is True:
+                    # Descendants are best-effort in the official contract.
+                    # An already archived root is an idempotent success even
+                    # when a spawned child remains active.
+                    archived_native_ids = tuple(
+                        candidate_native_sid
+                        for candidate_native_sid in candidate_native_sids
+                        if archive_snapshot[candidate_native_sid]
+                    )
+                else:
+                    isolated_cold_archive = bool(
+                        transient
+                        and preflight_descendant_sids
+                        and getattr(ctx.sdk, "using_daemon_proxy", False)
+                    )
+                    archive_cwd = next((
+                        os.path.realpath(candidate)
+                        for candidate in (
+                            ctx.cwd,
+                            self.cfg.cc_cwd,
+                            str(profile.home),
+                        )
+                        if (
+                            isinstance(candidate, str)
+                            and os.path.isdir(candidate)
+                        )
+                    ), None)
+                    journal_identity: tuple[
+                        CodexArchiveJournal, str, str,
+                    ] | None = None
+                    client_id = getattr(cmd, "client_id", None)
+                    cmd_id = getattr(cmd, "cmd_id", None)
+                    if client_id and cmd_id:
+                        archive_journal = self._codex_archives
+                        if archive_journal is None:
+                            return await reject(
+                                ERR_INTERNAL,
+                                "归档可靠性存储不可用，未执行归档",
+                            )
+                        try:
+                            await asyncio.to_thread(
+                                archive_journal.begin,
+                                client_id,
+                                cmd_id,
+                                profile.id,
+                                native_sid,
+                                candidate_native_sids,
+                                archive_snapshot,
+                            )
+                        except CodexArchiveJournalError as exc:
+                            log.warning(
+                                "Codex archive intent journal failed",
+                                session_id=sid,
+                                error_type=type(exc).__name__,
+                            )
+                            return await reject(
+                                ERR_INTERNAL,
+                                "无法保存归档请求状态，未执行归档",
+                            )
+                        journal_identity = (
+                            archive_journal,
+                            client_id,
+                            cmd_id,
+                        )
+                    if isolated_cold_archive and archive_cwd is None:
+                        message = "无法确定归档工作目录，未执行归档"
+                        if journal_identity is not None:
+                            archive_journal, client_id, cmd_id = journal_identity
+                            try:
+                                await asyncio.to_thread(
+                                    archive_journal.reject,
+                                    client_id,
+                                    cmd_id,
+                                    ERR_INTERNAL,
+                                    message,
+                                )
+                            except CodexArchiveJournalError:
+                                log.exception(
+                                    "Codex archive rejection journal failed")
+                        return await reject(ERR_INTERNAL, message)
+                    if journal_identity is not None:
+                        archive_journal, client_id, cmd_id = journal_identity
+                        try:
+                            claimed = await asyncio.to_thread(
+                                archive_journal.claim_submission,
+                                client_id,
+                                cmd_id,
+                            )
+                        except CodexArchiveJournalError as exc:
+                            log.warning(
+                                "Codex archive submission journal failed",
+                                session_id=sid,
+                                error_type=type(exc).__name__,
+                            )
+                            return await reject(
+                                ERR_INTERNAL,
+                                "无法确认归档提交状态，未执行归档",
+                            )
+                        if not claimed:
+                            return await reject(
+                                ERR_INTERNAL,
+                                "会话归档结果仍在确认中，请稍后刷新；"
+                                "未自动重试或回滚",
+                                outcome="unknown",
+                            )
+                    mutation_error: Exception | None = None
+                    mutation_outcome_unknown = False
+                    try:
+                        if isolated_cold_archive:
+                            assert archive_cwd is not None
+                            try:
+                                await self._codex_rpc_for_profile(
+                                    profile,
+                                    "thread/archive",
+                                    {"threadId": native_sid},
+                                    cwd=archive_cwd,
+                                    nofile_soft_limit=(
+                                        _CODEX_ARCHIVE_NOFILE_SOFT_LIMIT
+                                    ),
+                                )
+                            except CodexRpcRejected as isolated_exc:
+                                # A cold catalog row can still be loaded by the
+                                # shared daemon. Its exact active-writer rejection
+                                # proves that the isolated child did not mutate;
+                                # retry once through that writer's owner.
+                                if not (
+                                    isolated_exc.code == -32600
+                                    and "active writer"
+                                    in isolated_exc.message.lower()
+                                ):
+                                    raise
+                                await ctx.sdk.archive_thread(native_sid)
+                        else:
+                            await ctx.sdk.archive_thread(native_sid)
+                    except Exception as exc:
+                        mutation_error = exc
+                        mutation_outcome_unknown = isinstance(
+                            exc,
+                            (
+                                CodexArchiveOutcomeUnknown,
+                                CodexRpcOutcomeUnknown,
+                            ),
+                        )
+                        log.warning(
+                            "Codex session archive outcome requires "
+                            "tree reconciliation",
+                            session_id=sid,
+                            descendant_count=len(preflight_descendant_sids),
+                            isolated=isolated_cold_archive,
+                            error_type=type(exc).__name__,
+                            error_code=getattr(exc, "code", None),
+                            error_reason=self._codex_archive_error_reason(exc),
+                        )
+
+                    archive_states = await self._settle_codex_archive_states(
+                        profile,
+                        candidate_native_sids,
+                        # Official archive success is defined by the requested
+                        # root. Descendants are attempted independently and can
+                        # legitimately remain active without failing the root.
+                        expected={native_sid: True},
+                        settle=mutation_error is not None,
+                        allow_missing=True,
+                    )
+                    if archive_states is None:
+                        if journal_identity is not None:
+                            archive_journal, client_id, cmd_id = journal_identity
+                            try:
+                                await asyncio.to_thread(
+                                    archive_journal.mark_unknown,
+                                    client_id,
+                                    cmd_id,
+                                )
+                            except CodexArchiveJournalError:
+                                log.exception(
+                                    "Codex archive unknown journal failed")
+                        self._ensure_codex_archive_reconciler(
+                            cmd,
+                            profile,
+                            native_sid,
+                            tuple(candidate_native_sids),
+                        )
+                        await self._retire_uncertain_codex_archive_contexts(
+                            ctx,
+                            sid,
+                            profile,
+                            preflight_descendant_sids,
+                        )
+                        return await reject(
+                            ERR_INTERNAL,
+                            "会话归档结果暂时无法确认，请刷新后重试",
+                            outcome="unknown",
+                        )
+                    if archive_states[native_sid] is not True:
+                        if mutation_outcome_unknown:
+                            # The original request may still be executing in
+                            # the shared daemon. A compensating unarchive here
+                            # can race a late archive commit and produce the
+                            # exact false "已回滚" result this boundary exists
+                            # to prevent. Retire every possibly stale writer;
+                            # reliable-command ACK suppresses mutation replay.
+                            await self._retire_uncertain_codex_archive_contexts(
+                                ctx,
+                                sid,
+                                profile,
+                                preflight_descendant_sids,
+                            )
+                            if journal_identity is not None:
+                                archive_journal, client_id, cmd_id = (
+                                    journal_identity
+                                )
+                                try:
+                                    await asyncio.to_thread(
+                                        archive_journal.mark_unknown,
+                                        client_id,
+                                        cmd_id,
+                                    )
+                                except CodexArchiveJournalError:
+                                    log.exception(
+                                        "Codex archive unknown journal failed")
+                            self._ensure_codex_archive_reconciler(
+                                cmd,
+                                profile,
+                                native_sid,
+                                tuple(candidate_native_sids),
+                            )
+                            return await reject(
+                                ERR_INTERNAL,
+                                "会话归档结果仍在确认中，请稍后刷新；未自动重试或回滚",
+                                outcome="unknown",
+                            )
+                        changed_native_ids = tuple(
+                            candidate_native_sid
+                            for candidate_native_sid in candidate_native_sids
+                            if (
+                                archive_snapshot[candidate_native_sid] is False
+                                and archive_states.get(
+                                    candidate_native_sid
+                                ) is True
+                            )
+                        )
+                        if changed_native_ids:
+                            # Native archive is not a tree transaction. Never
+                            # undo a descendant that it already archived; just
+                            # retire possibly stale residents and project the
+                            # exact committed subset.
+                            changed_wire_sids = [
+                                self._codex_wire_sid(profile, value)
+                                for value in changed_native_ids
+                            ]
+                            await self._update_codex_work_archive_projection(
+                                changed_wire_sids,
+                                True,
+                            )
+                            await self._retire_uncertain_codex_archive_contexts(
+                                ctx,
+                                sid,
+                                profile,
+                                preflight_descendant_sids,
+                            )
+                        error_reason = self._codex_archive_error_reason(
+                            mutation_error
+                        )
+                        error_code = (
+                            ERR_BUSY
+                            if error_reason == "active_writer"
+                            else ERR_INTERNAL
+                        )
+                        if error_reason == "rollout_outside_profile":
+                            message = "Codex 会话目录记录不一致，归档未完成"
+                        elif error_reason == "active_writer":
+                            message = "会话正由 Codex 客户端使用，无法归档"
+                        else:
+                            message = "会话归档失败，请重试"
+                        if journal_identity is not None:
+                            archive_journal, client_id, cmd_id = journal_identity
+                            try:
+                                await asyncio.to_thread(
+                                    archive_journal.reject,
+                                    client_id,
+                                    cmd_id,
+                                    error_code,
+                                    message,
+                                )
+                            except CodexArchiveJournalError:
+                                log.exception(
+                                    "Codex archive rejection journal failed")
+                        return await reject(
+                            error_code,
+                            message,
+                        )
+                    archived_native_ids = tuple(
+                        candidate_native_sid
+                        for candidate_native_sid in candidate_native_sids
+                        if archive_states.get(candidate_native_sid) is True
+                    )
+                    if journal_identity is not None:
+                        archive_journal, client_id, cmd_id = journal_identity
+                        try:
+                            await asyncio.to_thread(
+                                archive_journal.complete,
+                                client_id,
+                                cmd_id,
+                                archived_native_ids,
+                            )
+                        except CodexArchiveJournalError:
+                            # ``submitted`` is already durable, so a retry will
+                            # reconcile exact native state without replaying.
+                            log.exception(
+                                "Codex archive completion journal failed")
+                (
+                    archived_sids,
+                    archived_contexts,
+                ) = await self._reconcile_loaded_codex_archive(
+                    ctx,
+                    sid,
+                    profile,
+                    preflight_descendant_sids,
+                    archived_native_ids,
+                )
+
+            for archived_ctx in archived_contexts:
+                await self._discard_query_queue(archived_ctx)
+                tasks = {
+                    task
+                    for task in (
+                        archived_ctx.turn_task,
+                        archived_ctx.codex_spontaneous_task,
+                    )
+                    if task is not None
+                    and task is not asyncio.current_task()
+                    and not task.done()
+                }
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await archived_ctx.sdk.disconnect()
+                except Exception as exc:
+                    log.warning(
+                        "archived Codex session disconnect failed",
+                        session_id=self._ctx_wire_sid(archived_ctx),
+                        error_type=type(exc).__name__,
+                    )
+                finally:
+                    await self._cleanup_codex_steer_attachments(archived_ctx)
+                self._purge_preview_image_snapshots(
+                    archived_ctx.preview_snapshot_token,
+                )
+            for archived_sid in archived_sids:
+                self._watch.pop(archived_sid, None)
+                self._codex_sidebar_watches.pop(archived_sid, None)
+            if self.focused_sid in set(archived_sids) | {ctx.key}:
+                self.focused_sid = None
+        return tuple(archived_sids)
+
     async def _handle_delete_session(self, cmd):
-        """Delete one native session without confusing Code and Work roots."""
+        """Serialize one native Code deletion with its conversation tree."""
         if getattr(cmd, "space", "code") == "work":
             return await self._handle_delete_work_session(cmd)
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
+        async with self._conversation_tree_mutation_lock(engine, sid):
+            return await self._handle_delete_session_locked(cmd)
+
+    async def _handle_delete_session_locked(self, cmd):
+        """Delete one native session without confusing Code and Work roots."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         requested_engine = getattr(cmd, "engine", "claude")
         is_codex = await self._is_codex_session(sid)
@@ -24180,6 +26574,61 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        if engine == "codex":
+            try:
+                profile, resolved_native_sid = self._codex_target(sid)
+            except ValueError:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_AUTH,
+                    "Codex 账号或会话标识无效",
+                )
+            if resolved_native_sid != native_sid:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_AUTH,
+                    "Codex 会话标识不一致",
+                )
+            home = self._codex_home(profile)
+            rollout_record = await asyncio.to_thread(
+                codex_thread_rollout_record,
+                native_sid,
+                **({} if home is None else {"codex_home": home}),
+            )
+            if rollout_record is None:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_INTERNAL,
+                    "无法确认 Codex 会话归档状态，未执行删除",
+                )
+            catalog_rollout_path, catalog_archived = rollout_record
+            if not catalog_archived:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_BUSY,
+                    "请先归档 Codex 会话，确认归档完成后再删除",
+                )
+            if not self._codex_catalog_rollout_is_profile_local(
+                profile,
+                catalog_rollout_path,
+                archived=True,
+            ):
+                log.error(
+                    "Codex archived rollout escaped CODEX_HOME",
+                    profile_id=profile.id,
+                    session_id=native_sid,
+                )
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_INTERNAL,
+                    "Codex CODEX_HOME 迁移不完整：已归档会话目录仍指向"
+                    "账号目录外；未执行删除",
+                )
         ctx = self._ctx_for(sid)
         transient_codex_ctx = False
         transient_codex_ctx_closed = False
@@ -24580,6 +27029,7 @@ class WrapperMachine:
             # The terminal may have appended and exited before this control
             # request arrived.  Rewind must never run against the resident
             # Claude child's stale in-memory conversation/checkpoint map.
+            self._invalidate_claude_context_usage(ctx)
             ctx.needs_reload = False
             try:
                 await ctx.sdk.force_reconnect(
@@ -25147,6 +27597,11 @@ class WrapperMachine:
                     await ctx.sdk.rollback_thread(native_turns)
                 else:
                     conversation_may_have_changed = True
+                    # The private rewind may mutate before its response is
+                    # observed. Drop every pre-rewind reading before crossing
+                    # that boundary; a rejection can safely recover the
+                    # unchanged transcript on the next cache-only read.
+                    self._invalidate_claude_context_usage(ctx)
                     try:
                         result = await ctx.sdk.rewind_conversation(
                             cmd.checkpoint_id, interrupt_if_running=False
@@ -26056,6 +28511,14 @@ class WrapperMachine:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
+        async with self._conversation_tree_mutation_lock(engine, sid):
+            return await self._handle_fork_session_in_tree_lane(cmd)
+
+    async def _handle_fork_session_in_tree_lane(self, cmd):
+        """Revalidate one message fork inside its native catalog lane."""
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        is_codex = await self._is_codex_session(sid)
+        engine = "codex" if is_codex else "claude"
         # Resident contexts already carry the authoritative surface.  Avoid an
         # unnecessary thread hop for Code: reliable Codex fork reconciliation
         # deliberately relies on there being no scheduling point between its
@@ -26385,6 +28848,25 @@ class WrapperMachine:
             if info is None:
                 return await self._send_session_fork_error(
                     cmd, ERR_INTERNAL, "Claude 源会话不存在")
+            if getattr(info, "tag", None) == "archived":
+                if entry is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self._claude_forks.reject,
+                            cmd.request_id,
+                            "会话已归档，请先取消归档再派生",
+                        )
+                    except ClaudeForkJournalError as exc:
+                        log.warning(
+                            "archived Claude fork rejection journal failed",
+                            parent=sid,
+                            error_type=type(exc).__name__,
+                        )
+                return await self._send_session_fork_error(
+                    cmd,
+                    ERR_AUTH,
+                    "会话已归档，请先取消归档再派生",
+                )
             raw_cwd = source_cwd or (ctx.cwd if ctx is not None else info.cwd)
             if not raw_cwd:
                 return await self._send_session_fork_error(
@@ -26655,6 +29137,32 @@ class WrapperMachine:
                 cmd, sid, source_cwd, marker)
             raise _ForkOutcomeUncertain(
                 "fork outcome is still waiting for rollout reconciliation")
+
+        archived = await self._native_session_archived_state("codex", sid)
+        if archived is None:
+            return await self._send_session_fork_error(
+                cmd,
+                ERR_INTERNAL,
+                "无法确认源会话归档状态，派生未开始",
+            )
+        if archived:
+            try:
+                await asyncio.to_thread(
+                    self._codex_forks.reject,
+                    cmd.request_id,
+                    "会话已归档，请先取消归档再派生",
+                )
+            except ForkJournalError as exc:
+                log.warning(
+                    "archived Codex fork rejection journal failed",
+                    parent=sid,
+                    error_type=type(exc).__name__,
+                )
+            return await self._send_session_fork_error(
+                cmd,
+                ERR_AUTH,
+                "会话已归档，请先取消归档再派生",
+            )
 
         recovered = await recover()
         if recovered:
@@ -27064,6 +29572,12 @@ class WrapperMachine:
 
     async def _handle_fork_session_worktree(self, cmd):
         """Serialize reliable worktree retries with their reconciler."""
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        async with self._conversation_tree_mutation_lock("codex", sid):
+            return await self._handle_fork_session_worktree_in_tree_lane(cmd)
+
+    async def _handle_fork_session_worktree_in_tree_lane(self, cmd):
+        """Revalidate a worktree fork inside its native catalog lane."""
         request_id = cmd.request_id
         lock = self._codex_fork_locks.get(request_id)
         if lock is None:
@@ -27098,6 +29612,50 @@ class WrapperMachine:
         except ValueError:
             return await self._send_worktree_fork_error(
                 cmd, ERR_AUTH, "Codex 账号或会话标识无效")
+        try:
+            archive_guard_entry = await asyncio.to_thread(
+                self._codex_forks.get,
+                cmd.request_id,
+            )
+        except ForkJournalError as exc:
+            return await self._send_worktree_fork_error(
+                cmd,
+                ERR_INTERNAL,
+                f"无法读取派生请求状态: {exc}",
+            )
+        if (
+            archive_guard_entry is None
+            or archive_guard_entry.get("status") == "intent"
+        ):
+            archived = await self._native_session_archived_state(
+                "codex",
+                sid,
+            )
+            if archived is None:
+                return await self._send_worktree_fork_error(
+                    cmd,
+                    ERR_INTERNAL,
+                    "无法确认源会话归档状态，派生未开始",
+                )
+            if archived:
+                if archive_guard_entry is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self._codex_forks.reject,
+                            cmd.request_id,
+                            "会话已归档，请先取消归档再派生",
+                        )
+                    except ForkJournalError as exc:
+                        log.warning(
+                            "archived worktree fork rejection journal failed",
+                            parent=sid,
+                            error_type=type(exc).__name__,
+                        )
+                return await self._send_worktree_fork_error(
+                    cmd,
+                    ERR_AUTH,
+                    "会话已归档，请先取消归档再派生",
+                )
         ctx = self._ctx_by_sid(sid)
         # The session menu (no turn id) still means "fork the current complete
         # thread" and must wait for idle. A message action names an already
@@ -27430,6 +29988,12 @@ class WrapperMachine:
     async def _handle_migrate_session(self, cmd):
         """Continue one idle Codex Code thread in another cwd."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        async with self._conversation_tree_mutation_lock("codex", sid):
+            return await self._handle_migrate_session_in_tree_lane(cmd)
+
+    async def _handle_migrate_session_in_tree_lane(self, cmd):
+        """Revalidate and migrate one thread inside its catalog lane."""
+        sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         requested = os.path.expanduser(cmd.cwd.strip())
         if not os.path.isabs(requested):
             return await self._send_session_migration_error(
@@ -27454,6 +30018,22 @@ class WrapperMachine:
                 cmd,
                 ERR_AUTH,
                 "Codex 账号或会话标识无效",
+                sid=sid,
+            )
+
+        archived = await self._native_session_archived_state("codex", sid)
+        if archived is None:
+            return await self._send_session_migration_error(
+                cmd,
+                ERR_INTERNAL,
+                "无法确认会话归档状态，迁移未开始",
+                sid=sid,
+            )
+        if archived:
+            return await self._send_session_migration_error(
+                cmd,
+                ERR_AUTH,
+                "会话已归档，请先取消归档再迁移",
                 sid=sid,
             )
 
@@ -30195,6 +32775,8 @@ class WrapperMachine:
 
         async def reconnect_claude(reason: str) -> None:
             """Reconnect without hiding transcript changes during the await."""
+            if reason.startswith("external transcript change"):
+                self._invalidate_claude_context_usage(ctx)
             resume_id, fork = self._claude_reconnect_identity(ctx)
             fork_option = {"fork": True} if fork else {}
             await ctx.sdk.force_reconnect(

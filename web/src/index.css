@@ -1278,6 +1278,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .hint-ring:hover svg{ transform:scale(1.12); }
 .hint-ring .hr-track{ fill:none; stroke:var(--border); stroke-width:3.5; }
 .hint-ring .hr-fill{ fill:none; stroke:var(--accent); stroke-width:3.5; stroke-linecap:round; }
+.hint-ring.unavailable{ opacity:.55; }
 /* Codex account quota: two compact remaining-capacity bars beside context. */
 .usage-meter-wrap{ position:relative; display:flex; align-items:center; flex:none; }
 .usage-meter{ width:46px; min-height:34px; display:grid; align-content:center;
@@ -1345,6 +1346,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .ctx-pop-cat-tok{ font-family:var(--mono); font-size:10.5px; color:var(--faint); }
 .ctx-pop-foot{ margin-top:10px; font-size:11px; color:var(--faint); }
 .ctx-pop-loading{ font-size:12.5px; color:var(--faint); }
+.ctx-pop-status{ margin-top:9px; padding-top:8px; border-top:1px solid var(--divider);
+  font-size:10.5px; color:var(--faint); }
+.ctx-pop-status.error{ color:var(--danger); }
 .auto-compact-control{ display:flex; flex-direction:column; gap:9px; min-width:0; }
 .auto-compact-pop{ width:270px; }
 .auto-compact-pop .auto-compact-control{ margin:0; padding:0; border:0; }

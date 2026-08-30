@@ -824,15 +824,16 @@ export class RelayWs {
     });
   }
 
-  sendGetContext(): string | null {
+  sendGetContext(refresh = false): string | null {
     return this.sendTracked({
-      v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
+      v: PROTOCOL_VERSION, type: "get_context", refresh,
+      ts: nowTs(), ...this.sidObj(),
     });
   }
 
-  sendGetContextTo(sid: string): string | null {
+  sendGetContextTo(sid: string, refresh = false): string | null {
     return this.sendTracked({
-      v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs(),
+      v: PROTOCOL_VERSION, type: "get_context", sid, refresh, ts: nowTs(),
     });
   }
 

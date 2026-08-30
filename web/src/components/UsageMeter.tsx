@@ -20,6 +20,7 @@ interface Props {
   rateLimits?: StatusRateLimit[] | null;
   error?: string | null;
   loading?: boolean;
+  disabled?: boolean;
   onToggle: () => void;
   onRefresh?: () => void;
   onOpenStatus?: () => void;
@@ -88,6 +89,7 @@ export function UsageMeter({
   rateLimits,
   error,
   loading = false,
+  disabled = false,
   onToggle,
   onRefresh,
   onOpenStatus,
@@ -173,10 +175,11 @@ export function UsageMeter({
       type="button"
       className={`usage-meter ${summaryTone}`}
       aria-label={`账户额度：${quotaSummary}`}
-      aria-expanded={open}
+      aria-expanded={disabled ? false : open}
       aria-controls={popoverId}
       aria-haspopup="true"
       title={`${provider} 账户剩余额度`}
+      disabled={disabled}
       onClick={onToggle}
     >
       {hasOverallQuota
@@ -188,7 +191,7 @@ export function UsageMeter({
           <MiniQuota label="周" value={weekly} />
         </>}
     </button>
-    {open && <div
+    {!disabled && open && <div
       id={popoverId}
       className="ctx-pop usage-pop"
       role="region"

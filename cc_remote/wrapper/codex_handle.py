@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import sys
 import time
 from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Optional
@@ -88,6 +89,10 @@ _RUNTIME_EVENT_PENDING_MAX = 32
 _RUNTIME_EVENT_SEEN_MAX = 128
 _THREAD_DELETE_NOTIFY_MAX = 512
 _THREAD_DELETE_NOTIFY_TIMEOUT = 1.0
+_APP_SERVER_NOFILE_SOFT_LIMIT = 4096
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
+_THREAD_ARCHIVE_NOTIFY_MAX = 512
+_THREAD_ARCHIVE_NOTIFY_TIMEOUT = 1.0
 _THREAD_DELETE_LIST_PAGE_SIZE = 100
 _THREAD_DELETE_LIST_MAX_PAGES = 20
 _THREAD_DELETE_LIST_MAX_IDS = 4096
@@ -271,6 +276,10 @@ class CodexNoActiveTurnError(RuntimeError):
 
 class CodexSteerOutcomeUnknown(RuntimeError):
     """turn/steer was written but no authoritative response was observed."""
+
+
+class CodexArchiveOutcomeUnknown(RuntimeError):
+    """thread/archive was submitted without an authoritative response."""
 
 
 def _restore_nullable_explicit_effort(
@@ -1466,6 +1475,10 @@ class CodexHandle:
         self._thread_deleted_ids: Optional[list[str]] = None
         self.thread_delete_notifications_overflowed = False
         self._thread_delete_done = asyncio.Event()
+        self._thread_archive_target: Optional[str] = None
+        self._thread_archived_ids: Optional[list[str]] = None
+        self.thread_archive_notifications_overflowed = False
+        self._thread_archive_done = asyncio.Event()
         self._thread_settings_revision = 0
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
@@ -1785,8 +1798,19 @@ class CodexHandle:
     async def _open_process(
         self, argv: list[str], codex_bin: str, *, daemon_proxy: bool,
     ) -> None:
+        process_argv = argv
+        if os.name == "posix" and not daemon_proxy:
+            # A private stdio app-server owns archive recursion itself.  Raise
+            # only that child so resident Work sessions and daemon-off Code
+            # sessions cannot inherit the wrapper's commonly-low FD ceiling.
+            process_argv = [
+                sys.executable,
+                _RLIMIT_EXEC,
+                str(_APP_SERVER_NOFILE_SOFT_LIMIT),
+                *argv,
+            ]
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            *process_argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -3752,6 +3776,130 @@ class CodexHandle:
         self._shared_resume_binding_thread_id = None
         return tuple(deleted_ids)
 
+    async def archive_thread(
+        self, expected_thread_id: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        """Archive a thread through the app-server which owns its writer."""
+        loaded_thread_id = self.thread_id
+        thread_id = expected_thread_id or loaded_thread_id
+        if not thread_id:
+            raise RuntimeError("connect() or an explicit thread id is required")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex archive requires a live control connection"
+            )
+        if (
+            loaded_thread_id is not None
+            and expected_thread_id is not None
+            and expected_thread_id != loaded_thread_id
+        ):
+            raise ValueError("loaded Codex thread does not match archive target")
+        if not _STATUS_WIRE_ID.fullmatch(thread_id):
+            raise ValueError("invalid Codex thread id")
+        if self.turn_active or self.turn_start_pending:
+            raise RuntimeError("Codex turn is active")
+        if self._thread_archive_target is not None:
+            raise RuntimeError("Codex thread archive is already active")
+        self._thread_archive_target = thread_id
+        self._thread_archived_ids = []
+        self.thread_archive_notifications_overflowed = False
+        self._thread_archive_done.clear()
+        try:
+            try:
+                await self._request(
+                    "thread/archive",
+                    {"threadId": thread_id},
+                )
+            except CodexAppServerError:
+                # A JSON-RPC error is a terminal boundary. The caller may read
+                # the exact tree and safely compensate any partial mutation.
+                raise
+            except Exception as exc:
+                # From the request write onward, timeout/EOF cannot prove that
+                # the shared app-server stopped mutating the archive tree.
+                raise CodexArchiveOutcomeUnknown(
+                    "Codex archive outcome is unknown"
+                ) from exc
+            if self._reader is not None and not self._reader.done():
+                loop = asyncio.get_running_loop()
+                notification_deadline = (
+                    loop.time() + _THREAD_ARCHIVE_NOTIFY_TIMEOUT
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._thread_archive_done.wait(),
+                        timeout=_THREAD_ARCHIVE_NOTIFY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Codex thread archive notification timed out",
+                        thread_id=thread_id,
+                    )
+                else:
+                    # The wire contract does not order root and descendant
+                    # notifications. Keep the bounded collector open for the
+                    # same window even after the target has been observed.
+                    remaining = notification_deadline - loop.time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+            archived_ids = list(self._thread_archived_ids)
+        finally:
+            self._thread_archive_target = None
+            self._thread_archived_ids = None
+            self._thread_archive_done.clear()
+        if thread_id not in archived_ids:
+            archived_ids.append(thread_id)
+        if self.thread_id == thread_id:
+            self.thread_id = None
+        self._shared_resume_binding_thread_id = None
+        return tuple(archived_ids)
+
+    async def unarchive_thread(self, thread_id: str) -> dict[str, Any]:
+        """Restore one archived thread without resuming its model context."""
+        loaded_thread_id = self.thread_id
+        if not isinstance(thread_id, str) or not _STATUS_WIRE_ID.fullmatch(
+            thread_id
+        ):
+            raise ValueError("invalid Codex thread id")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex unarchive requires a live control connection"
+            )
+        if loaded_thread_id is not None and loaded_thread_id != thread_id:
+            raise ValueError("loaded Codex thread does not match unarchive target")
+        response = await self._request(
+            "thread/unarchive",
+            {"threadId": thread_id},
+        )
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise RuntimeError("Codex thread/unarchive returned another thread")
+        return thread
+
+    async def set_thread_name(self, thread_id: str, name: str) -> None:
+        """Rename one thread through its authoritative app-server."""
+        loaded_thread_id = self.thread_id
+        if not isinstance(thread_id, str) or not _STATUS_WIRE_ID.fullmatch(
+            thread_id
+        ):
+            raise ValueError("invalid Codex thread id")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex rename requires a live control connection"
+            )
+        if loaded_thread_id is not None and loaded_thread_id != thread_id:
+            raise ValueError("loaded Codex thread does not match rename target")
+        await self._request(
+            "thread/name/set",
+            {"threadId": thread_id, "name": name},
+        )
+
     async def read_thread_parent(self, thread_id: str) -> Optional[str]:
         """Return one thread's authoritative native fork parent."""
         if (
@@ -3854,6 +4002,62 @@ class CodexHandle:
                     "Codex deletion catalog exceeds the page limit"
                 )
         return tuple(candidates.items())
+
+    async def list_loaded_thread_ids(self) -> tuple[str, ...]:
+        """List the bounded set of threads cached by this app-server owner."""
+        loaded: list[str] = []
+        seen_ids: set[str] = set()
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        for _page in range(_THREAD_DELETE_LIST_MAX_PAGES):
+            params: dict[str, Any] = {
+                "limit": _THREAD_DELETE_LIST_PAGE_SIZE,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._request("thread/loaded/list", params)
+            rows = (
+                response.get("data")
+                if isinstance(response, dict)
+                else None
+            )
+            if not isinstance(rows, list):
+                raise RuntimeError(
+                    "Codex thread/loaded/list returned an invalid response"
+                )
+            if len(rows) > _THREAD_DELETE_LIST_PAGE_SIZE:
+                raise RuntimeError(
+                    "Codex thread/loaded/list exceeded its requested page size"
+                )
+            for thread_id in rows:
+                if (
+                    not isinstance(thread_id, str)
+                    or not _STATUS_WIRE_ID.fullmatch(thread_id)
+                ):
+                    raise RuntimeError(
+                        "Codex thread/loaded/list returned an invalid thread"
+                    )
+                if thread_id in seen_ids:
+                    continue
+                seen_ids.add(thread_id)
+                loaded.append(thread_id)
+                if len(loaded) > _THREAD_DELETE_LIST_MAX_IDS:
+                    raise RuntimeError(
+                        "Codex loaded-thread catalog exceeds the safety limit"
+                    )
+            next_cursor = response.get("nextCursor")
+            if next_cursor in (None, ""):
+                return tuple(loaded)
+            if (
+                not isinstance(next_cursor, str)
+                or next_cursor in seen_cursors
+            ):
+                raise RuntimeError(
+                    "Codex thread/loaded/list returned an invalid cursor"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("Codex loaded-thread catalog exceeds the page limit")
 
     async def disconnect(self) -> None:
         self._http_provider_repair_stop.set()
@@ -6046,6 +6250,27 @@ class CodexHandle:
                 self._thread_delete_done.set()
         return True
 
+    def _capture_thread_archived_notification(self, message: dict) -> bool:
+        """Collect actually archived roots/descendants until the target arrives."""
+        if message.get("method") != "thread/archived":
+            return False
+        thread_id = _notification_thread_id(message)
+        archived_ids = self._thread_archived_ids
+        if archived_ids is None or self._thread_archive_target is None:
+            return False
+        if (
+            isinstance(thread_id, str)
+            and _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            if thread_id not in archived_ids:
+                if len(archived_ids) < _THREAD_ARCHIVE_NOTIFY_MAX:
+                    archived_ids.append(thread_id)
+                else:
+                    self.thread_archive_notifications_overflowed = True
+            if thread_id == self._thread_archive_target:
+                self._thread_archive_done.set()
+        return True
+
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
         has_method = "method" in m
@@ -6129,11 +6354,14 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
-        if self._capture_thread_deleted_notification(m):
+        if (
+            self._capture_thread_deleted_notification(m)
+            or self._capture_thread_archived_notification(m)
+        ):
             return
         if self._control_only_connection:
-            # Responses are handled above and thread/deleted is the only
-            # notification used by this connection. In particular, never let
+            # Responses are handled above and lifecycle collectors are the only
+            # notifications used by this connection. In particular, never let
             # shared-daemon sibling lifecycle bind or mutate this handle.
             return
         if method == "thread/started" and self._using_daemon_proxy:

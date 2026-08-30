@@ -322,7 +322,9 @@ export interface SessionRuntime {
   ccSessionId?: string;
   pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean } | null;
   contextReport: ContextReport | null;
+  contextExactReport: ContextReport | null;
   contextRequestId: string | null;
+  contextRefreshDeferred: boolean;
   contextError: string | null;
   goal: ThreadGoal | null;
   goalId: string | null;
@@ -448,8 +450,9 @@ export function createRuntime(): SessionRuntime {
     liveDetailTurnIds: [],
     historyNewestId: null,
     historyHeadKnown: false,
-    pendingQuestion: null, contextReport: null,
-    contextRequestId: null, contextError: null, goal: null,
+    pendingQuestion: null, contextReport: null, contextExactReport: null,
+    contextRequestId: null, contextRefreshDeferred: false,
+    contextError: null, goal: null,
     goalId: null, goalDismissed: false, completion: null,
     statusReport: null, rateLimits: [], statusRequestId: null, statusError: null,
     notices: [], sendMode: "steer",
@@ -482,6 +485,7 @@ export type Action =
   | { type: "set_context"; report: ContextReport }
   | { type: "clear_context" }
   | { type: "begin_context_request"; sid: string; requestId: string }
+  | { type: "defer_context_request"; sid: string }
   | { type: "begin_status_request"; sid: string; requestId: string }
   | { type: "set_turns"; sid: string; turns: Turn[] }
   | { type: "set_artifact"; artifact: Artifact }
@@ -2335,13 +2339,30 @@ export function reduce(state: AppState, action: Action): AppState {
         replaceWithBoundedTurns(rt, action.turns);
       }, true);
     case "set_context":
-      return patch(state, state.focusedSid, (rt) => { rt.contextReport = action.report; });
+      return patch(state, state.focusedSid, (rt) => {
+        rt.contextReport = action.report;
+        if (action.report.available !== false
+            && action.report.source !== "recent_turn") {
+          rt.contextExactReport = action.report;
+        }
+      });
     case "clear_context":
-      return patch(state, state.focusedSid, (rt) => { rt.contextReport = null; });
+      return patch(state, state.focusedSid, (rt) => {
+        rt.contextReport = null;
+        rt.contextExactReport = null;
+      });
     case "begin_context_request":
       return patch(state, action.sid, (rt) => {
         rt.contextRequestId = action.requestId;
+        rt.contextRefreshDeferred = false;
         rt.contextError = null;
+      });
+    case "defer_context_request":
+      return patch(state, action.sid, (rt) => {
+        if (rt.contextRequestId === null) {
+          rt.contextRefreshDeferred = true;
+          rt.contextError = null;
+        }
       });
     case "begin_status_request":
       return patch(state, action.sid, (rt) => {
@@ -4960,7 +4981,25 @@ function reduceEvent(
         rt.takeoverMessage = e.message ?? null;
       });
     case "model":
-      return patch(state, e.sid, (rt) => { rt.model = matchModelId(e.model); });
+      return patch(state, e.sid, (rt) => {
+        const contextModel = rt.contextExactReport?.model
+          ?? rt.contextReport?.model ?? rt.model;
+        // An unattributed report received before the first authoritative Model
+        // frame cannot be proven to belong to it: the empty rt.model fails this
+        // comparison. A repeated announcement retains that report once rt.model
+        // already establishes the same generation.
+        rt.model = matchModelId(e.model);
+        if (rt.contextReport
+            && matchModelId(contextModel) !== rt.model) {
+          // A model switch can change tokenization and context capacity. Never
+          // pair the newly announced model with a prior model's exact total or
+          // category breakdown. A new native/cache-only report will repopulate
+          // the ring without manufacturing a percentage in the meantime.
+          rt.contextReport = null;
+          rt.contextExactReport = null;
+          rt.contextError = null;
+        }
+      });
     case "effort":
       return patch(state, e.sid, (rt) => { rt.effort = e.effort; });
     case "auto_compact":
@@ -4984,6 +5023,7 @@ function reduceEvent(
           // merely queues a desired setting, but never display the old window
           // after the replacement Claude child has applied a new threshold.
           rt.contextReport = null;
+          rt.contextExactReport = null;
           rt.contextError = null;
         }
       });
@@ -5026,8 +5066,30 @@ function reduceEvent(
     case "context_report":
       return patch(state, e.sid, (rt) => {
         rt.contextReport = e;
-        rt.contextRequestId = null;
-        rt.contextError = null;
+        if (e.available !== false && e.source !== "recent_turn") {
+          rt.contextExactReport = e;
+        }
+        // Reports are broadcast so every viewer benefits from the fresh value,
+        // but only the matching response may settle this client's in-flight
+        // request. While an exact refresh is deferred, an uncorrelated
+        // recent-turn/cached publish is useful for the ring but cannot consume
+        // that user intent; only another proven native control reading can.
+        const matchesRequest = rt.contextRequestId !== null
+          && rt.contextRequestId === e.request_id;
+        const satisfiesDeferred = rt.contextRequestId === null
+          && rt.contextRefreshDeferred
+          && e.available !== false
+          && e.source === "control";
+        if (matchesRequest || satisfiesDeferred) {
+          rt.contextRequestId = null;
+          rt.contextRefreshDeferred = false;
+          rt.contextError = null;
+        } else if (rt.contextRequestId === null
+            && !rt.contextRefreshDeferred) {
+          // A normal unsolicited report still proves an obsolete local error
+          // no longer describes the visible reading.
+          rt.contextError = null;
+        }
       });
     case "ask_user":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select }; });
@@ -5244,7 +5306,13 @@ function reduceEvent(
         if (runtime?.contextRequestId === e.request_id) {
           return patch(state, e.sid, (rt) => {
             rt.contextRequestId = null;
-            rt.contextError = presentCommandProblem(e);
+            if (e.code === "busy") {
+              rt.contextRefreshDeferred = true;
+              rt.contextError = null;
+            } else {
+              rt.contextRefreshDeferred = false;
+              rt.contextError = presentCommandProblem(e);
+            }
           });
         }
         if (runtime?.statusRequestId === e.request_id) {

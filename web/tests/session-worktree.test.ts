@@ -7,9 +7,11 @@ import {
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
 import {
+  canDeleteSidebarSession,
   canForkTurn,
   FORK_FOCUS_REFRESH_MS,
   forkFocusLeaseSession,
+  isSessionArchiveBlockedByState,
   isSessionMigrationBlockedByState,
   isTerminalSessionMigrationError,
   isWorktreeForkNameValid,
@@ -48,6 +50,14 @@ assert.equal(sessionMenuCapabilities(archivedCodex).migrate, false);
 assert.equal(sessionMenuCapabilities({
   ...codex, space: "work",
 }).migrate, false);
+assert.equal(canDeleteSidebarSession("codex", "code", false), false,
+  "active Codex Code sessions must be archived before deletion is offered");
+assert.equal(canDeleteSidebarSession("codex", "code", true), true,
+  "archived Codex Code sessions remain deletable");
+assert.equal(canDeleteSidebarSession("claude", "code", false), true,
+  "Claude Code keeps its existing direct-delete lifecycle");
+assert.equal(canDeleteSidebarSession("codex", "work", false), true,
+  "Work deletion remains independent from native Code archival");
 assert.equal(isWorktreeForkBlockedByState("running"), true);
 assert.equal(isWorktreeForkBlockedByState("interrupting"), true);
 assert.equal(isWorktreeForkBlockedByState("idle"), false);
@@ -56,6 +66,11 @@ assert.equal(isSessionMigrationBlockedByState("interrupting"), true);
 assert.equal(isSessionMigrationBlockedByState("draining"), true);
 assert.equal(isSessionMigrationBlockedByState(undefined), false);
 assert.equal(isSessionMigrationBlockedByState("idle"), false);
+assert.equal(isSessionArchiveBlockedByState("running"), true);
+assert.equal(isSessionArchiveBlockedByState("interrupting"), true);
+assert.equal(isSessionArchiveBlockedByState("draining"), true);
+assert.equal(isSessionArchiveBlockedByState(undefined), false);
+assert.equal(isSessionArchiveBlockedByState("idle"), false);
 
 assert.equal(normalizeWorktreeForkName("  fix-login  "), "fix-login");
 assert.equal(isWorktreeForkNameValid(""), false);

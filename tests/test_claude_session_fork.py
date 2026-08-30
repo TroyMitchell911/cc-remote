@@ -135,6 +135,35 @@ def test_claude_handler_passes_exact_sdk_boundary_then_renames_and_lists(monkeyp
     asyncio.run(run())
 
 
+def test_archived_claude_parent_rejects_fork_before_sdk(monkeypatch):
+    async def run():
+        machine, _ = _resident_machine(monkeypatch)
+        archived = _info()
+        archived.tag = "archived"
+
+        def fork(*_args, **_kwargs):
+            raise AssertionError("archived parent must not reach SDK fork")
+
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _session_id, directory=None: archived,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "fork_session",
+            fork,
+        )
+
+        result = await machine._handle_fork_session(_command())
+
+        assert result.type == "error" and result.code == "auth"
+        assert "已归档" in result.message
+        assert machine._claude_forks.get("request-1") is None
+
+    asyncio.run(run())
+
+
 def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
     async def run():
         machine, _ = _resident_machine(monkeypatch)

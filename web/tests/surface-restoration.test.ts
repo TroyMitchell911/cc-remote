@@ -53,7 +53,7 @@ assert.match(appSource,
   /const immediate = preserveAuthority[\s\S]{0,180}selectSurfaceSession\(cachedSessions, remembered\)/,
   "ordinary surface switches must select from the scoped cached list synchronously");
 assert.match(appSource,
-  /if \(immediate\) \{[\s\S]{0,500}dispatch\(\{ type: "focus_session", sid: immediate\.session_id \}\)[\s\S]{0,500}sendSwitchSession\(immediate\.session_id, nextEngine, nextSpace\)/,
+  /if \(immediate\) \{[\s\S]{0,500}dispatch\(\{ type: "focus_session", sid: immediate\.session_id \}\)[\s\S]{0,500}resumeListedSession\(immediate, nextEngine, nextSpace, ws\)/,
   "cached surface focus must paint and resume immediately while authority refreshes");
 assert.match(appSource,
   /dispatch\(\{ type: "exit_new_chat" \}\);\s*setRestoringSurfaceScope\(focusScopeKey\)/,

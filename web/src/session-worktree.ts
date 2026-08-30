@@ -1,4 +1,4 @@
-import type { SessionInfo, State } from "./protocol";
+import type { Engine, SessionInfo, Space, State } from "./protocol";
 
 export const WORKTREE_FORK_NAME_MAX = 80;
 
@@ -92,11 +92,25 @@ export function sessionMenuCapabilities(session: SessionInfo): SessionMenuCapabi
   };
 }
 
+export function canDeleteSidebarSession(
+  engine: Engine,
+  space: Space,
+  archived: boolean,
+): boolean {
+  return space === "work" || engine !== "codex" || archived;
+}
+
 export function isWorktreeForkBlockedByState(state?: State | null): boolean {
   return state === "running" || state === "interrupting";
 }
 
 export function isSessionMigrationBlockedByState(state?: State | null): boolean {
+  return state === "running"
+    || state === "interrupting"
+    || state === "draining";
+}
+
+export function isSessionArchiveBlockedByState(state?: State | null): boolean {
   return state === "running"
     || state === "interrupting"
     || state === "draining";

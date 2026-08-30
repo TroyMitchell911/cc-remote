@@ -124,6 +124,58 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
     asyncio.run(run())
 
 
+def test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit(
+    monkeypatch,
+    tmp_path,
+):
+    async def run():
+        process = _FakeProcess([
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "id": 2, "result": {}},
+        ])
+        spawned = {}
+
+        async def create_subprocess_exec(*args, **kwargs):
+            spawned["args"] = args
+            spawned["kwargs"] = kwargs
+            return process
+
+        monkeypatch.setattr(
+            codex_rpc_module,
+            "_resolve_codex_bin",
+            lambda: "/bin/codex",
+        )
+        monkeypatch.setattr(
+            codex_rpc_module,
+            "_codex_env",
+            lambda _path: {},
+        )
+        monkeypatch.setattr(
+            codex_rpc_module.asyncio,
+            "create_subprocess_exec",
+            create_subprocess_exec,
+        )
+
+        await codex_rpc_module.codex_rpc(
+            "thread/archive",
+            {"threadId": "root"},
+            cwd=str(tmp_path),
+            nofile_soft_limit=4096,
+        )
+
+        assert spawned["args"] == (
+            codex_rpc_module.sys.executable,
+            codex_rpc_module._RLIMIT_EXEC,
+            "4096",
+            "/bin/codex",
+            "app-server",
+            "--stdio",
+        )
+        assert spawned["kwargs"]["cwd"] == str(tmp_path.resolve())
+
+    asyncio.run(run())
+
+
 def test_codex_rpc_batch_uses_one_process_and_preserves_partial_results(
     monkeypatch, tmp_path,
 ):

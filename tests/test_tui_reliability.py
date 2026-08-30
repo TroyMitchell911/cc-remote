@@ -17,6 +17,41 @@ class _Ws:
         self.frames.append(raw)
 
 
+def test_tui_context_command_requests_an_explicit_native_refresh():
+    async def run() -> None:
+        tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "claude", "s1")
+        tui._line = lambda _line: None
+        ws = _Ws()
+        tui.ws = ws
+
+        await tui._command("/context")
+
+        frame = json.loads(ws.frames[-1])
+        assert frame["type"] == "get_context"
+        assert frame["sid"] == "s1"
+        assert frame["refresh"] is True
+
+    asyncio.run(run())
+
+
+def test_tui_context_fallback_omits_unknown_capacity_and_labels_source():
+    tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "claude", "s1")
+    lines: list[str] = []
+    tui._line = lines.append
+
+    tui._render_context({
+        "total_tokens": 88_259,
+        "max_tokens": 0,
+        "percentage": 0,
+        "source": "recent_turn",
+        "model": "claude-opus-5",
+    })
+
+    assert "88,259 tokens" in lines[-1]
+    assert "0/0" not in lines[-1]
+    assert "recent turn" in lines[-1]
+
+
 def test_tui_retries_same_command_until_matching_ack():
     async def run() -> None:
         tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "claude", "s1")

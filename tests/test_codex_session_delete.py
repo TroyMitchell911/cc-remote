@@ -227,6 +227,29 @@ def _prepare(machine, monkeypatch, *, external: bool = False):
     monkeypatch.setattr(machine, "_handle_list_sessions", list_sessions)
     monkeypatch.setattr(machine, "_codex_rpc_for_wire", forbidden_rpc)
     monkeypatch.setattr(machine, "_codex_rollout_for_wire", lambda _sid: None)
+    monkeypatch.setattr(
+        machine_module,
+        "codex_thread_parent_maps",
+        lambda **_kwargs: ({}, {}),
+    )
+    def archived_rollout_record(_sid, **kwargs):
+        codex_home = Path(
+            kwargs.get("codex_home", machine._codex_profile().home)
+        )
+        return (
+            str(
+                codex_home
+                / "archived_sessions"
+                / "rollout-codex-thread.jsonl"
+            ),
+            True,
+        )
+
+    monkeypatch.setattr(
+        machine_module,
+        "codex_thread_rollout_record",
+        archived_rollout_record,
+    )
     for ctx in machine.sessions.values():
         if ctx.engine != "codex" or ctx.space != "code":
             continue
@@ -236,6 +259,141 @@ def _prepare(machine, monkeypatch, *, external: bool = False):
             "scan_complete": True,
             "active_external_turns": {},
         })
+
+
+def test_active_codex_thread_must_be_archived_before_delete(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        handle = _DeleteHandle()
+        ctx = _resident(machine, handle)
+        _prepare(machine, monkeypatch)
+        profile = machine._codex_profile()
+        active_rollout = str(
+            profile.home / "sessions" / "rollout-codex-thread.jsonl"
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_rollout_record",
+            lambda _sid, **_kwargs: (active_rollout, False),
+        )
+
+        result = await machine._handle_delete_session(_delete_command())
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_BUSY
+        assert "先归档" in result.message
+        assert handle.calls == []
+        assert machine.sessions[ctx.key] is ctx
+
+    asyncio.run(run())
+
+
+def test_archived_cross_home_codex_thread_is_not_deleted(monkeypatch, tmp_path):
+    async def run():
+        machine, _ = _mk_machine()
+        handle = _DeleteHandle()
+        ctx = _resident(machine, handle)
+        _prepare(machine, monkeypatch)
+        external_rollout = str(
+            tmp_path / "old-codex" / "archived_sessions" / "rollout.jsonl"
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_rollout_record",
+            lambda _sid, **_kwargs: (external_rollout, True),
+        )
+
+        result = await machine._handle_delete_session(_delete_command())
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_INTERNAL
+        assert "迁移不完整" in result.message
+        assert handle.calls == []
+        assert machine.sessions[ctx.key] is ctx
+
+    asyncio.run(run())
+
+
+def test_ordinary_fork_tree_requires_deepest_child_first(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        handle = _DeleteHandle()
+        handle.delete_candidates = (
+            ("codex-thread", False),
+            ("fork-child", False),
+            ("fork-grandchild", False),
+        )
+        ctx = _resident(machine, handle)
+        _prepare(machine, monkeypatch)
+        parents = {
+            "fork-child": "codex-thread",
+            "fork-grandchild": "fork-child",
+        }
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_parent_maps",
+            lambda **_kwargs: (parents, parents),
+        )
+
+        result = await machine._handle_delete_session(_delete_command())
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_BUSY
+        assert "最深层派生会话" in result.message
+        assert handle.calls == []
+        assert machine.sessions[ctx.key] is ctx
+
+    asyncio.run(run())
+
+
+def test_codex_delete_waits_for_concurrent_fork_tree_lane(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        fork_entered = asyncio.Event()
+        release_fork = asyncio.Event()
+        delete_entered = asyncio.Event()
+
+        async def is_codex(_sid):
+            return True
+
+        async def hold_fork(_cmd):
+            fork_entered.set()
+            await release_fork.wait()
+
+        async def record_delete(_cmd):
+            delete_entered.set()
+            return "deleted"
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine,
+            "_handle_fork_session_in_tree_lane",
+            hold_fork,
+        )
+        monkeypatch.setattr(
+            machine,
+            "_handle_delete_session_locked",
+            record_delete,
+        )
+
+        fork_task = asyncio.create_task(machine._handle_fork_session(
+            SimpleNamespace(session_id="codex-thread")
+        ))
+        await fork_entered.wait()
+        delete_task = asyncio.create_task(
+            machine._handle_delete_session(_delete_command())
+        )
+        await asyncio.sleep(0)
+
+        assert not delete_entered.is_set()
+        assert not delete_task.done()
+
+        release_fork.set()
+        await fork_task
+        assert await delete_task == "deleted"
+        assert delete_entered.is_set()
+
+    asyncio.run(run())
 
 
 def test_resident_shared_thread_deletes_before_proxy_disconnect(monkeypatch):
@@ -1404,7 +1562,7 @@ def test_cold_codex_delete_rejects_active_catalog_root_without_rollout(
     asyncio.run(run())
 
 
-def test_cold_codex_delete_falls_back_to_loaded_stdio(
+def test_cold_codex_delete_does_not_resume_when_shared_control_is_unavailable(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -1426,9 +1584,10 @@ def test_cold_codex_delete_falls_back_to_loaded_stdio(
 
         result = await machine._handle_delete_session(_delete_command())
 
-        assert result is None
-        assert len(_ColdDeleteHandle.created) == 2
-        shared, stdio = _ColdDeleteHandle.created
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_RUNNING
+        assert len(_ColdDeleteHandle.created) == 1
+        shared = _ColdDeleteHandle.created[0]
         assert shared.daemon_mode == "auto"
         assert shared.calls == [
             (
@@ -1438,18 +1597,6 @@ def test_cold_codex_delete_falls_back_to_loaded_stdio(
                     "control_only": True,
                 },
             ),
-            ("disconnect", None),
-        ]
-        assert stdio.daemon_mode == "off"
-        assert stdio.calls == [
-            (
-                "connect",
-                {
-                    "resume_id": "codex-thread",
-                    "cwd": str(tmp_path),
-                },
-            ),
-            ("delete", "codex-thread"),
             ("disconnect", None),
         ]
 
