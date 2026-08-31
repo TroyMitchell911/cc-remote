@@ -97,12 +97,16 @@ def claude_recent_context_usage(
     return {"totalTokens": total}
 
 
-def recover_claude_context_usage(session_id: str) -> dict[str, Any] | None:
+def recover_claude_context_usage(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, Any] | None:
     """Recover the newest main-chain Claude context depth from its JSONL tail."""
-    path = transcript_path(session_id)
-    if not path:
+    source_path = path or transcript_path(session_id)
+    if not source_path:
         return None
-    lines = _bounded_context_tail(path)
+    lines = _bounded_context_tail(source_path)
     if lines is None:
         return None
     for raw in reversed(lines):
@@ -222,6 +226,7 @@ def recover_work_context_baseline(
     session_id: str,
     *,
     codex_home: str | None = None,
+    claude_path: str | None = None,
 ) -> int | None:
     """Recover a migrated Work session's first authoritative input depth.
 
@@ -236,7 +241,7 @@ def recover_work_context_baseline(
             else codex_rollout_path(session_id, codex_home=codex_home)
         )
     else:
-        path = transcript_path(session_id)
+        path = claude_path or transcript_path(session_id)
     if not path:
         return None
     try:

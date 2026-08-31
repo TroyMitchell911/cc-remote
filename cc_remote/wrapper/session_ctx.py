@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
 
-from cc_remote.protocol import AskUser, State
+from cc_remote.protocol import AskUser, BackgroundProcessItem, State
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.stream import StreamTranslator
@@ -120,10 +120,13 @@ class SessionContext:
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    # Claude's complete local account boundary. ``session_id`` remains the
+    # native UUID while ``key`` is namespaced when multiple profiles exist.
+    claude_profile_id: Optional[str] = None
     # Codex's complete local account boundary. ``session_id`` remains the
     # native app-server UUID while ``key`` is the browser-facing routing id
     # (namespaced for every profile when multiple profiles are configured).
-    # Claude leaves this unset.
+    # Claude uses the parallel field above.
     codex_profile_id: Optional[str] = None
     # Product-space identity. Work sessions are native engine sessions whose
     # cwd and metadata are owned by cc-remote's private Work registry.
@@ -184,6 +187,14 @@ class SessionContext:
     # wait for these tasks and their autonomous post-result follow-up to drain.
     claude_active_tasks: set[str] = field(default_factory=set)
     claude_task_tracking_overflow: bool = False
+    # Public, bounded activity projection used for reconnect/Hello replacement.
+    # Membership follows Claude's native background task level; ProcessEvent
+    # edges enrich these snapshots without becoming reconnect authority.
+    claude_background_processes: dict[str, BackgroundProcessItem] = field(
+        default_factory=dict)
+    # Sanitized Bash command metadata survives ResultMessage translator swaps
+    # so a later task_started edge can still expose the script in the dock.
+    claude_item_commands: dict[str, str] = field(default_factory=dict)
     # Every terminal background notification can enqueue its own autonomous
     # Claude turn.  Keep an insertion-ordered ledger instead of a boolean so an
     # earlier Result cannot release a later notification which was already

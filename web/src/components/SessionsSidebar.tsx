@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
-import type { CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
+import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
 import { Icon, ClaudeMark } from "../icons";
 import {
@@ -23,6 +23,8 @@ interface Props {
   engine: Engine;
   space: Space;
   profileScopeKey: string;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   onSpaceChange: (space: Space) => void;
@@ -33,7 +35,7 @@ interface Props {
   completionBadges?: Record<string, CompletionBadgeKind>;
   activeSessionId: string | null;
   onSelect: (id: string) => void;
-  onNew: (codexProfileId?: string) => void;
+  onNew: (profileId?: string) => void;
   onNewInDir: (cwd: string) => void;
   onClose: () => void;
   onRename: (id: string, title: string) => void;
@@ -67,7 +69,8 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 }
 
 export function SessionsSidebar({ open, engine, space,
-  profileScopeKey, codexProfiles = [], defaultCodexProfileId,
+  profileScopeKey, claudeProfiles = [], defaultClaudeProfileId,
+  codexProfiles = [], defaultCodexProfileId,
   onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
@@ -76,7 +79,7 @@ export function SessionsSidebar({ open, engine, space,
   const [lifting, setLifting] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [codexProfileFilters, setCodexProfileFilters] =
+  const [profileFilters, setProfileFilters] =
     useState<Record<string, string>>({});
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
@@ -84,11 +87,13 @@ export function SessionsSidebar({ open, engine, space,
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
 
-  const showCodexProfileManagement =
-    engine === "codex" && codexProfiles.length > 1;
-  const codexProfileFilter = codexProfileFilters[profileScopeKey] ?? "all";
-  const setCodexProfileFilter = (profileId: string) => {
-    setCodexProfileFilters((current) => (
+  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = engine === "codex"
+    ? defaultCodexProfileId : defaultClaudeProfileId;
+  const showProfileManagement = accountProfiles.length > 1;
+  const profileFilter = profileFilters[profileScopeKey] ?? "all";
+  const setProfileFilter = (profileId: string) => {
+    setProfileFilters((current) => (
       current[profileScopeKey] === profileId
         ? current
         : { ...current, [profileScopeKey]: profileId }
@@ -96,24 +101,25 @@ export function SessionsSidebar({ open, engine, space,
   };
 
   const profilePresentationFor = (session: SessionInfo) =>
-    engine === "codex"
-      ? codexProfilePresentation(
-        codexProfiles,
-        defaultCodexProfileId,
-        session.codex_profile_id,
-      )
-      : null;
+    codexProfilePresentation(
+      accountProfiles,
+      defaultAccountProfileId,
+      engine === "codex"
+        ? session.codex_profile_id : session.claude_profile_id,
+    );
   const filter = q.toLowerCase();
   const matches = (s: SessionInfo) => {
     const profilePresentation = profilePresentationFor(s);
     return (
-      (!showCodexProfileManagement
-        || codexProfileFilter === "all"
-        || s.codex_profile_id === codexProfileFilter)
+      (!showProfileManagement
+        || profileFilter === "all"
+        || (engine === "codex"
+          ? s.codex_profile_id : s.claude_profile_id) === profileFilter)
       && (!filter
         || (s.summary || "").toLowerCase().includes(filter)
         || (s.first_prompt || "").toLowerCase().includes(filter)
         || (s.cwd || "").toLowerCase().includes(filter)
+        || (s.claude_profile_label || "").toLowerCase().includes(filter)
         || (s.codex_profile_label || "").toLowerCase().includes(filter)
         || (profilePresentation?.fullLabel ?? "").toLowerCase().includes(filter)
         || (s.native_session_id || s.session_id).toLowerCase().includes(filter))
@@ -179,20 +185,20 @@ export function SessionsSidebar({ open, engine, space,
   useEffect(() => { if (!open) { setMenuCardId(null); setLifting(false); } }, [open]);
 
   useEffect(() => {
-    if (!showCodexProfileManagement
-        || (codexProfileFilter !== "all"
-          && !codexProfiles.some(
-            (profile) => profile.id === codexProfileFilter))) {
-      setCodexProfileFilters((current) => {
+    if (!showProfileManagement
+        || (profileFilter !== "all"
+          && !accountProfiles.some(
+            (profile) => profile.id === profileFilter))) {
+      setProfileFilters((current) => {
         if ((current[profileScopeKey] ?? "all") === "all") return current;
         return { ...current, [profileScopeKey]: "all" };
       });
     }
   }, [
-    codexProfileFilter,
-    codexProfiles,
+    accountProfiles,
+    profileFilter,
     profileScopeKey,
-    showCodexProfileManagement,
+    showProfileManagement,
   ]);
 
   // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
@@ -300,8 +306,8 @@ export function SessionsSidebar({ open, engine, space,
         {profilePresentation && (
           <span
             className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
-            title={`Codex 账号：${profilePresentation.fullLabel}`}
-            aria-label={`Codex 账号：${profilePresentation.fullLabel}`}
+            title={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
+            aria-label={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
           >
             {profilePresentation.name}
           </span>
@@ -453,19 +459,19 @@ export function SessionsSidebar({ open, engine, space,
               <Icon name="code" size={18} />Code
             </button>
           </div>
-          {showCodexProfileManagement && (
+          {showProfileManagement && (
             <div className="codex-profile-filter" role="group"
-              aria-label="筛选 Codex 账号">
-              <button className={codexProfileFilter === "all" ? "active" : ""}
-                onClick={() => setCodexProfileFilter("all")}>全部</button>
-              {codexProfiles.map((profile) => (
+              aria-label={`筛选 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
+              <button className={profileFilter === "all" ? "active" : ""}
+                onClick={() => setProfileFilter("all")}>全部</button>
+              {accountProfiles.map((profile) => (
                 (() => {
                   const presentation = codexProfilePresentation(
-                    codexProfiles, defaultCodexProfileId, profile.id);
+                    accountProfiles, defaultAccountProfileId, profile.id);
                   return (
                     <button key={profile.id}
-                      className={codexProfileFilter === profile.id ? "active" : ""}
-                      onClick={() => setCodexProfileFilter(profile.id)}
+                      className={profileFilter === profile.id ? "active" : ""}
+                      onClick={() => setProfileFilter(profile.id)}
                       title={profile.error ?? presentation?.fullLabel ?? profile.label}>
                       {presentation && (
                         <i className={`profile-tone tone-${presentation.tone}`} />
@@ -493,7 +499,7 @@ export function SessionsSidebar({ open, engine, space,
           <div className="s-foot">
             <button className="newbtn" onClick={() => onNew(
               newWorkProfileForSidebarFilter(
-                engine, space, codexProfileFilter,
+                engine, space, profileFilter,
               ),
             )}><Icon name="plus" size={19} />{space === "work" ? "新工作" : "新会话"}</button>
           </div>

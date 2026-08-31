@@ -23,6 +23,10 @@ export interface TextBlock {
   text: string;
   done: boolean;
   channel?: AssistantChannel;
+  /** Source event time and detached-follow-up scope, preserved for chronology. */
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -51,6 +55,9 @@ export interface ToolBlock {
     duration_ms?: number | null;
   };
   done: boolean;
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -83,6 +90,11 @@ export interface ProcessBlock {
   explanation?: string | null;
   plan?: PlanEntry[];
   done: boolean;
+  startedTs?: number;
+  updatedTs?: number;
+  /** Completion is a later chronological boundary than a detached start. */
+  terminalOrder?: number;
+  terminalTs?: number;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }

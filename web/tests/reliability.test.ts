@@ -17867,7 +17867,7 @@ assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 assert.match(appSource,
-  /focusedSession\?\.native_session_id[\s\S]{0,180}nativeCodexSessionId\(rt\.ccSessionId\)/,
+  /focusedSession\?\.native_session_id[\s\S]{0,180}nativeProfileSessionId\(rt\.ccSessionId\)/,
   "the Work header must not expose a profile-namespaced routing id");
 assert.match(appSource,
   /<span className=\{`work-profile-owner tone-\$\{focusedWorkProfile\.tone\}`\}/,
@@ -17891,7 +17891,7 @@ assert.match(sidebarSource,
   /disabled=\{archiveBlocked\}[\s\S]{0,160}请停止当前任务并清空排队后再归档/,
   "running Codex sessions must not expose an actionable archive command");
 assert.match(sidebarSource,
-  /codexProfileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
+  /profileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
   "Code, Work and different devices must not share one account filter");
 const newChatSource = readFileSync(
   resolve(process.cwd(), "src/components/NewChatView.tsx"), "utf8");
@@ -17988,8 +17988,8 @@ assert.match(appSource,
 assert.match(appSource,
   /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
   "a failed Skill refresh must not replace a usable cached catalog");
-assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
-  "focused Codex sessions must prefetch Skills before the user types $");
+assert.match(appSource, /Warm the cwd\/account-scoped Skill catalog[\s\S]*requestSkillCatalog/,
+  "focused sessions must prefetch account-scoped Skills before the user types $");
 assert.match(appSource,
   /msg\.type === "wrapper_reconnected"[\s\S]*skillCatalogsRef\.current = \{\}[\s\S]*requestSkillCatalog\(focusedSkills, true\)/,
   "a wrapper generation change must invalidate and rewarm native Skill catalogs");

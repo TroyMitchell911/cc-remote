@@ -423,48 +423,52 @@ def _table_columns(db: sqlite3.Connection, table: str) -> set[str]:
 
 
 def verify_profile_migration(snapshot: Path) -> None:
-    """Verify the v33 Codex Work schema and ownership backfill."""
+    """Verify account-aware Work schemas and ownership backfills."""
     snapshot = Path(os.path.realpath(snapshot))
     manifest = _load_manifest(snapshot)
-    entry = manifest["registries"]["codex"]
-    if not isinstance(entry, dict):
-        raise WorkRegistrySnapshotError("invalid Codex snapshot entry")
-    database, _backup = _entry_paths(snapshot, "codex", entry)
-    _regular_file(database)
-    db = sqlite3.connect(_sqlite_uri(database), uri=True, timeout=5)
-    try:
-        _check_database(db, label=str(database))
-        required = {
-            "work_sessions": "codex_profile_id",
-            "work_schedules": "codex_profile_id",
-            "work_schedule_runs": "codex_profile_id",
-        }
-        for table, column in required.items():
-            if column not in _table_columns(db, table):
-                raise WorkRegistrySnapshotError(
-                    f"Codex Work migration is missing {table}.{column}"
-                )
-        unowned = {
-            "sessions": db.execute(
-                "SELECT COUNT(*) FROM work_sessions "
-                "WHERE engine = 'codex' AND codex_profile_id IS NULL"
-            ).fetchone()[0],
-            "schedules": db.execute(
-                "SELECT COUNT(*) FROM work_schedules "
-                "WHERE codex_profile_id IS NULL"
-            ).fetchone()[0],
-            "runs": db.execute(
-                "SELECT COUNT(*) FROM work_schedule_runs "
-                "WHERE codex_profile_id IS NULL"
-            ).fetchone()[0],
-        }
-    finally:
-        db.close()
-    if any(unowned.values()):
-        detail = ", ".join(f"{key}={value}" for key, value in unowned.items())
-        raise WorkRegistrySnapshotError(
-            f"Codex Work profile ownership migration is incomplete: {detail}"
-        )
+    for engine, display_name in (("claude", "Claude"), ("codex", "Codex")):
+        entry = manifest["registries"][engine]
+        if not isinstance(entry, dict):
+            raise WorkRegistrySnapshotError(
+                f"invalid {display_name} snapshot entry")
+        database, _backup = _entry_paths(snapshot, engine, entry)
+        _regular_file(database)
+        profile_column = f"{engine}_profile_id"
+        db = sqlite3.connect(_sqlite_uri(database), uri=True, timeout=5)
+        try:
+            _check_database(db, label=str(database))
+            for table in (
+                "work_sessions", "work_schedules", "work_schedule_runs",
+            ):
+                if profile_column not in _table_columns(db, table):
+                    raise WorkRegistrySnapshotError(
+                        f"{display_name} Work migration is missing "
+                        f"{table}.{profile_column}"
+                    )
+            unowned = {
+                "sessions": db.execute(
+                    "SELECT COUNT(*) FROM work_sessions "
+                    f"WHERE engine = ? AND {profile_column} IS NULL",
+                    (engine,),
+                ).fetchone()[0],
+                "schedules": db.execute(
+                    "SELECT COUNT(*) FROM work_schedules "
+                    f"WHERE {profile_column} IS NULL"
+                ).fetchone()[0],
+                "runs": db.execute(
+                    "SELECT COUNT(*) FROM work_schedule_runs "
+                    f"WHERE {profile_column} IS NULL"
+                ).fetchone()[0],
+            }
+        finally:
+            db.close()
+        if any(unowned.values()):
+            detail = ", ".join(
+                f"{key}={value}" for key, value in unowned.items())
+            raise WorkRegistrySnapshotError(
+                f"{display_name} Work profile ownership migration is "
+                f"incomplete: {detail}"
+            )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -496,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Work registry snapshot restored")
         else:
             verify_profile_migration(args.snapshot)
-            print("Codex Work profile migration verified")
+            print("Claude/Codex Work profile migrations verified")
     except (OSError, sqlite3.Error, WorkRegistrySnapshotError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

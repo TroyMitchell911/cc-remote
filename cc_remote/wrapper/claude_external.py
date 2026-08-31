@@ -24,6 +24,7 @@ from cc_remote.wrapper.process_scan import (
     _process_start_ticks,
     _process_stat,
     darwin_process_snapshot,
+    process_command_environment_value,
     process_identity,
 )
 
@@ -44,6 +45,74 @@ _NEUTRAL_METADATA_TYPES = frozenset({
     "queue-operation",
 })
 _MAX_DARWIN_CLAUDE_CANDIDATES = 256
+
+
+def _profile_scoped_process(
+    identity: ProcessIdentity,
+    args: tuple[bytes, ...],
+    paths: Mapping[str, str],
+    *,
+    config_dirs: Mapping[str, str] | None,
+    default_config_dir: str | None,
+    process_cwd: str | None,
+    proc_root: str = "/proc",
+) -> tuple[bool, tuple[bytes, ...], set[str], str | None]:
+    """Bind one exact Claude CLI process to one config-root namespace.
+
+    The legacy single-account scanner deliberately skips environment reads.
+    Once explicit profiles are configured, an unreadable or malformed
+    ``CLAUDE_CONFIG_DIR`` is an incomplete ownership observation: assigning an
+    identical native UUID to the wrong account would weaken the read-only
+    boundary.
+    """
+    if config_dirs is None:
+        return True, args, set(paths), None
+    complete, exact_args, configured = process_command_environment_value(
+        identity, "CLAUDE_CONFIG_DIR", proc_root=proc_root)
+    if not complete or exact_args is None:
+        return False, args, set(), None
+    if not _is_claude_cli(exact_args):
+        return True, exact_args, set(), None
+    raw_root = configured if configured is not None else default_config_dir
+    if (
+        not isinstance(raw_root, str)
+        or not raw_root
+        or "\x00" in raw_root
+        or len(os.fsencode(raw_root)) > 4096
+    ):
+        return False, exact_args, set(), None
+    if not os.path.isabs(raw_root):
+        if not process_cwd:
+            return False, exact_args, set(), None
+        raw_root = os.path.join(process_cwd, raw_root)
+    root = os.path.realpath(raw_root)
+    scoped = {
+        sid for sid in paths
+        if os.path.realpath(config_dirs[sid]) == root
+    }
+    return True, exact_args, scoped, root
+
+
+def _scoped_sid_by_arg(
+    sids: Collection[str],
+    native_session_ids: Mapping[str, str] | None,
+) -> dict[bytes, str]:
+    return {
+        (native_session_ids[sid] if native_session_ids is not None else sid).encode(): sid
+        for sid in sids
+    }
+
+
+def _resolve_continue_target(
+    resolver: Callable[..., str | None],
+    cwd: str,
+    config_root: str | None,
+    *,
+    profile_scoped: bool,
+) -> str | None:
+    if profile_scoped:
+        return resolver(cwd, config_root)
+    return resolver(cwd)
 
 
 def classify_claude_growth(
@@ -262,7 +331,10 @@ def _darwin_claude_session_holders(
     wrapper_pid: int,
     continue_bindings: dict[ProcessIdentity, str],
     continue_candidates: dict[ProcessIdentity, str],
-    continue_resolver: Callable[[str], str | None] | None,
+    continue_resolver: Callable[..., str | None] | None,
+    config_dirs: Mapping[str, str] | None,
+    native_session_ids: Mapping[str, str] | None,
+    default_config_dir: str | None,
 ) -> HolderScan:
     holders = {sid: set() for sid in paths}
     snapshot, complete = darwin_process_snapshot()
@@ -280,7 +352,6 @@ def _darwin_claude_session_holders(
 
     process_cwds, cwd_scan_complete = _darwin_process_cwds(
         [info[0].pid for info in candidates])
-    sid_by_arg = {sid.encode(): sid for sid in paths}
     cwd_sids: dict[str, set[str]] = {}
     for sid in paths:
         cwd = cwds.get(sid)
@@ -290,7 +361,25 @@ def _darwin_claude_session_holders(
         sid for sids in cwd_sids.values() for sid in sids)
     seen_continue: set[ProcessIdentity] = set()
 
-    for identity, _parent_pid, _tty_nr, args in candidates:
+    for identity, _parent_pid, _tty_nr, snapshot_args in candidates:
+        process_cwd = process_cwds.get(identity.pid)
+        account_complete, args, account_sids, config_root = (
+            _profile_scoped_process(
+                identity,
+                snapshot_args,
+                paths,
+                config_dirs=config_dirs,
+                default_config_dir=default_config_dir,
+                process_cwd=process_cwd,
+            )
+        )
+        if not account_complete:
+            complete = False
+            continue
+        if not account_sids:
+            continue
+        sid_by_arg = _scoped_sid_by_arg(
+            account_sids, native_session_ids)
         matched, has_explicit_session = _explicit_session_ids(
             args, sid_by_arg)
         continue_command = (
@@ -301,7 +390,6 @@ def _darwin_claude_session_holders(
             if bound_sid is None:
                 bound_sid = continue_candidates.get(identity)
             if bound_sid is None:
-                process_cwd = process_cwds.get(identity.pid)
                 if process_cwd is None or not cwd_scan_complete:
                     complete = False
                     continue
@@ -309,7 +397,12 @@ def _darwin_claude_session_holders(
                     complete = False
                     continue
                 try:
-                    bound_sid = continue_resolver(process_cwd)
+                    bound_sid = _resolve_continue_target(
+                        continue_resolver,
+                        process_cwd,
+                        config_root,
+                        profile_scoped=config_dirs is not None,
+                    )
                 except Exception:
                     complete = False
                     continue
@@ -317,21 +410,22 @@ def _darwin_claude_session_holders(
                     complete = False
                     continue
                 continue_candidates[identity] = bound_sid
-            if bound_sid in paths:
+            if bound_sid in account_sids:
                 continue_bindings[identity] = bound_sid
                 matched.add(bound_sid)
         elif not matched and not has_explicit_session:
-            process_cwd = process_cwds.get(identity.pid)
             if process_cwd is None:
                 if not cwd_scan_complete or process_identity(identity.pid) == identity:
                     complete = False
                 continue
-            cwd_matches = cwd_sids.get(process_cwd, ())
+            cwd_matches = set(cwd_sids.get(process_cwd, ())).intersection(
+                account_sids)
             if len(cwd_matches) == 1:
                 matched.update(cwd_matches)
 
         if not matched:
-            if missing_cwds and not has_explicit_session:
+            if (missing_cwds.intersection(account_sids)
+                    and not has_explicit_session):
                 complete = False
             continue
         if process_identity(identity.pid) != identity:
@@ -358,7 +452,10 @@ def claude_session_holders(
     proc_root: str = "/proc",
     continue_bindings: dict[ProcessIdentity, str] | None = None,
     continue_candidates: dict[ProcessIdentity, str] | None = None,
-    continue_resolver: Callable[[str], str | None] | None = None,
+    continue_resolver: Callable[..., str | None] | None = None,
+    config_dirs: Mapping[str, str] | None = None,
+    native_session_ids: Mapping[str, str] | None = None,
+    default_config_dir: str | None = None,
 ) -> HolderScan:
     """Return stable external Claude process identities for watched sessions.
 
@@ -369,6 +466,13 @@ def claude_session_holders(
     Ambiguous same-cwd processes must not make every sibling session read-only.
     """
     holders = {sid: set() for sid in paths}
+    if config_dirs is not None and set(config_dirs) != set(paths):
+        return HolderScan(holders, False)
+    if (
+        native_session_ids is not None
+        and set(native_session_ids) != set(paths)
+    ):
+        return HolderScan(holders, False)
     root = Path(proc_root)
     bindings = continue_bindings if continue_bindings is not None else {}
     candidates = (
@@ -381,8 +485,10 @@ def claude_session_holders(
             continue_bindings=bindings,
             continue_candidates=candidates,
             continue_resolver=continue_resolver,
+            config_dirs=config_dirs,
+            native_session_ids=native_session_ids,
+            default_config_dir=default_config_dir,
         )
-    sid_by_arg = {sid.encode(): sid for sid in paths}
     cwd_sids: dict[str, set[str]] = {}
     for sid in paths:
         cwd = cwds.get(sid)
@@ -417,10 +523,36 @@ def claude_session_holders(
                     int(proc_dir.name), parent_pid, wrapper_pid,
                     proc_root=root):
                 continue
-
+            identity = ProcessIdentity(int(proc_dir.name), start_ticks)
+            process_cwd: str | None = None
+            if config_dirs is not None:
+                try:
+                    process_cwd = os.path.realpath(
+                        os.readlink(proc_dir / "cwd"))
+                except OSError:
+                    if _process_start_ticks(proc_dir) == start_ticks:
+                        complete = False
+                    continue
+            account_complete, args, account_sids, config_root = (
+                _profile_scoped_process(
+                    identity,
+                    args,
+                    paths,
+                    config_dirs=config_dirs,
+                    default_config_dir=default_config_dir,
+                    process_cwd=process_cwd,
+                    proc_root=proc_root,
+                )
+            )
+            if not account_complete:
+                complete = False
+                continue
+            if not account_sids:
+                continue
+            sid_by_arg = _scoped_sid_by_arg(
+                account_sids, native_session_ids)
             matched, has_explicit_session = _explicit_session_ids(
                 args, sid_by_arg)
-            identity = ProcessIdentity(int(proc_dir.name), start_ticks)
             continue_command = (
                 not matched
                 and not has_explicit_session
@@ -434,13 +566,14 @@ def claude_session_holders(
                     if identity in candidates:
                         bound_sid = candidates[identity]
                     else:
-                        try:
-                            process_cwd = os.path.realpath(
-                                os.readlink(proc_dir / "cwd"))
-                        except OSError:
-                            if _process_start_ticks(proc_dir) == start_ticks:
-                                complete = False
-                            continue
+                        if process_cwd is None:
+                            try:
+                                process_cwd = os.path.realpath(
+                                    os.readlink(proc_dir / "cwd"))
+                            except OSError:
+                                if _process_start_ticks(proc_dir) == start_ticks:
+                                    complete = False
+                                continue
                         if continue_resolver is None:
                             # The watched subset cannot prove Claude's cwd-global
                             # "latest" target. Treat missing catalog authority as
@@ -448,7 +581,12 @@ def claude_session_holders(
                             complete = False
                             continue
                         try:
-                            bound_sid = continue_resolver(process_cwd)
+                            bound_sid = _resolve_continue_target(
+                                continue_resolver,
+                                process_cwd,
+                                config_root,
+                                profile_scoped=config_dirs is not None,
+                            )
                         except Exception:
                             complete = False
                             continue
@@ -463,22 +601,25 @@ def claude_session_holders(
                         # watches it, but do not call that an ownership binding.
                         # When the exact sid enters `paths`, promote it below.
                         candidates[identity] = bound_sid
-                if bound_sid in paths:
+                if bound_sid in account_sids:
                     bindings[identity] = bound_sid
                     matched.add(bound_sid)
             if (not matched and not has_explicit_session
                     and not continue_command):
-                try:
-                    process_cwd = os.path.realpath(os.readlink(proc_dir / "cwd"))
-                except OSError:
-                    if _process_start_ticks(proc_dir) == start_ticks:
-                        complete = False
-                    continue
-                cwd_matches = cwd_sids.get(process_cwd, ())
+                if process_cwd is None:
+                    try:
+                        process_cwd = os.path.realpath(
+                            os.readlink(proc_dir / "cwd"))
+                    except OSError:
+                        if _process_start_ticks(proc_dir) == start_ticks:
+                            complete = False
+                        continue
+                cwd_matches = set(cwd_sids.get(
+                    process_cwd, ())).intersection(account_sids)
                 if len(cwd_matches) == 1:
                     matched.update(cwd_matches)
             if not matched:
-                if missing_cwds:
+                if missing_cwds.intersection(account_sids):
                     complete = False
                 continue
             if _process_start_ticks(proc_dir) != start_ticks:

@@ -62,7 +62,7 @@ assert.match(appSource,
   /restoringSurfaceScope === activeScopeKey \? \([\s\S]{0,220}正在恢复会话/,
   "only the exact active machine/engine/space restore scope may show the loading gate");
 assert.match(appSource,
-  /!state\.newChat \|\| newChatCodexProfileMissing\s*\|\| restoringSurfaceScope === activeScopeKey/,
+  /!state\.newChat \|\| newChatCodexProfileMissing\s*\|\| newChatClaudeProfileMissing\s*\|\| restoringSurfaceScope === activeScopeKey/,
   "the first-message path must fail closed even if a stale composer invokes it");
 assert.match(appSource,
   /if \(!current\.newChat\) \{[\s\S]{0,500}cwd: inheritedCwd \|\| "~"[\s\S]{0,500}scope === focusScopeKey \? null : scope/,

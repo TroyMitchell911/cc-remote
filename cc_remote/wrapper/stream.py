@@ -32,8 +32,10 @@ from claude_agent_sdk.types import (
 
 from cc_remote.claude_paths import claude_projects_dir
 from cc_remote.protocol import (
+    MAX_BACKGROUND_PROCESS_COMMAND_CHARS, MAX_BACKGROUND_PROCESS_ITEMS,
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
-    ToolDelta, ProcessEvent, TurnPlan,
+    ToolDelta, ProcessEvent, BackgroundProcessItem, BackgroundProcessSync,
+    TurnPlan,
     TurnEnd, TurnResult, UserMsg,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
@@ -62,6 +64,9 @@ _MAX_DIFF_SOURCE_CHARS = 512 * 1024
 _MAX_DIFF_SOURCE_LINES = 4096
 _MAX_LIVE_TOOL_ITEMS = 4096
 _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
+_CLAUDE_IMAGE_READ_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp",
+})
 _SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
 _INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
 _SYNTHETIC_API_ERROR_PREFIX = "API Error:"
@@ -90,6 +95,161 @@ def _short_text(value: Any, limit: int = 1024) -> str | None:
     text, _ = bounded_text(value, limit)
     text = " ".join(text.split())
     return text or None
+
+
+def _claude_image_read_path(name: Any, tool_input: Any) -> str | None:
+    """Recognize Claude's built-in binary image read before its result arrives.
+
+    SVG deliberately remains a normal text Read: Claude Code returns SVG source
+    rather than an image content block.  The binary formats below are the ones
+    which produce ``tool_result.content[].type=image`` in the transcript.
+    """
+    normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if normalized not in {"read", "readfile"} or not isinstance(tool_input, dict):
+        return None
+    path = tool_input.get("file_path") or tool_input.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > 4096
+        or os.path.splitext(path)[1].lower() not in _CLAUDE_IMAGE_READ_SUFFIXES
+    ):
+        return None
+    return path
+
+
+def _claude_image_blocks(content: Any) -> list[dict[str, str]]:
+    """Extract only public base64 image blocks from one Claude tool result."""
+    blocks = (
+        [content]
+        if isinstance(content, dict) and content.get("type") == "image"
+        else content.get("content") if isinstance(content, dict)
+        else content
+    )
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    if not isinstance(blocks, list):
+        return []
+    images: list[dict[str, str]] = []
+    for block in blocks[:8]:
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        image = _cc_img_block(block)
+        if (
+            image is not None
+            and isinstance(image.get("media_type"), str)
+            and isinstance(image.get("data"), str)
+        ):
+            images.append(image)
+    return images
+
+
+def _claude_history_tool_use_block(block: Any) -> bool:
+    return (
+        isinstance(block, dict)
+        and block.get("type") in {"tool_use", "server_tool_use"}
+    )
+
+
+def _claude_history_tool_result_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    block_type = block.get("type")
+    return bool(
+        block_type == "tool_result"
+        or (
+            isinstance(block_type, str)
+            and block_type.endswith("_tool_result")
+            and block.get("tool_use_id")
+        )
+    )
+
+
+def _claude_history_tool_result_error(block: dict[str, Any]) -> bool:
+    content = block.get("content")
+    content_type = content.get("type", "") if isinstance(content, dict) else ""
+    return bool(block.get("is_error")) or "error" in str(content_type).lower()
+
+
+def claude_history_image_id(tool_use_id: str, index: int = 0) -> str:
+    """Stable opaque id for an image returned by one native Claude tool call."""
+    digest = hashlib.sha256(
+        f"claude-tool-image\0{tool_use_id}\0{index}".encode(
+            "utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+    return f"img-{digest}"
+
+
+@dataclass(frozen=True)
+class ClaudeHistoryImageAsset:
+    """Private transcript image body paired with its public process item."""
+
+    item_id: str
+    image_id: str
+    media_type: str
+    data: str
+
+
+def extract_claude_history_image_assets(
+    messages: Any,
+    *,
+    item_ids: set[str] | frozenset[str] | None = None,
+    max_assets: int = 64,
+) -> tuple[ClaudeHistoryImageAsset, ...]:
+    """Read only requested Claude ``Read`` image bodies from loaded history.
+
+    The ordinary history translator emits no base64.  This side channel is used
+    after pagination selected the visible turns, so a transcript containing many
+    old images cannot make one four-turn History request retain every body.
+    """
+    wanted = set(item_ids) if item_ids is not None else None
+    if max_assets <= 0 or wanted == set():
+        return ()
+    image_reads: dict[str, str] = {}
+    assets: list[ClaudeHistoryImageAsset] = []
+    for message in messages or ():
+        payload = getattr(message, "message", None)
+        if not isinstance(payload, dict):
+            continue
+        role = payload.get("role") or getattr(message, "type", None)
+        content = payload.get("content")
+        if not isinstance(content, list):
+            continue
+        if role not in {"assistant", "user"}:
+            continue
+        for block in content:
+            if _claude_history_tool_use_block(block):
+                raw_id = block.get("id")
+                if (
+                    not isinstance(raw_id, str)
+                    or not _SAFE_WIRE_ID.fullmatch(raw_id)
+                    or (wanted is not None and raw_id not in wanted)
+                ):
+                    continue
+                if _claude_image_read_path(
+                    block.get("name"), block.get("input")
+                ):
+                    image_reads[raw_id] = raw_id
+                continue
+            if not _claude_history_tool_result_block(block):
+                continue
+            raw_id = block.get("tool_use_id")
+            item_id = image_reads.pop(raw_id, None) if isinstance(raw_id, str) else None
+            if item_id is None or _claude_history_tool_result_error(block):
+                continue
+            images = _claude_image_blocks(block.get("content"))
+            if not images:
+                continue
+            image = images[0]
+            assets.append(ClaudeHistoryImageAsset(
+                item_id=item_id,
+                image_id=claude_history_image_id(item_id),
+                media_type=image["media_type"],
+                data=image["data"],
+            ))
+            if len(assets) >= max_assets:
+                return tuple(assets)
+    return tuple(assets)
 
 
 def _is_agent_task_type(value: Any) -> bool:
@@ -386,6 +546,28 @@ def _safe_result_content(tool_name: str | None, content: Any) -> Any:
     return "\n".join(texts) if texts else "MCP 调用已完成"
 
 
+def _safe_image_read_result_content(tool_name: str, content: Any) -> Any:
+    """Preserve diagnostics without ever projecting an image body as text."""
+    blocks = (
+        [content]
+        if isinstance(content, dict) and content.get("type") == "image"
+        else content.get("content") if isinstance(content, dict)
+        else content
+    )
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    if isinstance(blocks, list):
+        removed_image = False
+        filtered = []
+        for block in blocks[:64]:
+            if isinstance(block, dict) and block.get("type") == "image":
+                removed_image = True
+                continue
+            filtered.append(block)
+        return filtered or ("图片读取结果不可用" if removed_image else [])
+    return _safe_result_content(tool_name, content)
+
+
 def _assistant_text_channel(stop_reason: str | None, has_tool: bool,
                             parent_tool_use_id: str | None = None) -> str:
     # Claude's intermediate narration commonly arrives in an AssistantMessage
@@ -434,11 +616,51 @@ def public_agent_run_id(tool_id: str) -> str:
     return _agent_process_id(_wire_id(tool_id, "tool"))
 
 
+def claude_background_tasks(
+    message: object,
+) -> tuple[dict[str, str | bool], ...] | None:
+    """Return Claude's authoritative live-background-task level.
+
+    Claude Code documents ``background_tasks_changed.tasks`` as a full
+    replacement, not an edge stream.  ``None`` means this is not a valid level
+    event; an empty tuple is the meaningful authoritative empty set.  Ambient
+    runner bookkeeping is intentionally excluded from user-visible work.
+    """
+    if not (
+        isinstance(message, SystemMessage)
+        and message.subtype == "background_tasks_changed"
+    ):
+        return None
+    data = message.data if isinstance(message.data, dict) else {}
+    raw_tasks = data.get("tasks")
+    if not isinstance(raw_tasks, list):
+        return None
+    tasks: list[dict[str, str | bool]] = []
+    seen: set[str] = set()
+    for raw in raw_tasks:
+        if not isinstance(raw, dict) or raw.get("ambient") is True:
+            continue
+        raw_id = raw.get("task_id")
+        if not isinstance(raw_id, str) or not raw_id or raw_id in seen:
+            continue
+        seen.add(raw_id)
+        task: dict[str, str | bool] = {"task_id": raw_id}
+        task_type = raw.get("task_type")
+        if isinstance(task_type, str) and task_type:
+            task["task_type"] = task_type
+        description = raw.get("description")
+        if isinstance(description, str) and description:
+            task["description"] = description
+        tasks.append(task)
+    return tuple(tasks)
+
+
 class StreamTranslator:
     def __init__(self, tool_result_max: int, turn_id: str | None = None,
                  item_turns: dict[str, str] | None = None,
                  item_titles: dict[str, str] | None = None,
-                 item_meta: dict[str, tuple[str, str | None]] | None = None):
+                 item_meta: dict[str, tuple[str, str | None]] | None = None,
+                 item_commands: dict[str, str] | None = None):
         self.tool_result_max = tool_result_max
         self.turn_id = _wire_id(turn_id, "turn") if turn_id else None
         # These maps are optionally shared by every translator for one resident
@@ -448,6 +670,8 @@ class StreamTranslator:
         self.item_turns = item_turns if item_turns is not None else {}
         self.item_titles = item_titles if item_titles is not None else {}
         self.item_meta = item_meta if item_meta is not None else {}
+        self.item_commands = (
+            item_commands if item_commands is not None else {})
         self._message_ids: dict[str, str] = {}
         self._started_channels: set[str] = set()
         # Only the emitted prefix LENGTH is needed to deduplicate the assembled
@@ -469,6 +693,11 @@ class StreamTranslator:
         self._tool_items: set[str] = set()
         self._finished_tool_items: set[str] = set()
         self._tool_items_truncated = False
+        # Claude exposes viewed images as a normal Read tool followed by an
+        # image-valued ToolResult. Project those calls through the existing
+        # engine-neutral view_image process instead of serializing base64 as
+        # ordinary tool output.
+        self._image_reads: dict[str, tuple[str, str | None]] = {}
         self._plan_item_id: str | None = None
         # stop_reason can be null even for Claude's true final text. Keep the
         # last top-level no-tool candidate until the authoritative successful
@@ -497,6 +726,7 @@ class StreamTranslator:
                 self.item_turns.pop(old, None)
                 self.item_titles.pop(old, None)
                 self.item_meta.pop(old, None)
+                self.item_commands.pop(old, None)
         return turn
 
     def _background_for_turn(self, turn: str | None) -> bool | None:
@@ -583,6 +813,24 @@ class StreamTranslator:
         safe_input = bounded_tool_input(public_input, self.tool_result_max)
         category, title, server = _tool_meta(
             block.name, redacted_input, server_tool=server_tool)
+        image_path = _claude_image_read_path(block.name, block.input)
+        self._tool_names[tool_id] = block.name
+        if image_path is not None:
+            self._image_reads[tool_id] = (image_path, parent)
+            self.item_titles[tool_id] = "查看图片"
+            events.append(ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="start",
+                status="running",
+                turn_id=tool_turn,
+                parent_id=parent,
+                title="查看图片",
+                input={"file_path": image_path},
+                tool="view_image",
+                background=self._background_for_turn(tool_turn),
+            ))
+            return
         events.append(ToolUse(
             message_id=message_id, tool_use_id=tool_id,
             turn_id=tool_turn, tool=block.name,
@@ -590,8 +838,14 @@ class StreamTranslator:
             parent_id=parent, server=server,
             background=self._background_for_turn(tool_turn),
         ))
-        self._tool_names[tool_id] = block.name
         self.item_titles[tool_id] = title
+        if category == "command":
+            command = safe_input.get("command") or safe_input.get("cmd")
+            if isinstance(command, str) and command:
+                safe_command, _ = bounded_text(
+                    command, MAX_BACKGROUND_PROCESS_COMMAND_CHARS)
+                if safe_command:
+                    self.item_commands[tool_id] = safe_command
         diff, was_truncated = _tool_diff(
             block.name, block.input, self.tool_result_max)
         if diff:
@@ -644,6 +898,52 @@ class StreamTranslator:
                 or tool_id in self._finished_tool_items):
             return
         events.extend(self._flush_tool_deltas(tool_id))
+        image_read = self._image_reads.pop(tool_id, None)
+        if image_read is not None:
+            image_path, parent = image_read
+            tool_turn = self._remember_turn(tool_id, parent)
+            tool_name = self._tool_names.get(tool_id) or "Read"
+            status = "failed" if is_error else "succeeded"
+            if not is_error and _claude_image_blocks(content):
+                events.append(ProcessEvent(
+                    item_id=tool_id,
+                    kind="server_tool",
+                    phase="end",
+                    status=status,
+                    turn_id=tool_turn,
+                    parent_id=parent,
+                    title="查看图片",
+                    summary=summary,
+                    input={"file_path": image_path},
+                    tool="view_image",
+                    duration_ms=duration_ms,
+                    background=self._background_for_turn(tool_turn),
+                ))
+            else:
+                safe_content = _safe_image_read_result_content(
+                    tool_name, content)
+                output, was_truncated = bounded_text(
+                    safe_content, self.tool_result_max)
+                _category, fallback_title, _server = _tool_meta(
+                    tool_name, {"file_path": image_path})
+                events.append(ProcessEvent(
+                    item_id=tool_id,
+                    kind="server_tool",
+                    phase="end",
+                    status=status,
+                    turn_id=tool_turn,
+                    parent_id=parent,
+                    title=fallback_title,
+                    summary=summary,
+                    input={"file_path": image_path},
+                    output=output or None,
+                    tool=tool_name,
+                    duration_ms=duration_ms,
+                    truncated=was_truncated or None,
+                    background=self._background_for_turn(tool_turn),
+                ))
+            self._finish_tool_item(tool_id)
+            return
         content = _safe_result_content(self._tool_names.get(tool_id), content)
         text, was_truncated = bounded_text(content, self.tool_result_max)
         diff_info = self._tool_diffs.pop(tool_id, None)
@@ -674,7 +974,11 @@ class StreamTranslator:
                 tool_id, phase="update", status=agent_status or "running",
                 summary=summary, duration_ms=duration_ms,
             ))
+        self._finish_tool_item(tool_id)
+
+    def _finish_tool_item(self, tool_id: str) -> None:
         self._finished_tool_items.add(tool_id)
+        self._image_reads.pop(tool_id, None)
         self._tool_outputs.pop(tool_id, None)
         self._tool_delta_totals.pop(tool_id, None)
         self._tool_last_progress.pop(tool_id, None)
@@ -1016,11 +1320,16 @@ class StreamTranslator:
         self.item_titles[item_id] = title
         self.item_meta[task_id] = (kind, parent)
         self.item_meta[item_id] = (kind, parent)
+        command = self.item_commands.get(parent or "")
+        if command:
+            self.item_commands[task_id] = command
+            self.item_commands[item_id] = command
         if isinstance(msg, TaskStartedMessage):
             return [ProcessEvent(
                 item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
+                command=command,
                 background=True,
             )]
         if isinstance(msg, TaskProgressMessage):
@@ -1029,6 +1338,7 @@ class StreamTranslator:
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
+                command=command,
                 background=True,
             )]
         if isinstance(msg, TaskUpdatedMessage):
@@ -1042,6 +1352,7 @@ class StreamTranslator:
                 item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
+                command=command,
                 background=True,
             )]
         if isinstance(msg, TaskNotificationMessage):
@@ -1051,9 +1362,67 @@ class StreamTranslator:
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
+                command=command,
                 background=True,
             )]
         return []
+
+    def _feed_background_tasks_changed(
+        self, msg: SystemMessage,
+    ) -> list[BackgroundProcessSync]:
+        tasks = claude_background_tasks(msg)
+        if tasks is None:
+            return []
+        items: list[BackgroundProcessItem] = []
+        for task in tasks[:MAX_BACKGROUND_PROCESS_ITEMS]:
+            task_id = _wire_id(task["task_id"], "task")
+            remembered_kind, parent = self.item_meta.get(
+                task_id, ("task", None))
+            task_type = task.get("task_type")
+            kind = "agent" if (
+                _is_agent_task_type(task_type)
+                or remembered_kind == "agent"
+            ) else "task"
+            item_id = (
+                _agent_process_id(parent)
+                if kind == "agent" and parent
+                else task_id
+            )
+            description = task.get("description")
+            title = (
+                description if isinstance(description, str) else None
+            ) or self.item_titles.get(item_id) \
+                or self.item_titles.get(task_id) \
+                or "后台任务"
+            title = _short_text(title, 1000) or "后台任务"
+            self.item_titles[task_id] = title
+            self.item_titles[item_id] = title
+            self.item_meta[task_id] = (kind, parent)
+            self.item_meta[item_id] = (kind, parent)
+            command = (
+                self.item_commands.get(item_id)
+                or self.item_commands.get(task_id)
+                or self.item_commands.get(parent or "")
+            )
+            turn_id = self._remember_turn(item_id, parent)
+            items.append(BackgroundProcessItem(
+                item_id=item_id,
+                kind=kind,
+                status="running",
+                turn_id=turn_id,
+                parent_id=parent,
+                title=title,
+                command=command,
+            ))
+        return [BackgroundProcessSync(items=items)]
+
+    def _feed_compaction(self, msg: SystemMessage) -> list[ProcessEvent]:
+        event = _compaction_event_from_row(
+            msg.data if isinstance(msg.data, dict) else {})
+        if event is None:
+            return []
+        event.turn_id = self.turn_id
+        return [event]
 
     def _feed_hook(self, msg: HookEventMessage) -> list:
         data = msg.data if isinstance(msg.data, dict) else {}
@@ -1122,6 +1491,10 @@ class StreamTranslator:
                 return self._feed_progress_system(msg)
             if msg.subtype == "tool_use_summary":
                 return self._feed_tool_summary(msg)
+            if msg.subtype == "background_tasks_changed":
+                return self._feed_background_tasks_changed(msg)
+            if msg.subtype == "compact_boundary":
+                return self._feed_compaction(msg)
             return []
         if isinstance(msg, ResultMessage):
             events = []
@@ -1262,6 +1635,60 @@ def _bounded_jsonl_lines(file):
             continue
         while line and not line.endswith("\n"):
             line = file.readline(_MAX_TRANSCRIPT_RECORD_CHARS + 1)
+
+
+def read_claude_history_image_asset(
+    source_path: str,
+    image_id: str,
+) -> ClaudeHistoryImageAsset | None:
+    """Rehydrate one already-authorized image id from the canonical JSONL.
+
+    Callers must first prove that ``image_id`` is referenced by the requested
+    turn.  This function performs no path discovery and returns no neighboring
+    image, so an opaque id cannot be used to enumerate transcript attachments.
+    """
+    if not isinstance(image_id, str) or not _SAFE_WIRE_ID.fullmatch(image_id):
+        return None
+    try:
+        with open(source_path, encoding="utf-8") as source:
+            for line in _bounded_jsonl_lines(source):
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                message = row.get("message")
+                content = (
+                    message.get("content") if isinstance(message, dict) else None
+                )
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (
+                        not _claude_history_tool_result_block(block)
+                        or _claude_history_tool_result_error(block)
+                    ):
+                        continue
+                    tool_id = block.get("tool_use_id")
+                    if (
+                        not isinstance(tool_id, str)
+                        or not _SAFE_WIRE_ID.fullmatch(tool_id)
+                    ):
+                        continue
+                    for index, image in enumerate(
+                        _claude_image_blocks(block.get("content"))
+                    ):
+                        candidate_id = claude_history_image_id(tool_id, index)
+                        if candidate_id != image_id:
+                            continue
+                        return ClaudeHistoryImageAsset(
+                            item_id=tool_id,
+                            image_id=candidate_id,
+                            media_type=image["media_type"],
+                            data=image["data"],
+                        )
+    except (OSError, UnicodeError):
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -1840,6 +2267,8 @@ def _load_compact_chain_messages(
                 if row.get("uuid") != uid:
                     return None
                 internal = _internal_user_event_from_row(row, queued)
+                if internal is None:
+                    internal = _compaction_event_from_row(row)
                 if internal is not None:
                     internal_events[uid] = internal
                 row_type = row.get("type")
@@ -1856,6 +2285,22 @@ def _load_compact_chain_messages(
                             or row.get("parent_tool_use_id")
                         ),
                     ))
+                elif row_type == "system" \
+                        and row.get("subtype") == "compact_boundary":
+                    # The SDK projection drops system rows. Preserve a tiny
+                    # positional shell so translate_history can place the
+                    # existing compaction ProcessEvent at the true boundary.
+                    messages.append(SimpleNamespace(
+                        type="system",
+                        subtype="compact_boundary",
+                        uuid=uid,
+                        session_id=session_id,
+                        message={
+                            "role": "system",
+                            "content": row.get("content") or "",
+                        },
+                        parent_tool_use_id=None,
+                    ))
                 timestamp = row.get("timestamp")
                 if not isinstance(timestamp, str):
                     continue
@@ -1871,7 +2316,11 @@ def _load_compact_chain_messages(
     return messages, timestamps, internal_events
 
 
-def transcript_timestamps(session_id: str) -> dict[str, float]:
+def transcript_timestamps(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, float]:
     """Map each transcript entry's uuid -> epoch seconds, read straight from the
     .jsonl. The SDK's SessionMessage drops the per-message timestamp, so without
     this, history events default their `ts` to now (making every past message show
@@ -1881,10 +2330,10 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return out
     try:
-        path = transcript_path(session_id)
-        if not path:
+        source_path = path or transcript_path(session_id)
+        if not source_path:
             return out
-        with open(path) as f:
+        with open(source_path) as f:
             for line in _bounded_jsonl_lines(f):
                 try:
                     d = json.loads(line)
@@ -2064,6 +2513,53 @@ def _notification_tag(text: str, name: str, limit: int) -> str | None:
     return _short_text(text[start:end].strip(), limit)
 
 
+def _compaction_event_from_row(row: dict[str, Any]) -> ProcessEvent | None:
+    uid = row.get("uuid")
+    if not (
+        row.get("type") == "system"
+        and row.get("subtype") == "compact_boundary"
+        and isinstance(uid, str)
+        and _SAFE_WIRE_ID.fullmatch(uid)
+    ):
+        return None
+    metadata = row.get("compactMetadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    trigger = metadata.get("trigger")
+    pre_tokens = metadata.get("preTokens")
+    post_tokens = metadata.get("postTokens")
+    summary_bits: list[str] = []
+    if trigger == "auto":
+        summary_bits.append("自动压缩")
+    elif trigger == "manual":
+        summary_bits.append("手动压缩")
+    if all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (pre_tokens, post_tokens)
+    ):
+        summary_bits.append(f"{pre_tokens:,} → {post_tokens:,} tokens")
+    duration = metadata.get("durationMs")
+    duration_ms = (
+        duration
+        if isinstance(duration, int) and not isinstance(duration, bool)
+        and duration >= 0
+        else None
+    )
+    event = ProcessEvent(
+        item_id=uid,
+        kind="compaction",
+        phase="end",
+        status="succeeded",
+        title="压缩上下文",
+        summary=" · ".join(summary_bits) or None,
+        duration_ms=duration_ms,
+    )
+    timestamp = _parse_timestamp(row.get("timestamp"))
+    if timestamp is not None:
+        event.ts = timestamp
+    return event
+
+
 def _internal_user_event_from_row(
     row: dict[str, Any],
     queued: set[tuple[int, str]] | frozenset[tuple[int, str]],
@@ -2115,7 +2611,11 @@ def _internal_user_event_from_row(
     )
 
 
-def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
+def transcript_internal_user_events(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, ProcessEvent]:
     """Recover structured Claude-internal user rows from raw transcript proof.
 
     ``get_session_messages`` drops ``origin`` and queue-operation records.  We
@@ -2126,13 +2626,13 @@ def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
     """
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return {}
-    path = transcript_path(session_id)
-    if not path:
+    source_path = path or transcript_path(session_id)
+    if not source_path:
         return {}
     queued: set[tuple[int, str]] = set()
     events: dict[str, ProcessEvent] = {}
     try:
-        with open(path, encoding="utf-8") as source:
+        with open(source_path, encoding="utf-8") as source:
             for line in _bounded_jsonl_lines(source):
                 try:
                     row = json.loads(line)
@@ -2189,10 +2689,12 @@ def translate_history(
     current_turn_id = None
     history_tool_diffs: dict[str, tuple[str, bool]] = {}
     history_tool_names: dict[str, str] = {}
+    history_image_reads: dict[str, tuple[str, str | None]] = {}
     history_plan_id: str | None = None
     ambiguous_final_mid: str | None = None
     ambiguous_final_start: int | None = None
     settled_answer_seen = False
+    background_followup = False
     turn_failed = False
     # Older wrappers could bind a replacement query's browser id to Claude's
     # late ``[Request interrupted by user]`` record.  The marker terminates the
@@ -2220,6 +2722,55 @@ def translate_history(
 
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
+
+    def _history_image_result_event(
+        tool_id: str,
+        image_read: tuple[str, str | None],
+        raw_content: Any,
+        *,
+        is_error: bool,
+        source_uid: str | None = None,
+    ) -> ProcessEvent:
+        image_path, image_parent = image_read
+        tool_name = history_tool_names.get(tool_id) or "Read"
+        if not is_error and _claude_image_blocks(raw_content):
+            event = ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="end",
+                status="succeeded",
+                turn_id=current_turn_id,
+                parent_id=image_parent,
+                title="查看图片",
+                input={"file_path": image_path},
+                tool="view_image",
+                background=background_followup or None,
+            )
+        else:
+            output, was_truncated = bounded_text(
+                _safe_image_read_result_content(tool_name, raw_content),
+                tool_result_max,
+            )
+            _category, fallback_title, _server = _tool_meta(
+                tool_name, {"file_path": image_path})
+            event = ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="end",
+                status="failed" if is_error else "succeeded",
+                turn_id=current_turn_id,
+                parent_id=image_parent,
+                title=fallback_title,
+                input={"file_path": image_path},
+                output=output or None,
+                tool=tool_name,
+                truncated=was_truncated or None,
+                background=background_followup or None,
+            )
+        timestamp = _ts(source_uid) if source_uid is not None else None
+        if timestamp is not None:
+            event.ts = timestamp
+        return event
 
     client_message_ids = client_message_ids or {}
 
@@ -2250,6 +2801,7 @@ def translate_history(
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
         nonlocal turn_start_ts, settled_answer_seen, turn_failed
+        nonlocal background_followup
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
@@ -2294,6 +2846,7 @@ def translate_history(
             ambiguous_final_start = None
             turn_start_ts = None
             settled_answer_seen = False
+            background_followup = False
             turn_failed = False
 
     for message_index, m in enumerate(messages):
@@ -2321,6 +2874,7 @@ def translate_history(
                     # completed answer remains the turn's terminal boundary.
                     if settled_answer_seen or ambiguous_final_mid is not None:
                         advance_terminal_clock = False
+                        background_followup = True
                     event = internal_event.model_copy(deep=True)
                     parent_name = (
                         history_tool_names.get(event.parent_id or "") or ""
@@ -2344,6 +2898,7 @@ def translate_history(
                     events.append(_um(message_uid, content))
                     turn_open = True
                     current_turn_id = message_uid
+                    background_followup = False
             elif isinstance(content, list):
                 if _is_interrupted_user_content(content):
                     misplaced_alias = client_message_ids.get(message_uid)
@@ -2369,19 +2924,29 @@ def translate_history(
                     if not isinstance(b, dict):
                         continue
                     bt = b.get("type")
-                    if bt == "tool_result":
+                    if _claude_history_tool_result_block(b):
                         ambiguous_final_mid = None
                         ambiguous_final_start = None
                         tool_id = _history_id(
                             b.get("tool_use_id"), "tool",
                             f"{message_index}-{block_index}-result")
                         raw_result_content = b.get("content")
+                        image_read = history_image_reads.pop(tool_id, None)
+                        is_error = _claude_history_tool_result_error(b)
+                        if image_read is not None:
+                            events.append(_history_image_result_event(
+                                tool_id,
+                                image_read,
+                                raw_result_content,
+                                is_error=is_error,
+                                source_uid=source_uid,
+                            ))
+                            continue
                         text, was_truncated = bounded_text(
                             _safe_result_content(
                                 history_tool_names.get(tool_id), raw_result_content),
                             tool_result_max)
                         diff_info = history_tool_diffs.pop(tool_id, None)
-                        is_error = bool(b.get("is_error"))
                         truncated = bool(
                             was_truncated or (diff_info and diff_info[1])) or None
                         agent_result = (history_tool_names.get(tool_id) or "").lower() in {
@@ -2423,6 +2988,7 @@ def translate_history(
                             events.append(um)
                             turn_open = True
                             current_turn_id = message_uid
+                            background_followup = False
                 if imgs and not made:   # image-only user turn
                     close_turn()
                     turn_start_ts = _ts(source_uid)
@@ -2431,6 +2997,17 @@ def translate_history(
                     events.append(um)
                     turn_open = True
                     current_turn_id = message_uid
+                    background_followup = False
+        elif role == "system":
+            internal_event = (internal_user_events or {}).get(source_uid)
+            if internal_event is not None:
+                event = internal_event.model_copy(deep=True)
+                event.turn_id = event.turn_id or current_turn_id
+                timestamp = _ts(source_uid)
+                if timestamp is not None:
+                    event.ts = timestamp
+                events.append(event)
+                turn_open = True
         elif role == "assistant":
             if not isinstance(content, list):
                 continue
@@ -2441,6 +3018,7 @@ def translate_history(
                 turn_failed = True
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
+            assistant_event_start = len(events)
             mid = message_uid
             thinking_mid = _wire_id(f"{mid}:thinking", "msg", str(message_index))
             has_client_tool = any(
@@ -2499,27 +3077,32 @@ def translate_history(
                     txt = b.get("text", "")
                     if not text_started:
                         events.append(AssistantMsgStart(
-                            message_id=mid, channel=text_channel))
+                            message_id=mid, channel=text_channel,
+                            background=background_followup or None))
                         text_started = True
                     if txt:
                         events.append(Delta(
-                            message_id=mid, text=txt, channel=text_channel))
+                            message_id=mid, text=txt, channel=text_channel,
+                            background=background_followup or None))
                 elif bt == "thinking":
                     thinking = b.get("thinking", "")
                     if not thinking_started:
                         events.append(AssistantMsgStart(
-                            message_id=thinking_mid, channel="thinking"))
+                            message_id=thinking_mid, channel="thinking",
+                            background=background_followup or None))
                         thinking_started = True
                     if isinstance(thinking, str) and thinking:
                         safe_thinking, _ = bounded_text(thinking, tool_result_max)
                         if safe_thinking:
                             events.append(Delta(
                                 message_id=thinking_mid, text=safe_thinking,
-                                channel="thinking"))
+                                channel="thinking",
+                                background=background_followup or None))
                 elif bt in {"tool_use", "server_tool_use"}:
                     if not text_started:
                         events.append(AssistantMsgStart(
-                            message_id=mid, channel="commentary"))
+                            message_id=mid, channel="commentary",
+                            background=background_followup or None))
                         text_started = True
                     # a stored tool_use input SHOULD be a dict, but old/odd history
                     # can carry a scalar (e.g. 3); coerce so ToolUse validation
@@ -2537,16 +3120,35 @@ def translate_history(
                     category, title, server = _tool_meta(
                         b.get("name") or "", redacted_input,
                         server_tool=server_tool)
-                    events.append(ToolUse(
-                        message_id=mid,
-                        tool_use_id=tool_id,
-                        tool=b.get("name") or "",
-                        input=bounded_tool_input(public_input, tool_result_max),
-                        category=category, title=title, parent_id=parent,
-                        server=server,
-                    ))
+                    image_path = _claude_image_read_path(
+                        b.get("name"), raw_input)
+                    if image_path is not None:
+                        history_image_reads[tool_id] = (image_path, parent)
+                        events.append(ProcessEvent(
+                            item_id=tool_id,
+                            kind="server_tool",
+                            phase="start",
+                            status="running",
+                            turn_id=current_turn_id,
+                            parent_id=parent,
+                            title="查看图片",
+                            input={"file_path": image_path},
+                            tool="view_image",
+                            background=background_followup or None,
+                        ))
+                    else:
+                        events.append(ToolUse(
+                            message_id=mid,
+                            tool_use_id=tool_id,
+                            tool=b.get("name") or "",
+                            input=bounded_tool_input(
+                                public_input, tool_result_max),
+                            category=category, title=title, parent_id=parent,
+                            server=server,
+                            background=background_followup or None,
+                        ))
                     history_tool_names[tool_id] = b.get("name") or ""
-                    if category == "agent":
+                    if image_path is None and category == "agent":
                         events.append(ProcessEvent(
                             item_id=_agent_process_id(tool_id), kind="agent",
                             phase="start", status="running",
@@ -2579,20 +3181,26 @@ def translate_history(
                             item_id=plan_id, kind="plan", phase="end",
                             status="succeeded", turn_id=current_turn_id,
                             title="计划模式", summary="计划已完成"))
-                elif bt == "tool_result" or (
-                        isinstance(bt, str) and bt.endswith("_tool_result")
-                        and b.get("tool_use_id")):
+                elif _claude_history_tool_result_block(b):
                     tool_id = _history_id(
                         b.get("tool_use_id"), "tool",
                         f"{message_index}-{block_index}-assistant-result")
                     raw_result_content = b.get("content")
+                    image_read = history_image_reads.pop(tool_id, None)
+                    is_error = _claude_history_tool_result_error(b)
+                    if image_read is not None:
+                        events.append(_history_image_result_event(
+                            tool_id,
+                            image_read,
+                            raw_result_content,
+                            is_error=is_error,
+                            source_uid=source_uid,
+                        ))
+                        continue
                     text, was_truncated = bounded_text(
                         _safe_result_content(
                             history_tool_names.get(tool_id), raw_result_content),
                         tool_result_max)
-                    result_type = (b.get("content") or {}).get("type", "") if isinstance(
-                        b.get("content"), dict) else ""
-                    is_error = bool(b.get("is_error")) or "error" in str(result_type).lower()
                     diff_info = history_tool_diffs.pop(tool_id, None)
                     agent_result = (history_tool_names.get(tool_id) or "").lower() in {
                         "agent", "task"}
@@ -2610,6 +3218,7 @@ def translate_history(
                         truncated=bool(
                             was_truncated or (diff_info and diff_info[1])) or None,
                         diff=diff_info[0] if diff_info and not is_error else None,
+                        background=background_followup or None,
                     ))
                     if agent_result:
                         events.append(ProcessEvent(
@@ -2622,16 +3231,26 @@ def translate_history(
                         ))
             if thinking_started:
                 events.append(AssistantMsgEnd(
-                    message_id=thinking_mid, channel="thinking"))
+                    message_id=thinking_mid, channel="thinking",
+                    background=background_followup or None))
             if text_started:
                 events.append(AssistantMsgEnd(
-                    message_id=mid, channel=text_channel))
+                    message_id=mid, channel=text_channel,
+                    background=background_followup or None))
                 turn_open = True
+            assistant_ts = _ts(source_uid)
+            if assistant_ts is not None:
+                for event in events[assistant_event_start:]:
+                    event.ts = assistant_ts
         # advance last_ts AFTER handling m: a leading close_turn (for the next user
         # msg) stamps the PRIOR turn's tail; the final close_turn stamps this turn's
         # last (assistant) message = answer-done time.
         mts = _ts(source_uid)
-        if mts is not None and advance_terminal_clock:
+        if (
+            mts is not None
+            and advance_terminal_clock
+            and not background_followup
+        ):
             last_ts = mts
     # Claude's transcript does not persist the SDK ResultMessage. EOF normally
     # acts as a synthetic completed boundary for an idle historical snapshot,
@@ -2654,7 +3273,12 @@ def _parse_timestamp(value: Any) -> float | None:
         return None
 
 
-def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
+def translate_subagent_history(
+    session_id: str,
+    tool_result_max: int,
+    *,
+    path: str | None = None,
+) -> list:
     """Recover only lightweight Claude Agent lifecycle cards.
 
     Full subagent conversations belong to ``GetAgentDetail`` and must never be
@@ -2662,7 +3286,7 @@ def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
     for launch/notification state; EOF without a terminal is deliberately
     ``unknown`` rather than a fabricated success.
     """
-    main_path = transcript_path(session_id)
+    main_path = path or transcript_path(session_id)
     if not main_path:
         return []
 

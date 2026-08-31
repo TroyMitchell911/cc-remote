@@ -19,6 +19,7 @@ export interface SkillCatalogRequest {
   space: Space;
   cwd: string;
   skillsOnly: boolean;
+  claudeProfileId?: string | null;
   codexProfileId?: string | null;
 }
 
@@ -46,11 +47,16 @@ export const skillCatalogKey = (
   space: Space,
   cwd: string,
   codexProfileId?: string | null,
+  claudeProfileId?: string | null,
 ): string => [
   machineId,
   engine,
   space,
-  engine === "codex" ? (codexProfileId || "__default__") : "",
+  engine === "codex"
+    ? (codexProfileId || "__default__")
+    : engine === "claude"
+      ? (claudeProfileId || "__default__")
+      : "",
   cwd || ".",
 ].join("\u0000");
 
@@ -74,6 +80,9 @@ export const skillCatalogResponseMatches = (
   && (read.engine !== "codex"
     || (response.codex_profile_id ?? null)
       === (read.codexProfileId ?? null))
+  && (read.engine !== "claude"
+    || (response.claude_profile_id ?? null)
+      === (read.claudeProfileId ?? null))
 );
 
 export const skillCatalogMutationResponseMatches = (

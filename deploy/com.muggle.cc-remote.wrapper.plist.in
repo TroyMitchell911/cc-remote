@@ -25,6 +25,8 @@
     <string>auto</string>
     <key>CC_REMOTE_CODEX_PROFILES_FILE</key>
     <string>__HOME__/.cc-remote/codex-profiles.json</string>
+    <key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>
+    <string>__HOME__/.cc-remote/claude-profiles.json</string>
     <key>CLAUDE_WORK_ROOT</key>
     <string>__CLAUDE_WORK_ROOT__</string>
     <key>CODEX_WORK_ROOT</key>

@@ -10,7 +10,7 @@ import {
   effortsFor, modelsFor, parseSlash, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
@@ -37,6 +37,7 @@ type Engine = "claude" | "codex";
 export interface NewChatCatalogRequest {
   engine: Engine;
   cwd?: string;
+  claudeProfileId?: string;
   codexProfileId?: string;
 }
 
@@ -45,6 +46,7 @@ export interface NewChatCatalogRequest {
 export function newChatCatalogRequest(
   engine: Engine, space: Space, cwd: string,
   codexProfileId?: string | null,
+  claudeProfileId?: string | null,
 ): NewChatCatalogRequest | null {
   if (engine === "codex") {
     return {
@@ -52,7 +54,11 @@ export function newChatCatalogRequest(
       ...(codexProfileId ? { codexProfileId } : {}),
     };
   }
-  return space === "code" ? { engine, cwd } : null;
+  return space === "code" ? {
+    engine,
+    cwd,
+    ...(claudeProfileId ? { claudeProfileId } : {}),
+  } : null;
 }
 
 export interface NewChatLocalDefaults {
@@ -148,6 +154,9 @@ interface Props {
   autoCompact?: AutoCompactSelection;
   defaultModel?: string | null;
   defaultEffort?: string | null;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
+  claudeProfileId?: string | null;
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   codexProfileId?: string | null;
@@ -161,6 +170,7 @@ interface Props {
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
   onPickAutoCompact?: (selection: AutoCompactSelection) => void;
+  onPickClaudeProfile?: (profileId: string) => void;
   onPickCodexProfile?: (profileId: string) => void;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onGetPermissionProfiles?: (cwd: string) => void;
@@ -253,9 +263,11 @@ export function NewChatView({ cwd, controlScopeKey,
   catalog = {}, model = null, effort = null,
   autoCompact = { mode: "inherit", thresholdTokens: null },
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
+  claudeProfiles = [], defaultClaudeProfileId = null, claudeProfileId = null,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, onPickAutoCompact, onPickCodexProfile,
+  onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile,
+  onPickCodexProfile,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -333,16 +345,20 @@ export function NewChatView({ cwd, controlScopeKey,
       ...patch,
     }));
   };
-  const selectedCodexProfile = engine === "codex"
-    ? codexProfiles.find((profile) => profile.id === codexProfileId) ?? null
-    : null;
-  const selectedProfileMissing = engine === "codex" && !!codexProfileId
-    && selectedCodexProfile === null;
+  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = engine === "codex"
+    ? defaultCodexProfileId : defaultClaudeProfileId;
+  const accountProfileId = engine === "codex"
+    ? codexProfileId : claudeProfileId;
+  const selectedAccountProfile = accountProfiles.find(
+    (profile) => profile.id === accountProfileId) ?? null;
+  const selectedProfileMissing = !!accountProfileId
+    && selectedAccountProfile === null;
   // A catalog read can fail while direct app-server startup still succeeds.
   // Warn without treating that transient read as an authentication verdict.
   const selectedProfileWarning = selectedProfileMissing
-    ? "所选 Codex 账号已移除，请重新选择。"
-    : selectedCodexProfile?.error ?? null;
+    ? `所选 ${engine === "codex" ? "Codex" : "Claude"} 账号已移除，请重新选择。`
+    : selectedAccountProfile?.error ?? null;
   const canSend = (text.trim().length > 0 || hasAttachments || pastes.length > 0)
     && !creating && !importing && !selectedProfileMissing;
   const modelList = modelsFor(engine, catalog);
@@ -488,24 +504,25 @@ export function NewChatView({ cwd, controlScopeKey,
       <Icon name="edit" size={13} />
     </button>
   );
-  const showCodexProfileSelector =
-    engine === "codex"
-    && (codexProfiles.length > 1 || selectedProfileMissing);
-  const profileSelector = showCodexProfileSelector ? (
+  const showProfileSelector = accountProfiles.length > 1
+    || selectedProfileMissing;
+  const pickAccountProfile = engine === "codex"
+    ? onPickCodexProfile : onPickClaudeProfile;
+  const profileSelector = showProfileSelector ? (
     <label className="newchat-profile">
       <span>账号</span>
-      <select value={codexProfileId ?? ""}
-        onChange={(event) => onPickCodexProfile?.(event.target.value)}
-        disabled={creating || importing || !onPickCodexProfile}
-        aria-label="选择 Codex 账号">
-        {selectedProfileMissing && codexProfileId && (
-          <option value={codexProfileId} disabled>已移除账号</option>
+      <select value={accountProfileId ?? ""}
+        onChange={(event) => pickAccountProfile?.(event.target.value)}
+        disabled={creating || importing || !pickAccountProfile}
+        aria-label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
+        {selectedProfileMissing && accountProfileId && (
+          <option value={accountProfileId} disabled>已移除账号</option>
         )}
-        {codexProfiles.map((profile) => (
+        {accountProfiles.map((profile) => (
           <option key={profile.id} value={profile.id}>
             {codexProfilePresentation(
-              codexProfiles,
-              defaultCodexProfileId,
+              accountProfiles,
+              defaultAccountProfileId,
               profile.id,
             )?.fullLabel ?? profile.label}
             {profile.error ? " · 目录暂不可用" : ""}

@@ -309,7 +309,7 @@ function ProcessImagePreview({
   );
 }
 
-function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
+export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewImage, onPreviewHistoryImage, openOverride, onOpenChange,
@@ -456,6 +456,29 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
       }>
         <div className="process-item-body">{body}</div>
     </ProcessDisclosure>
+  );
+}
+
+export function BackgroundProcessDock({ processes, onOpenFile, onOpenAgent }: {
+  processes: ProcessBlock[];
+  onOpenFile?: (path: string, line?: number) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
+}) {
+  if (processes.length === 0) return null;
+  return (
+    <aside className="background-process-dock">
+      <div className="background-process-head">
+        <span className="background-process-pulse" />
+        <span>后台任务正在运行</span>
+        <span className="background-process-count">{processes.length}</span>
+      </div>
+      <div className="background-process-items">
+        {processes.map((process) => (
+          <ProcessActivity key={process.item_id} block={process}
+            onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
+        ))}
+      </div>
+    </aside>
   );
 }
 

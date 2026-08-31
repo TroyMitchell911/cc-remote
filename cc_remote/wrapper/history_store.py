@@ -46,8 +46,10 @@ from cc_remote.protocol import ConversationTurn
 # rebuilds Codex pages whose leading compact marker was projected as a separate
 # prompt-less turn before the owning user item reached the full snapshot. v26
 # rebuilds Claude pages/details whose terminal clock could be extended by a
-# cold-resume task notification appended after the final answer.
-_SCHEMA_VERSION = 26
+# cold-resume task notification appended after the final answer. v27 rebuilds
+# Claude narrative projections so image-producing Read results use the lazy
+# view-image projection instead of cached textual tool output.
+_SCHEMA_VERSION = 27
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -551,6 +553,7 @@ def materialize_history_turns(
         text_first_ms: dict[str, int] = {}
         text_last_ms: dict[str, int] = {}
         text_done_ms: dict[str, int] = {}
+        text_background: set[str] = set()
         detail_items: set[str] = set()
         process_evidence: dict[str, dict[str, Any]] = {}
         live_blocks: list[dict[str, Any]] = []
@@ -636,6 +639,8 @@ def materialize_history_turns(
             elif event_type == "assistant_msg_start":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     channels[message_id] = str(event.get("channel") or "unknown")
                     if message_id not in texts:
                         texts[message_id] = []
@@ -648,6 +653,8 @@ def materialize_history_turns(
             elif event_type == "delta":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str) and isinstance(event.get("text"), str):
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     channels[message_id] = str(
                         event.get("channel") or channels.get(message_id) or "unknown")
                     if message_id not in texts:
@@ -664,6 +671,8 @@ def materialize_history_turns(
             elif event_type == "assistant_msg_end":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     text_done.add(message_id)
                     block = live_texts.get(message_id)
                     if block is not None:
@@ -787,6 +796,16 @@ def materialize_history_turns(
                     for key in ("exit_code", "duration_ms", "truncated"):
                         if event.get(key) is not None:
                             block[key] = event[key]
+                    for key in ("command", "cwd"):
+                        value = short(event.get(key))
+                        if value is not None:
+                            block[key] = value
+                    if event.get("background") is True:
+                        block["background"] = True
+                    stamp = _event_ms(event.get("ts"))
+                    if block.get("background") is True and stamp is not None:
+                        block.setdefault("startedTs", stamp)
+                        block["updatedTs"] = stamp
                     block["phase"] = event.get("phase") or block["phase"]
                     block["status"] = event.get("status") or block["status"]
                     block["done"] = (
@@ -796,6 +815,9 @@ def materialize_history_turns(
                             "interrupted",
                         }
                     )
+                    if (block.get("background") is True
+                            and block["done"] and stamp is not None):
+                        block["terminalTs"] = stamp
             elif include_live_detail and event_type == "turn_plan":
                 item_id = event.get("item_id")
                 if isinstance(item_id, str):
@@ -1010,13 +1032,22 @@ def materialize_history_turns(
                         text = text[:keep] + suffix
                     summary_truncated = True
                 remaining_summary_chars -= len(text)
-                blocks.append({
+                text_block = {
                     "kind": "text",
                     "message_id": message_id,
                     "text": text,
                     "done": done,
                     "channel": "final",
-                })
+                }
+                if message_id in text_background:
+                    text_block["background"] = True
+                    started_ts = text_first_ms.get(message_id)
+                    done_ts = text_done_ms.get(message_id)
+                    if started_ts is not None:
+                        text_block["startedTs"] = started_ts
+                    if done_ts is not None:
+                        text_block["doneTs"] = done_ts
+                blocks.append(text_block)
         visible_process = [
             row for row in process_evidence.values()
             if row.get("visible")
@@ -1164,10 +1195,11 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
-            if current in range(10, 26):
-                # v22 changes Claude turn identity and v26 changes its terminal
-                # clock without changing transcript bytes. Rebuild only Claude
-                # narrative projections so both repairs reach History;
+            if current in range(10, 27):
+                # v22 changes Claude turn identity, v26 changes its terminal
+                # clock, and v27 changes image Read projection without changing
+                # transcript bytes. Rebuild only Claude narrative rows so every
+                # repair reaches History;
                 # source-bound images, compact ancestry, and Agent detail
                 # payloads stay valid.
                 for table in ("history_pages", "history_turn_details"):
@@ -1213,8 +1245,8 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25):
-                # The independent v22/v23/v24/v25/v26 invalidations above suffice.
+            elif current in (21, 22, 23, 24, 25, 26):
+                # The independent v22-v27 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows

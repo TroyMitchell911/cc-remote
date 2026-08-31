@@ -14,7 +14,7 @@ import {
   deferredQueueCapacity,
   initialState,
   modelCatalogScopeKey,
-  nativeCodexSessionId,
+  nativeProfileSessionId,
   reduce,
   type PendingQuery,
   type PreviewAuthorizationState,
@@ -49,6 +49,8 @@ import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
 import {
+  claudeProfileIdForSession,
+  claudeProfilePresentation,
   codexProfileIdForSession,
   codexProfilePresentation,
 } from "./codex-profile-presentation";
@@ -158,6 +160,7 @@ import {
   type CancelledHistoryBrowseRequest,
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
+  type HistoryRequestOptions,
 } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
@@ -199,12 +202,17 @@ import {
   catalogCompletionProjection,
   completionAcknowledgementId,
   completionBadgeKind,
+  completionNeedsHistoryRepair,
   discardBtwCompletionReceipts,
+  idleTurnNeedsHistoryRepair,
   markCompletionUnread,
+  nextTerminalHistoryRepairAttempt,
   newestCompletionProjection,
   rekeyCompletionReceipts,
+  settleTerminalHistoryRepairAttempt,
   type CompletionBadgeKind,
   type CompletionReceipts,
+  type TerminalHistoryRepairAttempt,
 } from "./completion-badges";
 import {
   cacheSkillCatalog,
@@ -268,24 +276,25 @@ interface QueuedQueryEditorState extends QueuedQueryEditor {
   pendingPrompt: string | null;
 }
 
+const MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS = 2;
+
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
 // ONLY on mobile; on desktop keep it open.
 const isMobile = () => window.matchMedia("(max-width: 979px)").matches;
 
-/** Present one account's Codex catalog under the historical `codex` key used
- * by model pickers. The underlying cache remains profile-keyed, so a missing
+/** Present one account's catalog under the historical engine key used by
+ * model pickers. The underlying cache remains profile-keyed, so a missing
  * secondary-account response never falls back to another account's models. */
 function catalogForEngineProfile(
   catalog: Catalog,
   engine: Engine,
-  codexProfileId?: string | null,
+  profileId?: string | null,
 ): Catalog {
-  if (engine !== "codex") return catalog;
-  const scoped = catalog[modelCatalogScopeKey(engine, codexProfileId)];
+  const scoped = catalog[modelCatalogScopeKey(engine, profileId)];
   return {
     ...catalog,
-    codex: scoped ?? (codexProfileId ? [] : (catalog.codex ?? [])),
+    [engine]: scoped ?? (profileId ? [] : (catalog[engine] ?? [])),
   };
 }
 
@@ -485,6 +494,7 @@ export default function App() {
         request.cwd,
         request.skillsOnly,
         request.codexProfileId,
+        request.claudeProfileId,
       ) ?? null,
     );
   }
@@ -494,9 +504,15 @@ export default function App() {
     space: Space;
     cwd: string;
     skillsOnly: boolean;
+    claudeProfileId?: string | null;
     codexProfileId?: string | null;
   } | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const terminalHistoryRepairRef = useRef<Map<
+    string, TerminalHistoryRepairAttempt
+  >>(new Map());
+  const [terminalHistoryRepairEpoch, setTerminalHistoryRepairEpoch] =
+    useState(0);
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
     (context) => {
       dispatch({ type: "history_detail_cancelled", context });
@@ -655,9 +671,22 @@ export default function App() {
     generation?: string | null,
     revision?: string | null,
     browse?: HistoryBrowseRequestContext,
+    options?: HistoryRequestOptions,
   ) => {
     const ws = wsRef.current;
     if (!ws) return false;
+    const current = stateRef.current;
+    const completion = newestCompletionProjection(
+      current.runtimes[sid]?.completion,
+      catalogCompletionProjection(current.sessions.find(
+        (session) => session.session_id === sid)),
+    );
+    const requestOptions: HistoryRequestOptions = {
+      ...options,
+      causalKey: options?.causalKey === undefined
+        ? completion?.id ?? null
+        : options.causalKey,
+    };
     return historyRequestsRef.current.request({
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
@@ -668,8 +697,22 @@ export default function App() {
       before,
       limit,
       resolveHistoryCwdHint(historySessionListsRef.current, sid),
-    ), settleCancelledHistoryBrowse);
+    ), settleCancelledHistoryBrowse, requestOptions);
   }, [settleCancelledHistoryBrowse]);
+  const settleTerminalHistoryRepair = useCallback((
+    sid: string,
+    causalKey: string,
+  ) => {
+    const current = terminalHistoryRepairRef.current.get(sid);
+    if (!current || causalKey !== current.key) return;
+    const settled = settleTerminalHistoryRepairAttempt(current);
+    if (!settled) return;
+    terminalHistoryRepairRef.current.set(sid, settled);
+    // The matching History reducer runs in the same inbound-message batch.
+    // This local epoch gives the repair effect an explicit response boundary,
+    // including when the reducer correctly rejects an older build_seq page.
+    setTerminalHistoryRepairEpoch((value) => value + 1);
+  }, []);
   const cancelPendingNotificationTarget = useCallback(() => {
     setPendingNotificationTarget(null);
     notificationListRequestRef.current = null;
@@ -819,9 +862,16 @@ export default function App() {
     : null;
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const newChatCwd = state.newChat?.cwd ?? null;
+  const knownClaudeProfileIds = new Set(
+    state.claudeProfiles.map((profile) => profile.id));
   const knownCodexProfileIds = new Set(
     state.codexProfiles.map((profile) => profile.id));
-  const requestedNewChatProfileId = engine === "codex"
+  const requestedNewChatClaudeProfileId = engine === "claude"
+    ? state.newChat?.claudeProfileId
+      ?? state.claudeProfileByScope[activeScopeKey]
+      ?? state.defaultClaudeProfileId
+    : null;
+  const requestedNewChatCodexProfileId = engine === "codex"
     ? state.newChat?.codexProfileId
       ?? state.codexProfileByScope[activeScopeKey]
       ?? state.defaultCodexProfileId
@@ -829,8 +879,15 @@ export default function App() {
   // Preserve an explicitly selected id even if a later registry refresh drops
   // it. Silently replacing a drafted Work turn with the default account would
   // cross the user's billing and conversation boundary.
+  const newChatClaudeProfileId = engine === "claude"
+    ? requestedNewChatClaudeProfileId
+      ?? state.claudeProfiles.find(
+        (profile) => profile.id === state.defaultClaudeProfileId)?.id
+      ?? state.claudeProfiles[0]?.id
+      ?? null
+    : null;
   const newChatCodexProfileId = engine === "codex"
-    ? requestedNewChatProfileId
+    ? requestedNewChatCodexProfileId
       ?? state.codexProfiles.find(
         (profile) => profile.id === state.defaultCodexProfileId)?.id
       ?? state.codexProfiles[0]?.id
@@ -839,10 +896,15 @@ export default function App() {
   const newChatCodexProfileMissing = engine === "codex"
     && !!newChatCodexProfileId
     && !knownCodexProfileIds.has(newChatCodexProfileId);
+  const newChatClaudeProfileMissing = engine === "claude"
+    && !!newChatClaudeProfileId
+    && !knownClaudeProfileIds.has(newChatClaudeProfileId);
+  const newChatProfileId = engine === "codex"
+    ? newChatCodexProfileId : newChatClaudeProfileId;
   const newChatCatalogScopeKey = modelCatalogScopeKey(
-    engine, newChatCodexProfileId);
+    engine, newChatProfileId);
   const newChatCatalog = catalogForEngineProfile(
-    state.catalog, engine, newChatCodexProfileId);
+    state.catalog, engine, newChatProfileId);
   const newChatDefaults = resolveNewChatLocalDefaults(
     engine,
     space,
@@ -897,20 +959,32 @@ export default function App() {
     ? focusedSession?.codex_profile_id
       ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
     : null;
+  const focusedClaudeProfileId = focusedEngine === "claude"
+    ? focusedSession?.claude_profile_id
+      ?? claudeProfileIdForSession(focusedSid, state.defaultClaudeProfileId)
+    : null;
+  const focusedAccountProfileId = focusedEngine === "codex"
+    ? focusedCodexProfileId : focusedClaudeProfileId;
   const focusedWorkProfile = space === "work" && !state.newChat
-    && focusedEngine === "codex" && focusedSession?.codex_profile_id
-    ? codexProfilePresentation(
-      state.codexProfiles,
-      state.defaultCodexProfileId,
-      focusedSession.codex_profile_id,
-    )
+    && focusedAccountProfileId
+    ? (focusedEngine === "codex"
+      ? codexProfilePresentation(
+        state.codexProfiles,
+        state.defaultCodexProfileId,
+        focusedAccountProfileId,
+      )
+      : claudeProfilePresentation(
+        state.claudeProfiles,
+        state.defaultClaudeProfileId,
+        focusedAccountProfileId,
+      ))
     : null;
   const focusedNativeSessionId = focusedSession?.native_session_id
-    ?? (focusedEngine === "codex" && rt.ccSessionId
-      ? nativeCodexSessionId(rt.ccSessionId)
+    ?? (rt.ccSessionId
+      ? nativeProfileSessionId(rt.ccSessionId)
       : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
-    state.catalog, focusedEngine, focusedCodexProfileId);
+    state.catalog, focusedEngine, focusedAccountProfileId);
   const completedGoalRetired = completedGoalHasNewerUserTurn(
     rt.goal, rt.turns,
   ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
@@ -951,13 +1025,14 @@ export default function App() {
   );
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
-    focusedCodexProfileId);
+    focusedCodexProfileId, focusedClaudeProfileId);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
     space,
     cwd: capabilityCwd,
     skillsOnly: true,
+    claudeProfileId: focusedClaudeProfileId,
     codexProfileId: focusedCodexProfileId,
   };
   const activeBtwDraftKey = composerDraftKey(
@@ -999,6 +1074,15 @@ export default function App() {
         }
       : undefined)
     : undefined;
+  const focusedCompletion = newestCompletionProjection(
+    rt.completion,
+    catalogCompletionProjection(focusedSession),
+  );
+  const terminalRepairState = mergeSessionActivityState(
+    focusedSession?.state,
+    rt.state,
+    rt.mirroredRunning,
+  );
 
   useEffect(() => {
     setQueuedQueryEditor((current) => (
@@ -1049,6 +1133,73 @@ export default function App() {
     state.connState,
     state.newChat,
     state.wrapperOnline,
+  ]);
+
+  useEffect(() => {
+    // Request/build ordering is scoped to one wrapper connection. Keep each
+    // sid's bounded attempts across ordinary focus changes so a legacy receipt
+    // outside the newest page cannot rescan a multi-megabyte transcript every
+    // time the user returns to the session.
+    terminalHistoryRepairRef.current.clear();
+  }, [machineId, state.connState]);
+
+  useEffect(() => {
+    const completionId = focusedCompletion?.id ?? null;
+    if (!focusedSid || state.newChat
+        || historyView.browsing || state.connState !== "connected"
+        || !state.wrapperOnline || !rt.syncReady
+        || terminalRepairState !== "idle" || rt.acceptancePending) return;
+    const completionMissing = completionNeedsHistoryRepair(
+      historyView.turns, completionId);
+    const idleTailMissing = idleTurnNeedsHistoryRepair(historyView.turns);
+    if (!completionMissing && !idleTailMissing) {
+      terminalHistoryRepairRef.current.delete(focusedSid);
+      return;
+    }
+    const latest = historyView.turns[historyView.turns.length - 1];
+    // A successful completion receipt is the strongest post-TurnEnd causal
+    // key. Failed/interrupted turns have no unread receipt, so bind their
+    // fallback to the exact idle generation/lifecycle and newest display row.
+    const repairKey = completionMissing && completionId
+      ? completionId
+      : [
+          "idle",
+          wsRef.current?.generationFor(focusedSid) ?? "",
+          rt.lastLifecycleSeq,
+          latest?.clientMsgId ?? latest?.historyTurnId ?? latest?.id ?? "",
+        ].join("\0");
+    const attempt = nextTerminalHistoryRepairAttempt(
+      terminalHistoryRepairRef.current.get(focusedSid),
+      repairKey,
+      MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS,
+    );
+    if (!attempt) return;
+    const accepted = requestHistory(
+      focusedSid,
+      undefined,
+      HISTORY_INITIAL_PAGE,
+      wsRef.current?.generationFor(focusedSid),
+      undefined,
+      undefined,
+      { supersedePending: true, causalKey: repairKey },
+    );
+    if (accepted) {
+      terminalHistoryRepairRef.current.set(focusedSid, attempt);
+    }
+  }, [
+    focusedCompletion?.id,
+    focusedSid,
+    historyView.browsing,
+    historyView.turns,
+    requestHistory,
+    rt.acceptancePending,
+    rt.lastLifecycleSeq,
+    rt.syncReady,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+    terminalHistoryRepairEpoch,
+    terminalRepairState,
   ]);
 
   useEffect(() => {
@@ -1523,15 +1674,20 @@ export default function App() {
   }, [engine, space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
-        || !state.wrapperOnline || newChatCodexProfileMissing) return;
+        || !state.wrapperOnline || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing) return;
     const request = newChatCatalogRequest(
-      engine, space, newChatCwd, newChatCodexProfileId);
+      engine, space, newChatCwd,
+      newChatCodexProfileId, newChatClaudeProfileId);
     if (!request) return;
     wsRef.current?.sendGetModels(
-      request.engine, request.cwd, request.codexProfileId);
+      request.engine, request.cwd,
+      request.codexProfileId, request.claudeProfileId);
   }, [
     engine,
     newChatCwd,
+    newChatClaudeProfileId,
+    newChatClaudeProfileMissing,
     newChatCodexProfileId,
     newChatCodexProfileMissing,
     space,
@@ -1557,12 +1713,17 @@ export default function App() {
     state.newChat,
   ]);
   useEffect(() => {
-    if (state.newChat || focusedEngine !== "codex"
-        || !focusedCodexProfileId
+    if (state.newChat || !focusedAccountProfileId
         || state.connState !== "connected" || !state.wrapperOnline) return;
     wsRef.current?.sendGetModels(
-      "codex", undefined, focusedCodexProfileId);
+      focusedEngine,
+      focusedEngine === "claude" ? capabilityCwd : undefined,
+      focusedCodexProfileId,
+      focusedClaudeProfileId);
   }, [
+    capabilityCwd,
+    focusedAccountProfileId,
+    focusedClaudeProfileId,
     focusedCodexProfileId,
     focusedEngine,
     state.connState,
@@ -2249,7 +2410,8 @@ export default function App() {
                   parentSid,
                   msg.sid!,
                   isBtw ? "btw" : "main",
-                  isBtw ? null : msg.turn_id ?? null,
+                  isBtw ? null
+                    : msg.checkpoint_id ?? msg.turn_id ?? null,
                   isBtw ? null : msg.seq ?? null,
                   isBtw ? null : ws.generationFor(msg.sid!),
                 ));
@@ -2380,9 +2542,11 @@ export default function App() {
                 module.allowSessionCache(msg.session_id));
             }
           }
+          let settledHistoryCausalKey: string | undefined;
           if (msg.type === "history") {
             const completedHistory =
               historyRequestsRef.current.complete(msg);
+            settledHistoryCausalKey = completedHistory.settledCausalKey;
             const browseWaiters = completedHistory.matched;
             for (const browse of completedHistory.stale) {
               dispatch({
@@ -2780,13 +2944,21 @@ export default function App() {
             setSpace("code");
             dispatch({ type: "exit_new_chat" });
             dispatch({ type: "focus_session", sid: msg.session_id });
-            const parentProfileId = targetEngine === "codex"
-              ? stateRef.current.sessions.find(
-                (session) => session.session_id === msg.parent_session_id,
-              )?.codex_profile_id
+            const parentSession = stateRef.current.sessions.find(
+              (session) => session.session_id === msg.parent_session_id,
+            );
+            const parentCodexProfileId = targetEngine === "codex"
+              ? parentSession?.codex_profile_id
                 ?? codexProfileIdForSession(
                   msg.parent_session_id,
                   stateRef.current.defaultCodexProfileId,
+                )
+              : undefined;
+            const parentClaudeProfileId = targetEngine === "claude"
+              ? parentSession?.claude_profile_id
+                ?? claudeProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultClaudeProfileId,
                 )
               : undefined;
             startForkFocusLease({
@@ -2798,14 +2970,16 @@ export default function App() {
               machineId,
               cwd: msg.cwd,
               gitBranch: msg.git_branch,
-              codexProfileId: parentProfileId,
+              claudeProfileId: parentClaudeProfileId,
+              codexProfileId: parentCodexProfileId,
               refreshAt: Date.now() + FORK_FOCUS_REFRESH_MS,
             });
             ws.setSessionEngines([{
               session_id: msg.session_id,
               engine: targetEngine,
               space: "code",
-              codex_profile_id: parentProfileId,
+              claude_profile_id: parentClaudeProfileId,
+              codex_profile_id: parentCodexProfileId,
             }]);
             ws.setFocusedSid(msg.session_id, targetEngine, "code");
             ws.sendListSessions(targetEngine, "code");
@@ -3157,6 +3331,12 @@ export default function App() {
           } else {
             dispatch({ type: "event", event: msg, ownership });
           }
+          if (msg.type === "history" && !msg.before
+              && msg.authoritative !== false
+              && settledHistoryCausalKey) {
+            settleTerminalHistoryRepair(
+              msg.session_id, settledHistoryCausalKey);
+          }
           if (settlesContextRequest && msg.type === "error"
               && msg.code === "busy" && msg.sid) {
             // The reducer first converts this exact request into a deferred
@@ -3213,7 +3393,7 @@ export default function App() {
             setSkillCatalogs({});
             skillCatalogRequestsRef.current?.resetReads();
             const focusedSkills = focusedSkillScopeRef.current;
-            if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
+            if (focusedSkills?.cwd) {
               requestSkillCatalog(focusedSkills, true);
             }
             ws.sendListSessions(engineRef.current, spaceRef.current);
@@ -3422,6 +3602,7 @@ export default function App() {
     sendContextRequestTo,
     setBtwOpeningFor,
     settleCancelledHistoryBrowse,
+    settleTerminalHistoryRepair,
     startForkFocusLease,
   ]);
 
@@ -3454,6 +3635,10 @@ export default function App() {
           type: "enter_new_chat",
           cwd: inheritedCwd || "~",
           cwdSource: inheritedCwd ? "inherited" : "default",
+          claudeProfileId: engineRef.current === "claude"
+            ? current.claudeProfileByScope[focusScopeKey]
+              ?? current.defaultClaudeProfileId
+            : null,
           codexProfileId: engineRef.current === "codex"
             ? current.codexProfileByScope[focusScopeKey]
               ?? current.defaultCodexProfileId
@@ -3514,11 +3699,11 @@ export default function App() {
     ] = focusedSid;
   }, [focusedSid, state.newChat, state.sessions, engine, machineId]);
 
-  // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
+  // Warm the cwd/account-scoped Skill catalog when a session becomes usable.
   // Composer completion then reads memory synchronously; an expired entry stays
   // visible while this refresh runs in the background.
   useEffect(() => {
-    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+    if (!authed || !focusedSid || state.newChat
         || !capabilityCwd || state.connState !== "connected"
         || !state.wrapperOnline) return;
     requestSkillCatalog({
@@ -3527,11 +3712,13 @@ export default function App() {
       space,
       cwd: capabilityCwd,
       skillsOnly: true,
+      claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
     });
   }, [
     authed,
     capabilityCwd,
+    focusedClaudeProfileId,
     focusedEngine,
     focusedCodexProfileId,
     focusedSid,
@@ -3556,12 +3743,14 @@ export default function App() {
       space,
       cwd: capabilityCwd,
       skillsOnly: false,
+      claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
     }, true);
   }, [
     authed,
     capabilitiesOpen,
     capabilityCwd,
+    focusedClaudeProfileId,
     focusedEngine,
     focusedCodexProfileId,
     focusedSkillCatalogKey,
@@ -4348,6 +4537,7 @@ export default function App() {
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
     if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing
         || restoringSurfaceScope === activeScopeKey) {
       return false;
     }
@@ -4378,7 +4568,8 @@ export default function App() {
       engine === "claude" ? {
         mode: autoCompactMode,
         thresholdTokens: autoCompactThresholdTokens,
-      } : undefined);
+      } : undefined,
+      engine === "claude" ? newChatClaudeProfileId : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -4429,6 +4620,14 @@ export default function App() {
     setNewChatPermissionCatalog(null);
     dispatch({
       type: "set_new_chat_codex_profile",
+      scopeKey: activeScopeKey,
+      profileId,
+    });
+  };
+  const pickNewChatClaudeProfile = (profileId: string) => {
+    if (engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_claude_profile",
       scopeKey: activeScopeKey,
       profileId,
     });
@@ -4962,6 +5161,8 @@ export default function App() {
         engine={engine}
         space={space}
         profileScopeKey={activeScopeKey}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
         onSpaceChange={switchSpace}
@@ -4982,8 +5183,8 @@ export default function App() {
           const selected = state.sessions.find((s) => s.session_id === id);
           if (selected) focusListedSession(selected);
         }}
-        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(profileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", claudeProfileId: engine === "claude" ? profileId ?? newChatClaudeProfileId : null, codexProfileId: engine === "codex" ? profileId ?? newChatCodexProfileId : null }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", claudeProfileId: newChatClaudeProfileId, codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -5019,6 +5220,7 @@ export default function App() {
           if (focusedSid === id) clearHistoryDetailRequests();
           if (focusedSid === id) dispatch({
             type: "enter_new_chat", cwd: "~", cwdSource: "default",
+            claudeProfileId: newChatClaudeProfileId,
             codexProfileId: newChatCodexProfileId,
           });
           wsRef.current?.sendDeleteSession(
@@ -5064,8 +5266,8 @@ export default function App() {
               </button>
               {focusedWorkProfile && (
                 <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
-                  title={`Codex 账号：${focusedWorkProfile.fullLabel}`}
-                  aria-label={`Codex 账号：${focusedWorkProfile.fullLabel}`}>
+                  title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
+                  aria-label={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}>
                   <i className="profile-tone" />
                   {focusedWorkProfile.name}
                 </span>
@@ -5124,9 +5326,7 @@ export default function App() {
           </div>
         ) : state.newChat ? (
           <NewChatView cwd={state.newChat.cwd}
-            controlScopeKey={engine === "codex"
-              ? `${activeScopeKey}\u0000${newChatCodexProfileId ?? "__default__"}`
-              : activeScopeKey}
+            controlScopeKey={`${activeScopeKey}\u0000${newChatProfileId ?? "__default__"}`}
             space={space}
             createError={createError}
             autoFocus={newChatAutoFocus}
@@ -5140,6 +5340,9 @@ export default function App() {
             }}
             defaultModel={newChatDefaults.model}
             defaultEffort={newChatDefaults.effort}
+            claudeProfiles={state.claudeProfiles}
+            defaultClaudeProfileId={state.defaultClaudeProfileId}
+            claudeProfileId={newChatClaudeProfileId}
             codexProfiles={state.codexProfiles}
             defaultCodexProfileId={state.defaultCodexProfileId}
             codexProfileId={newChatCodexProfileId}
@@ -5151,6 +5354,7 @@ export default function App() {
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
             onPickAutoCompact={pickNewChatAutoCompact}
+            onPickClaudeProfile={pickNewChatClaudeProfile}
             onPickCodexProfile={pickNewChatCodexProfile}
             permissionProfiles={
               newChatPermissionCatalog?.machineId === machineId
@@ -5215,6 +5419,8 @@ export default function App() {
                 turnId: planProgress.turnId,
                 itemId: planProgress.block.item_id,
               } : null}
+              backgroundProcesses={focusedEngine === "claude"
+                ? rt.backgroundProcesses : []}
               activeTurnId={activeTurnId}
               ambiguousActiveTurnIds={ambiguousActiveTurnIds}
               onOpenAgent={focusedEngine === "claude" && space === "code"
@@ -5343,6 +5549,7 @@ export default function App() {
             type: "enter_new_chat",
             cwd: space === "work" ? "~" : (currentCwd || "~"),
             cwdSource: space === "work" || !currentCwd ? "default" : "inherited",
+            claudeProfileId: focusedClaudeProfileId ?? newChatClaudeProfileId,
             codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
@@ -5368,6 +5575,7 @@ export default function App() {
               space,
               cwd: capabilityCwd,
               skillsOnly: false,
+              claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
             }, true);
           }}
@@ -5379,6 +5587,7 @@ export default function App() {
               space,
               cwd: capabilityCwd,
               skillsOnly: true,
+              claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
             });
           }}
@@ -5549,6 +5758,10 @@ export default function App() {
         open={workManagerOpen && space === "work"}
         scopeKey={sessionScopeKey(machineId, engine, "work")}
         dashboard={activeWorkDashboard}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
+        claudeProfileId={state.newChat
+          ? newChatClaudeProfileId : focusedClaudeProfileId}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
         codexProfileId={state.newChat
@@ -5561,9 +5774,10 @@ export default function App() {
         onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(engine, projectId, kind, title, uri, file)}
         onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(engine, sourceId)}
         onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId,
-          codexProfileId) => !!wsRef.current?.sendCreateWorkSchedule(
+          profileId) => !!wsRef.current?.sendCreateWorkSchedule(
           engine, title, prompt, nextRunAt, repeatSeconds, projectId,
-          codexProfileId)}
+          engine === "codex" ? profileId : undefined,
+          engine === "claude" ? profileId : undefined)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
         onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
@@ -5588,6 +5802,7 @@ export default function App() {
             space,
             cwd: capabilityCwd,
             skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           }, true);
         }}
@@ -5597,10 +5812,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEnginePlugin(
             focusedEngine, space, action, item.id,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5610,10 +5826,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, action, { skillId: item.id },
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5621,10 +5838,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, "create", draft,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5633,10 +5851,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "remove", { hookId: item.id },
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5644,10 +5863,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "create", draft,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}

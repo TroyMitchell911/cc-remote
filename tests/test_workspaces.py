@@ -82,6 +82,7 @@ class WorkRegistryTests(unittest.TestCase):
                 row[1] for row in db.execute("PRAGMA index_list(work_sessions)")
             }
         self.assertEqual(columns.count("context_baseline_tokens"), 1)
+        self.assertEqual(columns.count("claude_profile_id"), 1)
         self.assertEqual(columns.count("codex_profile_id"), 1)
         self.assertNotRegex(table_sql, r"session_id\s+TEXT\s+UNIQUE")
         self.assertIn("work_sessions_updated", indexes)
@@ -174,6 +175,57 @@ class WorkRegistryTests(unittest.TestCase):
         )
         assert migrated is not None
         self.assertEqual(migrated.codex_profile_id, "primary")
+
+    def test_claude_work_records_keep_their_profile_identity(self):
+        personal = self.store.create_session(claude_profile_id="personal")
+        company = self.store.create_session(claude_profile_id="company")
+        self.store.bind_session(
+            personal.work_id, "same-native-id",
+            claude_profile_id="personal",
+        )
+        self.store.bind_session(
+            company.work_id, "same-native-id",
+            claude_profile_id="company",
+        )
+
+        records = self.store.records_by_profile_session()
+        self.assertEqual(
+            records[("personal", "same-native-id")].work_id,
+            personal.work_id,
+        )
+        self.assertEqual(
+            records[("company", "same-native-id")].work_id,
+            company.work_id,
+        )
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            self.store.get_by_session("same-native-id")
+        with self.assertRaisesRegex(ValueError, "account-aware"):
+            self.store.records_by_session()
+
+        self.store.update_title(
+            "same-native-id", "Company only",
+            claude_profile_id="company",
+        )
+        unchanged = self.store.get_by_session(
+            "same-native-id", claude_profile_id="personal")
+        updated = self.store.get_by_session(
+            "same-native-id", claude_profile_id="company")
+        assert unchanged is not None and updated is not None
+        self.assertIsNone(unchanged.title)
+        self.assertEqual(updated.title, "Company only")
+
+    def test_legacy_claude_work_profile_is_assigned_only_once(self):
+        record = self.store.create_session()
+        self.store.bind_session(record.work_id, "native-id")
+
+        self.assertEqual(
+            self.store.assign_legacy_claude_profile("personal"), 1)
+        self.assertEqual(
+            self.store.assign_legacy_claude_profile("company"), 0)
+        migrated = self.store.get_by_session(
+            "native-id", claude_profile_id="personal")
+        assert migrated is not None
+        self.assertEqual(migrated.claude_profile_id, "personal")
 
     def test_project_sources_plugins_are_materialized_into_private_session(self):
         project_id = self.store.create_project("季度复盘", "整理业务结果")
@@ -347,6 +399,32 @@ class WorkRegistryTests(unittest.TestCase):
         schedule = store.dashboard()["schedules"][0]
         self.assertEqual(schedule["codex_profile_id"], "stack")
         self.assertEqual(schedule["last_codex_profile_id"], "stack")
+
+    def test_claude_schedule_freezes_profile_for_every_retry(self):
+        now = time.time()
+        schedule_id = self.store.create_schedule(
+            "Company task", "Generate report", now - 1,
+            claude_profile_id="company",
+        )
+
+        run = self.store.claim_due_schedules(now)[0]
+        self.assertEqual(run["schedule_id"], schedule_id)
+        self.assertEqual(run["claude_profile_id"], "company")
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            self.store.complete_schedule(
+                run["run_id"], None, "failed",
+                claude_profile_id="personal",
+            )
+        self.assertEqual(
+            self.store.complete_schedule(
+                run["run_id"], None, "account removed",
+                claude_profile_id="company", retryable=False,
+            ),
+            "failed",
+        )
+        schedule = self.store.dashboard()["schedules"][0]
+        self.assertEqual(schedule["claude_profile_id"], "company")
+        self.assertEqual(schedule["last_claude_profile_id"], "company")
 
     def test_legacy_schedule_profile_backfill_is_topology_independent(self):
         store = WorkRegistry(self.root / "legacy-codex", "codex")
@@ -547,6 +625,22 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(payload["sandbox"]["filesystem"]["allowWrite"],
                          [record.cwd])
         self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+
+    def test_repeated_initialize_does_not_rebuild_profile_identity_index(self):
+        self.store.initialize()
+        with sqlite3.connect(self.store.db_path) as db:
+            before = db.execute("PRAGMA schema_version").fetchone()[0]
+            index_sql = db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'work_sessions_identity'"
+            ).fetchone()[0]
+
+        self.store.initialize()
+
+        with sqlite3.connect(self.store.db_path) as db:
+            after = db.execute("PRAGMA schema_version").fetchone()[0]
+        self.assertIn("claude_profile_id", index_sql)
+        self.assertEqual(after, before)
 
     def test_claude_policy_ignores_invalid_or_oversized_user_settings(self):
         config_dir = Path(self.tmp.name) / "claude-config"

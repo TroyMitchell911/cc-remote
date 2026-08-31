@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v44 and add
+  Claude account profiles. Each user-defined profile owns one explicit
+  `CLAUDE_CONFIG_DIR`; Code, Work, schedules, models, Skills, extensions,
+  history, external ownership, and forks remain bound to that account. Empty
+  configuration preserves the original single-account IDs and UI. Profile
+  topology changes migrate local ownership by resolved config-directory path,
+  fail closed on ambiguity, and are covered by the same rollback-aware Work
+  deployment transaction as Codex profiles. Claude's authoritative background
+  task level now restores a native-style detached Bash/Agent monitor on every
+  client Hello without reopening an idle session; task-completion follow-ups
+  retain their source-time boundary, and real compact boundaries use the
+  existing context-compaction process presentation.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v42. Pending
   Claude and Codex questions are now authoritative session state restored on
   every client Hello, independent of the replay ring. Fresh clients retain a

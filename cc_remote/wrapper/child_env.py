@@ -15,6 +15,42 @@ CONTROL_PLANE_SECRET_KEYS = (
     "SESSION_SECRET",
 )
 
+# Ambient provider credentials would make every configured Claude profile use
+# the wrapper service account regardless of its CLAUDE_CONFIG_DIR. Explicit
+# multi-profile children clear these keys; each profile may repopulate the
+# intended values through its own settings.json (or use native keychain auth).
+CLAUDE_ACCOUNT_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION",
+    "ANTHROPIC_BETAS",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+)
+
 
 def sanitized_child_env(source: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if source is None else source)
@@ -26,6 +62,41 @@ def sanitized_child_env(source: Mapping[str, str] | None = None) -> dict[str, st
 def child_env_tombstones() -> dict[str, str]:
     """Claude SDK merges options.env over os.environ, so empty values scrub it."""
     return {key: "" for key in CONTROL_PLANE_SECRET_KEYS}
+
+
+def claude_profile_child_env(
+    config_dir: str | None,
+    *,
+    isolate_account_env: bool,
+) -> dict[str, str]:
+    """Build an SDK env overlay without mutating the wrapper environment."""
+    result = child_env_tombstones()
+    if isolate_account_env:
+        result.update({key: "" for key in CLAUDE_ACCOUNT_ENV_KEYS})
+    if config_dir is not None:
+        result["CLAUDE_CONFIG_DIR"] = config_dir
+    return result
+
+
+def claude_profile_process_env(
+    config_dir: str | None,
+    *,
+    isolate_account_env: bool,
+) -> dict[str, str]:
+    """Build a complete environment for a directly spawned Claude CLI.
+
+    Unlike ``ClaudeAgentOptions.env``, ``subprocess`` does not merge an env
+    mapping over the parent. Preserve ordinary runtime variables while
+    removing control-plane credentials and any ambient account selectors that
+    could override the requested config directory.
+    """
+    result = sanitized_child_env()
+    if isolate_account_env:
+        for key in CLAUDE_ACCOUNT_ENV_KEYS:
+            result.pop(key, None)
+    if config_dir is not None:
+        result["CLAUDE_CONFIG_DIR"] = config_dir
+    return result
 
 
 def scrub_parent_control_secrets() -> None:

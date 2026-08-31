@@ -32,7 +32,12 @@ from cc_remote.wrapper.codex_stream import (
     codex_translate_history,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
-from cc_remote.wrapper.session import _session_file, load_session_id, save_session_id
+from cc_remote.wrapper.session import (
+    _session_file,
+    load_session_id,
+    load_session_state,
+    save_session_id,
+)
 from cc_remote.wrapper.stream import replayed_user_message_id
 from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
 
@@ -606,6 +611,23 @@ def test_session_state_filename_is_utf8_safe_and_state_read_is_bounded(tmp_path)
     assert load_session_id(tmp_path, cwd) is None
     path.write_text(json.dumps({"cc_session_id": "../invalid"}))
     assert load_session_id(tmp_path, cwd) is None
+
+
+def test_session_state_persists_claude_profile_revision(tmp_path):
+    cwd = "/workspace/profiled"
+    save_session_id(
+        tmp_path,
+        cwd,
+        "nyx@session-1",
+        claude_profile_id="nyx",
+        claude_profile_revision=4,
+    )
+
+    state = load_session_state(tmp_path, cwd)
+    assert state is not None
+    assert state.session_id == "nyx@session-1"
+    assert state.claude_profile_id == "nyx"
+    assert state.claude_profile_revision == 4
 
 
 def test_session_alias_state_read_is_bounded_and_validated():

@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v42
+**当前版本：v3.0.0** · Wire protocol v44
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -58,7 +58,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v42。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v44。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -135,6 +135,15 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   这条控制面。如果本机版本或 daemon 不可用，cc-remote 会降级到私有 stdio
   app-server：Remote 仍可独立控制会话，但无法再与原生 Codex CLI/App 实时双向协同。
   `CC_REMOTE_CODEX_DAEMON=off` 会强制使用这个私有路径，仅建议用于故障排查。
+- **同时使用多个 Claude 账号：**可通过 `CC_REMOTE_CLAUDE_PROFILES_JSON` 或
+  `CC_REMOTE_CLAUDE_PROFILES_FILE` 注册最多 32 个完整、互相隔离的
+  `CLAUDE_CONFIG_DIR`。每个 Profile 使用自己的登录/供应商配置、settings、
+  session/transcript、模型和扩展目录；Code、Work 与定时任务都可选择账号，并冻结
+  该归属。wrapper 只给对应 Claude 子进程注入所选目录，不修改自身或其他会话的
+  全局环境。空配置继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`），
+  保持原生 session ID 且不增加账号 UI；多账号才使用
+  `<profile>@<native-session-id>` 作为 cc-remote 内部路由。同一原生 UUID 因此可在
+  两个账号中安全并存。
 - **同时使用多个 Codex 账号：**可通过 `CC_REMOTE_CODEX_PROFILES_JSON` 或
   `CC_REMOTE_CODEX_PROFILES_FILE` 注册最多 32 个完整、互相隔离的 `CODEX_HOME`。
   每个 Profile 使用自己的登录状态、配置、
@@ -156,16 +165,34 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   `~/.cc-remote/codex-daemon-restart.log`。它不会重放 Prompt，也不读取或保存
   Codex 凭据。
 - **Work：**Claude 与 Codex Work 都保持各自的私有进程和目录，不加入 Code 的共享
-  控制面，避免工作资料与代码会话互相泄漏。Codex Work 新会话可选择任一已配置
-  Profile；会话与定时任务会冻结该账号归属，重试或默认账号变化都不会换号。若账号
+  控制面，避免工作资料与代码会话互相泄漏。两种引擎的 Work 新会话都可选择任一
+  已配置 Profile；会话与定时任务会冻结该账号归属，重试或默认账号变化都不会换号。若账号
   被移除，既有 Work 会保持原归属并明确失败；需恢复该 Profile，或在其他账号下新建
   Work / 定时任务，不会把既有数据静默改绑到默认账号。
 
-多账号配置示例（每个目录都必须是绝对路径、互不重复，并且已经分别登录 Codex）：
+Claude 多账号配置示例（Profile id 和标签由部署者自定义；目录必须为绝对路径且互不重复）：
 
 ```bash
 # /etc/cc-remote/wrapper.env
-CC_REMOTE_CODEX_PROFILES_JSON='{"primary":{"label":"主账号","home":"/home/youruser/.codex","default":true},"stack":{"label":"Stack","home":"/home/youruser/.codex-stack"}}'
+CC_REMOTE_CLAUDE_PROFILES_JSON='{"personal":{"label":"个人账号","config_dir":"/home/youruser/.claude","default":true},"company":{"label":"公司账号","config_dir":"/home/youruser/.claude-company"}}'
+```
+
+也可把同一 JSON 保存到私有普通文件，并通过
+`CC_REMOTE_CLAUDE_PROFILES_FILE` 指向它；macOS LaunchAgent 默认读取
+`~/.cc-remote/claude-profiles.json`。每个目录可使用 Claude 订阅登录，也可在该目录
+自己的配置中设置 API/provider 认证。先用相同目录启动日常 CLI 完成登录或验证，例如
+`CLAUDE_CONFIG_DIR=/home/youruser/.claude-company claude`；cc-remote 不代管、复制或
+下发模型凭据。多账号模式会清除 wrapper 进程继承的账号级 Claude/provider 环境变量，
+避免所有 Profile 意外共用同一凭据；需要环境变量的供应商配置应写入对应 Profile 的
+`settings.json`。第一次启用显式注册表时，当前生效的旧 `CLAUDE_CONFIG_DIR` 必须在
+注册表中恰好出现一次，旧会话和 Work 归属才会迁移到正确账号。之后修改 Profile id
+会按配置目录真实路径迁移；不得把已有 id 直接改绑到另一个目录。
+
+Codex 多账号配置示例（每个目录都必须是绝对路径、互不重复，并且已经分别登录 Codex）：
+
+```bash
+# /etc/cc-remote/wrapper.env
+CC_REMOTE_CODEX_PROFILES_JSON='{"personal":{"label":"个人账号","home":"/home/youruser/.codex","default":true},"company":{"label":"公司账号","home":"/home/youruser/.codex-company"}}'
 ```
 
 macOS LaunchAgent 默认还会读取
@@ -175,14 +202,14 @@ macOS LaunchAgent 默认还会读取
 单账号模式。
 
 现有的第二账号命令无需改变，例如
-`alias codex-stack='CODEX_HOME=/home/youruser/.codex-stack codex'`；终端和 cc-remote
-中的 `stack` Profile 会连接这个 `CODEX_HOME` 对应的同一套账号数据和独立 daemon。
+`alias codex-company='CODEX_HOME=/home/youruser/.codex-company codex'`；终端和 cc-remote
+中的 `company` Profile 会连接这个 `CODEX_HOME` 对应的同一套账号数据和独立 daemon。
 如果次账号只有 OAuth/会话目录、没有重复安装 standalone，wrapper 会在首次启动
 daemon 时严格校验当前官方 managed CLI，并只把它的 `current` 入口链接进次账号；
 登录、配置、rollout、socket 和 daemon 进程仍各自隔离。已有自定义安装或不明确的
 目录绝不会被覆盖。
 配置中必须且只能有一个 `default: true`。Relay 和 Web 只收到 Profile id、标签与
-可用状态，不会收到 `CODEX_HOME` 路径或凭据。修改后需重启 wrapper；protocol v42
+可用状态，不会收到 `CODEX_HOME` 路径或凭据。修改后需重启 wrapper；protocol v44
 必须让 wrapper、relay 和 Web 同批升级。
 Profile id 调整、单账号与多账号切换会按 `CODEX_HOME` 的真实路径迁移本地控制和
 恢复状态；迁移被异常中断时，请保持同一份目标配置并重启 wrapper 继续完成。为避免
@@ -196,7 +223,7 @@ marker 与 Profile 对齐，例如：
 
 ```bash
 scripts/codex-auth-daemon-restart \
-  --profile-id stack --codex-home /home/youruser/.codex-stack
+  --profile-id company --codex-home /home/youruser/.codex-company
 ```
 
 显式 Profile 配置中的每个账号（包括默认账号）都应传稳定的 `--profile-id`。
@@ -485,12 +512,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v42**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v44**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v42 relay 和
-> v42 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v44 relay 和
+> v44 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
 > 版本跨级升级，仍须执行 v34 引入的 Work SQLite 迁移保护：启动新 wrapper 前用
 > `deploy/work_registry_snapshot.py snapshot` 保存两个注册表。回滚时先停新版本、恢复
 > 该快照，再切回旧代码；不要在 wrapper 运行时只复制主 `.sqlite3` 文件而漏掉 WAL。
@@ -547,7 +574,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v42 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v44 wrapper。
 
 验证：
 
@@ -671,6 +698,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CC_REMOTE_MACHINE_ID` | `default` | 多机器 relay 中的稳定路由 id；使用 `WRAPPER_TOKENS_JSON` 时必须匹配对应键。 |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | 交互配对凭据路径；文件必须仅当前用户可读。显式的 `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` 优先。 |
 | `CLAUDE_BIN` | `~/.local/bin/claude` | wrapper 实际启动的日常 Claude Code；空值仍使用该默认路径。只有 CLI 安装在别处时才设为另一个绝对路径。 |
+| `CC_REMOTE_CLAUDE_PROFILES_JSON` | 空 | 可选 Claude 多账号注册表；格式为 `{profile_id:{"label":"…","config_dir":"/绝对/CLAUDE_CONFIG_DIR","default":true}}`。最多 32 项、目录必须唯一，且必须且只能有一个默认项。Code、Work 与定时任务均可选择账号；空值保持当前单账号行为。显式 JSON 优先于文件。 |
+| `CC_REMOTE_CLAUDE_PROFILES_FILE` | 空（macOS LaunchAgent 为 `~/.cc-remote/claude-profiles.json`） | 可选注册表 JSON 文件；必须是有上限的普通文件。文件不存在等同单账号，便于先安装再配置。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server，并失去与原生 Codex CLI/App 的实时双向协同。Work 始终私有，不受此项影响。 |
 | `CC_REMOTE_CODEX_PROFILES_JSON` | 空 | 可选 Codex 多账号注册表；格式为 `{profile_id:{"label":"…","home":"/绝对/CODEX_HOME","default":true}}`。最多 32 项、home 必须唯一，且必须且只能有一个默认项。每项使用独立 daemon；Code 合并展示并按标签区分，Codex Work 新会话和定时任务可选择任一项。空值保持单账号兼容。显式 JSON 优先于文件。 |

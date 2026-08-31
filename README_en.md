@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v42
+**Current release: v3.0.0** · Wire protocol v44
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -62,7 +62,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. Exact files outside cwd require confirmation in the requesting session and are bound to that file identity; user-approved Markdown stays read-only, while only files successfully written by the session can be saved. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v42. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v44. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -154,6 +154,17 @@ commands:
   but it no longer has live bidirectional coordination with native Codex CLI/App.
   `CC_REMOTE_CODEX_DAEMON=off` forces this private path and is intended only for
   troubleshooting.
+- **Concurrent Claude accounts:** `CC_REMOTE_CLAUDE_PROFILES_JSON` or
+  `CC_REMOTE_CLAUDE_PROFILES_FILE` can register up to 32 isolated
+  `CLAUDE_CONFIG_DIR` profiles. Each owns its login/provider configuration,
+  settings, sessions/transcripts, models, and extensions. Claude Code, Work,
+  and schedules can select an account and freeze that ownership. The wrapper
+  injects only the selected directory into that Claude child; it never mutates
+  its process-wide environment or another resident session. Empty configuration
+  keeps the effective `CLAUDE_CONFIG_DIR` (or `~/.claude`), native session ids,
+  and the original single-account UI. Multiple profiles use
+  `<profile>@<native-session-id>` only as cc-remote's routing key, so the same
+  native UUID can safely exist in two accounts.
 - **Concurrent Codex accounts:** `CC_REMOTE_CODEX_PROFILES_JSON` or
   `CC_REMOTE_CODEX_PROFILES_FILE` can register up to 32 fully isolated
   `CODEX_HOME` profiles. Each profile owns its login,
@@ -182,19 +193,42 @@ commands:
   reads/stores Codex credentials.
 - **Work:** Claude and Codex Work keep private processes and directories and do
   not join the Code control plane, preventing work material from leaking into code
-  sessions. A new Codex Work session can select any configured profile. Sessions
+  sessions. New Work sessions for either engine can select any configured profile. Sessions
   and schedules freeze that account identity, so retries and default-account
   changes never switch accounts. If a profile is removed, existing Work keeps
   its original owner and fails clearly; restore that profile or create new Work
   or a schedule under another account. Existing data is never silently rebound
   to the default.
 
-Example multi-account configuration (every home must be an absolute, unique,
-already authenticated Codex home):
+Example Claude multi-account configuration (profile ids and labels are chosen
+by the deployer; every directory must be absolute and unique):
 
 ```bash
 # /etc/cc-remote/wrapper.env
-CC_REMOTE_CODEX_PROFILES_JSON='{"primary":{"label":"Primary","home":"/home/youruser/.codex","default":true},"stack":{"label":"Stack","home":"/home/youruser/.codex-stack"}}'
+CC_REMOTE_CLAUDE_PROFILES_JSON='{"personal":{"label":"Personal","config_dir":"/home/youruser/.claude","default":true},"company":{"label":"Company","config_dir":"/home/youruser/.claude-company"}}'
+```
+
+The same JSON may live in a private regular file selected with
+`CC_REMOTE_CLAUDE_PROFILES_FILE`; the macOS LaunchAgent reads
+`~/.cc-remote/claude-profiles.json` by default. Each directory may use a Claude
+subscription login or API/provider authentication stored in that profile's own
+configuration. Authenticate or verify it with the same directory, for example
+`CLAUDE_CONFIG_DIR=/home/youruser/.claude-company claude`; cc-remote never
+manages, copies, or sends model credentials. Multi-account mode clears ambient
+Claude/provider account variables inherited by the wrapper so every profile
+cannot accidentally share one credential. Provider variables, when required,
+belong in that profile's `settings.json`. On the first explicit configuration,
+the previously effective `CLAUDE_CONFIG_DIR` must appear exactly once so legacy
+sessions and Work state are attached to the right account. Later profile-id
+changes migrate by resolved config-directory path; an existing id cannot be
+silently rebound to another directory.
+
+Example Codex multi-account configuration (every home must be an absolute,
+unique, already authenticated Codex home):
+
+```bash
+# /etc/cc-remote/wrapper.env
+CC_REMOTE_CODEX_PROFILES_JSON='{"personal":{"label":"Personal","home":"/home/youruser/.codex","default":true},"company":{"label":"Company","home":"/home/youruser/.codex-company"}}'
 ```
 
 The macOS LaunchAgent also reads `~/.cc-remote/codex-profiles.json` by default;
@@ -204,8 +238,8 @@ the file contains the JSON value above without shell quotes. Linux may point
 settings empty, preserves the original single-account behavior.
 
 An existing second-account command remains valid, for example
-`alias codex-stack='CODEX_HOME=/home/youruser/.codex-stack codex'`. The terminal
-and cc-remote's `stack` profile use the same account data and that home's own
+`alias codex-company='CODEX_HOME=/home/youruser/.codex-company codex'`. The terminal
+and cc-remote's `company` profile use the same account data and that home's own
 daemon. If the secondary home contains only OAuth/session state rather than a
 duplicate standalone install, the wrapper verifies the current official managed
 CLI and links only its `current` entry into that home before first bootstrap.
@@ -214,7 +248,7 @@ an existing custom or ambiguous layout is never replaced. Exactly one profile
 must set `default: true`. Relay and Web receive only
 the public profile id, label, and availability—not the local path or credentials.
 Restart the wrapper after changing the registry, and deploy wrapper, relay, and
-Web together for protocol v42.
+Web together for protocol v44.
 Profile-id changes and single/multi-profile transitions migrate local controls
 and recovery state by the resolved `CODEX_HOME`. If that migration is
 interrupted, keep the same target registry and restart the wrapper to resume it.
@@ -230,7 +264,7 @@ profile marker, for example:
 
 ```bash
 scripts/codex-auth-daemon-restart \
-  --profile-id stack --codex-home /home/youruser/.codex-stack
+  --profile-id company --codex-home /home/youruser/.codex-company
 ```
 
 Every account in an explicit Profile configuration, including the default,
@@ -569,14 +603,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v42:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v44:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v42 relay and v42 wrapper so the old wrapper cannot occupy the
+> then start the v44 relay and v44 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`. When upgrading from a pre-v34 release, retain
 > the Work SQLite migration protection introduced by v34: a manual release must
 > run `deploy/work_registry_snapshot.py snapshot` before the new wrapper starts.
@@ -639,7 +673,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v42 wrapper after success.
+release's `/healthz` is verified. Start the v44 wrapper after success.
 
 Verify:
 
@@ -766,6 +800,8 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CC_REMOTE_MACHINE_ID` | `default` | Stable route id on a multi-machine relay; must match its `WRAPPER_TOKENS_JSON` key when that policy is enabled. |
 | `CC_REMOTE_DEVICE_CONFIG` | `~/.cc-remote/device.json` | Interactive pairing credential; the file must be private to the current user. Explicit `RELAY_URL` / `WRAPPER_TOKEN` / `CC_REMOTE_MACHINE_ID` values take precedence. |
 | `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
+| `CC_REMOTE_CLAUDE_PROFILES_JSON` | empty | Optional Claude multi-account registry in the form `{profile_id:{"label":"…","config_dir":"/absolute/CLAUDE_CONFIG_DIR","default":true}}`. At most 32 unique directories are allowed and exactly one entry must be the default. Code, Work, and schedules may select any entry. Empty preserves the current single-account behavior; inline JSON takes precedence over the file. |
+| `CC_REMOTE_CLAUDE_PROFILES_FILE` | empty (macOS LaunchAgent: `~/.cc-remote/claude-profiles.json`) | Optional bounded regular JSON file. A missing file means single-account mode, allowing installation before configuration. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server and loses live bidirectional coordination with native Codex CLI/App. Work is always private and ignores this setting. |
 | `CC_REMOTE_CODEX_PROFILES_JSON` | empty | Optional multi-account registry in the form `{profile_id:{"label":"…","home":"/absolute/CODEX_HOME","default":true}}`. At most 32 unique homes are allowed and exactly one entry must be the default. Each entry owns an independent daemon; Code combines and labels their sessions, while new Codex Work sessions and schedules may select any entry. Empty preserves single-account compatibility. Inline JSON takes precedence over the file. |

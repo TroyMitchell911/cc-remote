@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 
@@ -11,7 +12,9 @@ from cc_remote.wrapper.claude_rate_limits import (
     ClaudeRateLimitStore,
     ClaudeRateLimitStoreError,
 )
-from tests.test_multisession import _mk_ctx, _mk_machine
+from cc_remote.config import WrapperConfig
+from cc_remote.wrapper.machine import WrapperMachine
+from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
 
 
 def _info(
@@ -180,7 +183,7 @@ def test_machine_publishes_sdk_rate_limits_to_every_resident_claude_session():
         }
 
         assert await machine._observe_claude_rate_limit_message(
-            _event("five_hour", 0.25)) is True
+            code, _event("five_hour", 0.25)) is True
         published = [message for message in transport.sent
                      if message.type == "rate_limit_update"]
         assert {message.sid for message in published} == {
@@ -209,7 +212,7 @@ def test_hello_reseeds_unexpired_claude_limits_without_a_model_probe():
         ctx = _mk_ctx("claude-session", "claude-session")
         machine.sessions[ctx.key] = ctx
         await machine._observe_claude_rate_limit_message(
-            _event("five_hour", 0.4))
+            ctx, _event("five_hour", 0.4))
         transport.sent.clear()
 
         await machine._handle_client_hello(SimpleNamespace(
@@ -224,5 +227,57 @@ def test_hello_reseeds_unexpired_claude_limits_without_a_model_probe():
         assert limits[0].to == "client-1"
         assert limits[0].route_id == "route-1"
         assert limits[0].primary.used_percent == 40
+
+    asyncio.run(run())
+
+
+def test_machine_keeps_rate_limits_inside_claude_profile(
+    tmp_path, monkeypatch,
+):
+    async def run():
+        personal_root = tmp_path / "personal"
+        company_root = tmp_path / "company"
+        personal_root.mkdir()
+        company_root.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(personal_root))
+        cfg = WrapperConfig()
+        cfg.state_dir = tmp_path / "state"
+        cfg.claude_work_root = tmp_path / "work" / "claude"
+        cfg.codex_work_root = tmp_path / "work" / "codex"
+        cfg.claude_profiles_json = json.dumps({
+            "personal": {
+                "label": "Personal",
+                "config_dir": str(personal_root),
+                "default": True,
+            },
+            "company": {
+                "label": "Company",
+                "config_dir": str(company_root),
+            },
+        })
+        transport = _StubTransport()
+        machine = WrapperMachine(cfg, transport)
+        personal = _mk_ctx("personal@native-a", "native-a")
+        personal.claude_profile_id = "personal"
+        company = _mk_ctx("company@native-b", "native-b")
+        company.claude_profile_id = "company"
+        machine.sessions = {
+            personal.key: personal,
+            company.key: company,
+        }
+
+        assert await machine._observe_claude_rate_limit_message(
+            company, _event("five_hour", 0.6),
+        ) is True
+
+        published = [
+            message for message in transport.sent
+            if message.type == "rate_limit_update"
+        ]
+        assert [message.sid for message in published] == [company.key]
+        assert await machine._claude_rate_limit_snapshot(personal) == ()
+        company_snapshot = await machine._claude_rate_limit_snapshot(company)
+        assert len(company_snapshot) == 1
+        assert company_snapshot[0].primary.used_percent == 60
 
     asyncio.run(run())

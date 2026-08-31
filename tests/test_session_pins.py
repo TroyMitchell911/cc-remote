@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 
@@ -87,6 +88,37 @@ def test_session_pin_store_persists_and_unpins(tmp_path):
 
 def test_session_pin_store_rejects_malformed_state(tmp_path):
     (tmp_path / "session-pins.json").write_text('{"claude":"bad"}')
+    with pytest.raises(SessionPinStoreError, match="unreadable"):
+        SessionPinStore(tmp_path)
+
+
+def test_pin_profile_revisions_round_trip_consistently(tmp_path):
+    store = SessionPinStore(tmp_path)
+    store.set_pinned("codex", "old@native", True)
+
+    assert store.migrate_codex_profile_sessions(
+        lambda session_id: session_id.replace("old@", "new@", 1),
+        profile_revision=7,
+    ) == 1
+
+    payload = json.loads(
+        (tmp_path / "session-pins.json").read_text(encoding="utf-8")
+    )
+    assert payload["profile_revision"] == 7
+    assert payload["profile_revisions"] == {"claude": 0, "codex": 7}
+    assert SessionPinStore(tmp_path).ids("codex") == {"new@native"}
+
+
+def test_pin_store_rejects_inconsistent_profile_revisions(tmp_path):
+    (tmp_path / "session-pins.json").write_text(
+        json.dumps({
+            "claude": [],
+            "codex": [],
+            "profile_revision": 3,
+            "profile_revisions": {"claude": 0, "codex": 4},
+        }),
+        encoding="utf-8",
+    )
     with pytest.raises(SessionPinStoreError, match="unreadable"):
         SessionPinStore(tmp_path)
 

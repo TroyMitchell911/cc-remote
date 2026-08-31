@@ -4,6 +4,14 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v44，并新增 Claude 多账号
+  Profile。每个用户自定义 Profile 独占一个明确的 `CLAUDE_CONFIG_DIR`；Code、Work、
+  定时任务、模型、Skills、扩展、历史、外部进程归属和 fork 都保持账号绑定。空配置
+  继续沿用原来的单账号 ID 和界面。Profile 拓扑按配置目录真实路径迁移本地归属，
+  遇到歧义会 fail-closed，并与 Codex Profile 一样纳入可回滚的 Work 发布事务。
+  Claude 的后台任务全量状态现在会在每次客户端 Hello 时恢复原生风格的 Bash/Agent
+  监视区，同时不会把空闲会话重新标成运行中；任务完成后的续答保留真实时间分界，
+  transcript 中真实的 compact boundary 也会复用现有“压缩上下文”过程标签。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v42。Claude 与 Codex 的
   待回答问题现在是会话权威状态，每次客户端 Hello 都会独立于 replay ring 恢复；
   超长活动回合即使淘汰开头标记，也会保留压缩后的 live 后缀，并只自动安装一页

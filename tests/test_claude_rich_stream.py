@@ -27,6 +27,7 @@ from claude_agent_sdk.types import (
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     AssistantMsgEnd,
+    BackgroundProcessSync,
     Delta,
     ProcessEvent,
     ToolDelta,
@@ -592,6 +593,143 @@ def test_background_bash_task_is_not_presented_as_collaborating_agent():
     assert completed[0].turn_id == "bash-turn"
     assert completed[0].status == "succeeded"
     assert completed[0].background is True
+
+
+def test_native_background_task_level_is_authoritative_and_bounded():
+    item_turns = {}
+    item_titles = {}
+    item_meta = {}
+    item_commands = {}
+    translator = StreamTranslator(
+        4096,
+        turn_id="bash-turn",
+        item_turns=item_turns,
+        item_titles=item_titles,
+        item_meta=item_meta,
+        item_commands=item_commands,
+    )
+    translator.feed(_assistant([ToolUseBlock(
+        id="bash-tool", name="Bash",
+        input={"command": "make verify", "run_in_background": True},
+    )], stop_reason="tool_use"))
+    translator.feed(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="bash-task",
+        description="Run verification", uuid="bash-start", session_id="s1",
+        tool_use_id="bash-tool", task_type="local_bash",
+    ))
+
+    populated = translator.feed(SystemMessage(
+        subtype="background_tasks_changed",
+        data={"tasks": [
+            {"task_id": "ambient", "task_type": "local_bash",
+             "description": "internal watcher", "ambient": True},
+            {"task_id": "bash-task", "task_type": "local_bash",
+             "description": "Run verification"},
+        ]},
+    ))
+    assert len(populated) == 1
+    assert isinstance(populated[0], BackgroundProcessSync)
+    assert len(populated[0].items) == 1
+    item = populated[0].items[0]
+    assert item.item_id == "bash-task" and item.kind == "task"
+    assert item.title == "Run verification"
+    assert item.command == "make verify"
+
+    bounded = translator.feed(SystemMessage(
+        subtype="background_tasks_changed",
+        data={"tasks": [
+            {"task_id": f"task-{index}", "task_type": "local_bash",
+             "description": f"Task {index}"}
+            for index in range(80)
+        ]},
+    ))
+    assert len(bounded[0].items) == 64
+
+    cleared = translator.feed(SystemMessage(
+        subtype="background_tasks_changed", data={"tasks": []},
+    ))
+    assert len(cleared) == 1
+    assert isinstance(cleared[0], BackgroundProcessSync)
+    assert cleared[0].items == []
+
+
+def test_live_compact_boundary_uses_existing_process_event():
+    [event] = StreamTranslator(4096, turn_id="turn-1").feed(SystemMessage(
+        subtype="compact_boundary",
+        data={
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "compact-boundary",
+            "timestamp": "2026-08-31T01:34:35.339Z",
+            "compactMetadata": {
+                "trigger": "auto", "preTokens": 168_193,
+                "postTokens": 4_862, "durationMs": 188_390,
+            },
+        },
+    ))
+    assert isinstance(event, ProcessEvent)
+    assert event.item_id == "compact-boundary"
+    assert event.kind == "compaction" and event.title == "压缩上下文"
+    assert event.summary == "自动压缩 · 168,193 → 4,862 tokens"
+    assert event.turn_id == "turn-1" and event.duration_ms == 188_390
+
+
+def test_history_marks_task_completion_followup_as_later_background_segment():
+    answer_before = "11111111-1111-4111-8111-111111111111"
+    answer_after = "22222222-2222-4222-8222-222222222222"
+    messages = [
+        SimpleNamespace(
+            uuid="user-1", type="user", parent_tool_use_id=None,
+            message={"role": "user", "content": "run it"},
+        ),
+        SimpleNamespace(
+            uuid=answer_before, type="assistant", parent_tool_use_id=None,
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Build is running."}]},
+        ),
+        SimpleNamespace(
+            uuid="notification", type="user", parent_tool_use_id=None,
+            message={"role": "user", "content": "<task-notification/>"},
+        ),
+        SimpleNamespace(
+            uuid=answer_after, type="assistant", parent_tool_use_id=None,
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Build passed."}]},
+        ),
+    ]
+    internal = {
+        "notification": ProcessEvent(
+            item_id="task-1", kind="task", phase="end",
+            status="succeeded", title="Build", background=True,
+        ),
+    }
+    timestamps = {
+        "user-1": 1.0, answer_before: 2.0,
+        "notification": 20.0, answer_after: 21.0,
+    }
+
+    events = translate_history(
+        messages, 4096, timestamps=timestamps,
+        internal_user_events=internal,
+    )
+    starts = [
+        event for event in events
+        if event.type == "assistant_msg_start" and event.channel == "final"
+    ]
+    assert [event.message_id for event in starts] == [
+        answer_before, answer_after,
+    ]
+    assert starts[0].background is None and starts[0].ts == 2.0
+    assert starts[1].background is True and starts[1].ts == 21.0
+    notification = next(
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "task-1"
+    )
+    assert notification.ts == 20.0 and notification.background is True
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.ts == 2.0
+    assert terminal.result.duration_ms == 1_000
+    assert terminal.turn_id == answer_after
 
 
 def test_live_agent_tool_has_dedicated_realtime_lifecycle():

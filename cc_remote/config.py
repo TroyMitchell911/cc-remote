@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cc_remote.claude_broker.paths import default_socket_path
+from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
 
 try:
@@ -108,6 +109,28 @@ def _codex_profiles_json() -> str:
         raise ValueError(f"invalid Codex profile file: {path}") from exc
     if len(payload.encode("utf-8")) > 64 * 1024:
         raise ValueError(f"invalid Codex profile file: {path}")
+    return payload.strip()
+
+
+def _claude_profiles_json() -> str:
+    inline = _env("CC_REMOTE_CLAUDE_PROFILES_JSON", "").strip()
+    if inline:
+        return inline
+    configured = _env("CC_REMOTE_CLAUDE_PROFILES_FILE", "").strip()
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("profile file is not a bounded regular file")
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        raise ValueError(f"invalid Claude profile file: {path}") from exc
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise ValueError(f"invalid Claude profile file: {path}")
     return payload.strip()
 
 
@@ -217,6 +240,10 @@ class WrapperConfig:
     # shell. An explicit absolute CLAUDE_BIN may override this standard path,
     # but an empty value must never silently select the SDK-bundled executable.
     claude_bin: str = field(default_factory=_claude_bin)
+    # Optional account registry. Each entry owns one complete
+    # CLAUDE_CONFIG_DIR. Empty preserves the historical single-account path.
+    claude_profiles_json: str = field(
+        default_factory=_claude_profiles_json)
     # Optional proxy inherited only by Codex subprocesses launched by this
     # wrapper.  It deliberately does not mutate the wrapper process or the
     # user's shell/CLI environment.
@@ -501,9 +528,23 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     """Reject credentials or relay URLs that could expose wrapper authority."""
     errors: list[str] = []
     try:
+        claude_profiles = ClaudeProfileRegistry.from_json(
+            cfg.claude_profiles_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+        claude_profiles = None
+    try:
         CodexProfileRegistry.from_json(cfg.codex_profiles_json)
     except ValueError as exc:
         errors.append(str(exc))
+    if (
+        claude_profiles is not None
+        and claude_profiles.is_multi_profile
+        and cfg.experimental_claude_broker
+    ):
+        errors.append(
+            "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER is not supported with "
+            "multiple Claude profiles")
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if not valid_machine_id(cfg.machine_id):

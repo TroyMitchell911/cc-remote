@@ -1,4 +1,4 @@
-import type { CodexProfileInfo } from "./protocol";
+import type { ClaudeProfileInfo, CodexProfileInfo } from "./protocol";
 
 const SECONDARY_NAMES = [
   "nyx",
@@ -22,8 +22,10 @@ export interface CodexProfilePresentation {
   tone: number;
 }
 
+type AccountProfileInfo = ClaudeProfileInfo | CodexProfileInfo;
+
 /** Resolve account ownership from the routing id while a fresh/forked row is
- * still waiting for the authoritative catalog. Multi-profile Codex wire ids
+ * still waiting for the authoritative catalog. Multi-profile wire ids
  * are always ``profile@native``; falling back to the default during this gap
  * would paint the wrong account's model and capability catalogs. */
 export function codexProfileIdForSession(
@@ -37,8 +39,10 @@ export function codexProfileIdForSession(
     : defaultProfileId ?? null;
 }
 
+export const claudeProfileIdForSession = codexProfileIdForSession;
+
 export function codexProfilePresentation(
-  profiles: readonly CodexProfileInfo[],
+  profiles: readonly AccountProfileInfo[],
   defaultProfileId: string | null | undefined,
   profileId: string | null | undefined,
 ): CodexProfilePresentation | null {
@@ -61,3 +65,5 @@ export function codexProfilePresentation(
     tone: isDefault ? 0 : (secondaryIndex % 7) + 1,
   };
 }
+
+export const claudeProfilePresentation = codexProfilePresentation;

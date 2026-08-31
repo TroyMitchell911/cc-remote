@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -1192,13 +1193,15 @@ def test_switching_to_resident_claude_reseeds_its_actual_permission():
             session_id="claude-1", engine="claude"))
 
         assert [event.type for event in result] == [
-            "session_focus", "session_control", "completion_state", "perm",
+            "session_focus", "background_process_sync", "session_control",
+            "completion_state", "perm",
             "model", "effort", "auto_compact", "state"]
-        assert result[3].mode == "default"
-        assert result[4].model == "claude-sonnet-5"
-        assert result[5].effort == "high"
-        assert result[6].mode == "inherit"
-        assert result[7].state == "idle"
+        assert result[1].items == []
+        assert result[4].mode == "default"
+        assert result[5].model == "claude-sonnet-5"
+        assert result[6].effort == "high"
+        assert result[7].mode == "inherit"
+        assert result[8].state == "idle"
 
     asyncio.run(go())
 
@@ -1279,6 +1282,92 @@ def test_claude_work_btw_reuses_registered_policy_and_work_identity(monkeypatch)
         assert fork.sdk.connected == {
             "resume_id": "parent-work", "cwd": record.cwd, "fork": True,
         }
+
+    asyncio.run(go())
+
+
+def test_claude_profile_work_btw_keeps_config_and_policy_account(
+    monkeypatch, tmp_path,
+):
+    created = []
+
+    class FakeHandle:
+        @staticmethod
+        def preflight(_path):
+            return None
+
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.permission_mode = "bypassPermissions"
+            self.effort = "max"
+            self.work_mode = False
+            self.work_settings_path = None
+            self.connected = None
+            created.append(self)
+
+        async def connect(self, **kwargs):
+            self.connected = kwargs
+
+        async def disconnect(self):
+            return None
+
+    async def go():
+        personal = tmp_path / "personal"
+        company = tmp_path / "company"
+        personal.mkdir()
+        company.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(personal))
+        cfg = WrapperConfig()
+        cfg.state_dir = tmp_path / "state"
+        cfg.claude_work_root = tmp_path / "work" / "claude"
+        cfg.codex_work_root = tmp_path / "work" / "codex"
+        cfg.claude_profiles_json = json.dumps({
+            "personal": {
+                "label": "Personal",
+                "config_dir": str(personal),
+                "default": True,
+            },
+            "company": {
+                "label": "Company",
+                "config_dir": str(company),
+            },
+        })
+        machine, transport = _mk_machine()
+        machine = machine_module.WrapperMachine(cfg, transport)
+        monkeypatch.setattr(machine_module, "SdkHandle", FakeHandle)
+
+        store = machine._work.for_engine("claude")
+        record = store.create_session(claude_profile_id="company")
+        store.bind_session(
+            record.work_id, "parent-work", claude_profile_id="company")
+        observed_policy_roots = []
+        real_policy = store.ensure_claude_policy
+
+        def tracked_policy(work_record, *, claude_config_dir=None):
+            observed_policy_roots.append(claude_config_dir)
+            return real_policy(
+                work_record, claude_config_dir=claude_config_dir)
+
+        monkeypatch.setattr(store, "ensure_claude_policy", tracked_policy)
+        parent = _mk_ctx("company@parent-work", "parent-work")
+        parent.claude_profile_id = "company"
+        parent.cwd = record.cwd
+        parent.space = "work"
+        parent.work_id = record.work_id
+        parent.sdk = SimpleNamespace(permission_mode="bypassPermissions")
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        handle = created[-1]
+        assert handle.init == {
+            "claude_config_dir": str(company.resolve()),
+            "isolate_account_env": True,
+        }
+        assert observed_policy_roots == [str(company.resolve())]
+        assert fork.claude_profile_id == "company"
+        assert fork.sdk.permission_mode == "acceptEdits"
 
     asyncio.run(go())
 

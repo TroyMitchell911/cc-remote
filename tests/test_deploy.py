@@ -297,27 +297,40 @@ def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
     assert not Path(f"{codex_database}-shm").exists()
 
 
-def test_work_registry_migration_verifier_rejects_unowned_codex_rows(tmp_path):
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_work_registry_migration_verifier_rejects_unowned_profile_rows(
+    tmp_path, engine,
+):
     roots = {
         "claude": tmp_path / "claude-work",
         "codex": tmp_path / "codex-work",
     }
-    roots["codex"].mkdir()
-    database_path = roots["codex"] / "registry.sqlite3"
+    for candidate, root in roots.items():
+        root.mkdir()
+        profile_column = f"{candidate}_profile_id"
+        with sqlite3.connect(root / "registry.sqlite3") as database:
+            database.executescript(
+                f"""
+                CREATE TABLE work_sessions (
+                    engine TEXT NOT NULL,
+                    {profile_column} TEXT
+                );
+                CREATE TABLE work_schedules ({profile_column} TEXT);
+                CREATE TABLE work_schedule_runs ({profile_column} TEXT);
+                INSERT INTO work_sessions VALUES ('{candidate}', 'primary');
+                INSERT INTO work_schedules VALUES ('primary');
+                INSERT INTO work_schedule_runs VALUES ('primary');
+                """
+            )
+    database_path = roots[engine] / "registry.sqlite3"
+    profile_column = f"{engine}_profile_id"
     with sqlite3.connect(database_path) as database:
-        database.executescript(
-            """
-            CREATE TABLE work_sessions (
-                engine TEXT NOT NULL,
-                codex_profile_id TEXT
-            );
-            CREATE TABLE work_schedules (codex_profile_id TEXT);
-            CREATE TABLE work_schedule_runs (codex_profile_id TEXT);
-            INSERT INTO work_sessions VALUES ('codex', NULL);
-            INSERT INTO work_schedules VALUES (NULL);
-            INSERT INTO work_schedule_runs VALUES (NULL);
-            """
-        )
+        database.execute(
+            f"UPDATE work_sessions SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedules SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedule_runs SET {profile_column} = NULL")
     snapshot = tmp_path / "snapshot"
     create_snapshot(snapshot, roots)
 
@@ -329,13 +342,13 @@ def test_work_registry_migration_verifier_rejects_unowned_codex_rows(tmp_path):
 
     with sqlite3.connect(database_path) as database:
         database.execute(
-            "UPDATE work_sessions SET codex_profile_id = 'primary'"
+            f"UPDATE work_sessions SET {profile_column} = 'primary'"
         )
         database.execute(
-            "UPDATE work_schedules SET codex_profile_id = 'primary'"
+            f"UPDATE work_schedules SET {profile_column} = 'primary'"
         )
         database.execute(
-            "UPDATE work_schedule_runs SET codex_profile_id = 'primary'"
+            f"UPDATE work_schedule_runs SET {profile_column} = 'primary'"
         )
     verify_profile_migration(snapshot)
 
@@ -661,7 +674,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v42_layout():
+def test_release_docs_and_examples_describe_one_atomic_v44_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -674,11 +687,11 @@ def test_release_docs_and_examples_describe_one_atomic_v42_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v42" in deploy_readme
+    assert "Protocol v44" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v42" in document
+        assert "v44" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -689,11 +702,15 @@ def test_release_docs_and_examples_describe_one_atomic_v42_layout():
     assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
     assert "CC_REMOTE_CODEX_PROFILES_JSON" in wrapper_env
     assert "CC_REMOTE_CODEX_PROFILES_FILE" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_JSON" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_FILE" in wrapper_env
     assert "Codex Work uses only that default" not in wrapper_env
     assert "Work 只使用默认项" not in readme
     assert "Work uses only the default" not in readme_en
     assert "<key>CC_REMOTE_CODEX_PROFILES_FILE</key>" in wrapper_plist
     assert "__HOME__/.cc-remote/codex-profiles.json" in wrapper_plist
+    assert "<key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>" in wrapper_plist
+    assert "__HOME__/.cc-remote/claude-profiles.json" in wrapper_plist
     assert "<key>CLAUDE_WORK_ROOT</key>" in wrapper_plist
     assert "<string>__CLAUDE_WORK_ROOT__</string>" in wrapper_plist
     assert "<key>CODEX_WORK_ROOT</key>" in wrapper_plist
@@ -710,12 +727,15 @@ def test_release_docs_and_examples_describe_one_atomic_v42_layout():
     restart = wrapper_installer.index("if ! restart_after_rollback")
     assert snapshot < activate
     assert restore < restart
-    assert "Codex Work profile migration did not become ready" in wrapper_installer
+    assert (
+        "Claude/Codex Work profile migrations did not become ready"
+        in wrapper_installer
+    )
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.142" in claude
-    assert "protocol v42" in claude
+    assert "protocol v44" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

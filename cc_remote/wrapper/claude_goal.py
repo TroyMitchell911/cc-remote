@@ -111,7 +111,10 @@ def current_goal(goal: dict[str, Any] | None, now: float | None = None):
 
 
 def read_claude_goal(
-    session_id: str, *, now: float | None = None,
+    session_id: str,
+    *,
+    now: float | None = None,
+    path: str | None = None,
 ) -> tuple[bool, dict[str, Any] | None]:
     """Return ``(transcript_exists, active_goal)`` for ``session_id``.
 
@@ -119,15 +122,15 @@ def read_claude_goal(
     status is one evaluator iteration, and any true status clears it (natural
     completion and ``/goal clear`` use the same persisted transition).
     """
-    path = transcript_path(session_id)
-    if not path:
+    source_path = path or transcript_path(session_id)
+    if not source_path:
         return False, None
 
     goal: dict[str, Any] | None = None
     message_tokens: dict[str, int] = {}
     records = 0
     try:
-        with open(path, encoding="utf-8") as transcript:
+        with open(source_path, encoding="utf-8") as transcript:
             for line in _bounded_jsonl_lines(transcript):
                 records += 1
                 if records > _MAX_GOAL_RECORDS:

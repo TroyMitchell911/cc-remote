@@ -167,6 +167,32 @@ assert.deepEqual(
   },
   "a transient empty catalog keeps the exact fork child visible",
 );
+const claudeFocusLease = {
+  ...focusLease,
+  parentSessionId: "company@claude-parent",
+  childSessionId: "company@claude-child",
+  engine: "claude" as const,
+  gitBranch: null,
+  codexProfileId: null,
+  claudeProfileId: "company",
+};
+assert.deepEqual(
+  forkFocusLeaseSession(
+    claudeFocusLease, [claude], "machine-1", "claude", "code"),
+  {
+    session_id: "company@claude-child",
+    summary: "派生会话",
+    cwd: "/repo",
+    git_branch: null,
+    engine: "claude",
+    space: "code",
+    forked_from_id: "company@claude-parent",
+    claude_profile_id: "company",
+    state: "idle",
+    provisional_fork: true,
+  },
+  "a Claude fork placeholder retains its config-directory account",
+);
 assert.equal(forkFocusLeaseSession(
   focusLease, [{ session_id: "codex-child" }],
   "machine-1", "codex", "code"), null,

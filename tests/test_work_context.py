@@ -221,6 +221,31 @@ def test_migrated_work_baseline_recovers_from_native_histories(
     assert recover_work_context_baseline("codex", "codex-session") == 16_774
 
 
+def test_claude_context_and_work_baseline_accept_profile_explicit_paths(
+    tmp_path: Path, monkeypatch,
+):
+    transcript = tmp_path / "company.jsonl"
+    transcript.write_text(
+        '{"type":"assistant","message":{"usage":{'
+        '"input_tokens":300,"cache_creation_input_tokens":20,'
+        '"cache_read_input_tokens":4,"output_tokens":5}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        work_context_module,
+        "transcript_path",
+        lambda _sid: (_ for _ in ()).throw(
+            AssertionError("ambient Claude catalog must not be read")),
+    )
+
+    assert recover_claude_context_usage(
+        "same-native-id", path=str(transcript),
+    ) == {"totalTokens": 329}
+    assert recover_work_context_baseline(
+        "claude", "same-native-id", claude_path=str(transcript),
+    ) == 324
+
+
 def test_codex_work_baseline_uses_the_default_profile_home(
     tmp_path: Path, monkeypatch,
 ):

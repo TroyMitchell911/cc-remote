@@ -47,6 +47,31 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
         fresh.complete("request-1", "child-1")
 
 
+def test_profile_migration_revision_prevents_swap_replay(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-1", "a@parent", "message-1", "/repo")
+    assert journal.claim_submission("request-1") is True
+    journal.complete("request-1", "a@child")
+
+    def swap(value: str) -> str:
+        profile, native = value.split("@", 1)
+        return f"{'b' if profile == 'a' else 'a'}@{native}"
+
+    assert journal.migrate_profile_sessions(
+        swap, profile_revision=2) == 2
+    assert journal.entries["request-1"]["parent_session_id"] == "b@parent"
+    assert journal.entries["request-1"]["session_id"] == "b@child"
+
+    # Simulate a wrapper crash after this journal committed but before the
+    # topology transaction completed. Replaying revision 2 must be a no-op,
+    # even though applying the swap transform twice would reverse ownership.
+    reloaded = ClaudeForkJournal(tmp_path)
+    assert reloaded.migrate_profile_sessions(
+        swap, profile_revision=2) == 0
+    assert reloaded.entries["request-1"]["parent_session_id"] == "b@parent"
+    assert reloaded.entries["request-1"]["session_id"] == "b@child"
+
+
 def test_same_unresolved_identity_aliases_to_canonical_marker(tmp_path):
     journal = ClaudeForkJournal(tmp_path)
     original = _begin(journal, "request-old")

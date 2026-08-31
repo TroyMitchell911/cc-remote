@@ -31,6 +31,7 @@ from claude_agent_sdk.types import (
 )
 
 from cc_remote.protocol import ProcessEvent, ToolUse, TurnEnd, UserMsg
+from cc_remote.wrapper import claude_catalog
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     _is_agent_task_type,
@@ -436,9 +437,13 @@ def _notification_event(content: str) -> ProcessEvent | None:
     )
 
 
-def _source_agent_files(session_id: str) -> dict[str, str]:
+def _source_agent_files(
+    session_id: str,
+    *,
+    main_path: str | None = None,
+) -> dict[str, str]:
     """Collect bounded Agent transcript paths without opening their payloads."""
-    main = transcript_path(session_id)
+    main = main_path or transcript_path(session_id)
     if not main:
         return {}
     root = os.path.join(os.path.splitext(main)[0], "subagents")
@@ -493,12 +498,20 @@ def _main_metadata(
     session_id: str,
     run_id: str,
     fallback_title: str | None = None,
+    *,
+    main_path: str | None = None,
 ) -> tuple[str, str]:
     title = fallback_title or "协作代理"
     status = "unknown"
     # The shared lifecycle scanner handles launch titles, notifications and
     # resumed/no-terminal records in one pass over the main transcript.
-    for event in translate_subagent_history(session_id, 64 * 1024):
+    events = (
+        translate_subagent_history(session_id, 64 * 1024)
+        if main_path is None
+        else translate_subagent_history(
+            session_id, 64 * 1024, path=main_path)
+    )
+    for event in events:
         if isinstance(event, ProcessEvent) and event.item_id == run_id:
             title = event.title or title
             status = event.status
@@ -509,10 +522,13 @@ def resolve_source_agent(
     session_id: str,
     run_id: str,
     directory: str | None,
+    *,
+    main_path: str | None = None,
 ) -> SourceAgentLocation | None:
     """Resolve public identity without reading the complete Agent transcript."""
     del directory  # transcript_path already resolves the canonical session
-    source_files = _source_agent_files(session_id)
+    source_files = _source_agent_files(
+        session_id, main_path=main_path)
     resolved: dict[str, tuple[str, str | None, str, str | None]] = {}
     target_id = None
     for agent_id, source_path in source_files.items():
@@ -530,7 +546,11 @@ def resolve_source_agent(
     parent_run_id = resolved.get(parent_agent or "", (None, None))[0]
     source_path = resolved[target_id][2]
     title, status = _main_metadata(
-        session_id, run_id, resolved[target_id][3])
+        session_id,
+        run_id,
+        resolved[target_id][3],
+        main_path=main_path,
+    )
     return SourceAgentLocation(
         run_id=run_id,
         title=title,
@@ -546,6 +566,8 @@ def translate_source_agent(
     location: SourceAgentLocation,
     directory: str | None,
     tool_result_max: int,
+    *,
+    config_dir: str | os.PathLike[str] | None = None,
 ) -> SourceAgentDetail:
     """Translate one resolved Agent while omitting every delegated user prompt."""
     if location.source_path:
@@ -556,8 +578,17 @@ def translate_source_agent(
         if source_bytes > _MAX_AGENT_SOURCE_BYTES:
             raise AgentSourceTooLarge(
                 "Claude Agent transcript exceeds the bounded read budget")
-    target_messages = get_subagent_messages(
-        session_id, location.agent_id, directory=directory)
+    target_messages = (
+        get_subagent_messages(
+            session_id, location.agent_id, directory=directory)
+        if config_dir is None
+        else claude_catalog.get_subagent_messages(
+            config_dir,
+            session_id,
+            location.agent_id,
+            directory=directory,
+        )
+    )
 
     rows: list[SimpleNamespace] = []
     internal_events: dict[str, ProcessEvent] = {}
@@ -622,10 +653,19 @@ def load_source_agent_detail(
     run_id: str,
     directory: str | None,
     tool_result_max: int,
+    *,
+    main_path: str | None = None,
+    config_dir: str | os.PathLike[str] | None = None,
 ) -> SourceAgentDetail | None:
     """Compatibility helper combining official identity and detail reads."""
-    location = resolve_source_agent(session_id, run_id, directory)
+    location = resolve_source_agent(
+        session_id, run_id, directory, main_path=main_path)
     if location is None:
         return None
     return translate_source_agent(
-        session_id, location, directory, tool_result_max)
+        session_id,
+        location,
+        directory,
+        tool_result_max,
+        config_dir=config_dir,
+    )

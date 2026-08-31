@@ -66,7 +66,7 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
         replay_frames = [msg for msg in transport.sent if msg.sid == "s-replay"]
         assert [msg.type for msg in replay_frames] == [
             "replay_start", "delta", "turn_end", "replay_end",
-            "ask_user_sync", "session_control", "query_queue",
+            "ask_user_sync", "background_process_sync", "session_control", "query_queue",
             "completion_state", "perm", "auto_compact",
         ]
         assert all(msg.to == "client-1" for msg in replay_frames)

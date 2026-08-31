@@ -82,6 +82,40 @@ def test_transcript_goal_status_recovers_progress_and_clear(tmp_path, monkeypatc
     assert read_claude_goal("session-1", now=1_783_814_410) == (True, None)
 
 
+def test_profile_sdk_goal_refresh_reads_only_its_config_dir(
+    tmp_path, monkeypatch,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+    transcript = (
+        tmp_path / "company" / "projects" / "-repo"
+        / f"{session_id}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps(_record(
+        "attachment",
+        timestamp="2026-07-12T00:00:00Z",
+        attachment={
+            "type": "goal_status",
+            "met": False,
+            "sentinel": True,
+            "condition": "company goal",
+        },
+    )) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        goal_module,
+        "transcript_path",
+        lambda _sid: (_ for _ in ()).throw(
+            AssertionError("ambient Claude catalog must not be read")),
+    )
+
+    handle = SdkHandle(
+        SimpleNamespace(), claude_config_dir=str(tmp_path / "company"))
+    goal = asyncio.run(handle.refresh_goal(session_id))
+
+    assert goal["threadId"] == session_id
+    assert goal["objective"] == "company goal"
+
+
 def test_raw_active_goal_schema_maps_to_common_contract():
     message = SystemMessage(subtype="active_goal", data={
         "type": "active_goal",

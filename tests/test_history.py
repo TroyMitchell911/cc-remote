@@ -33,6 +33,7 @@ from cc_remote.protocol import (
     CodexTerminalFence, GetHistory, GetHistoryImage, GetTurnDetail, History,
     HistoryImage,
     TurnDetail, HistoryInvalidated,
+    BackgroundProcessSync,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
     ToolUse, ToolResult,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
@@ -4717,6 +4718,123 @@ def test_history_image_tool_asset_is_served_only_from_current_turn_reference(
     asyncio.run(go())
 
 
+def test_claude_tool_image_rehydrates_from_transcript_after_asset_eviction(
+    tmp_path,
+):
+    raw, encoded = _test_png()
+    prompt_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    rows = [
+        {
+            "uuid": prompt_id,
+            "type": "user",
+            "message": {"role": "user", "content": "draw it"},
+        },
+        {
+            "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image",
+                "name": "Read",
+                "input": {"file_path": "/tmp/chart.png"},
+            }]},
+        },
+        {
+            "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded,
+                    },
+                }],
+            }]},
+        },
+        {
+            "uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "type": "assistant",
+            "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "done"}]},
+        },
+    ]
+    transcript = tmp_path / "claude-tool-image.jsonl"
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    messages = [SimpleNamespace(**row) for row in rows]
+    events = translate_history(messages, 65_536)
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image"})
+    materialized = mm._attach_claude_history_image_refs([events], assets)
+    assert len(materialized) == 1
+    event_rows = tuple(event.model_dump(mode="json") for event in events)
+    assert encoded not in json.dumps(event_rows)
+    image_ref = next(
+        event["input"]["history_image"]
+        for event in event_rows
+        if event.get("type") == "process"
+        and event.get("item_id") == "tool-image"
+        and event.get("phase") == "end"
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-claude-image")
+        machine._watch_session = lambda _sid: None
+        machine._claude_transcript_path_for_wire = (
+            lambda _sid: str(transcript)
+        )
+        ctx = _mk_ctx("session-claude-image", "session-claude-image")
+        ctx.engine = "claude"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(transcript)
+        page = MaterializedHistoryPage(
+            events=event_rows,
+            has_more=False,
+            oldest_id=prompt_id,
+            newest_id=prompt_id,
+            turns=materialize_history_turns(event_rows),
+        )
+        machine._history_index.put_page(
+            "session-claude-image", "claude", source,
+            before=None, limit=4, page=page, detail_events=event_rows,
+        )
+        revision = machine._history_revision("session-claude-image")
+
+        thumbnail = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-claude-image",
+            turn_id=prompt_id,
+            image_id=image_ref["image_id"],
+            variant="thumbnail",
+            request_id="thumbnail-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert thumbnail.error is None
+        assert thumbnail.media_type == "image/webp"
+        assert thumbnail.width == 48 and thumbnail.height == 24
+
+        full = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-claude-image",
+            turn_id=prompt_id,
+            image_id=image_ref["image_id"],
+            variant="full",
+            request_id="full-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert full.error is None and full.media_type == "image/png"
+        assert base64.b64decode(full.data) == raw
+
+    asyncio.run(go())
+
+
 def test_codex_summary_keeps_rollout_image_refs_and_lazy_source_detail(
     monkeypatch, tmp_path,
 ):
@@ -5502,7 +5620,7 @@ def test_compacted_claude_main_chain_recovers_precompact_history(
     assert recovered is not None
     messages, timestamps = recovered
     assert [message.uuid for message in messages] == [
-        "user-before", "assistant-before", "compact-summary",
+        "user-before", "assistant-before", "compact-boundary", "compact-summary",
         "compact-command", "user-after", "assistant-after",
     ]
     events = translate_history(messages, 10_000, timestamps=timestamps)
@@ -5776,6 +5894,7 @@ def test_compact_index_loads_large_active_record_and_task_notification(tmp_path)
                     if message.uuid == "answer-large").message["content"][0][
                         "text"]) == 20 * 1024 * 1024
     assert internal_events["task-notification"].kind == "task"
+    assert internal_events["compact-boundary"].kind == "compaction"
 
 
 def test_compacted_claude_page_loads_only_requested_main_chain_turns(
@@ -5845,7 +5964,8 @@ def test_compacted_claude_page_loads_only_requested_main_chain_turns(
         "claude-compact", path=str(transcript), before="user-4", limit=2)
     assert older is not None
     assert [message.uuid for message in older.messages] == [
-        "user-2", "answer-2", "compact-summary", "compact-command",
+        "user-2", "answer-2", "compact-boundary",
+        "compact-summary", "compact-command",
         "user-3", "answer-3",
     ]
     assert older.has_more is True
@@ -5901,7 +6021,7 @@ def test_compacted_claude_page_uses_only_visible_human_boundaries(tmp_path):
     assert older.oldest_cursor == "user-old"
     assert older.has_more is False
     assert [message.uuid for message in older.messages] == [
-        "user-old", "answer-old", "compact-summary",
+        "user-old", "answer-old", "compact-boundary", "compact-summary",
         "task-notification", "blank-user",
     ]
     exhausted = transcript_compact_history_page(
@@ -6816,13 +6936,59 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
         assert types == [
-            "snapshot", "ask_user_sync", "query_queue",
+            "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
             "completion_state", "perm", "auto_compact",
-            "snapshot", "ask_user_sync", "query_queue",
+            "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
             "completion_state", "perm", "auto_compact",
         ]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
+    asyncio.run(go())
+
+
+def test_background_process_membership_replays_and_clears_authoritatively():
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s1", "s1")
+        machine.sessions["s1"] = ctx
+
+        await machine._emit(ctx, ProcessEvent(
+            item_id="bash-task", kind="task", phase="start",
+            status="running", turn_id="turn-1", parent_id="bash-tool",
+            title="Run verification", command="make verify",
+            background=True,
+        ))
+        assert [message.type for message in transport.sent] == [
+            "process", "background_process_sync",
+        ]
+        assert is_downstream(transport.sent[-1]) is False
+        assert ctx.seq == 1
+        assert ctx.claude_background_processes["bash-task"].command \
+            == "make verify"
+
+        transport.sent.clear()
+        await machine._handle_client_hello(SimpleNamespace(client_id="phone"))
+        snapshot = next(
+            message for message in transport.sent
+            if isinstance(message, BackgroundProcessSync)
+        )
+        assert snapshot.to == "phone" and snapshot.seq is None
+        assert [item.item_id for item in snapshot.items] == ["bash-task"]
+
+        transport.sent.clear()
+        await machine._emit(ctx, ProcessEvent(
+            item_id="bash-task", kind="task", phase="end",
+            status="succeeded", turn_id="turn-1", parent_id="bash-tool",
+            title="Run verification", background=True,
+        ))
+        assert [message.type for message in transport.sent] == [
+            "process", "background_process_sync",
+        ]
+        assert is_downstream(transport.sent[-1]) is False
+        assert ctx.seq == 2
+        assert transport.sent[-1].items == []
+        assert ctx.claude_background_processes == {}
+
     asyncio.run(go())
 
 
@@ -6844,7 +7010,8 @@ def test_hello_with_cursor_replays_only_missing_tail():
 
         assert [msg.type for msg in tr.sent] == [
             "replay_start", "user_msg", "replay_end", "ask_user_sync",
-            "session_control", "query_queue", "completion_state", "perm",
+            "background_process_sync", "session_control", "query_queue",
+            "completion_state", "perm",
             "auto_compact"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
@@ -6871,7 +7038,8 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 
         assert [msg.type for msg in tr.sent] == [
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
-            "ask_user_sync", "query_queue", "completion_state", "perm",
+            "ask_user_sync", "background_process_sync", "query_queue",
+            "completion_state", "perm",
             "auto_compact"]
         assert tr.sent[2].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
@@ -8622,6 +8790,380 @@ def test_claude_history_keeps_synthetic_api_error_but_marks_turn_failed():
     assert terminal.result.subtype == "error"
     assert terminal.result.is_error is True
     assert last_assistant_model(messages) is None
+
+
+def _test_png() -> tuple[bytes, str]:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (48, 24), (34, 92, 150)).save(buffer, "PNG")
+    raw = buffer.getvalue()
+    return raw, base64.b64encode(raw).decode("ascii")
+
+
+def test_live_claude_image_read_reuses_view_image_process_without_base64():
+    _raw, encoded = _test_png()
+    translator = StreamTranslator(65_536, turn_id="turn-image")
+
+    started = translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image", name="Read",
+            input={"file_path": "/tmp/chart.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image",
+    ))
+    process_start = next(
+        event for event in started
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    )
+    assert process_start.kind == "server_tool"
+    assert process_start.phase == "start"
+    assert process_start.tool == "view_image"
+    assert process_start.input == {"file_path": "/tmp/chart.png"}
+    assert not any(isinstance(event, ToolUse) for event in started)
+
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image",
+        content=[{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": encoded,
+            },
+        }],
+    )]))
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    )
+    assert process_end.phase == "end"
+    assert process_end.status == "succeeded"
+    assert process_end.tool == "view_image"
+    assert not any(isinstance(event, ToolResult) for event in finished)
+    assert encoded not in "".join(
+        event.model_dump_json() for event in [*started, *finished]
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "is_error", "status"),
+    [
+        ("file is not a supported image", False, "succeeded"),
+        ("permission denied", True, "failed"),
+    ],
+)
+def test_live_claude_image_suffix_without_image_preserves_result(
+    content, is_error, status,
+):
+    translator = StreamTranslator(65_536, turn_id="turn-image-fallback")
+    translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image-fallback", name="Read",
+            input={"file_path": "/tmp/not-an-image.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image-fallback",
+    ))
+
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image-fallback",
+        content=content,
+        is_error=is_error,
+    )]))
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-fallback"
+    )
+    assert process_end.phase == "end"
+    assert process_end.status == status
+    assert process_end.tool == "Read"
+    assert process_end.output == content
+    assert "preview_id" not in (process_end.input or {})
+
+
+def test_failed_claude_image_read_never_projects_base64_as_output():
+    _raw, encoded = _test_png()
+    translator = StreamTranslator(65_536, turn_id="turn-image-error")
+    translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image-error", name="Read",
+            input={"file_path": "/tmp/error.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image-error",
+    ))
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image-error",
+        content=[{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": encoded,
+            },
+        }],
+        is_error=True,
+    )]))
+
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-error"
+    )
+    assert process_end.status == "failed"
+    assert process_end.tool == "Read"
+    assert process_end.output == "图片读取结果不可用"
+    assert encoded not in process_end.model_dump_json()
+
+
+def test_image_read_fallback_clears_provisional_preview_candidate():
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("image-fallback", "image-fallback")
+        start = ProcessEvent(
+            item_id="tool-image-fallback",
+            kind="server_tool",
+            phase="start",
+            status="running",
+            title="查看图片",
+            input={"file_path": "/tmp/not-an-image.png"},
+            tool="view_image",
+        )
+        await machine._observe_preview_image_event(ctx, start)
+        assert set(ctx.preview_image_candidates) == {"tool-image-fallback"}
+        assert ctx.preview_image_candidates["tool-image-fallback"].endswith(
+            "/tmp/not-an-image.png")
+
+        fallback = ProcessEvent(
+            item_id="tool-image-fallback",
+            kind="server_tool",
+            phase="end",
+            status="failed",
+            title="读取 · /tmp/not-an-image.png",
+            input={"file_path": "/tmp/not-an-image.png"},
+            output="permission denied",
+            tool="Read",
+        )
+        await machine._observe_preview_image_event(ctx, fallback)
+        assert ctx.preview_image_candidates == {}
+
+    asyncio.run(go())
+
+
+def test_claude_history_image_read_uses_lazy_ref_not_tool_output():
+    raw, encoded = _test_png()
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "draw it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image",
+                "name": "Read",
+                "input": {"file_path": "/tmp/chart.png"},
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="33333333-3333-4333-8333-333333333333",
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded,
+                    },
+                }],
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="44444444-4444-4444-8444-444444444444",
+            type="assistant",
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "done"}]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    image_rows = [
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    ]
+    assert [event.phase for event in image_rows] == ["start", "end"]
+    assert all(event.tool == "view_image" for event in image_rows)
+    assert not any(
+        isinstance(event, (ToolUse, ToolResult))
+        and getattr(event, "tool_use_id", None) == "tool-image"
+        for event in events
+    )
+    assert encoded not in "".join(event.model_dump_json() for event in events)
+
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image"})
+    materialized = mm._attach_claude_history_image_refs([events], assets)
+    assert len(materialized) == 1
+    assert materialized[0].data == raw
+    image_ref = image_rows[-1].input["history_image"]
+    assert image_ref["width"] == 48 and image_ref["height"] == 24
+    assert image_ref["byte_size"] == len(raw)
+    assert encoded not in "".join(event.model_dump_json() for event in events)
+
+
+def test_claude_history_image_materialization_bounds_retained_bodies():
+    raw, encoded = _test_png()
+    groups = []
+    assets = []
+    for index in range(2):
+        turn_id = f"11111111-1111-4111-8111-11111111111{index}"
+        item_id = f"tool-image-{index}"
+        groups.append([
+            UserMsg(msg_id=turn_id, prompt="draw it"),
+            ProcessEvent(
+                item_id=item_id,
+                kind="server_tool",
+                phase="end",
+                status="succeeded",
+                title="查看图片",
+                input={"file_path": f"/tmp/chart-{index}.png"},
+                tool="view_image",
+            ),
+        ])
+        assets.append(stream_module.ClaudeHistoryImageAsset(
+            item_id=item_id,
+            image_id=stream_module.claude_history_image_id(item_id),
+            media_type="image/png",
+            data=encoded,
+        ))
+
+    materialized = mm._attach_claude_history_image_refs(
+        groups,
+        tuple(assets),
+        max_cached_bytes=len(raw),
+    )
+    assert len(materialized) == 2
+    assert sum(image.data is not None for image in materialized) == 1
+    assert all(
+        group[-1].input.get("history_image") is not None
+        for group in groups
+    )
+
+
+def test_claude_history_non_image_read_result_stays_visible():
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "open it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image-fallback",
+                "name": "Read",
+                "input": {"file_path": "/tmp/not-an-image.png"},
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="33333333-3333-4333-8333-333333333333",
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image-fallback",
+                "is_error": True,
+                "content": "permission denied",
+            }]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    process_end = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-fallback"
+        and event.phase == "end"
+    )
+    assert process_end.status == "failed"
+    assert process_end.tool == "Read"
+    assert process_end.output == "permission denied"
+    assert stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image-fallback"},
+    ) == ()
+
+
+def test_claude_history_assistant_result_uses_same_image_shapes(tmp_path):
+    raw, encoded = _test_png()
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "draw it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "tool-image-server",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/server-chart.png"},
+                },
+                {
+                    "type": "server_tool_result",
+                    "tool_use_id": "tool-image-server",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": encoded,
+                        },
+                    }],
+                },
+            ]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    image_end = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-server"
+        and event.phase == "end"
+    )
+    assert image_end.tool == "view_image"
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image-server"},
+    )
+    assert len(assets) == 1 and base64.b64decode(assets[0].data) == raw
+    transcript = tmp_path / "assistant-image-result.jsonl"
+    transcript.write_text("".join(
+        json.dumps({
+            "uuid": message.uuid,
+            "type": message.type,
+            "message": message.message,
+        }) + "\n"
+        for message in messages
+    ))
+    assert stream_module.read_claude_history_image_asset(
+        str(transcript), assets[0].image_id,
+    ) is not None
 
 
 def test_live_claude_turn_end_uses_last_assistant_transcript_uuid():

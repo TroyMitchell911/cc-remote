@@ -88,6 +88,20 @@ def test_session_presentation_rejects_unknown_payload_fields(tmp_path):
         SessionPresentationStore(tmp_path)
 
 
+def test_session_presentation_rejects_inconsistent_profile_revisions(tmp_path):
+    (tmp_path / "session-presentation.json").write_text(
+        json.dumps({
+            "version": 4,
+            "profile_revision": 3,
+            "profile_revisions": {"claude": 0, "codex": 4},
+            "sessions": {},
+        }),
+        encoding="utf-8",
+    )
+    with pytest.raises(SessionPresentationStoreError, match="unreadable"):
+        SessionPresentationStore(tmp_path)
+
+
 def test_session_presentation_rejects_symlinks(tmp_path):
     target = tmp_path / "target.json"
     target.write_text('{"version":1,"sessions":{}}', encoding="utf-8")
@@ -133,7 +147,7 @@ def test_presentation_is_engine_scoped_and_v1_bare_ids_are_quarantined(
     restored = SessionPresentationStore(tmp_path)
     assert restored.get("claude", "ambiguous-native").completion_id == "turn-a"
     assert restored.get("codex", "ambiguous-native").completion_id is None
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 4
 
 
 def test_claiming_legacy_does_not_replace_newer_scoped_receipt(tmp_path):

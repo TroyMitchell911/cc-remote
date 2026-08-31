@@ -15,12 +15,14 @@ import type {
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
-  PreviewAuthorizationOperation, CodexProfileInfo,
+  PreviewAuthorizationOperation, ClaudeProfileInfo, CodexProfileInfo,
   CodexTerminalFence, AutoCompact, AutoCompactMode,
+  BackgroundProcessItem,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
   compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
+  MAX_BACKGROUND_PROCESS_ITEMS,
 } from "./protocol";
 import type { Catalog } from "./data";
 import type { DiffLine, GitDiffSection } from "./diff";
@@ -115,19 +117,17 @@ const MAX_LIVE_SPILL_ARCHIVE_CHARS = 16 * 1024 * 1024;
 // noisy app-server to grow every resident session indefinitely.
 export const MAX_SESSION_NOTICES = 8;
 
-/** Account-sensitive model/default cache key. Claude remains byte-for-byte
- * compatible with its historical engine key; every Codex CODEX_HOME gets an
- * isolated lane so a late response can only update its own account. */
+/** Account-sensitive model/default cache key. */
 export function modelCatalogScopeKey(
   engine: string,
-  codexProfileId?: string | null,
+  profileId?: string | null,
 ): string {
-  return engine === "codex"
-    ? `codex\u0000${codexProfileId || "__default__"}`
+  return (engine === "codex" || engine === "claude") && profileId
+    ? `${engine}\u0000${profileId}`
     : engine;
 }
 
-export function nativeCodexSessionId(sessionId: string): string {
+export function nativeProfileSessionId(sessionId: string): string {
   const separator = sessionId.indexOf("@");
   return separator >= 0 ? sessionId.slice(separator + 1) : sessionId;
 }
@@ -202,6 +202,12 @@ export interface SessionRuntime {
   // Display-only activity observed from a native/external client. It must not
   // grant Stop/Interrupt semantics to a turn this wrapper does not own.
   mirroredRunning: boolean;
+  /** Claude-owned detached work, replaced authoritatively on Hello/reconnect. */
+  backgroundProcesses: ProcessBlock[];
+  /** True only for an explicit empty level, never inferred from terminal edges. */
+  backgroundLevelEmpty: boolean;
+  /** Source time of the last authoritative level, used to settle cached detail. */
+  backgroundLevelTs?: number;
   model: string;
   effort: string;
   autoCompact: AutoCompact | null;
@@ -381,8 +387,13 @@ export interface AppState {
     effort: string | null;
     autoCompactMode: AutoCompactMode;
     autoCompactThresholdTokens: number | null;
+    claudeProfileId: string | null;
     codexProfileId: string | null;
   } | null;
+  // Public labels/errors only; CLAUDE_CONFIG_DIR never crosses the wire.
+  claudeProfiles: ClaudeProfileInfo[];
+  defaultClaudeProfileId: string | null;
+  claudeProfileByScope: Record<string, string>;
   // Public labels/errors only; CODEX_HOME never crosses the wire. Selection is
   // scoped like cwd so Code accounts cannot leak across devices or surfaces.
   codexProfiles: CodexProfileInfo[];
@@ -429,6 +440,9 @@ export function createRuntime(): SessionRuntime {
     // has not heard them yet, so keep them unknown instead of briefly claiming a
     // model, effort, or permission policy that may not match the native CLI.
     turns: [], state: "idle", mirroredRunning: false,
+    backgroundProcesses: [],
+    backgroundLevelEmpty: false,
+    backgroundLevelTs: undefined,
     model: "", effort: "", autoCompact: null, perm: "",
     permissionProfile: null, permissionProfiles: null, webSearch: null,
     collaborationMode: "default",
@@ -520,9 +534,10 @@ export type Action =
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; autoCompactMode?: AutoCompactMode; autoCompactThresholdTokens?: number | null; codexProfileId?: string | null }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; autoCompactMode?: AutoCompactMode; autoCompactThresholdTokens?: number | null; claudeProfileId?: string | null; codexProfileId?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
   | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
+  | { type: "set_new_chat_claude_profile"; scopeKey: string; profileId: string }
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
@@ -539,6 +554,9 @@ export const initialState: AppState = {
   dirPicker: null,
   cwdByScope: {},
   newChat: null,
+  claudeProfiles: [],
+  defaultClaudeProfileId: null,
+  claudeProfileByScope: {},
   codexProfiles: [],
   defaultCodexProfileId: null,
   codexProfileByScope: {},
@@ -648,18 +666,20 @@ function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   return turn;
 }
 
-function appendLiveBlock<T extends Block>(turn: Turn, block: T): T {
-  if (block.liveOrder == null) {
-    let next = turn.nextLiveBlockOrder;
-    if (next == null) {
-      next = turn.blocks.reduce(
-        (maximum, candidate) => Math.max(maximum, candidate.liveOrder ?? -1),
-        -1,
-      ) + 1;
-    }
-    block.liveOrder = next;
-    turn.nextLiveBlockOrder = next + 1;
+function allocateLiveOrder(turn: Turn): number {
+  let next = turn.nextLiveBlockOrder;
+  if (next == null) {
+    next = turn.blocks.reduce(
+      (maximum, candidate) => Math.max(maximum, candidate.liveOrder ?? -1),
+      -1,
+    ) + 1;
   }
+  turn.nextLiveBlockOrder = next + 1;
+  return next;
+}
+
+function appendLiveBlock<T extends Block>(turn: Turn, block: T): T {
+  if (block.liveOrder == null) block.liveOrder = allocateLiveOrder(turn);
   turn.blocks.push(block);
   return block;
 }
@@ -1227,6 +1247,77 @@ function resolvedChannel(current: AssistantChannel | undefined, next: AssistantC
 function terminalProcessStatus(status: ProcessStatus): boolean {
   return status === "succeeded" || status === "failed" || status === "declined"
     || status === "cancelled" || status === "interrupted";
+}
+
+function backgroundProcessBlock(item: BackgroundProcessItem): ProcessBlock {
+  const startedTs = eventTimestampMs(item.started_at);
+  const updatedTs = eventTimestampMs(item.updated_at);
+  return {
+    kind: "process",
+    item_id: item.item_id,
+    processKind: item.kind,
+    phase: "snapshot",
+    status: item.status,
+    turn_id: item.turn_id,
+    parent_id: item.parent_id,
+    title: item.title,
+    summary: item.summary,
+    progress: item.progress,
+    command: item.command,
+    cwd: item.cwd,
+    background: true,
+    done: false,
+    startedTs,
+    updatedTs,
+  };
+}
+
+function applyBackgroundProcessEdge(
+  runtime: SessionRuntime,
+  event: Extract<ServerEvent, { type: "process" }>,
+): void {
+  if (event.background !== true
+      || (event.kind !== "agent" && event.kind !== "task")) return;
+  const current = runtime.backgroundProcesses;
+  const index = current.findIndex((block) => block.item_id === event.item_id);
+  const terminal = event.phase === "end" || terminalProcessStatus(event.status);
+  if (terminal) {
+    if (index >= 0) {
+      runtime.backgroundProcesses = [
+        ...current.slice(0, index), ...current.slice(index + 1),
+      ];
+    }
+    return;
+  }
+  // Only a fresh level can prove that no background work remains. A start edge
+  // invalidates a previously empty level; a terminal edge deliberately does
+  // not turn the locally-derived empty list into authority.
+  runtime.backgroundLevelEmpty = false;
+  if (index < 0 && current.length >= MAX_BACKGROUND_PROCESS_ITEMS) return;
+  const prior = index >= 0 ? current[index] : undefined;
+  const stamp = eventTimestampMs(event.ts);
+  const block: ProcessBlock = {
+    kind: "process",
+    item_id: event.item_id,
+    processKind: event.kind,
+    phase: event.phase,
+    status: event.status,
+    turn_id: event.turn_id ?? prior?.turn_id,
+    parent_id: event.parent_id ?? prior?.parent_id,
+    title: event.title || prior?.title || "后台任务",
+    summary: event.summary ?? prior?.summary,
+    progress: event.progress ?? prior?.progress,
+    command: event.command ?? prior?.command,
+    cwd: event.cwd ?? prior?.cwd,
+    background: true,
+    done: false,
+    startedTs: prior?.startedTs ?? stamp,
+    updatedTs: stamp ?? prior?.updatedTs,
+  };
+  runtime.backgroundProcesses = index >= 0
+    ? current.map((candidate, candidateIndex) =>
+        candidateIndex === index ? block : candidate)
+    : [...current, block];
 }
 
 function isOmissionBlock(block: Block): boolean {
@@ -1904,6 +1995,46 @@ function settleVisibleProcessIfComplete(
   turn.processDoneTs = Math.max(turn.processStartedTs, stamp);
 }
 
+function settleOrphanedBackgroundProcessBlocks(
+  turns: Turn[], stamp: number | undefined,
+): Turn[] {
+  const next = cloneTurns(turns);
+  let changed = false;
+  for (const turn of next) {
+    let turnChanged = false;
+    const blockLists: Block[][] = [turn.blocks];
+    if (turn.liveSpillBlocks) blockLists.push(turn.liveSpillBlocks);
+    if (turn.detailProjection) blockLists.push(turn.detailProjection.blocks);
+    for (const blocks of blockLists) {
+      for (const block of blocks) {
+        if (block.kind !== "process"
+            || block.background !== true
+            || (block.processKind !== "agent" && block.processKind !== "task")
+            || block.done) continue;
+        block.done = true;
+        block.phase = "end";
+        // The empty native level proves only that the process is no longer
+        // active. Do not fabricate success, failure, or cancellation.
+        block.status = "unknown";
+        block.updatedTs = stamp ?? block.updatedTs;
+        block.terminalTs ??= stamp ?? block.updatedTs;
+        turnChanged = true;
+        changed = true;
+      }
+    }
+    if (turnChanged) settleVisibleProcessIfComplete(turn, stamp);
+  }
+  return changed ? next : turns;
+}
+
+function reconcileAuthoritativeBackgroundProcessLevel(
+  runtime: SessionRuntime,
+): void {
+  if (!runtime.backgroundLevelEmpty) return;
+  runtime.turns = settleOrphanedBackgroundProcessBlocks(
+    runtime.turns, runtime.backgroundLevelTs);
+}
+
 function markTurnDetailAsLive(
   runtime: SessionRuntime, turnId: string, liveEvent: boolean,
 ): void {
@@ -1972,6 +2103,9 @@ function switchControlGeneration(
     runtime.pendingLiveBinding = null;
     runtime.pendingTerminalFences = null;
     runtime.legacyLiveFallbackBlocked = true;
+    runtime.backgroundProcesses = [];
+    runtime.backgroundLevelEmpty = false;
+    runtime.backgroundLevelTs = undefined;
   }
   if (runtime.historyGeneration !== null
       && generation !== runtime.historyGeneration) {
@@ -2118,7 +2252,8 @@ export function reduce(state: AppState, action: Action): AppState {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
         newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
-        catalogDefaultEffort: {}, catalogDefaultCwd: {}, codexProfiles: [],
+        catalogDefaultEffort: {}, catalogDefaultCwd: {}, claudeProfiles: [],
+        defaultClaudeProfileId: null, claudeProfileByScope: {}, codexProfiles: [],
         defaultCodexProfileId: null, codexProfileByScope: {},
         retainedHistoryBrowse: null,
       };
@@ -2987,6 +3122,7 @@ export function reduce(state: AppState, action: Action): AppState {
             activeCacheOwnerId);
         }
         applyPendingCodexTerminalFences(rt);
+        reconcileAuthoritativeBackgroundProcessLevel(rt);
         rt.loading = false;
       }, true);
     case "prune_runtimes": {
@@ -3026,6 +3162,7 @@ export function reduce(state: AppState, action: Action): AppState {
             action.autoCompactMode === "custom"
               ? action.autoCompactThresholdTokens ?? null
               : null,
+          claudeProfileId: action.claudeProfileId ?? null,
           codexProfileId: action.codexProfileId ?? null,
         },
       };
@@ -3051,6 +3188,26 @@ export function reduce(state: AppState, action: Action): AppState {
           codexProfileId: action.profileId,
           // Catalog and execution controls are account-owned. Never carry an
           // explicit choice into another CODEX_HOME before its catalog arrives.
+          model: null,
+          effort: null,
+        },
+      };
+    }
+    case "set_new_chat_claude_profile": {
+      if (!state.newChat
+          || !state.claudeProfiles.some(
+            (profile) => profile.id === action.profileId)) {
+        return state;
+      }
+      return {
+        ...state,
+        claudeProfileByScope: {
+          ...state.claudeProfileByScope,
+          [action.scopeKey]: action.profileId,
+        },
+        newChat: {
+          ...state.newChat,
+          claudeProfileId: action.profileId,
           model: null,
           effort: null,
         },
@@ -3164,11 +3321,14 @@ function reduceEvent(
           state: base.state,
           engine: ownership.engine,
           space: ownership.space,
+          claude_profile_id: ownership.engine === "claude"
+            ? ownership.claudeProfileId ?? undefined
+            : undefined,
           codex_profile_id: ownership.engine === "codex"
             ? ownership.codexProfileId ?? undefined
             : undefined,
-          native_session_id: ownership.engine === "codex" && newF.includes("@")
-            ? nativeCodexSessionId(newF)
+          native_session_id: newF.includes("@")
+            ? nativeProfileSessionId(newF)
             : undefined,
         } satisfies SessionInfo, ...state.sessions]
         : state.sessions;
@@ -3372,6 +3532,7 @@ function reduceEvent(
           switchControlGeneration(mergedRuntime, mergedControlGeneration);
           if (mergedControl) applySessionControl(mergedRuntime, mergedControl);
           replaceWithBoundedTurns(mergedRuntime, mergedTurns);
+          reconcileAuthoritativeBackgroundProcessLevel(mergedRuntime);
           // switchControlGeneration intentionally clears cross-generation
           // sequence evidence. Restore only the owner already filtered to the
           // source generation above, then bind it to a row which survived the
@@ -3412,8 +3573,20 @@ function reduceEvent(
             ...sourceSession,
             ...targetSession,
             session_id,
-            native_session_id: ownership?.engine === "codex"
-              ? nativeCodexSessionId(session_id)
+            claude_profile_id: ownership?.engine === "claude"
+              ? ownership.claudeProfileId
+                ?? targetSession?.claude_profile_id
+                ?? sourceSession.claude_profile_id
+              : targetSession?.claude_profile_id
+                ?? sourceSession.claude_profile_id,
+            codex_profile_id: ownership?.engine === "codex"
+              ? ownership.codexProfileId
+                ?? targetSession?.codex_profile_id
+                ?? sourceSession.codex_profile_id
+              : targetSession?.codex_profile_id
+                ?? sourceSession.codex_profile_id,
+            native_session_id: session_id.includes("@")
+              ? nativeProfileSessionId(session_id)
               : targetSession?.native_session_id
                 ?? sourceSession.native_session_id,
             cwd: e.cwd ?? targetSession?.cwd ?? sourceSession.cwd,
@@ -3488,13 +3661,19 @@ function reduceEvent(
         state.codexProfiles,
         state.defaultCodexProfileId,
         e,
+        state.claudeProfiles,
+        state.defaultClaudeProfileId,
       );
       const {
         sessions,
+        claudeProfiles,
+        defaultClaudeProfileId,
         codexProfiles,
         defaultCodexProfileId,
       } = normalized;
+      let claudeProfileByScope = state.claudeProfileByScope;
       let codexProfileByScope = state.codexProfileByScope;
+      let selectedClaudeProfileId: string | null = null;
       let selectedCodexProfileId: string | null = null;
       if (e.engine === "codex" && ownership && codexProfiles.length > 0) {
         const known = new Set(codexProfiles.map((profile) => profile.id));
@@ -3514,6 +3693,24 @@ function reduceEvent(
           codexProfileByScope = {
             ...state.codexProfileByScope,
             [ownership.scopeKey]: selectedCodexProfileId,
+          };
+        }
+      }
+      if (e.engine === "claude" && ownership && claudeProfiles.length > 0) {
+        const known = new Set(claudeProfiles.map((profile) => profile.id));
+        const preferred = state.newChat?.claudeProfileId
+          ?? state.claudeProfileByScope[ownership.scopeKey]
+          ?? defaultClaudeProfileId;
+        selectedClaudeProfileId = preferred
+          ? preferred
+          : defaultClaudeProfileId && known.has(defaultClaudeProfileId)
+            ? defaultClaudeProfileId
+            : claudeProfiles[0].id;
+        if (state.claudeProfileByScope[ownership.scopeKey]
+            !== selectedClaudeProfileId) {
+          claudeProfileByScope = {
+            ...state.claudeProfileByScope,
+            [ownership.scopeKey]: selectedClaudeProfileId,
           };
         }
       }
@@ -3545,6 +3742,16 @@ function reduceEvent(
           model: null,
           effort: null,
         };
+      } else if (replacementNewChat && e.engine === "claude"
+          && selectedClaudeProfileId
+          && replacementNewChat.claudeProfileId
+            !== selectedClaudeProfileId) {
+        replacementNewChat = {
+          ...replacementNewChat,
+          claudeProfileId: selectedClaudeProfileId,
+          model: null,
+          effort: null,
+        };
       } else if (focusedMissing && !replacementNewChat) {
         replacementNewChat = {
           cwd: (ownership
@@ -3556,6 +3763,7 @@ function reduceEvent(
           effort: null,
           autoCompactMode: "inherit",
           autoCompactThresholdTokens: null,
+          claudeProfileId: selectedClaudeProfileId,
           codexProfileId: selectedCodexProfileId,
         };
       }
@@ -3585,6 +3793,9 @@ function reduceEvent(
         sessions,
         runtimes,
         cwdByScope,
+        claudeProfiles,
+        defaultClaudeProfileId,
+        claudeProfileByScope,
         codexProfiles,
         defaultCodexProfileId,
         codexProfileByScope,
@@ -4312,6 +4523,10 @@ function reduceEvent(
           };
         }
       }
+      if (base.backgroundLevelEmpty) {
+        turns = settleOrphanedBackgroundProcessBlocks(
+          turns, base.backgroundLevelTs);
+      }
       let historyBrowse = state.historyBrowse;
       let retainedHistoryBrowse = state.retainedHistoryBrowse;
       if (historyBrowse?.sid === sid) {
@@ -4576,6 +4791,7 @@ function reduceEvent(
           }
           return next;
         });
+        reconcileAuthoritativeBackgroundProcessLevel(rt);
       });
     }
     case "agent_detail":
@@ -4599,7 +4815,9 @@ function reduceEvent(
         e.engine,
         e.engine === "codex"
           ? (e.codex_profile_id ?? state.defaultCodexProfileId)
-          : null,
+          : e.engine === "claude"
+            ? (e.claude_profile_id ?? state.defaultClaudeProfileId)
+            : null,
       );
       const catalog = e.models.length
         ? { ...state.catalog, [cacheKey]: e.models }
@@ -5630,10 +5848,24 @@ function reduceEvent(
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
           && b.message_id === e.message_id) as TextBlock | undefined;
-        if (block) block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
+        const stamp = eventTimestampMs(e.ts);
+        if (block) {
+          block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
+          if (e.background === true) {
+            block.startedTs ??= stamp;
+            block.background = true;
+          }
+        }
         else {
-          appendLiveBlock(t, { kind: "text", message_id: e.message_id, text: "",
-            done: false, channel: e.channel ?? "unknown" });
+          const nextBlock: TextBlock = {
+            kind: "text", message_id: e.message_id, text: "",
+            done: false, channel: e.channel ?? "unknown",
+          };
+          if (e.background === true) {
+            nextBlock.startedTs = stamp;
+            nextBlock.background = true;
+          }
+          appendLiveBlock(t, nextBlock);
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         rt.turns = turns;
@@ -5659,10 +5891,18 @@ function reduceEvent(
         if (!block) {
           block = { kind: "text", message_id: e.message_id, text: "", done: false,
             channel: e.channel ?? "unknown" };
+          if (e.background === true) {
+            block.startedTs = eventTimestampMs(e.ts);
+            block.background = true;
+          }
           appendLiveBlock(t, block);
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
+        if (e.background === true) {
+          block.startedTs ??= eventTimestampMs(e.ts);
+          block.background = true;
+        }
         // History can win the race against an app-server replay and install the
         // completed native item before its delayed deltas arrive. Native message
         // ids are immutable, so a completed exact block is authoritative. Never
@@ -5707,11 +5947,20 @@ function reduceEvent(
           existing.title = e.title;
           existing.parent_id = e.parent_id;
           existing.server = e.server;
+          if (e.background === true) {
+            existing.startedTs ??= eventTimestampMs(e.ts);
+            existing.background = true;
+          }
         } else {
-          appendLiveBlock(t, { kind: "tool", message_id: e.message_id,
+          const nextBlock: ToolBlock = { kind: "tool", message_id: e.message_id,
             tool_use_id: e.tool_use_id, tool: e.tool, input: e.input,
             category: e.category ?? "tool", title: e.title, parent_id: e.parent_id,
-            server: e.server, done: false });
+            server: e.server, done: false };
+          if (e.background === true) {
+            nextBlock.startedTs = eventTimestampMs(e.ts);
+            nextBlock.background = true;
+          }
+          appendLiveBlock(t, nextBlock);
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         markVisibleProcessStarted(t, eventTimestampMs(e.ts));
@@ -5727,6 +5976,7 @@ function reduceEvent(
           const block = mutableTurnBlocks(t).find((b) => b.kind === "tool"
             && b.tool_use_id === e.tool_use_id) as ToolBlock | undefined;
           if (!block) continue;
+          if (e.background === true) block.background = true;
           const detachedBackground = e.background === true && t.done;
           if (!detachedBackground) {
             markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
@@ -5769,6 +6019,10 @@ function reduceEvent(
               duration_ms: e.duration_ms };
             if ("diff" in e) b.diff = e.diff ?? undefined;
             b.done = true;
+            if (e.background === true || b.background === true) {
+              b.doneTs = eventTimestampMs(e.ts);
+              b.background = true;
+            }
             t.progress = undefined;
             markVisibleProcessStarted(t, eventTimestampMs(e.ts));
             settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
@@ -5794,6 +6048,10 @@ function reduceEvent(
             }
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
             b.done = true;
+            if (e.background === true || b.background === true) {
+              b.doneTs = eventTimestampMs(e.ts);
+              b.background = true;
+            }
             if (b.channel === "commentary" && b.text.length > 0) {
               settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
             }
@@ -5802,8 +6060,22 @@ function reduceEvent(
         }
         rt.turns = turns;
       });
+    case "background_process_sync":
+      return patch(state, e.sid, (rt) => {
+        const runtimeGeneration = runtimeOrderingGeneration(rt);
+        if (e.generation && runtimeGeneration
+            && e.generation !== runtimeGeneration) return;
+        if (e.generation) switchControlGeneration(rt, e.generation);
+        rt.backgroundProcesses = e.items
+          .slice(0, MAX_BACKGROUND_PROCESS_ITEMS)
+          .map(backgroundProcessBlock);
+        rt.backgroundLevelEmpty = e.items.length === 0;
+        rt.backgroundLevelTs = eventTimestampMs(e.ts);
+        reconcileAuthoritativeBackgroundProcessLevel(rt);
+      });
     case "process":
       return patch(state, e.sid, (rt) => {
+        applyBackgroundProcessEdge(rt, e);
         const turns = cloneTurns(rt.turns);
         let owner: Turn | undefined;
         let block: ProcessBlock | undefined;
@@ -5858,6 +6130,10 @@ function reduceEvent(
         if (e.duration_ms != null) block.duration_ms = e.duration_ms;
         if (e.truncated != null) block.truncated = e.truncated;
         if (e.background != null) block.background = e.background;
+        if (block.background === true) {
+          block.startedTs ??= eventTimestampMs(e.ts);
+          block.updatedTs = eventTimestampMs(e.ts) ?? block.updatedTs;
+        }
         if (e.append_to && e.delta) {
           if (e.append_to === "summary") {
             block.summary = appendField(
@@ -5875,7 +6151,12 @@ function reduceEvent(
               block.progress, e.delta, MAX_LIVE_PROGRESS_CHARS);
           }
         }
+        const wasDone = block.done;
         block.done = e.phase === "end" || terminalProcessStatus(e.status);
+        if (block.background === true && block.done && !wasDone) {
+          block.terminalOrder = allocateLiveOrder(owner);
+          block.terminalTs = eventTimestampMs(e.ts);
+        }
         if (isStateVisibleProcessBlock(block)) {
           markVisibleProcessStarted(owner, eventTimestampMs(e.ts));
           if (block.done) {

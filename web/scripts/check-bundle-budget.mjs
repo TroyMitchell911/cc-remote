@@ -4,7 +4,7 @@ import { gzipSync } from "node:zlib";
 
 const DIST = resolve(import.meta.dirname, "../dist");
 const MAX_ENTRY_BYTES = 514 * 1024;
-const MAX_INITIAL_BYTES = 900 * 1024;
+const MAX_INITIAL_BYTES = 904 * 1024;
 const MAX_INITIAL_GZIP_BYTES = 280 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 

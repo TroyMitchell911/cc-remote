@@ -13,12 +13,17 @@ import {
   defaultRangeExtractor,
   useVirtualizer,
 } from "@tanstack/react-virtual";
-import type { Turn } from "../domain/conversation";
+import type {
+  Block, ProcessBlock, TextBlock, Turn,
+} from "../domain/conversation";
 import type { Space } from "../protocol";
 import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
-import { ProcessTimeline } from "./ProcessTimeline";
+import {
+  BackgroundProcessDock,
+  ProcessTimeline,
+} from "./ProcessTimeline";
 import {
   finalTextBlocks,
   hasActiveProcess,
@@ -262,6 +267,48 @@ function formatTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+const BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS = 160;
+
+function backgroundFollowupLabel(process?: ProcessBlock): string {
+  const raw = process?.summary || process?.title || "后台任务完成";
+  return raw.length <= BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS
+    ? raw
+    : `${raw.slice(0, BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS - 1)}…`;
+}
+
+function backgroundFollowupBoundaries(
+  finalBlocks: TextBlock[], timelineBlocks: Block[],
+): Map<string, ProcessBlock | null> {
+  const completions = timelineBlocks.filter(
+    (block): block is ProcessBlock => block.kind === "process"
+      && block.background === true && block.done
+      && (block.processKind === "task" || block.processKind === "agent"),
+  );
+  const used = new Set<string>();
+  const boundaries = new Map<string, ProcessBlock | null>();
+  let emittedFallback = false;
+  for (const block of finalBlocks) {
+    if (block.background !== true) continue;
+    const candidate = block.startedTs == null ? undefined : completions
+      .filter((process) => !used.has(process.item_id)
+        && process.terminalTs != null
+        && process.terminalTs <= block.startedTs!)
+      .sort((left, right) => (right.terminalTs ?? 0) - (left.terminalTs ?? 0))[0];
+    if (candidate) {
+      used.add(candidate.item_id);
+      boundaries.set(block.message_id, candidate);
+      continue;
+    }
+    // Legacy history can lack source clocks. Mark the first detached reply once
+    // without manufacturing a relationship for every text fragment.
+    if (boundaries.size === 0 && !emittedFallback) {
+      boundaries.set(block.message_id, null);
+      emittedFallback = true;
+    }
+  }
+  return boundaries;
+}
+
 function detailTurnFingerprint(turn: Turn): string {
   return [
     turn.detailLoaded ? "1" : "0",
@@ -294,6 +341,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   externalPlanProgress,
+  backgroundProcesses = [],
   onOpenAgent,
   activeTurnId = null,
   ambiguousActiveTurnIds = [],
@@ -349,6 +397,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string;
     itemId: string;
   } | null;
+  backgroundProcesses?: ProcessBlock[];
   /** Exact displayed row owned by the still-running native task. Runtime-only:
    * never infer this from array position, final text, or historical activity. */
   activeTurnId?: string | null;
@@ -2507,19 +2556,29 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   if (turns.length === 0) {
     if (loading) {
       return (
-        <div className="empty">
-          <div className="spinner" aria-label="加载中" />
-          <p className="loading-tx">加载会话历史…</p>
+        <div className={surface === "work"
+          ? "thread-shell work-thread-shell" : "thread-shell"}>
+          <div className="empty">
+            <div className="spinner" aria-label="加载中" />
+            <p className="loading-tx">加载会话历史…</p>
+          </div>
+          <BackgroundProcessDock processes={backgroundProcesses}
+            onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
         </div>
       );
     }
     return (
-      <div className="empty">
-        <div className="glyph"><ClaudeMark size={30} /></div>
-        <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
-        <p>{surface === "work"
-          ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
-          : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+      <div className={surface === "work"
+        ? "thread-shell work-thread-shell" : "thread-shell"}>
+        <div className="empty">
+          <div className="glyph"><ClaudeMark size={30} /></div>
+          <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
+          <p>{surface === "work"
+            ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
+            : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+        </div>
+        <BackgroundProcessDock processes={backgroundProcesses}
+          onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
       </div>
     );
   }
@@ -2534,7 +2593,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             ? "正在加载更早历史…" : "正在加载更新历史…"}</span>
         </div>
       )}
-      <div className="thread" ref={scrollRef}
+      <div className="thread-frame">
+        <div className="thread" ref={scrollRef}
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         data-text-selection-dragging={
           activeTextSelection?.dragging ? "true" : "false"
@@ -2607,6 +2667,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeTimeline = activeProcess
               || foregroundProcessItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
+            const followupBoundaries = backgroundFollowupBoundaries(
+              finalBlocks, timelineBlocks);
             const enclosingTaskActive = activeTurnId === t.id;
             const processDetailState = processItems.length > 0
               ? "present"
@@ -2846,11 +2908,31 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             {t.blocks.length > 0 && (
               <>
                 {finalBlocks.map((block) => (
-                  <MessageBlock key={block.message_id} text={block.text}
-                    done={block.done} onOpenFile={onOpenFile}
-                    imageAssets={imageAssets} onLoadImage={onLoadImage}
-                    onAuthorizeImage={onAuthorizeImage}
-                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+                  <div key={block.message_id} className="assistant-answer-segment">
+                    {followupBoundaries.has(block.message_id) && (
+                      <div className="background-followup-boundary">
+                        <span className="background-followup-icon">
+                          <Icon name="check" size={13} />
+                        </span>
+                        <span>{backgroundFollowupLabel(
+                          followupBoundaries.get(block.message_id)
+                            ?? undefined,
+                        )} · Claude 随后继续回复</span>
+                        {(followupBoundaries.get(block.message_id)?.terminalTs
+                            || block.startedTs) && (
+                          <time>{formatTime(
+                            followupBoundaries.get(block.message_id)?.terminalTs
+                              ?? block.startedTs!,
+                          )}</time>
+                        )}
+                      </div>
+                    )}
+                    <MessageBlock text={block.text}
+                      done={block.done} onOpenFile={onOpenFile}
+                      imageAssets={imageAssets} onLoadImage={onLoadImage}
+                      onAuthorizeImage={onAuthorizeImage}
+                      onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+                  </div>
                 ))}
                 {showCompletionFooter && (
                   <>
@@ -2923,16 +3005,19 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             overflowAnchor: "none",
           }} />
         </div>
-      </div>
-      {(!scrollState.followOutput || !scrollState.nearBottom) && (
-        <div className="scroll-bottom-wrap">
-          <button className="scroll-bottom-btn" onClick={returnToLatest}
-            aria-label={browseMode ? "回到最新" : "滚动到底部"}
-            data-tooltip={browseMode ? "回到最新" : undefined}>
-            <Icon name="chev" size={20} />
-          </button>
         </div>
-      )}
+        {(!scrollState.followOutput || !scrollState.nearBottom) && (
+          <div className="scroll-bottom-wrap">
+            <button className="scroll-bottom-btn" onClick={returnToLatest}
+              aria-label={browseMode ? "回到最新" : "滚动到底部"}
+              data-tooltip={browseMode ? "回到最新" : undefined}>
+              <Icon name="chev" size={20} />
+            </button>
+          </div>
+        )}
+      </div>
+      <BackgroundProcessDock processes={backgroundProcesses}
+        onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
       {zoom && (() => {
         const asset = zoom.kind === "history" ? historyImageAssets?.[
           historyImageAssetKey(zoom.turnId, zoom.imageId, "full")

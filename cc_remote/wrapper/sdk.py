@@ -2,10 +2,15 @@
 
 Isolates the one version-sensitive call site (`include_partial_messages` on
 ClaudeAgentOptions) so an SDK upgrade touches only this file. Code sessions use
-Claude's ordinary setting sources. Work sessions use one wrapper-owned settings
-file containing only provider connectivity and the fail-closed sandbox; they
-must never inherit user/project memory, hooks or skills. Permission mode is
-explicit live session state and survives reconnects.
+Claude's ordinary setting sources. An explicit multi-account profile starts
+under a private shadow HOME whose ``.claude`` symlink selects that profile's
+user source; a secret-free settings file restores the real HOME before tools
+spawn. This prevents the ambient home account from overriding
+``CLAUDE_CONFIG_DIR`` without cc-remote opening model credentials. Work
+sessions use one wrapper-owned settings file containing only provider
+connectivity and the fail-closed sandbox; they must never inherit user/project
+memory, hooks or skills. Permission mode is explicit live session state and
+survives reconnects.
 """
 from __future__ import annotations
 
@@ -30,7 +35,11 @@ from mcp.server import Server
 from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
-from cc_remote.wrapper.child_env import child_env_tombstones
+from cc_remote.wrapper.child_env import claude_profile_child_env
+from cc_remote.wrapper.claude_profile_home import (
+    ClaudeProfileHomeBoundary,
+    materialize_claude_profile_home,
+)
 from cc_remote.wrapper.claude_rewind import (
     ClaudeConversationRewindCapability,
     ClaudeConversationRewindResult,
@@ -49,6 +58,7 @@ from cc_remote.wrapper.claude_controls import (
 )
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 from cc_remote.wrapper.work_context import claude_recent_context_usage
+from cc_remote.wrapper import claude_catalog
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
     active_goal_from_message,
@@ -116,6 +126,39 @@ def _explicit_cli_path(value: str) -> str | None:
     return path
 
 
+def _claude_profile_settings_path(
+    config_dir: str | None,
+    *,
+    isolate_account_env: bool,
+) -> str | None:
+    """Return a legacy explicit profile settings path when not isolated."""
+    if isolate_account_env:
+        return None
+    if config_dir is None:
+        return None
+    path = os.path.join(config_dir, "settings.json")
+    return path if os.path.isfile(path) else None
+
+
+def _claude_profile_home_boundary(
+    config_dir: str | None,
+    *,
+    state_dir: os.PathLike[str],
+    isolate_account_env: bool,
+) -> ClaudeProfileHomeBoundary | None:
+    """Build the credential-opaque user-settings boundary when required.
+
+    ``CLAUDE_CONFIG_DIR`` redirects transcripts and account storage, but Claude
+    Code still resolves its user source from ``HOME/.claude``.  Multi-profile
+    callers must never fall back to an unbounded ambient HOME.
+    """
+    if not isolate_account_env:
+        return None
+    if config_dir is None:
+        raise ValueError("isolated Claude profile requires a config directory")
+    return materialize_claude_profile_home(config_dir, state_dir)
+
+
 def _is_control_request_timeout(
     error: BaseException,
     *,
@@ -139,9 +182,18 @@ def _is_control_request_timeout(
 
 
 class SdkHandle:
-    def __init__(self, cfg: WrapperConfig, ask_server: Server | None = None):
+    def __init__(
+        self,
+        cfg: WrapperConfig,
+        ask_server: Server | None = None,
+        *,
+        claude_config_dir: str | None = None,
+        isolate_account_env: bool = False,
+    ):
         self.cfg = cfg
         self.ask_server = ask_server  # in-process MCP server exposing ask_user
+        self.claude_config_dir = claude_config_dir
+        self.isolate_account_env = isolate_account_env
         self.client: ClaudeSDKClient | None = None
         # reasoning effort is a spawn-time flag (--effort), not a runtime setter.
         # `effort` is the desired level; `applied_effort` is what the live client
@@ -312,6 +364,29 @@ class SdkHandle:
             # A Code session restored while currently in a safer mode must still
             # retain Claude's native ability to cycle back to bypass later.
             extra_args["allow-dangerously-skip-permissions"] = None
+        code_profile_home = (
+            None
+            if self.work_mode
+            else _claude_profile_home_boundary(
+                self.claude_config_dir,
+                state_dir=self.cfg.state_dir,
+                isolate_account_env=self.isolate_account_env,
+            )
+        )
+        code_profile_settings = (
+            code_profile_home.restore_settings
+            if code_profile_home is not None
+            else _claude_profile_settings_path(
+                self.claude_config_dir,
+                isolate_account_env=self.isolate_account_env,
+            )
+        )
+        code_child_env = claude_profile_child_env(
+            self.claude_config_dir,
+            isolate_account_env=self.isolate_account_env,
+        )
+        if code_profile_home is not None:
+            code_child_env["HOME"] = code_profile_home.launch_home
         return ClaudeAgentOptions(
             tools=list(CLAUDE_WORK_TOOLS) if self.work_mode else None,
             include_partial_messages=True,        # StreamEvent with content_block_delta
@@ -346,12 +421,15 @@ class SdkHandle:
             effort=self.effort,                   # reasoning strength; None -> CLI default (high)
             # The SDK otherwise copies the wrapper's complete environment into
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
-            env=child_env_tombstones(),
+            env=code_child_env,
             stderr=self._on_stderr,               # surface cc subprocess errors
             # Work uses only a wrapper-owned policy that the writable workspace
             # cannot edit. [] is the SDK's filesystem-settings isolation mode:
             # no user/project/local settings, CLAUDE.md, hooks or skills leak in.
-            settings=self.work_settings_path if self.work_mode else None,
+            settings=(
+                self.work_settings_path
+                if self.work_mode else code_profile_settings
+            ),
             setting_sources=[] if self.work_mode else None,
             skills=[] if self.work_mode else None,
             # The wrapper-owned Work settings file already contains the complete
@@ -974,7 +1052,20 @@ class SdkHandle:
         """Refresh cached state from Claude's native transcript if it exists."""
         target = session_id or self.goal_session_id
         if target:
-            exists, goal = await asyncio.to_thread(read_claude_goal, target)
+            if self.claude_config_dir is None:
+                exists, goal = await asyncio.to_thread(
+                    read_claude_goal, target)
+            else:
+                source = await asyncio.to_thread(
+                    claude_catalog.find_session_file,
+                    self.claude_config_dir,
+                    target,
+                )
+                if source is None:
+                    exists, goal = False, None
+                else:
+                    exists, goal = await asyncio.to_thread(
+                        read_claude_goal, target, path=str(source))
             if exists:
                 self.goal = goal
                 self.goal_session_id = target

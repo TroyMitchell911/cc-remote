@@ -566,7 +566,7 @@ if [ "$migration_ready" -ne 1 ]; then
   "$target/.venv/bin/python" \
     "$target/deploy/work_registry_snapshot.py" verify \
     --snapshot "$rollback_snapshot" || true
-  die "Codex Work profile migration did not become ready"
+  die "Claude/Codex Work profile migrations did not become ready"
 fi
 
 echo

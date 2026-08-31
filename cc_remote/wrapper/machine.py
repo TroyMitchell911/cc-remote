@@ -73,11 +73,18 @@ from claude_agent_sdk.types import (
 
 from cc_remote.attachments import (
     MAX_IMAGE_PIXELS,
+    MAX_TOTAL_ATTACHMENT_BYTES,
     decode_attachment,
     image_dimensions,
     validate_attachments,
 )
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.claude_profiles import (
+    ClaudeProfile,
+    ClaudeProfileRegistry,
+    ClaudeProfileTopologyStore,
+    ClaudeProfileTopologyTransition,
+)
 from cc_remote.config import WrapperConfig
 from cc_remote.codex_profiles import (
     CodexProfile,
@@ -85,6 +92,7 @@ from cc_remote.codex_profiles import (
     CodexProfileTopologyStore,
     CodexProfileTopologyTransition,
 )
+from cc_remote.wrapper import claude_catalog
 from cc_remote.codex_daemon_restart import (
     CodexDaemonRestartState,
     read_restart_state,
@@ -99,6 +107,10 @@ from cc_remote.workspaces import (
 )
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
+    MAX_BACKGROUND_PROCESS_COMMAND_CHARS,
+    MAX_BACKGROUND_PROCESS_CWD_CHARS,
+    MAX_BACKGROUND_PROCESS_ITEMS,
+    MAX_BACKGROUND_PROCESS_SUMMARY_CHARS,
     MAX_SAFE_WIRE_INTEGER,
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, QueryQueueState, QueuedQueryDetail, QueuedQueryInfo,
@@ -113,6 +125,7 @@ from cc_remote.protocol import (
     HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserSync,
     AskUserClosed,
+    BackgroundProcessItem, BackgroundProcessSync,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
     State, TakeoverState, SessionControl,
     UserMsg, TurnSteered, Delta,
@@ -197,7 +210,7 @@ from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
     RollbackJournalError,
 )
-from cc_remote.wrapper.session import load_session_id, save_session_id
+from cc_remote.wrapper.session import load_session_state, save_session_id
 from cc_remote.wrapper.session_ctx import (
     ActiveTurnBinding,
     ClaudeClientAliasProbe,
@@ -224,8 +237,11 @@ from cc_remote.wrapper.claude_agents import (
     translate_source_agent,
 )
 from cc_remote.wrapper.stream import (
+    ClaudeHistoryImageAsset,
     StreamTranslator, extract_session_id, extract_model,
-    replayed_user_message_id,
+    claude_background_tasks, replayed_user_message_id,
+    extract_claude_history_image_assets,
+    read_claude_history_image_asset,
     translate_history, last_assistant_model, transcript_compact_snapshot,
     transcript_compact_history_page,
     recover_claude_delayed_retry_tail,
@@ -957,6 +973,94 @@ def _render_history_image(
                 output, format="WEBP", quality=70, method=4)
             thumb = output.getvalue()
         return "image/webp", source.width, source.height, thumb
+
+
+@dataclass(frozen=True)
+class _MaterializedClaudeHistoryImage:
+    turn_id: str
+    image_id: str
+    media_type: str
+    width: int
+    height: int
+    data: bytes | None
+
+
+def _validate_claude_history_image(
+    asset: ClaudeHistoryImageAsset,
+) -> tuple[dict[str, object], str, int, int, bytes] | None:
+    image = {"media_type": asset.media_type, "data": asset.data}
+    if validate_attachments([image], None) is not None:
+        return None
+    try:
+        data = decode_attachment(asset.data)
+    except ValueError:
+        return None
+    dimensions = image_dimensions(data, asset.media_type)
+    if dimensions is None:
+        return None
+    width, height = dimensions
+    media_type = (
+        "image/jpeg" if asset.media_type == "image/jpg" else asset.media_type
+    )
+    return ({
+        "image_id": asset.image_id,
+        "media_type": media_type,
+        "width": width,
+        "height": height,
+        "byte_size": len(data),
+    }, media_type, width, height, data)
+
+
+def _attach_claude_history_image_refs(
+    groups: list[list],
+    assets: tuple[ClaudeHistoryImageAsset, ...],
+    *,
+    max_cached_bytes: int = MAX_TOTAL_ATTACHMENT_BYTES,
+) -> tuple[_MaterializedClaudeHistoryImage, ...]:
+    """Attach wire-safe refs only to selected Claude history process rows."""
+    by_item: dict[str, ClaudeHistoryImageAsset] = {}
+    for asset in assets:
+        by_item.setdefault(asset.item_id, asset)
+    materialized: list[_MaterializedClaudeHistoryImage] = []
+    cached_bytes = 0
+    for group in groups:
+        turn_id = next((
+            event.msg_id for event in group
+            if isinstance(event, UserMsg)
+        ), None)
+        if not isinstance(turn_id, str):
+            continue
+        for event in group:
+            if (
+                not isinstance(event, ProcessEvent)
+                or event.tool != "view_image"
+                or event.phase != "end"
+            ):
+                continue
+            asset = by_item.get(event.item_id)
+            if asset is None:
+                continue
+            validated = _validate_claude_history_image(asset)
+            if validated is None:
+                continue
+            image_ref, media_type, width, height, data = validated
+            event.input = {
+                **(event.input if isinstance(event.input, dict) else {}),
+                "history_image": image_ref,
+            }
+            cached_data = None
+            if cached_bytes + len(data) <= max(0, max_cached_bytes):
+                cached_data = data
+                cached_bytes += len(data)
+            materialized.append(_MaterializedClaudeHistoryImage(
+                turn_id=turn_id,
+                image_id=asset.image_id,
+                media_type=media_type,
+                width=width,
+                height=height,
+                data=cached_data,
+            ))
+    return tuple(materialized)
 
 
 def _normalized_tool_name(value: object) -> str:
@@ -1716,6 +1820,7 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
+    PRIVATE_BTW_PROFILE_META_KEY = "__cc_remote_profile__"
     PREVIEW_WRITE_CANDIDATE_CAP = 64
     PREVIEW_AUTHORIZATION_CAP = 256
     PREVIEW_AUTHORIZATION_TTL = 5 * 60
@@ -1820,6 +1925,52 @@ class WrapperMachine:
         self.transport = transport
         self._command_router = CommandRouter(self)
         self.instance_id = uuid4().hex
+        # Each configured CLAUDE_CONFIG_DIR is an independent account/session
+        # boundary. Keep implicit single-account mode source-compatible and
+        # introduce routing namespaces only when more than one profile exists.
+        raw_claude_profiles = getattr(cfg, "claude_profiles_json", "")
+        self._claude_profiles_explicit = bool(
+            isinstance(raw_claude_profiles, str)
+            and raw_claude_profiles.strip()
+        )
+        self._claude_legacy_config_dir = claude_config_dir()
+        self._claude_profiles = ClaudeProfileRegistry.from_json(
+            raw_claude_profiles
+            if isinstance(raw_claude_profiles, str) else "",
+            default_config_dir=self._claude_legacy_config_dir,
+        )
+        if (
+            self._claude_profiles.is_multi_profile
+            and getattr(cfg, "experimental_claude_broker", False)
+        ):
+            raise ValueError(
+                "experimental Claude broker does not support multiple profiles")
+        self._claude_profile_topology = ClaudeProfileTopologyStore(
+            cfg.state_dir)
+        try:
+            self._claude_profile_transition = (
+                self._claude_profile_topology.prepare(
+                    self._claude_profiles,
+                    legacy_config_dir=self._claude_legacy_config_dir,
+                )
+            )
+            self._claude_profile_revision = (
+                self._claude_profile_transition.revision
+                if self._claude_profile_transition is not None
+                else self._claude_profile_topology.revision(
+                    self._claude_profiles,
+                    legacy_config_dir=self._claude_legacy_config_dir,
+                )
+            )
+            self._claude_profile_migration_ok = True
+        except Exception as exc:
+            self._claude_profile_transition = None
+            self._claude_profile_revision = 0
+            self._claude_profile_migration_ok = False
+            log.warning(
+                "Claude profile topology could not be loaded",
+                error_type=type(exc).__name__,
+            )
         # Each CODEX_HOME is a complete account boundary, including its own
         # official daemon/socket. Keep the historical default attributes as
         # aliases so single-profile embedders and tests retain their API.
@@ -1925,15 +2076,32 @@ class WrapperMachine:
             cfg, "experimental_claude_broker", False))
         self._claude_rate_limit_lock = asyncio.Lock()
         self._claude_rate_limit_emit_lock = asyncio.Lock()
-        try:
-            self._claude_rate_limits: ClaudeRateLimitStore | None = (
-                ClaudeRateLimitStore(cfg.state_dir)
+        legacy_claude_root = str(
+            ClaudeProfileRegistry._effective_config_dir(
+                self._claude_legacy_config_dir))
+        self._claude_rate_limit_stores: dict[
+            str, ClaudeRateLimitStore | None
+        ] = {}
+        for profile in self._claude_profiles:
+            cache_root = (
+                Path(cfg.state_dir)
+                if str(profile.config_dir) == legacy_claude_root else
+                Path(cfg.state_dir) / "claude-rate-limit-profiles" /
+                hashlib.sha256(
+                    str(profile.config_dir).encode("utf-8")
+                ).hexdigest()
             )
-        except ClaudeRateLimitStoreError:
-            # Quota is optional presentation state. A damaged cache must never
-            # prevent Claude sessions from starting or receiving model output.
-            self._claude_rate_limits = None
-            log.exception("Claude rate-limit cache unavailable")
+            try:
+                store = ClaudeRateLimitStore(cache_root)
+            except ClaudeRateLimitStoreError:
+                store = None
+                log.exception(
+                    "Claude rate-limit cache unavailable",
+                    profile_id=profile.id,
+                )
+            self._claude_rate_limit_stores[profile.id] = store
+        self._claude_rate_limits = self._claude_rate_limit_stores.get(
+            self._claude_profiles.default.id)
         # A History token changes for every wrapper process and every local
         # destructive conversation mutation.  Browsers persist this token with
         # IndexedDB turns, so a fresh wrapper can never merge a pre-crash cache
@@ -2120,6 +2288,7 @@ class WrapperMachine:
         # if its one live send is lost after NewSession was ACKed, the next Hello
         # uses this map to replay the rekey before cursor catch-up.
         self._session_alias_profile_revision = 0
+        self._session_alias_profile_revisions = {"claude": 0, "codex": 0}
         self._session_aliases = self._load_session_aliases()
         # Persistent thread/fork is a mutation. Journal it independently of the
         # in-memory command ACK cache so a wrapper restart cannot duplicate a
@@ -2147,9 +2316,12 @@ class WrapperMachine:
         # archive/fork/migration mutation within one engine account so a fork
         # cannot materialize below a descendant after archive preflight but
         # before the native tree mutation. The scope count is bounded by the
-        # configured Codex profiles plus Claude's single local catalog.
+        # configured account profiles for both engines.
         self._conversation_tree_mutation_locks: dict[str, asyncio.Lock] = {
-            "claude": asyncio.Lock(),
+            **{
+                f"claude:{profile.id}": asyncio.Lock()
+                for profile in self._claude_profiles
+            },
             **{
                 f"codex:{profile.id}": asyncio.Lock()
                 for profile in self._codex_profiles
@@ -2247,6 +2419,7 @@ class WrapperMachine:
         # ephemeral, owner-only UI. Persist tombstones until that transcript is
         # deleted so a crash or failed cleanup cannot expose it in SessionList or
         # let another client cold-resume it as a normal session.
+        self._private_btw_profile_revision = 0
         self._private_btw_sessions = self._load_private_btw_sessions()
         # Catalog/default reads stay off the serial mutation/query command lane
         # so opening New Chat can never delay an immediate NewSession or Interrupt.
@@ -2274,6 +2447,95 @@ class WrapperMachine:
             getattr(cfg, "claude_work_root", fallback_work / "claude"),
             getattr(cfg, "codex_work_root", fallback_work / "codex"),
         )
+        self._claude_work_profile_migration_ok = (
+            self._claude_profile_migration_ok
+        )
+        claude_transition = self._claude_profile_transition
+        if (
+            claude_transition is not None
+            and self._claude_profile_migration_ok
+        ):
+            try:
+                self._migrate_claude_core_profile_state(claude_transition)
+            except Exception as exc:
+                self._claude_profile_migration_ok = False
+                self._claude_work_profile_migration_ok = False
+                log.warning(
+                    "Claude profile state migration is incomplete",
+                    error_type=type(exc).__name__,
+                )
+        if (
+            claude_transition is not None
+            and self._claude_profile_migration_ok
+        ):
+            try:
+                self._work.for_engine("claude").migrate_claude_profiles(
+                    claude_transition.remaps,
+                    legacy_profile_id=claude_transition.legacy_profile_id,
+                    profile_revision=claude_transition.revision,
+                )
+            except Exception as exc:
+                self._claude_work_profile_migration_ok = False
+                log.warning(
+                    "Claude Work profile ownership migration is incomplete",
+                    error_type=type(exc).__name__,
+                )
+        if self._claude_work_profile_migration_ok:
+            try:
+                self._work.for_engine("claude").assign_legacy_claude_profile(
+                    self._claude_profiles.default.id
+                )
+            except Exception as exc:
+                self._claude_work_profile_migration_ok = False
+                log.warning(
+                    "Claude Work profile ownership migration is incomplete",
+                    error_type=type(exc).__name__,
+                )
+        self._claude_presentation_profile_migration_ok = (
+            self._claude_profile_migration_ok
+        )
+        if (
+            self._claude_profile_migration_ok
+            and self._session_presentation is not None
+        ):
+            try:
+                transform = (
+                    claude_transition.wire_session_id
+                    if claude_transition is not None
+                    else lambda value: value
+                )
+                self._session_presentation.migrate_claude_profile_sessions(
+                    transform,
+                    profile_revision=self._claude_profile_revision,
+                )
+            except Exception:
+                self._session_presentation = None
+                self._claude_presentation_profile_migration_ok = False
+                log.exception(
+                    "Claude optional presentation state migration failed")
+        elif claude_transition is not None:
+            # Keep the replay marker until this rebuildable projection either
+            # migrates or is quarantined. Code and Work stay available, but a
+            # later restart must retain the old-id -> new-id transform.
+            self._claude_presentation_profile_migration_ok = False
+        if (
+            self._claude_profile_migration_ok
+            and self._claude_work_profile_migration_ok
+            and self._claude_presentation_profile_migration_ok
+            and claude_transition is not None
+        ):
+            try:
+                self._claude_profile_topology.complete(
+                    self._claude_profiles,
+                    claude_transition,
+                )
+            except Exception as exc:
+                self._claude_profile_migration_ok = False
+                self._claude_work_profile_migration_ok = False
+                log.warning(
+                    "Claude profile topology could not be persisted",
+                    error_type=type(exc).__name__,
+                )
         self._codex_work_profile_migration_ok = (
             self._codex_profile_migration_ok
         )
@@ -2346,6 +2608,34 @@ class WrapperMachine:
                     "Codex profile topology could not be persisted",
                     error_type=type(exc).__name__,
                 )
+
+    def _migrate_claude_core_profile_state(
+        self, transition: ClaudeProfileTopologyTransition,
+    ) -> None:
+        """Migrate authorization/privacy state before enabling Claude."""
+        transform = transition.wire_session_id
+        revision = transition.revision
+        rewrites_routes = (
+            transition.previous_is_multi or transition.current_is_multi
+        )
+        if self._claude_controls is None:
+            if rewrites_routes:
+                raise ClaudeControlStoreError(
+                    "Claude control store is unavailable")
+        else:
+            self._claude_controls.migrate_profile_sessions(
+                transform, profile_revision=revision)
+        if self._session_pins is None:
+            if rewrites_routes:
+                raise SessionPinStoreError("session pin store is unavailable")
+        else:
+            self._session_pins.migrate_claude_profile_sessions(
+                transform, profile_revision=revision)
+        self._migrate_session_aliases(
+            transition, engine="claude")
+        self._claude_forks.migrate_profile_sessions(
+            transform, profile_revision=revision)
+        self._migrate_private_btw_sessions(transition)
 
     def _migrate_codex_core_profile_state(
         self, transition: CodexProfileTopologyTransition,
@@ -2437,6 +2727,302 @@ class WrapperMachine:
         return self._codex_profiles.wire_session_id(owner, session_id)
 
     # ---- pool helpers ----
+
+    def _claude_profile(
+        self, profile_id: Optional[str] = None,
+    ) -> ClaudeProfile:
+        if not self._claude_profile_migration_ok:
+            raise RuntimeError(
+                "Claude profile state migration is incomplete")
+        return self._claude_profiles.get(profile_id)
+
+    def _claude_profile_for_ctx(self, ctx: SessionContext) -> ClaudeProfile:
+        return self._claude_profile(ctx.claude_profile_id)
+
+    def _claude_config_root(self, profile: ClaudeProfile) -> Optional[str]:
+        if (
+            not self._claude_profiles_explicit
+            and profile.id == self._claude_profiles.default.id
+        ):
+            # Preserve the exact inherited SDK environment in legacy mode.
+            return None
+        return str(profile.config_dir)
+
+    def _claude_spawn_profile_kwargs(
+        self, profile: Optional[ClaudeProfile],
+    ) -> dict[str, str]:
+        if profile is None or (
+            not self._claude_profiles_explicit
+            and profile.id == self._claude_profiles.default.id
+        ):
+            return {}
+        return {"claude_profile_id": profile.id}
+
+    def _claude_target(self, wire_sid: str) -> tuple[ClaudeProfile, str]:
+        return self._claude_profiles.resolve_wire_session_id(wire_sid)
+
+    def _claude_wire_sid(
+        self, profile: ClaudeProfile | str, native_sid: str,
+    ) -> str:
+        profile_id = profile.id if isinstance(profile, ClaudeProfile) else profile
+        return self._claude_profiles.wire_session_id(profile_id, native_sid)
+
+    def _claude_bootstrap_target(
+        self,
+        session_id: str,
+        *,
+        persisted: bool,
+        persisted_profile_id: str | None = None,
+        persisted_profile_revision: int | None = None,
+    ) -> tuple[ClaudeProfile, str, str]:
+        """Resolve one startup resume id without changing account ownership.
+
+        The cwd-scoped state file was written under the previous topology when
+        a transition is pending, so translate it before asking the current
+        registry to resolve the route. An explicit ``CC_RESUME_SESSION_ID`` is
+        current configuration instead; for compatibility, an unqualified id in
+        multi-profile mode selects the configured default account.
+        """
+        routed = session_id
+        transition = self._claude_profile_transition
+        translated = False
+        if persisted:
+            if persisted_profile_revision is not None:
+                if transition is not None:
+                    if persisted_profile_revision == transition.revision - 1:
+                        routed = transition.wire_session_id(routed)
+                        translated = True
+                    elif persisted_profile_revision != transition.revision:
+                        raise ValueError(
+                            "saved Claude route missed a profile transition"
+                        )
+                elif persisted_profile_revision != self._claude_profile_revision:
+                    raise ValueError("saved Claude route has a stale profile revision")
+            elif transition is not None:
+                # Pre-v43 state has no revision and belongs to the topology
+                # being replaced by the first pending migration.
+                routed = transition.wire_session_id(routed)
+                translated = True
+            elif self._claude_profiles.is_multi_profile and "@" not in routed:
+                # A crash may land after the initial topology commit but before
+                # the legacy recent-session file is rewritten. Its owner is the
+                # one account rooted at the inherited CLAUDE_CONFIG_DIR, which
+                # need not be the newly configured default.
+                legacy_root = str(
+                    ClaudeProfileRegistry._effective_config_dir(
+                        self._claude_legacy_config_dir
+                    )
+                )
+                matches = [
+                    profile for profile in self._claude_profiles
+                    if str(profile.config_dir) == legacy_root
+                ]
+                if len(matches) != 1:
+                    raise ValueError("saved Claude route owner is ambiguous")
+                routed = self._claude_wire_sid(matches[0], routed)
+        if (
+            not persisted
+            and self._claude_profiles.is_multi_profile
+            and "@" not in routed
+        ):
+            profile = self._claude_profiles.default
+            native_sid = routed
+            routed = self._claude_wire_sid(profile, native_sid)
+            return profile, native_sid, routed
+        profile, native_sid = self._claude_target(routed)
+        if persisted_profile_id is not None:
+            expected_profile_id = (
+                transition.remaps.get(
+                    persisted_profile_id, persisted_profile_id
+                )
+                if translated and transition is not None
+                else persisted_profile_id
+            )
+            if profile.id != expected_profile_id:
+                raise ValueError("saved Claude route profile is inconsistent")
+        return profile, native_sid, routed
+
+    def _claude_catalog_root(self, profile: ClaudeProfile) -> Path:
+        return profile.config_dir
+
+    def _claude_catalog_list_sessions(
+        self,
+        profile: ClaudeProfile,
+        *,
+        limit: int,
+        directory: str | None = None,
+        include_worktrees: bool = True,
+    ):
+        if self._claude_config_root(profile) is None:
+            if directory is None:
+                return list_sessions(limit=limit)
+            return list_sessions(
+                limit=limit,
+                directory=directory,
+                include_worktrees=include_worktrees,
+            )
+        return claude_catalog.list_sessions(
+            self._claude_catalog_root(profile),
+            limit=limit,
+            directory=directory,
+            include_worktrees=include_worktrees,
+        )
+
+    def _claude_catalog_session_info(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        *,
+        directory: str | None = None,
+    ):
+        if self._claude_config_root(profile) is None:
+            if directory is None:
+                return get_session_info(session_id)
+            return get_session_info(session_id, directory=directory)
+        return claude_catalog.get_session_info(
+            self._claude_catalog_root(profile),
+            session_id,
+            directory=directory,
+        )
+
+    def _claude_catalog_has_session_file(
+        self, profile: ClaudeProfile, session_id: str,
+    ) -> bool:
+        if self._claude_config_root(profile) is None:
+            return transcript_path(session_id) is not None
+        return claude_catalog.find_session_file(
+            self._claude_catalog_root(profile), session_id) is not None
+
+    def _claude_catalog_transcript_presence(
+        self, profile: ClaudeProfile, session_id: str,
+    ) -> bool | None:
+        if self._claude_config_root(profile) is None:
+            return transcript_presence(session_id)
+        return claude_catalog.transcript_presence(
+            self._claude_catalog_root(profile), session_id)
+
+    def _claude_transcript_path(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        *,
+        directory: str | None = None,
+    ) -> str | None:
+        if self._claude_config_root(profile) is None:
+            return transcript_path(session_id)
+        path = claude_catalog.find_session_file(
+            self._claude_catalog_root(profile),
+            session_id,
+            directory=directory,
+        )
+        return str(path) if path is not None else None
+
+    def _claude_transcript_path_for_wire(
+        self,
+        wire_session_id: str,
+        *,
+        directory: str | None = None,
+    ) -> str | None:
+        profile, native_sid = self._claude_target(wire_session_id)
+        return self._claude_transcript_path(
+            profile, native_sid, directory=directory)
+
+    def _claude_catalog_messages(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        *,
+        directory: str | None = None,
+    ):
+        if self._claude_config_root(profile) is None:
+            return get_session_messages(session_id, directory=directory)
+        return claude_catalog.get_session_messages(
+            self._claude_catalog_root(profile),
+            session_id,
+            directory=directory,
+        )
+
+    def _claude_catalog_rename_session(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        title: str,
+        *,
+        directory: str | None = None,
+    ) -> None:
+        if self._claude_config_root(profile) is None:
+            if directory is None:
+                rename_session(session_id, title)
+            else:
+                rename_session(session_id, title, directory=directory)
+            return
+        claude_catalog.rename_session(
+            self._claude_catalog_root(profile),
+            session_id,
+            title,
+            directory=directory,
+        )
+
+    def _claude_catalog_tag_session(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        tag: str | None,
+        *,
+        directory: str | None = None,
+    ) -> None:
+        if self._claude_config_root(profile) is None:
+            if directory is None:
+                tag_session(session_id, tag)
+            else:
+                tag_session(session_id, tag, directory=directory)
+            return
+        claude_catalog.tag_session(
+            self._claude_catalog_root(profile),
+            session_id,
+            tag,
+            directory=directory,
+        )
+
+    def _claude_catalog_fork_session(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        *,
+        directory: str | None = None,
+        up_to_message_id: str | None = None,
+        title: str | None = None,
+    ):
+        if self._claude_config_root(profile) is None:
+            return fork_session(
+                session_id,
+                directory=directory,
+                up_to_message_id=up_to_message_id,
+                title=title,
+            )
+        return claude_catalog.fork_session(
+            self._claude_catalog_root(profile),
+            session_id,
+            directory=directory,
+            up_to_message_id=up_to_message_id,
+            title=title,
+        )
+
+    def _claude_catalog_delete_session(
+        self,
+        profile: ClaudeProfile,
+        session_id: str,
+        *,
+        directory: str | None,
+    ) -> None:
+        if self._claude_config_root(profile) is None:
+            delete_session(session_id, directory=directory)
+            return
+        claude_catalog.delete_session(
+            self._claude_catalog_root(profile),
+            session_id,
+            directory=directory,
+        )
 
     def _codex_profile(
         self, profile_id: Optional[str] = None,
@@ -2534,8 +3120,14 @@ class WrapperMachine:
         wire_sid: str,
     ) -> asyncio.Lock:
         """Return the bounded catalog lane covering a native fork tree."""
-        scope = "claude"
-        if engine == "codex":
+        scope = "claude:invalid"
+        if engine == "claude":
+            try:
+                profile, _native_sid = self._claude_target(wire_sid)
+                scope = f"claude:{profile.id}"
+            except ValueError:
+                pass
+        elif engine == "codex":
             try:
                 profile, _native_sid = self._codex_target(wire_sid)
                 scope = f"codex:{profile.id}"
@@ -2554,6 +3146,9 @@ class WrapperMachine:
         self, engine: str, wire_sid: str,
     ) -> tuple[str, str | None]:
         """Translate a browser route into the Work registry's native key."""
+        if engine == "claude":
+            profile, native_sid = self._claude_target(wire_sid)
+            return native_sid, profile.id
         if engine != "codex":
             return wire_sid, None
         profile, native_sid = self._codex_target(wire_sid)
@@ -2562,7 +3157,12 @@ class WrapperMachine:
     def _ctx_wire_sid(self, ctx: SessionContext) -> Optional[str]:
         if ctx.key:
             return ctx.key
-        if ctx.engine != "codex" or not ctx.session_id:
+        if not ctx.session_id:
+            return ctx.session_id
+        if ctx.engine == "claude":
+            return self._claude_wire_sid(
+                self._claude_profile_for_ctx(ctx), ctx.session_id)
+        if ctx.engine != "codex":
             return ctx.session_id
         return self._codex_wire_sid(
             self._codex_profile_for_ctx(ctx), ctx.session_id)
@@ -2883,7 +3483,7 @@ class WrapperMachine:
 
     async def _claim_legacy_presentation_ids(
         self,
-        claude_session_ids: set[str],
+        claude_session_ids: dict[str, str],
         codex_session_ids: dict[str, str],
     ) -> None:
         """Claim v1 engine-less receipts only from a complete native witness.
@@ -2898,7 +3498,8 @@ class WrapperMachine:
         try:
             legacy_ids = await asyncio.to_thread(store.legacy_ids)
             for session_id in legacy_ids:
-                in_claude = session_id in claude_session_ids
+                claude_target = claude_session_ids.get(session_id)
+                in_claude = claude_target is not None
                 codex_target = codex_session_ids.get(session_id)
                 in_codex = codex_target is not None
                 if in_claude == in_codex:
@@ -2907,14 +3508,14 @@ class WrapperMachine:
                     store.claim_legacy,
                     "claude" if in_claude else "codex",
                     session_id,
-                    session_id if in_claude else codex_target,
+                    claude_target if in_claude else codex_target,
                 )
         except SessionPresentationStoreError:
             log.warning("legacy session presentation ownership claim failed")
 
     async def _claim_legacy_presentation_from_claude_catalog(
         self,
-        claude_session_ids: set[str],
+        claude_wire_session_ids: set[str],
     ) -> None:
         store = self._session_presentation
         if store is None:
@@ -2923,11 +3524,25 @@ class WrapperMachine:
             legacy_ids = await asyncio.to_thread(store.legacy_ids)
             if not legacy_ids:
                 return
+            claude_candidates: dict[str, list[str]] = {}
+            for wire_sid in claude_wire_session_ids:
+                try:
+                    _profile, native_sid = self._claude_target(wire_sid)
+                except ValueError:
+                    continue
+                if native_sid in legacy_ids:
+                    claude_candidates.setdefault(native_sid, []).append(
+                        wire_sid)
+            claude_ids = {
+                native_sid: matches[0]
+                for native_sid, matches in claude_candidates.items()
+                if len(matches) == 1
+            }
             codex_ids: dict[str, str] = {}
             # Only rows the Claude catalog can render need a collision probe.
             # This caps exact SQLite lookups to the bounded native page rather
             # than probing once for every quarantined receipt.
-            for session_id in legacy_ids & claude_session_ids:
+            for session_id in set(claude_ids):
                 matches: list[str] = []
                 uncertain = False
                 for profile in self._codex_profiles:
@@ -2945,13 +3560,13 @@ class WrapperMachine:
                 # More than one account owning the same native UUID is also
                 # ambiguous, even though the engine family is the same.
                 if uncertain:
-                    claude_session_ids.discard(session_id)
+                    claude_ids.pop(session_id, None)
                 elif len(matches) == 1:
                     codex_ids[session_id] = matches[0]
                 elif len(matches) > 1:
-                    claude_session_ids.discard(session_id)
+                    claude_ids.pop(session_id, None)
             await self._claim_legacy_presentation_ids(
-                claude_session_ids, codex_ids)
+                claude_ids, codex_ids)
         except Exception as exc:
             log.warning(
                 "legacy presentation Codex ownership probe failed",
@@ -2997,21 +3612,34 @@ class WrapperMachine:
                     codex_ids[session_id] = matches[0]
                 elif len(matches) > 1:
                     duplicate_codex_ids.add(session_id)
-            claude_ids: set[str] = set()
+            claude_candidates: dict[str, list[str]] = {}
             unknown_claude_ids: set[str] = set()
             for session_id in listed_native_ids:
-                presence = await asyncio.to_thread(
-                    transcript_presence, session_id)
-                if presence is True:
-                    claude_ids.add(session_id)
-                elif presence is None:
-                    unknown_claude_ids.add(session_id)
+                for profile in self._claude_profiles:
+                    presence = await asyncio.to_thread(
+                        self._claude_catalog_transcript_presence,
+                        profile,
+                        session_id,
+                    )
+                    if presence is True:
+                        claude_candidates.setdefault(
+                            session_id, []).append(self._claude_wire_sid(
+                                profile, session_id))
+                    elif presence is None:
+                        unknown_claude_ids.add(session_id)
             for session_id in unknown_claude_ids:
                 codex_ids.pop(session_id, None)
             # Duplicate native UUIDs across Codex profiles cannot map one v1
             # bare receipt to a unique wire id; keep those quarantined.
-            claude_ids.difference_update(
-                duplicate_codex_ids | unknown_codex_ids)
+            claude_ids = {
+                native_sid: matches[0]
+                for native_sid, matches in claude_candidates.items()
+                if (
+                    len(matches) == 1
+                    and native_sid not in duplicate_codex_ids
+                    and native_sid not in unknown_claude_ids
+                )
+            }
             await self._claim_legacy_presentation_ids(
                 claude_ids, codex_ids)
         except Exception as exc:
@@ -3950,7 +4578,11 @@ class WrapperMachine:
         offset = 0
         allow_new_file = session_id is None
         if session_id is not None:
-            candidate = transcript_path(session_id)
+            candidate = self._claude_transcript_path(
+                self._claude_profile_for_ctx(ctx),
+                session_id,
+                directory=ctx.cwd,
+            )
             if candidate:
                 candidate = os.path.realpath(candidate)
                 try:
@@ -4019,7 +4651,11 @@ class WrapperMachine:
                 ctx, generation=probe.generation)
             return
 
-        candidate = transcript_path(session_id)
+        candidate = self._claude_transcript_path(
+            self._claude_profile_for_ctx(ctx),
+            session_id,
+            directory=ctx.cwd,
+        )
         if not candidate:
             return
         candidate = os.path.realpath(candidate)
@@ -4067,7 +4703,8 @@ class WrapperMachine:
         probe.partial = (
             trailing if len(trailing) <= MAX_PARTIAL_LINE else b"")
 
-        watch = self._watch.get(session_id) or {}
+        route_sid = self._ctx_wire_sid(ctx) or session_id
+        watch = self._watch.get(route_sid) or {}
         origin, _owned_ids = classify_claude_growth(
             complete,
             (watch.get("owned_message_ids") or {}).keys(),
@@ -4103,15 +4740,19 @@ class WrapperMachine:
             or ctx.btw
         ):
             return
-        source_path = transcript_path(session_id)
+        profile = self._claude_profile_for_ctx(ctx)
+        source_path = self._claude_transcript_path(
+            profile, session_id, directory=ctx.cwd)
         if not source_path:
             return
+        route_sid = self._ctx_wire_sid(ctx) or self._claude_wire_sid(
+            profile, session_id)
         changed = False
         for native_id, client_id in tuple(ctx.claude_client_message_ids.items()):
             try:
                 inserted = await asyncio.to_thread(
                     store.put,
-                    session_id,
+                    route_sid,
                     source_path,
                     native_id,
                     client_id,
@@ -4130,7 +4771,7 @@ class WrapperMachine:
             # A source fingerprint cannot detect metadata newly learned outside
             # the transcript. Discard alias-free derived pages and advance the
             # browser revision before any switch-back History is assembled.
-            self._bump_history_revision(session_id)
+            self._bump_history_revision(route_sid)
 
     async def _remember_claude_client_message_id(
         self,
@@ -5277,8 +5918,7 @@ class WrapperMachine:
             setattr(target, "auto_compact_threshold_tokens", auto_threshold)
         return permission, model, effort
 
-    @staticmethod
-    def _reset_claude_task_lifecycle(ctx: SessionContext) -> None:
+    def _reset_claude_task_lifecycle(self, ctx: SessionContext) -> None:
         watchdog = ctx.claude_autonomous_interrupt_task
         ctx.claude_autonomous_interrupt_wakeup.set()
         try:
@@ -5299,6 +5939,9 @@ class WrapperMachine:
             ctx.claude_followup_recovery_task = None
         ctx.claude_active_tasks.clear()
         ctx.claude_task_tracking_overflow = False
+        had_background_processes = bool(ctx.claude_background_processes)
+        ctx.claude_background_processes.clear()
+        ctx.claude_item_commands.clear()
         ctx.claude_background_followups.clear()
         ctx.claude_background_followup_nonce = 0
         ctx.claude_background_followup_overflow = False
@@ -5312,6 +5955,17 @@ class WrapperMachine:
             for run in runs.values():
                 if getattr(run, "status", None) == "running":
                     run.status = "cancelled"
+        if had_background_processes and self._is_resident_context(ctx):
+            # Claude defines its task level as process-local.  A child restart
+            # resets that authority to empty even if the old terminal edge was
+            # never observed. Publish asynchronously because SDK lifecycle
+            # callbacks are synchronous and may run while disconnect unwinds.
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._publish_claude_background_processes(ctx)
+                )
+            except RuntimeError:
+                pass
 
     @staticmethod
     def _claude_followup_origin_key(origin: object) -> str | None:
@@ -5456,6 +6110,22 @@ class WrapperMachine:
         parent Result may trigger an autonomous follow-up, whose later Result
         is the first safe spawn-option reconnect boundary.
         """
+        background_level = claude_background_tasks(message)
+        if background_level is not None:
+            task_ids = {
+                task_id
+                for task in background_level
+                if isinstance((task_id := task.get("task_id")), str)
+            }
+            if len(task_ids) > self.CLAUDE_ACTIVE_TASK_CAP:
+                ctx.claude_active_tasks = set(
+                    sorted(task_ids)[:self.CLAUDE_ACTIVE_TASK_CAP])
+                ctx.claude_task_tracking_overflow = True
+            else:
+                ctx.claude_active_tasks = task_ids
+                ctx.claude_task_tracking_overflow = False
+            return
+
         if isinstance(message, ResultMessage):
             # Only the background callback knows that this Result closes an
             # injected turn. A managed human Result may overlap a notification
@@ -5528,6 +6198,137 @@ class WrapperMachine:
             ctx.claude_task_tracking_overflow = True
             return
         ctx.claude_active_tasks.add(task_id)
+
+    def _background_process_sync(
+        self, ctx: SessionContext,
+    ) -> BackgroundProcessSync:
+        items = sorted(
+            ctx.claude_background_processes.values(),
+            key=lambda item: (
+                item.started_at if item.started_at is not None else item.updated_at
+                if item.updated_at is not None else 0,
+                item.item_id,
+            ),
+        )
+        return BackgroundProcessSync(
+            generation=self.instance_id,
+            items=[
+                item.model_copy(deep=True)
+                for item in items[:MAX_BACKGROUND_PROCESS_ITEMS]
+            ],
+        )
+
+    async def _publish_claude_background_processes(
+        self, ctx: SessionContext,
+    ) -> None:
+        if not self._is_resident_context(ctx):
+            return
+        await self._emit(ctx, self._background_process_sync(ctx))
+
+    def _observe_claude_background_process_event(
+        self, ctx: SessionContext, message: object,
+    ) -> bool:
+        """Maintain the reconnect snapshot; return whether membership moved."""
+        if isinstance(message, BackgroundProcessSync):
+            now = message.ts
+            previous = ctx.claude_background_processes
+            replacement: dict[str, BackgroundProcessItem] = {}
+            for incoming in message.items[:MAX_BACKGROUND_PROCESS_ITEMS]:
+                old = previous.get(incoming.item_id)
+                old_started = old.started_at if old else None
+                replacement[incoming.item_id] = incoming.model_copy(update={
+                    "summary": incoming.summary or (old.summary if old else None),
+                    "progress": incoming.progress or (old.progress if old else None),
+                    "command": incoming.command or (old.command if old else None),
+                    "cwd": incoming.cwd or (old.cwd if old else None),
+                    "started_at": (
+                        incoming.started_at
+                        if incoming.started_at is not None
+                        else old_started if old_started is not None else now
+                    ),
+                    "updated_at": (
+                        incoming.updated_at
+                        if incoming.updated_at is not None else now
+                    ),
+                })
+            ctx.claude_background_processes = replacement
+            message.generation = self.instance_id
+            return False
+
+        if not (
+            isinstance(message, ProcessEvent)
+            and message.background is True
+            and message.kind in {"agent", "task"}
+        ):
+            return False
+
+        processes = ctx.claude_background_processes
+        membership_changed = False
+        if message.kind == "agent" and message.parent_id:
+            # The native level usually precedes task_started and therefore may
+            # initially know only the task id. Once the edge proves the Agent
+            # parent, retire that provisional id in favor of the stable public
+            # Agent run id used by the existing process timeline/detail route.
+            stale_ids = {
+                candidate
+                for candidate, meta in ctx.claude_item_meta.items()
+                if candidate != message.item_id
+                and meta == ("agent", message.parent_id)
+                and candidate in processes
+            }
+            for stale_id in stale_ids:
+                processes.pop(stale_id, None)
+                membership_changed = True
+
+        terminal = (
+            message.phase == "end"
+            or message.status in {
+                "succeeded", "failed", "declined", "cancelled",
+                "interrupted",
+            }
+        )
+        if terminal:
+            if processes.pop(message.item_id, None) is not None:
+                membership_changed = True
+            return membership_changed
+
+        previous = processes.get(message.item_id)
+        if previous is None and len(processes) >= MAX_BACKGROUND_PROCESS_ITEMS:
+            return membership_changed
+        now = message.ts
+        summary = message.summary or (previous.summary if previous else None)
+        progress = message.progress or (previous.progress if previous else None)
+        command = message.command or (previous.command if previous else None)
+        cwd = message.cwd or (previous.cwd if previous else None)
+        previous_started = previous.started_at if previous else None
+        processes[message.item_id] = BackgroundProcessItem(
+            item_id=message.item_id,
+            kind=message.kind,
+            status=message.status,
+            turn_id=message.turn_id or (previous.turn_id if previous else None),
+            parent_id=(
+                message.parent_id or (previous.parent_id if previous else None)
+            ),
+            title=message.title,
+            summary=(
+                summary[:MAX_BACKGROUND_PROCESS_SUMMARY_CHARS]
+                if summary else None
+            ),
+            progress=(
+                progress[:MAX_BACKGROUND_PROCESS_SUMMARY_CHARS]
+                if progress else None
+            ),
+            command=(
+                command[:MAX_BACKGROUND_PROCESS_COMMAND_CHARS]
+                if command else None
+            ),
+            cwd=(cwd[:MAX_BACKGROUND_PROCESS_CWD_CHARS] if cwd else None),
+            started_at=(
+                previous_started if previous_started is not None else now
+            ),
+            updated_at=now,
+        )
+        return membership_changed or previous is None
 
     @staticmethod
     def _claude_has_background_work(ctx: SessionContext) -> bool:
@@ -6199,6 +7000,8 @@ class WrapperMachine:
                 directory=ctx.cwd,
                 max_bytes=self.cfg.history_source_max_bytes,
                 index_store=self._history_index,
+                config_dir=self._claude_config_root(
+                    self._claude_profile_for_ctx(ctx)),
             )
         except Exception as exc:
             # Transcript controls are advisory during handoff. An unavailable or
@@ -6386,7 +7189,14 @@ class WrapperMachine:
             if not terminal_confirmed:
                 return False
 
-            sdk = SdkHandle(self.cfg)
+            profile = self._claude_profile_for_ctx(ctx)
+            claude_handle_kwargs = {}
+            claude_root = self._claude_config_root(profile)
+            if claude_root is not None:
+                claude_handle_kwargs["claude_config_dir"] = claude_root
+            if self._claude_profiles.is_multi_profile:
+                claude_handle_kwargs["isolate_account_env"] = True
+            sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
             permission, model, effort = self._copy_claude_runtime_options(
                 ctx, broker, sdk)
             self._configure_claude_sdk_callbacks(ctx, sdk)
@@ -6841,7 +7651,8 @@ class WrapperMachine:
             if profile_meta is not None:
                 if (
                     not isinstance(profile_meta, dict)
-                    or set(profile_meta) != {"revision"}
+                    or set(profile_meta) - {"revision", "revisions"}
+                    or "revision" not in profile_meta
                     or isinstance(profile_meta.get("revision"), bool)
                     or not isinstance(profile_meta.get("revision"), int)
                     or profile_meta["revision"] < 0
@@ -6849,6 +7660,23 @@ class WrapperMachine:
                     raise ValueError(
                         "session alias profile metadata is invalid")
                 self._session_alias_profile_revision = profile_meta["revision"]
+                revisions = profile_meta.get("revisions", {
+                    "claude": 0,
+                    "codex": profile_meta["revision"],
+                })
+                if (
+                    not isinstance(revisions, dict)
+                    or set(revisions) != {"claude", "codex"}
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in revisions.values()
+                    )
+                ):
+                    raise ValueError(
+                        "session alias profile revisions are invalid")
+                self._session_alias_profile_revisions = dict(revisions)
             now = time.time()
             for old_key, entry in raw.items():
                 if not isinstance(entry, dict):
@@ -6856,6 +7684,7 @@ class WrapperMachine:
                 real = entry.get("session_id")
                 cwd = entry.get("cwd")
                 created = entry.get("created_at", 0)
+                engine = entry.get("engine")
                 if (
                     isinstance(old_key, str)
                     and re.fullmatch(r"tmp-[0-9a-f]{32}", old_key)
@@ -6865,9 +7694,11 @@ class WrapperMachine:
                     and len(cwd.encode("utf-8", "surrogatepass")) <= 4096
                     and isinstance(created, (int, float))
                     and 0 <= now - created <= self.SESSION_ALIAS_TTL
+                    and engine in {None, "claude", "codex"}
                 ):
                     aliases[old_key] = {
                         "session_id": real, "cwd": cwd, "created_at": created,
+                        **({"engine": engine} if engine is not None else {}),
                     }
             while len(aliases) > self.SESSION_ALIAS_CAP:
                 aliases.popitem(last=False)
@@ -6884,6 +7715,7 @@ class WrapperMachine:
         payload = OrderedDict(self._session_aliases)
         payload[self.SESSION_ALIAS_PROFILE_META_KEY] = {
             "revision": self._session_alias_profile_revision,
+            "revisions": self._session_alias_profile_revisions,
         }
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         if len(encoded) > self.SESSION_ALIAS_FILE_MAX_BYTES:
@@ -6908,33 +7740,58 @@ class WrapperMachine:
                 pass
 
     def _migrate_session_aliases(
-        self, transition: CodexProfileTopologyTransition,
+        self,
+        transition: (
+            ClaudeProfileTopologyTransition | CodexProfileTopologyTransition
+        ),
+        *,
+        engine: str = "codex",
     ) -> int:
-        if self._session_alias_profile_revision >= transition.revision:
+        if self._session_alias_profile_revisions[engine] >= transition.revision:
             return 0
         updated: OrderedDict[str, dict] = OrderedDict()
         migrated = 0
         for old_key, entry in self._session_aliases.items():
-            routed = transition.wire_session_id(entry["session_id"])
+            entry_engine = entry.get("engine")
+            # Pre-engine aliases were historically migrated as Codex state.
+            # Do not guess that an ambiguous legacy row belongs to Claude.
+            applies = entry_engine == engine or (
+                entry_engine is None and engine == "codex")
+            routed = (
+                transition.wire_session_id(entry["session_id"])
+                if applies else entry["session_id"]
+            )
             migrated += routed != entry["session_id"]
             updated[old_key] = {**entry, "session_id": routed}
         previous_aliases = self._session_aliases
         previous_revision = self._session_alias_profile_revision
+        previous_revisions = dict(self._session_alias_profile_revisions)
         self._session_aliases = updated
-        self._session_alias_profile_revision = transition.revision
+        self._session_alias_profile_revisions[engine] = transition.revision
+        if engine == "codex":
+            self._session_alias_profile_revision = transition.revision
         try:
             self._persist_session_aliases()
         except Exception:
             self._session_aliases = previous_aliases
             self._session_alias_profile_revision = previous_revision
+            self._session_alias_profile_revisions = previous_revisions
             raise
         return migrated
 
-    def _remember_session_alias(self, old_key: str, session_id: str, cwd: str) -> None:
+    def _remember_session_alias(
+        self,
+        old_key: str,
+        session_id: str,
+        cwd: str,
+        *,
+        engine: str,
+    ) -> None:
         self._session_aliases[old_key] = {
             "session_id": session_id,
             "cwd": cwd,
             "created_at": time.time(),
+            "engine": engine,
         }
         self._session_aliases.move_to_end(old_key)
         while len(self._session_aliases) > self.SESSION_ALIAS_CAP:
@@ -6960,7 +7817,21 @@ class WrapperMachine:
                     > self.PRIVATE_BTW_FILE_MAX_BYTES:
                 raise ValueError("private btw state exceeds size limit")
             raw = json.loads(raw_text)
-            if not isinstance(raw, dict) or len(raw) > self.PRIVATE_BTW_CAP:
+            if not isinstance(raw, dict):
+                raise ValueError("private btw state has an invalid shape")
+            profile_meta = raw.pop(self.PRIVATE_BTW_PROFILE_META_KEY, None)
+            if profile_meta is not None:
+                if (
+                    not isinstance(profile_meta, dict)
+                    or set(profile_meta) != {"revision"}
+                    or isinstance(profile_meta.get("revision"), bool)
+                    or not isinstance(profile_meta.get("revision"), int)
+                    or profile_meta["revision"] < 0
+                ):
+                    raise ValueError(
+                        "private btw profile metadata is invalid")
+                self._private_btw_profile_revision = profile_meta["revision"]
+            if len(raw) > self.PRIVATE_BTW_CAP:
                 raise ValueError("private btw state has an invalid shape")
             for sid, entry in raw.items():
                 if not isinstance(entry, dict):
@@ -6970,7 +7841,7 @@ class WrapperMachine:
                 if (
                     isinstance(sid, str)
                     and re.fullmatch(
-                        r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}",
+                        r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}",
                         sid,
                     )
                     and isinstance(cwd, str) and "\x00" not in cwd
@@ -6991,8 +7862,33 @@ class WrapperMachine:
             ) from exc
         return entries
 
+    def _migrate_private_btw_sessions(
+        self, transition: ClaudeProfileTopologyTransition,
+    ) -> int:
+        if self._private_btw_profile_revision >= transition.revision:
+            return 0
+        updated: OrderedDict[str, dict] = OrderedDict()
+        migrated = 0
+        for session_id, entry in self._private_btw_sessions.items():
+            routed = transition.wire_session_id(session_id)
+            if routed in updated and updated[routed] != entry:
+                raise RuntimeError("private btw profile migration collides")
+            updated[routed] = entry
+            migrated += routed != session_id
+        # Persist the revision even when there are no ids to rewrite. A
+        # profile-id swap is not an idempotent transform, so a crash during the
+        # larger topology transaction must never apply it twice to privacy
+        # tombstones on restart.
+        self._persist_private_btw_sessions(
+            updated, profile_revision=transition.revision)
+        self._private_btw_sessions = updated
+        self._private_btw_profile_revision = transition.revision
+        return migrated
+
     def _persist_private_btw_sessions(
         self, entries: Optional[OrderedDict[str, dict]] = None,
+        *,
+        profile_revision: int | None = None,
     ) -> None:
         entries = self._private_btw_sessions if entries is None else entries
         path = self._private_btw_file()
@@ -7000,7 +7896,14 @@ class WrapperMachine:
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(path.parent, 0o700)
-            payload = json.dumps(entries, separators=(",", ":"))
+            serializable = OrderedDict(entries)
+            serializable[self.PRIVATE_BTW_PROFILE_META_KEY] = {
+                "revision": (
+                    self._private_btw_profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+            }
+            payload = json.dumps(serializable, separators=(",", ":"))
             if len(payload.encode("utf-8")) > self.PRIVATE_BTW_FILE_MAX_BYTES:
                 raise ValueError("private btw state exceeds size limit")
             with tmp.open("w") as stream:
@@ -7038,10 +7941,35 @@ class WrapperMachine:
         self._private_btw_sessions = updated
 
     async def _delete_private_btw(
-        self, session_id: str, cwd: str, *, forget: bool = True,
+        self,
+        session_id: str,
+        cwd: str,
+        *,
+        forget: bool = True,
+        claude_profile_id: str | None = None,
     ) -> bool:
         try:
-            await asyncio.to_thread(delete_session, session_id, directory=cwd)
+            if "@" in session_id:
+                profile, native_sid = self._claude_target(session_id)
+                wire_sid = session_id
+            else:
+                profile = self._claude_profile(claude_profile_id)
+                native_sid = session_id
+                wire_sid = self._claude_wire_sid(profile, native_sid)
+        except (RuntimeError, ValueError) as exc:
+            log.warning(
+                "btw fork profile resolution failed",
+                forked=session_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        try:
+            await asyncio.to_thread(
+                self._claude_catalog_delete_session,
+                profile,
+                native_sid,
+                directory=cwd,
+            )
         except FileNotFoundError:
             pass  # already absent is the desired state
         except Exception as exc:
@@ -7050,7 +7978,7 @@ class WrapperMachine:
             return False
         if forget:
             updated = OrderedDict(self._private_btw_sessions)
-            updated.pop(session_id, None)
+            updated.pop(wire_sid, None)
             try:
                 self._persist_private_btw_sessions(updated)
             except RuntimeError as exc:
@@ -7061,7 +7989,7 @@ class WrapperMachine:
                             error_type=type(exc).__name__)
             else:
                 self._private_btw_sessions = updated
-        log.info("btw fork transcript deleted", forked=session_id)
+        log.info("btw fork transcript deleted", forked=wire_sid)
         return True
 
     async def _cleanup_private_btw_sessions(self) -> None:
@@ -7135,27 +8063,69 @@ class WrapperMachine:
         # `new_session(engine="codex")` command.
         await self.transport.start()
         try:
-            bootstrap_sid = (
-                self.cfg.resume_session_id
-                or load_session_id(self.cfg.state_dir, self.cfg.cc_cwd)
+            configured_bootstrap_sid = self.cfg.resume_session_id or None
+            persisted_bootstrap_state = (
+                None if configured_bootstrap_sid is not None else
+                load_session_state(self.cfg.state_dir, self.cfg.cc_cwd)
             )
+            bootstrap_sid = (
+                configured_bootstrap_sid
+                or (
+                    persisted_bootstrap_state.session_id
+                    if persisted_bootstrap_state is not None else None
+                )
+            )
+            bootstrap_wire_sid = bootstrap_sid
+            bootstrap_native_sid = bootstrap_sid
+            bootstrap_profile_id: str | None = None
+            if bootstrap_sid and self._claude_profile_migration_ok:
+                try:
+                    profile, bootstrap_native_sid, bootstrap_wire_sid = (
+                        self._claude_bootstrap_target(
+                            bootstrap_sid,
+                            persisted=configured_bootstrap_sid is None,
+                            persisted_profile_id=(
+                                persisted_bootstrap_state.claude_profile_id
+                                if persisted_bootstrap_state is not None
+                                else None
+                            ),
+                            persisted_profile_revision=(
+                                persisted_bootstrap_state.claude_profile_revision
+                                if persisted_bootstrap_state is not None
+                                else None
+                            ),
+                        )
+                    )
+                    bootstrap_profile_id = profile.id
+                except ValueError as exc:
+                    log.warning(
+                        "saved Claude bootstrap route is not resumable",
+                        error_type=type(exc).__name__,
+                    )
+                    bootstrap_wire_sid = None
+                    bootstrap_native_sid = None
+            elif bootstrap_sid:
+                bootstrap_wire_sid = None
+                bootstrap_native_sid = None
             # Shared-daemon turns already accepted on behalf of Remote outrank
             # creating an idle bootstrap resident. Recover every durable lease
             # first; recovery may temporarily exceed the normal resident cap
             # because those native turns are already consuming daemon capacity.
             await self._restore_codex_owned_turns()
             ctx = (
-                self._ctx_by_sid(bootstrap_sid)
-                if bootstrap_sid else None
+                self._ctx_by_sid(bootstrap_wire_sid)
+                if bootstrap_wire_sid else None
             )
             if (
                 ctx is None
                 and len(self.sessions) < self.cfg.max_concurrent_sessions
+                and self._claude_profile_migration_ok
             ):
                 ctx = await self._spawn(
-                    resume_id=bootstrap_sid,
+                    resume_id=bootstrap_native_sid,
                     cwd=self.cfg.cc_cwd,
                     bootstrap=True,
+                    claude_profile_id=bootstrap_profile_id,
                 )
             elif ctx is None and self.sessions:
                 ctx = next(iter(self.sessions.values()))
@@ -7370,7 +8340,11 @@ class WrapperMachine:
                     await self._cleanup_codex_steer_attachments(c)
                 if c.btw and c.engine != "codex" and c.btw_real_id:
                     await self._delete_private_btw(
-                        c.btw_real_id, c.cwd, forget=disconnected)
+                        c.btw_real_id,
+                        c.cwd,
+                        forget=disconnected,
+                        claude_profile_id=c.claude_profile_id,
+                    )
             terminal_tasks = list(self._codex_terminal_persist_tasks)
             # Stop every producer first, then give the remaining small fsyncs a
             # chance to finish. Draining earlier could miss a terminal emitted
@@ -7395,6 +8369,14 @@ class WrapperMachine:
             try:
                 now = time.time()
                 for engine in ("claude", "codex"):
+                    if (
+                        engine == "claude"
+                        and (
+                            not self._claude_profile_migration_ok
+                            or not self._claude_work_profile_migration_ok
+                        )
+                    ):
+                        continue
                     if (
                         engine == "codex"
                         and (
@@ -7436,6 +8418,7 @@ class WrapperMachine:
         run_id = str(schedule["run_id"])
         record = None
         ctx = None
+        claude_profile = None
         codex_profile = None
         profile_id: str | None = None
         retryable = True
@@ -7455,7 +8438,26 @@ class WrapperMachine:
             lease_task = asyncio.create_task(
                 self._renew_work_schedule_lease(store, run_id)
             )
-            if engine == "codex":
+            if engine == "claude":
+                selected_profile_id = schedule.get("claude_profile_id")
+                if not isinstance(selected_profile_id, str):
+                    retryable = False
+                    raise ValueError("Claude Work schedule has no owning profile")
+                profile_id = selected_profile_id
+                try:
+                    claude_profile = self._claude_profile(profile_id)
+                except (RuntimeError, ValueError):
+                    retryable = False
+                    raise
+                if (
+                    self._claude_profiles_explicit
+                    and not claude_profile.config_dir.is_dir()
+                ):
+                    retryable = False
+                    raise ValueError(
+                        "Claude Work schedule profile directory is unavailable"
+                    )
+            elif engine == "codex":
                 selected_profile_id = schedule.get("codex_profile_id")
                 if not isinstance(selected_profile_id, str):
                     retryable = False
@@ -7469,7 +8471,10 @@ class WrapperMachine:
             record = await asyncio.to_thread(
                 store.create_session,
                 schedule.get("project_id"),
-                codex_profile_id=profile_id,
+                claude_profile_id=(
+                    profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    profile_id if engine == "codex" else None),
             )
             ctx = await self._spawn(
                 resume_id=None,
@@ -7478,6 +8483,7 @@ class WrapperMachine:
                 space="work",
                 work_id=record.work_id,
                 permission_mode=("on-request" if engine == "codex" else None),
+                **self._claude_spawn_profile_kwargs(claude_profile),
                 **self._codex_spawn_profile_kwargs(codex_profile),
             )
             if ctx is None:
@@ -7494,14 +8500,19 @@ class WrapperMachine:
             await ctx.turn_task
             if not ctx.session_id:
                 raise RuntimeError("scheduled session id unavailable")
-            if engine == "codex":
+            if engine == "claude":
+                profile_id = self._claude_profile_for_ctx(ctx).id
+            elif engine == "codex":
                 profile_id = self._codex_profile_for_ctx(ctx).id
             status = await asyncio.to_thread(
                 store.complete_schedule,
                 run_id,
                 ctx.session_id,
                 None,
-                codex_profile_id=profile_id,
+                claude_profile_id=(
+                    profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    profile_id if engine == "codex" else None),
             )
             log.info(
                 "Work schedule completed",
@@ -7517,7 +8528,10 @@ class WrapperMachine:
                 str(schedule["title"]),
                 status,
                 None,
-                codex_profile_id=profile_id,
+                claude_profile_id=(
+                    profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    profile_id if engine == "codex" else None),
             )
         except asyncio.CancelledError:
             # Do not mark a cancelled wrapper-owned task failed. Its lease will
@@ -7531,17 +8545,27 @@ class WrapperMachine:
                 error_type=type(exc).__name__,
             )
             message = (
-                "绑定的 Codex 账号不可用，请恢复账号配置"
-                if not retryable else "执行失败，请检查引擎和权限配置"
+                (
+                    "绑定的 Claude 账号不可用，请恢复账号配置"
+                    if engine == "claude"
+                    else "绑定的 Codex 账号不可用，请恢复账号配置"
+                )
+                if not retryable
+                else "执行失败，请检查引擎和权限配置"
             )
-            if engine == "codex" and ctx is not None:
+            if engine == "claude" and ctx is not None:
+                profile_id = self._claude_profile_for_ctx(ctx).id
+            elif engine == "codex" and ctx is not None:
                 profile_id = self._codex_profile_for_ctx(ctx).id
             status = await asyncio.to_thread(
                 store.complete_schedule,
                 run_id,
                 ctx.session_id if ctx is not None else None,
                 message,
-                codex_profile_id=profile_id,
+                claude_profile_id=(
+                    profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    profile_id if engine == "codex" else None),
                 retryable=retryable,
             )
             if ctx is not None and not ctx.session_id:
@@ -7560,7 +8584,10 @@ class WrapperMachine:
                 str(schedule["title"]),
                 status,
                 message,
-                codex_profile_id=profile_id,
+                claude_profile_id=(
+                    profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    profile_id if engine == "codex" else None),
             )
         finally:
             if lease_task is not None:
@@ -7584,6 +8611,7 @@ class WrapperMachine:
         status: str,
         error: str | None,
         *,
+        claude_profile_id: str | None = None,
         codex_profile_id: str | None = None,
     ) -> None:
         try:
@@ -7592,6 +8620,9 @@ class WrapperMachine:
             if session_id:
                 store = self._work.for_engine(engine)
                 wire_sid = (
+                    self._claude_wire_sid(claude_profile_id, session_id)
+                    if engine == "claude" and claude_profile_id is not None
+                    else
                     self._codex_wire_sid(codex_profile_id, session_id)
                     if engine == "codex" and codex_profile_id is not None
                     else session_id
@@ -7599,6 +8630,7 @@ class WrapperMachine:
                 artifacts = await asyncio.to_thread(
                     store.artifacts,
                     session_id,
+                    claude_profile_id=claude_profile_id,
                     codex_profile_id=codex_profile_id,
                 )
                 await self.transport.send(
@@ -7813,6 +8845,13 @@ class WrapperMachine:
         if isinstance(msg, ProcessEvent):
             tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
             if msg.kind != "server_tool" or tool != "viewimage":
+                if msg.phase == "end":
+                    # An extension-classified Read can resolve to ordinary text
+                    # or an error. Its terminal event deliberately changes back
+                    # to the native tool name so the Web does not render a dead
+                    # image placeholder; discard the provisional live snapshot
+                    # candidate created by the matching start event.
+                    ctx.preview_image_candidates.pop(msg.item_id, None)
                 return
             raw_path = None
             if isinstance(msg.input, dict):
@@ -8303,6 +9342,11 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        background_membership_changed = (
+            self._observe_claude_background_process_event(ctx, msg)
+            if ctx.engine == "claude"
+            else False
+        )
         if isinstance(msg, GoalState) and msg.sid:
             goal_id = self._goal_identity(msg.goal)
             dismissed = False
@@ -8435,6 +9479,12 @@ class WrapperMachine:
             else msg
         )
         await self.transport.send(live)
+        if background_membership_changed:
+            # Keep one explicit level after a membership edge.  Clients which
+            # miss either edge still converge, and Hello can always seed the
+            # exact same bounded replacement without consulting the replay ring.
+            await self._emit_locked(
+                ctx, self._background_process_sync(ctx))
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
         try:
@@ -8455,6 +9505,7 @@ class WrapperMachine:
             if (
                 isinstance(msg, TurnEnd)
                 and not msg.result.is_error
+                and msg.result.subtype != "steered"
                 and not ctx.btw
                 and self._session_presentation is not None
             ):
@@ -8465,7 +9516,13 @@ class WrapperMachine:
                             self._session_presentation.mark_completion,
                             ctx.engine,
                             sid,
-                            msg.turn_id,
+                            # Claude's top-level user/checkpoint id survives
+                            # autonomous background follow-ups. The assistant
+                            # id does not: canonical History legitimately ends
+                            # the same visible turn on a later background
+                            # assistant row. Codex has no checkpoint_id and
+                            # continues to use its native task id.
+                            msg.checkpoint_id or msg.turn_id,
                         )
                     except SessionPresentationStoreError:
                         log.warning(
@@ -9776,7 +10833,6 @@ class WrapperMachine:
             focused_id = self._ctx_wire_sid(focused) or focused.key
             if focused_id:
                 cursors[focused_id] = legacy_cursor
-        claude_rate_limits = await self._claude_rate_limit_snapshot()
         for old_key in list(cursors):
             alias = self._session_aliases.get(old_key)
             if alias is None:
@@ -9897,6 +10953,21 @@ class WrapperMachine:
                             "route_id": getattr(cmd, "route_id", None),
                         },
                     ))
+                if ctx.engine == "claude":
+                    # Background work is current state just like a pending
+                    # question. An explicit empty replacement is required to
+                    # clear stale browser state after a missed terminal edge.
+                    await self.transport.send(
+                        self._background_process_sync(ctx).model_copy(
+                            deep=True,
+                            update={
+                                "seq": None,
+                                "to": cmd.client_id,
+                                "sid": sid,
+                                "route_id": getattr(cmd, "route_id", None),
+                            },
+                        )
+                    )
                 # ReplayStart's synthetic Snapshot predates protocol-v15 and is
                 # built by RingBuffer. Always follow replay with the current
                 # revisioned control value; same-revision delivery is idempotent.
@@ -10011,7 +11082,9 @@ class WrapperMachine:
                             route_id=getattr(cmd, "route_id", None),
                         ))
                     if ctx.engine == "claude" and not ctx.btw:
-                        for rate_limit in claude_rate_limits:
+                        for rate_limit in await self._claude_rate_limit_snapshot(
+                            ctx
+                        ):
                             await self.transport.send(rate_limit.model_copy(
                                 deep=True,
                                 update={
@@ -10064,8 +11137,17 @@ class WrapperMachine:
         return next((
             ctx for ctx in self.sessions.values()
             if ctx.session_id == sid and (
-                ctx.engine != "codex"
+                (
+                    ctx.engine == "claude"
+                    and not self._claude_profiles.is_multi_profile
+                )
                 or (
+                    ctx.engine != "claude"
+                    and ctx.engine != "codex"
+                )
+                or (
+                    ctx.engine == "codex"
+                    and
                     not self._codex_profiles.is_multi_profile
                     and (ctx.codex_profile_id or default_profile_id)
                     == default_profile_id
@@ -10210,7 +11292,12 @@ class WrapperMachine:
                 except ValueError:
                     return
             else:
-                path = transcript_path(sid)
+                try:
+                    profile, native_sid = self._claude_target(sid)
+                except ValueError:
+                    return
+                path = self._claude_transcript_path(
+                    profile, native_sid, directory=ctx.cwd)
         else:
             # A session can be evicted from the resident pool while still present
             # in a browser. Resolve its store instead of silently parsing Codex as
@@ -10221,7 +11308,11 @@ class WrapperMachine:
                 path = None
             engine = "codex" if path else "claude"
             if path is None:
-                path = transcript_path(sid)
+                try:
+                    profile, native_sid = self._claude_target(sid)
+                except ValueError:
+                    return
+                path = self._claude_transcript_path(profile, native_sid)
         if not path:
             return
         try:
@@ -10298,6 +11389,10 @@ class WrapperMachine:
             if active_turns:
                 watch["external_ts"] = time.time()
         else:
+            try:
+                profile, native_sid = self._claude_target(sid)
+            except ValueError:
+                return
             broker_active = False
             broker_partial = b""
             if ctx is not None and getattr(ctx.sdk, "is_claude_broker", False):
@@ -10310,6 +11405,8 @@ class WrapperMachine:
                     ctx.state = "running"
             watch.update({
                 "cwd": ctx.cwd if ctx is not None else None,
+                "claude_profile_id": profile.id,
+                "native_session_id": native_sid,
                 "external": False,
                 "holders": set(),
                 "takeover_pending": False,
@@ -10671,6 +11768,29 @@ class WrapperMachine:
     async def _probe_claude_holders(
         self, paths: dict[str, str], cwds: dict[str, str],
     ):
+        profile_kwargs: dict[str, object] = {}
+        if self._claude_profiles_explicit:
+            profile_kwargs = {
+                "config_dirs": {
+                    sid: str(self._claude_profiles.get(
+                        self._watch[sid].get("claude_profile_id")
+                    ).config_dir)
+                    for sid in paths
+                    if sid in self._watch
+                },
+                "native_session_ids": {
+                    sid: self._watch[sid].get("native_session_id")
+                    for sid in paths
+                    if sid in self._watch
+                    and isinstance(
+                        self._watch[sid].get("native_session_id"), str)
+                },
+                # An unrelated shell that omits CLAUDE_CONFIG_DIR uses
+                # Claude's native per-user default, not the registry's chosen
+                # default profile.
+                "default_config_dir": str(
+                    (Path.home() / ".claude").resolve(strict=False)),
+            }
         scan = await asyncio.to_thread(
             claude_session_holders,
             paths,
@@ -10679,6 +11799,7 @@ class WrapperMachine:
             continue_bindings=self._claude_continue_bindings,
             continue_candidates=self._claude_continue_candidates,
             continue_resolver=self._latest_claude_session_for_cwd,
+            **profile_kwargs,
         )
         if not scan.complete:
             if not self._claude_probe_warned:
@@ -10690,8 +11811,11 @@ class WrapperMachine:
             self._claude_probe_warned = False
         return scan
 
-    @staticmethod
-    def _latest_claude_session_for_cwd(cwd: str) -> Optional[str]:
+    def _latest_claude_session_for_cwd(
+        self,
+        cwd: str,
+        config_root: str | None = None,
+    ) -> Optional[str]:
         """Return Claude's native cwd-global ``-c`` target.
 
         This runs inside the bounded process-scan worker and is called only for
@@ -10699,17 +11823,38 @@ class WrapperMachine:
         A catalog failure deliberately propagates so the ownership scan remains
         incomplete/fail-closed instead of guessing from the watched subset.
         """
-        infos = list_sessions(
-            directory=cwd,
-            limit=1,
-            include_worktrees=False,
-        )
+        profile: ClaudeProfile | None = None
+        if self._claude_profiles_explicit:
+            if not config_root:
+                raise RuntimeError(
+                    "Claude process config root is unavailable")
+            normalized_root = os.path.realpath(config_root)
+            matches = [
+                candidate for candidate in self._claude_profiles
+                if os.path.realpath(candidate.config_dir) == normalized_root
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    "Claude process config root is not uniquely registered")
+            profile = matches[0]
+            infos = self._claude_catalog_list_sessions(
+                profile,
+                directory=cwd,
+                limit=1,
+                include_worktrees=False,
+            )
+        else:
+            infos = list_sessions(
+                directory=cwd,
+                limit=1,
+                include_worktrees=False,
+            )
         if not infos:
             return None
         sid = getattr(infos[0], "session_id", None)
         if not isinstance(sid, str) or not sid or len(sid) > 256:
             raise RuntimeError("Claude catalog returned an invalid session id")
-        return sid
+        return self._claude_wire_sid(profile, sid) if profile else sid
 
     async def _prime_claude_ownership(self, sid: str) -> bool:
         """Synchronously close the watcher interval before History/Query."""
@@ -11647,9 +12792,20 @@ class WrapperMachine:
         )
         events: list = []
         mdl = None
+        claude_history_messages = None
+        claude_materialized_images: tuple[
+            _MaterializedClaudeHistoryImage, ...
+        ] = ()
         watched_engine = watch.get("engine")
         is_codex_hist = bool(
             (ctx is not None and ctx.engine == "codex") or watched_engine == "codex")
+        claude_profile: ClaudeProfile | None = None
+        claude_native_sid: str | None = None
+        if not is_codex_hist:
+            try:
+                claude_profile, claude_native_sid = self._claude_target(sid)
+            except ValueError:
+                pass
         claude_snapshot_in_progress = bool(
             not is_codex_hist
             and before is None
@@ -11688,11 +12844,15 @@ class WrapperMachine:
         codex_client_aliases = CodexClientMessageAliases({}, {})
         codex_process_clocks = CodexProcessClocks({})
         try:
-            source_path = await asyncio.to_thread(
-                self._codex_rollout_for_wire
-                if is_codex_hist else transcript_path,
-                sid,
-            )
+            if is_codex_hist:
+                source_path = await asyncio.to_thread(
+                    self._codex_rollout_for_wire, sid)
+            elif claude_profile is not None and claude_native_sid is not None:
+                source_path = await asyncio.to_thread(
+                    self._claude_transcript_path,
+                    claude_profile,
+                    claude_native_sid,
+                )
             source_too_large = bool(
                 source_path and not is_codex_hist
                 and await asyncio.to_thread(os.path.getsize, source_path)
@@ -11977,7 +13137,7 @@ class WrapperMachine:
         if source_too_large:
             oversized_compact_page = await asyncio.to_thread(
                 transcript_compact_history_page,
-                sid,
+                claude_native_sid or sid,
                 path=source_path,
                 before=before,
                 limit=(int(limit) if isinstance(limit, int) and limit > 0
@@ -12132,6 +13292,14 @@ class WrapperMachine:
             # writes the first JSONL row. That is an authoritative empty history,
             # not a read failure banner.
             events = []
+        elif (
+            claude_profile is not None
+            and self._claude_config_root(claude_profile) is not None
+            and source_path is None
+        ):
+            # Profile-explicit reads must never let a missing secondary source
+            # fall back to the wrapper process's ambient ~/.claude catalog.
+            history_error = "历史暂时不可用，请稍后重试"
         else:
             # Existing Claude sessions must never inherit the wrapper's current
             # default cwd. Resolve their immutable transcript directory from
@@ -12141,7 +13309,15 @@ class WrapperMachine:
             directory = (ctx.cwd if ctx else None) or None
             if directory is None:
                 try:
-                    info = await asyncio.to_thread(get_session_info, sid)
+                    info = (
+                        await asyncio.to_thread(
+                            self._claude_catalog_session_info,
+                            claude_profile,
+                            claude_native_sid,
+                        )
+                        if claude_profile is not None
+                        and claude_native_sid is not None else None
+                    )
                 except Exception as exc:
                     log.warning(
                         "Claude history session metadata unavailable",
@@ -12158,13 +13334,15 @@ class WrapperMachine:
                     directory = os.path.realpath(expanded_hint)
             try:
                 def _read():
+                    if claude_profile is None or claude_native_sid is None:
+                        raise ValueError("invalid Claude session route")
                     if oversized_compact_page is not None:
                         messages = oversized_compact_page.messages
                         timestamps = oversized_compact_page.timestamps
                         internal_events = oversized_compact_page.internal_events
                     else:
                         compact_snapshot = transcript_compact_snapshot(
-                            sid,
+                            claude_native_sid or sid,
                             path=source_path,
                             index_store=self._history_index,
                             snapshot_size=(source_fingerprint.size
@@ -12179,17 +13357,41 @@ class WrapperMachine:
                         if compact_snapshot is not None:
                             messages, timestamps, internal_events = compact_snapshot
                         else:
-                            messages = get_session_messages(
-                                sid, directory=directory)
+                            messages = self._claude_catalog_messages(
+                                claude_profile,
+                                claude_native_sid,
+                                directory=directory,
+                            )
                             if not messages and directory is not None:
-                                messages = get_session_messages(
-                                    sid, directory=None)
-                            timestamps = transcript_timestamps(sid)
-                            internal_events = transcript_internal_user_events(sid)
+                                messages = self._claude_catalog_messages(
+                                    claude_profile,
+                                    claude_native_sid,
+                                    directory=None,
+                                )
+                            if self._claude_config_root(
+                                claude_profile
+                            ) is None:
+                                timestamps = transcript_timestamps(
+                                    claude_native_sid or sid)
+                                internal_events = (
+                                    transcript_internal_user_events(
+                                        claude_native_sid or sid)
+                                )
+                            else:
+                                timestamps = transcript_timestamps(
+                                    claude_native_sid or sid,
+                                    path=source_path,
+                                )
+                                internal_events = (
+                                    transcript_internal_user_events(
+                                        claude_native_sid or sid,
+                                        path=source_path,
+                                    )
+                                )
                     messages = recover_claude_delayed_retry_tail(
-                        sid,
+                        claude_native_sid or sid,
                         messages,
-                        path=source_path or transcript_path(sid),
+                        path=source_path,
                         index_store=self._history_index,
                         snapshot_size=(
                             source_fingerprint.size
@@ -12209,10 +13411,11 @@ class WrapperMachine:
                         timestamps,
                         internal_events,
                         self._claude_history_client_message_ids(
-                            sid, source_path or transcript_path(sid)),
+                            sid, source_path),
                     )
                 (msgs, tss, internal_events,
                  client_message_ids) = await asyncio.to_thread(_read)
+                claude_history_messages = msgs
                 alias_kwargs = (
                     {"client_message_ids": client_message_ids}
                     if client_message_ids else {}
@@ -12232,8 +13435,24 @@ class WrapperMachine:
                     events = translate_history(
                         msgs, self.cfg.tool_result_max, timestamps=tss,
                         **alias_kwargs, **lifecycle_kwargs)
+                subagent_args = (
+                    (sid, self.cfg.tool_result_max)
+                    if self._claude_config_root(claude_profile) is None
+                    else (
+                        claude_native_sid,
+                        self.cfg.tool_result_max,
+                    )
+                )
+                subagent_kwargs = (
+                    {}
+                    if self._claude_config_root(claude_profile) is None
+                    else {"path": source_path}
+                )
                 subagent_events = await asyncio.to_thread(
-                    translate_subagent_history, sid, self.cfg.tool_result_max)
+                    translate_subagent_history,
+                    *subagent_args,
+                    **subagent_kwargs,
+                )
                 events = merge_subagent_history(events, subagent_events)
                 mdl = last_assistant_model(msgs)
             except Exception as e:
@@ -12439,6 +13658,28 @@ class WrapperMachine:
         # from tearing down the wrapper<->relay connection.
         selected = page
         effective_start = start
+        if not is_codex_hist and claude_history_messages is not None:
+            image_item_ids = {
+                event.item_id
+                for group in selected
+                for event in group
+                if (
+                    isinstance(event, ProcessEvent)
+                    and event.tool == "view_image"
+                    and event.phase == "end"
+                )
+            }
+            if image_item_ids:
+                image_assets = await asyncio.to_thread(
+                    extract_claude_history_image_assets,
+                    claude_history_messages,
+                    item_ids=image_item_ids,
+                    max_assets=min(64, len(image_item_ids)),
+                )
+                claude_materialized_images = (
+                    _attach_claude_history_image_refs(
+                        selected, image_assets)
+                )
         history = make_history(selected, effective_start)
         margin = min(64 * 1024, max(1024, self.cfg.ws_max_size_bytes // 16))
         frame_budget = max(1024, self.cfg.ws_max_size_bytes - margin)
@@ -12706,6 +13947,22 @@ class WrapperMachine:
                         page=materialized,
                         detail_events=detail_source_events,
                     )
+                    for image in claude_materialized_images:
+                        if image.data is None:
+                            continue
+                        await asyncio.to_thread(
+                            self._history_index.put_image_asset,
+                            sid,
+                            "claude",
+                            source_fingerprint,
+                            image.turn_id,
+                            image.image_id,
+                            "full",
+                            image.media_type,
+                            image.width,
+                            image.height,
+                            image.data,
+                        )
                 except Exception as exc:
                     # The index is a rebuildable acceleration layer. A failed
                     # write cannot make an otherwise coherent source snapshot
@@ -14180,7 +15437,7 @@ class WrapperMachine:
             if rows is None:
                 source_path = await asyncio.to_thread(
                     self._codex_rollout_for_wire
-                    if is_codex else transcript_path,
+                    if is_codex else self._claude_transcript_path_for_wire,
                     sid,
                 )
                 if not source_path:
@@ -14402,11 +15659,22 @@ class WrapperMachine:
             return await send(error="当前会话不支持协作代理详情")
         if ctx is not None and ctx.space != "code":
             return await send(error="Work 不提供协作代理详情")
+        try:
+            claude_profile, native_sid = self._claude_target(sid)
+        except ValueError:
+            return await send(error="Claude 账号或会话标识无效")
         if ctx is None:
             work_record = await asyncio.to_thread(
-                self._work.for_engine("claude").get_by_session, sid)
+                self._work.for_engine("claude").get_by_session,
+                native_sid,
+                claude_profile_id=claude_profile.id,
+            )
             if work_record is not None:
                 return await send(error="Work 不提供协作代理详情")
+
+        directory = ctx.cwd if ctx is not None else None
+        main_path = self._claude_transcript_path(
+            claude_profile, native_sid, directory=directory)
 
         registry = ctx.claude_agents if ctx is not None else None
         run = registry.snapshot(cmd.run_id) if registry is not None else None
@@ -14456,10 +15724,16 @@ class WrapperMachine:
                 newer_cursor=newer,
             )
 
+        if main_path is None:
+            return await send(error="未找到这个协作代理")
         try:
             location = await asyncio.to_thread(
-                resolve_source_agent, sid, cmd.run_id,
-                ctx.cwd if ctx is not None else None)
+                resolve_source_agent,
+                native_sid,
+                cmd.run_id,
+                directory,
+                main_path=main_path,
+            )
         except Exception as exc:
             log.warning(
                 "Claude Agent identity read failed",
@@ -14499,8 +15773,18 @@ class WrapperMachine:
             try:
                 detail = await asyncio.to_thread(
                     translate_source_agent,
-                    sid, location, ctx.cwd if ctx is not None else None,
+                    native_sid,
+                    location,
+                    directory,
                     self.cfg.tool_result_max,
+                    **(
+                        {}
+                        if self._claude_config_root(claude_profile) is None
+                        else {
+                            "config_dir": self._claude_config_root(
+                                claude_profile)
+                        }
+                    ),
                 )
             except AgentSourceTooLarge:
                 return await send(
@@ -14639,7 +15923,7 @@ class WrapperMachine:
                 return await send(error="历史图片暂时不可用")
             source_path = await asyncio.to_thread(
                 self._codex_rollout_for_wire
-                if is_codex else transcript_path,
+                if is_codex else self._claude_transcript_path_for_wire,
                 sid,
             )
             if not source_path:
@@ -14722,6 +16006,71 @@ class WrapperMachine:
                     height=height,
                     data=data,
                 )
+            if not is_codex:
+                asset = await asyncio.to_thread(
+                    read_claude_history_image_asset,
+                    source.path,
+                    cmd.image_id,
+                )
+                try:
+                    current_source = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source.path)
+                except OSError:
+                    current_source = None
+                source_stable = bool(
+                    current_source is not None
+                    and (
+                        current_source == source
+                        or history_source_extends(source, current_source)
+                    )
+                )
+                validated = (
+                    _validate_claude_history_image(asset)
+                    if asset is not None and source_stable else None
+                )
+                if validated is not None:
+                    image_ref, full_media_type, full_width, full_height, full_data = (
+                        validated
+                    )
+                    expected_ref = {
+                        key: image.get(key)
+                        for key in (
+                            "image_id", "media_type", "width", "height",
+                            "byte_size",
+                        )
+                    }
+                    if image_ref == expected_ref:
+                        asset_source = current_source or source
+                        await asyncio.to_thread(
+                            self._history_index.put_image_asset,
+                            sid, engine, asset_source, cmd.turn_id,
+                            cmd.image_id, "full", full_media_type,
+                            full_width, full_height, full_data,
+                        )
+                        media_type, width, height, data = (
+                            await asyncio.to_thread(
+                                _render_history_image,
+                                {
+                                    "media_type": full_media_type,
+                                    "data": base64.b64encode(
+                                        full_data).decode("ascii"),
+                                },
+                                cmd.variant,
+                            )
+                        )
+                        if cmd.variant == "thumbnail":
+                            await asyncio.to_thread(
+                                self._history_index.put_image_asset,
+                                sid, engine, asset_source, cmd.turn_id,
+                                cmd.image_id, "thumbnail", media_type,
+                                width, height, data,
+                            )
+                        return await send(
+                            media_type=media_type,
+                            width=width,
+                            height=height,
+                            data=data,
+                        )
             if cmd.variant != "thumbnail":
                 return await send(error="历史图片已过期，请重新展开该轮")
             full = await asyncio.to_thread(
@@ -15757,7 +17106,13 @@ class WrapperMachine:
         return result
 
     @classmethod
-    def _claude_configured_model(cls, cwd: str) -> Optional[str]:
+    def _claude_configured_model(
+        cls,
+        cwd: str,
+        *,
+        config_dir: Optional[str] = None,
+        isolate_account_env: bool = False,
+    ) -> Optional[str]:
         """Resolve an explicit new-session model without starting Claude CLI.
 
         Claude's account/organization runtime Default cannot be read without a
@@ -15765,7 +17120,10 @@ class WrapperMachine:
         cc-remote's curated new-session default.
         """
         root = cls._claude_project_root(cwd)
-        user_settings = str(claude_config_dir() / "settings.json")
+        user_settings = str(
+            (Path(config_dir) if config_dir is not None else claude_config_dir())
+            / "settings.json"
+        )
         ordinary_paths = [
             user_settings,
             os.path.join(root, ".claude", "settings.json"),
@@ -15822,7 +17180,7 @@ class WrapperMachine:
         # value from settings over the process environment inherited at launch;
         # the scalar model field remains the lowest-precedence explicit source.
         external_model_set, external_model = explicit_model(
-            os.environ.get("ANTHROPIC_MODEL"))
+            None if isolate_account_env else os.environ.get("ANTHROPIC_MODEL"))
         if managed_env_model_set:
             return managed_env_model
         if managed_model_set:
@@ -15834,14 +17192,22 @@ class WrapperMachine:
         return model if model_set else None
 
     async def _claude_new_session_defaults(
-        self, cwd: Optional[str],
+        self,
+        cwd: Optional[str],
+        *,
+        claude_profile: Optional[ClaudeProfile] = None,
     ) -> tuple[Optional[str], str]:
         raw_cwd = cwd or self.cfg.cc_cwd
         target_cwd = os.path.realpath(os.path.expanduser(raw_cwd))
         if not os.path.isdir(target_cwd):
             return CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_EFFORT
+        profile = claude_profile or self._claude_profile()
         model = await asyncio.to_thread(
-            self._claude_configured_model, target_cwd)
+            self._claude_configured_model,
+            target_cwd,
+            config_dir=self._claude_config_root(profile),
+            isolate_account_env=self._claude_profiles.is_multi_profile,
+        )
         # Claude's generic Opus aliases intentionally track the current Opus.
         # Pin cc-remote's new-session choice to the context-qualified id so a
         # provider cannot silently drop the requested 1M window. Exact custom
@@ -15861,8 +17227,22 @@ class WrapperMachine:
         the client keeps its static presentation table.
         """
         engine = getattr(cmd, "engine", None) or "cc"
+        claude_profile = None
         codex_profile = None
         codex_home = None
+        if engine in {"cc", "claude"}:
+            try:
+                claude_profile = self._claude_profile(
+                    getattr(cmd, "claude_profile_id", None))
+            except (RuntimeError, ValueError):
+                error = Error(
+                    code=ERR_AUTH,
+                    message="所选 Claude 账号不存在，请刷新后重试。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         if engine == "codex":
             try:
                 codex_profile = self._codex_profile(
@@ -15930,10 +17310,14 @@ class WrapperMachine:
             defaults_cwd = getattr(cmd, "cwd", None) or self.cfg.cc_cwd
             default_model, default_effort = (
                 await self._claude_new_session_defaults(
-                    defaults_cwd))
+                    defaults_cwd,
+                    claude_profile=claude_profile,
+                ))
         msg = Models(
             engine=engine, models=models, default_model=default_model,
             default_effort=default_effort, cwd=defaults_cwd,
+            claude_profile_id=(
+                claude_profile.id if claude_profile else None),
             codex_profile_id=(codex_profile.id if codex_profile else None),
         )
         client_id = getattr(cmd, "client_id", None)
@@ -15949,11 +17333,12 @@ class WrapperMachine:
         engine = cmd.engine
         space = getattr(cmd, "space", "code")
         try:
+            claude_profile = self._engine_capability_claude_profile(cmd)
             codex_profile = self._engine_capability_profile(cmd)
-        except ValueError:
+        except (RuntimeError, ValueError):
             error = Error(
                 code=ERR_AUTH,
-                message="所选 Codex 账号不存在或不可用于当前空间，请刷新后重试。",
+                message="所选账号不存在或不可用于当前空间，请刷新后重试。",
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
@@ -15967,9 +17352,16 @@ class WrapperMachine:
                 and focused.engine == engine
                 and focused.space == space
                 and (
-                    codex_profile is None
-                    or self._codex_profile_for_ctx(focused).id
-                    == codex_profile.id
+                    (
+                        claude_profile is None
+                        or self._claude_profile_for_ctx(focused).id
+                        == claude_profile.id
+                    )
+                    and (
+                        codex_profile is None
+                        or self._codex_profile_for_ctx(focused).id
+                        == codex_profile.id
+                    )
                 )
             ):
                 target_cwd = focused.cwd
@@ -15986,6 +17378,13 @@ class WrapperMachine:
             }
             if codex_home is not None:
                 discover_kwargs["codex_home"] = codex_home
+            if claude_profile is not None:
+                claude_root = self._claude_config_root(claude_profile)
+                if claude_root is not None:
+                    discover_kwargs["claude_config_root"] = claude_root
+                    discover_kwargs["isolate_claude_account_env"] = (
+                        self._claude_profiles.is_multi_profile
+                    )
             items, errors, notes = await engine_capabilities(
                 engine, target_cwd, space, self.cfg.claude_bin,
                 **discover_kwargs,
@@ -16004,6 +17403,9 @@ class WrapperMachine:
             errors=errors,
             notes=notes,
             skills_only=getattr(cmd, "skills_only", False),
+            claude_profile_id=(
+                claude_profile.id if claude_profile is not None else None
+            ),
             codex_profile_id=(
                 codex_profile.id if codex_profile is not None else None
             ),
@@ -16020,8 +17422,21 @@ class WrapperMachine:
         requested = getattr(cmd, "codex_profile_id", None)
         return self._codex_profile(requested)
 
+    def _engine_capability_claude_profile(
+        self, cmd,
+    ) -> Optional[ClaudeProfile]:
+        if getattr(cmd, "engine", None) != "claude":
+            if getattr(cmd, "claude_profile_id", None) is not None:
+                raise ValueError("Claude profile is only valid for Claude")
+            return None
+        requested = getattr(cmd, "claude_profile_id", None)
+        return self._claude_profile(requested)
+
     def _engine_capability_cwd(
-        self, cmd, codex_profile: Optional[CodexProfile] = None,
+        self,
+        cmd,
+        codex_profile: Optional[CodexProfile] = None,
+        claude_profile: Optional[ClaudeProfile] = None,
     ) -> str:
         target_cwd = getattr(cmd, "cwd", None)
         if target_cwd:
@@ -16032,9 +17447,16 @@ class WrapperMachine:
             and focused.engine == cmd.engine
             and focused.space == getattr(cmd, "space", "code")
             and (
-                codex_profile is None
-                or self._codex_profile_for_ctx(focused).id
-                == codex_profile.id
+                (
+                    claude_profile is None
+                    or self._claude_profile_for_ctx(focused).id
+                    == claude_profile.id
+                )
+                and (
+                    codex_profile is None
+                    or self._codex_profile_for_ctx(focused).id
+                    == codex_profile.id
+                )
             )
         ):
             return focused.cwd
@@ -16056,8 +17478,10 @@ class WrapperMachine:
 
     async def _handle_manage_engine_plugin(self, cmd):
         try:
+            claude_profile = self._engine_capability_claude_profile(cmd)
             codex_profile = self._engine_capability_profile(cmd)
-            target_cwd = self._engine_capability_cwd(cmd, codex_profile)
+            target_cwd = self._engine_capability_cwd(
+                cmd, codex_profile, claude_profile)
             codex_home = (
                 self._codex_home(codex_profile)
                 if codex_profile is not None else None
@@ -16068,6 +17492,13 @@ class WrapperMachine:
             }
             if codex_home is not None:
                 mutation_kwargs["codex_home"] = codex_home
+            if claude_profile is not None:
+                claude_root = self._claude_config_root(claude_profile)
+                if claude_root is not None:
+                    mutation_kwargs["claude_config_root"] = claude_root
+                    mutation_kwargs["isolate_claude_account_env"] = (
+                        self._claude_profiles.is_multi_profile
+                    )
             await manage_engine_plugin(
                 cmd.engine,
                 cmd.plugin_id,
@@ -16087,6 +17518,7 @@ class WrapperMachine:
 
     async def _handle_manage_engine_skill(self, cmd):
         try:
+            claude_profile = self._engine_capability_claude_profile(cmd)
             codex_profile = self._engine_capability_profile(cmd)
             codex_home = (
                 self._codex_home(codex_profile)
@@ -16102,10 +17534,15 @@ class WrapperMachine:
             }
             if codex_home is not None:
                 mutation_kwargs["codex_home"] = codex_home
+            if claude_profile is not None:
+                claude_root = self._claude_config_root(claude_profile)
+                if claude_root is not None:
+                    mutation_kwargs["claude_config_root"] = claude_root
             await manage_engine_skill(
                 cmd.engine,
                 cmd.action,
-                self._engine_capability_cwd(cmd, codex_profile),
+                self._engine_capability_cwd(
+                    cmd, codex_profile, claude_profile),
                 **mutation_kwargs,
             )
         except Exception as exc:
@@ -16119,11 +17556,18 @@ class WrapperMachine:
 
     async def _handle_manage_engine_hook(self, cmd):
         try:
+            claude_profile = self._engine_capability_claude_profile(cmd)
             codex_profile = self._engine_capability_profile(cmd)
+            hook_kwargs = {}
+            if claude_profile is not None:
+                claude_root = self._claude_config_root(claude_profile)
+                if claude_root is not None:
+                    hook_kwargs["claude_config_root"] = claude_root
             await manage_engine_hook(
                 cmd.engine,
                 cmd.action,
-                self._engine_capability_cwd(cmd, codex_profile),
+                self._engine_capability_cwd(
+                    cmd, codex_profile, claude_profile),
                 space=getattr(cmd, "space", "code"),
                 hook_id=getattr(cmd, "hook_id", None),
                 event=getattr(cmd, "event", None),
@@ -16131,6 +17575,7 @@ class WrapperMachine:
                 command=getattr(cmd, "command", None) or "",
                 timeout=getattr(cmd, "timeout", None) or 60,
                 scope=getattr(cmd, "scope", "user"),
+                **hook_kwargs,
             )
         except Exception as exc:
             # Never log the Hook command: it may legitimately contain tokens or
@@ -16986,7 +18431,11 @@ class WrapperMachine:
         # it stays hidden and cannot be cold-resumed.
         if ctx.engine != "codex" and ctx.btw_real_id:
             await self._delete_private_btw(
-                ctx.btw_real_id, ctx.cwd, forget=disconnected)
+                ctx.btw_real_id,
+                ctx.cwd,
+                forget=disconnected,
+                claude_profile_id=ctx.claude_profile_id,
+            )
         log.info("btw closed", btw_sid=sid)
 
     async def _handle_set_perm(self, cmd):
@@ -17783,8 +19232,17 @@ class WrapperMachine:
                 # A successful generation probe is newer than the transcript
                 # it resumed. Read disk only when no exact/live cache exists.
                 if recent is None and exact is None and ctx.session_id:
-                    recent = await asyncio.to_thread(
-                        recover_claude_context_usage, ctx.session_id)
+                    source_path = self._claude_transcript_path(
+                        self._claude_profile_for_ctx(ctx),
+                        ctx.session_id,
+                        directory=ctx.cwd,
+                    )
+                    if source_path is not None:
+                        recent = await asyncio.to_thread(
+                            recover_claude_context_usage,
+                            ctx.session_id,
+                            path=source_path,
+                        )
                     remember = getattr(
                         ctx.sdk, "remember_recent_context_usage", None)
                     if isinstance(recent, dict) and callable(remember):
@@ -18184,9 +19642,10 @@ class WrapperMachine:
         await self._emit(ctx, event)
 
     async def _claude_rate_limit_snapshot(
-        self,
+        self, ctx: SessionContext,
     ) -> tuple[RateLimitUpdate, ...]:
-        store = self._claude_rate_limits
+        store = self._claude_rate_limit_stores.get(
+            self._claude_profile_for_ctx(ctx).id)
         if store is None:
             return ()
         async with self._claude_rate_limit_lock:
@@ -18202,18 +19661,21 @@ class WrapperMachine:
         """Publish cached, unexpired account windows to one new runtime."""
         if ctx.engine != "claude" or ctx.btw:
             return ()
-        events = await self._claude_rate_limit_snapshot()
+        events = await self._claude_rate_limit_snapshot(ctx)
         for event in events:
             await self._emit(ctx, event.model_copy(deep=True))
         return events
 
     async def _observe_claude_rate_limit_message(
-        self, message,
+        self,
+        ctx: SessionContext,
+        message: object,
     ) -> bool:
         """Consume one SDK quota event without turning it into transcript UI."""
         if not isinstance(message, RateLimitEvent):
             return False
-        store = self._claude_rate_limits
+        profile_id = self._claude_profile_for_ctx(ctx).id
+        store = self._claude_rate_limit_stores.get(profile_id)
         if store is None:
             return True
         async with self._claude_rate_limit_lock:
@@ -18225,14 +19687,15 @@ class WrapperMachine:
                 return True
             if update is None:
                 return True
-        # Claude currently has one machine-level authentication boundary. Seed
-        # every resident normal session so a tab switch is immediate;
+        # Each CLAUDE_CONFIG_DIR is an authentication boundary. Seed only
+        # resident normal sessions from the same profile;
         # cold/evicted sessions receive the same cache on focus/Hello. Keep
         # transport backpressure outside the disk-cache lock while preserving
         # provider event order with a dedicated publisher lock.
         targets = tuple(
             ctx for ctx in self.sessions.values()
             if ctx.engine == "claude" and not ctx.btw
+            and self._claude_profile_for_ctx(ctx).id == profile_id
         )
         async with self._claude_rate_limit_emit_lock:
             for target in targets:
@@ -18252,7 +19715,7 @@ class WrapperMachine:
         the autonomous work extends its origin turn rather than creating a new
         visible human turn.
         """
-        if await self._observe_claude_rate_limit_message(message):
+        if await self._observe_claude_rate_limit_message(ctx, message):
             return
         is_result = isinstance(message, ResultMessage)
         followup_was_pending = self._claude_autonomous_followup_pending(ctx)
@@ -18294,6 +19757,7 @@ class WrapperMachine:
                             item_turns=ctx.claude_item_turns,
                             item_titles=ctx.claude_item_titles,
                             item_meta=ctx.claude_item_meta,
+                            item_commands=ctx.claude_item_commands,
                         )
                         ctx.claude_background_translator = translator
                     for event in translator.feed(message):
@@ -22025,6 +23489,21 @@ class WrapperMachine:
         space = getattr(cmd, "space", "code")
         if engine == "codex":
             return await self._list_codex_sessions(cmd)
+        if (
+            not self._claude_profile_migration_ok
+            or (
+                space == "work"
+                and not self._claude_work_profile_migration_ok
+            )
+        ):
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Claude 账号归属迁移未完成，请重启后重试。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         # Claude may create the fork transcript before its init/session id reaches
         # our turn consumer. Until capture durably tombstones that real id, scanning
         # the global session store could publish it to another client. Fail closed
@@ -22047,52 +23526,109 @@ class WrapperMachine:
                         client_id=client_id)
             return
         try:
-            infos = await asyncio.to_thread(list_sessions, limit=200)
-            blocked = await asyncio.to_thread(self._bg_blocked_session_ids)
+            async def read_profile(profile: ClaudeProfile):
+                if self._claude_profiles_explicit and not profile.config_dir.is_dir():
+                    return profile, [], set(), "账号目录不存在或不可访问"
+                try:
+                    infos = await asyncio.to_thread(
+                        self._claude_catalog_list_sessions,
+                        profile,
+                        limit=200,
+                    )
+                    if self._claude_config_root(profile) is None:
+                        blocked = await asyncio.to_thread(
+                            self._bg_blocked_session_ids)
+                    else:
+                        blocked = await asyncio.to_thread(
+                            self._bg_blocked_session_ids,
+                            self._claude_catalog_root(profile),
+                        )
+                    return profile, infos, blocked, None
+                except Exception as exc:
+                    log.warning(
+                        "Claude profile catalog unavailable",
+                        profile_id=profile.id,
+                        error_type=type(exc).__name__,
+                    )
+                    return profile, [], set(), "账号会话暂不可用"
+
+            profile_reads = await asyncio.gather(*(
+                read_profile(profile) for profile in self._claude_profiles
+            ))
             private_btw_ids = set(self._private_btw_sessions)
-            resident_ids = {c.session_id for c in self.sessions.values() if c.session_id}
-            resident_state = {c.session_id: c.state for c in self.sessions.values() if c.session_id}
+            resident_ids = {
+                c.key for c in self.sessions.values()
+                if c.key and c.session_id and c.engine == "claude"
+            }
+            resident_state = {
+                c.key: c.state for c in self.sessions.values()
+                if c.key and c.session_id and c.engine == "claude"
+            }
             work_records = await asyncio.to_thread(
-                self._work.for_engine("claude").records_by_session)
+                self._work.for_engine("claude").records_by_profile_session)
             pinned_ids = (self._session_pins.ids("claude")
                           if self._session_pins is not None else frozenset())
-            await self._claim_legacy_presentation_from_claude_catalog({
-                info.session_id
+            visible_catalog_ids = {
+                self._claude_wire_sid(profile, info.session_id)
+                for profile, infos, blocked, _error in profile_reads
                 for info in infos
                 if (
                     info.session_id not in blocked
-                    and info.session_id not in private_btw_ids
+                    and self._claude_wire_sid(profile, info.session_id)
+                        not in private_btw_ids
                 )
+            }
+            await self._claim_legacy_presentation_from_claude_catalog({
+                *visible_catalog_ids
             })
             sessions = []
-            for info in infos:
-                record = work_records.get(info.session_id)
-                if ((record is not None) != (space == "work")
-                        or info.session_id in blocked
-                        or info.session_id in private_btw_ids):
-                    continue
-                sessions.append(SessionInfo(
-                    session_id=info.session_id,
-                    summary=(
-                        (record.title if record else None)
-                        or (info.custom_title if hasattr(info, "custom_title") else None)
-                        or info.first_prompt
-                        or info.summary
-                        or ""
-                    )[:500] or None,
-                    last_modified=str(info.last_modified) if info.last_modified else None,
-                    first_prompt=(info.first_prompt or "")[:2000] or None,
-                    git_branch=(info.git_branch or "")[:500] or None,
-                    cwd=(info.cwd or "")[:4096] or None,
-                    tag=("archived" if record and record.archived else
-                         (info.tag or "")[:128] or None),
-                    pinned=info.session_id in pinned_ids,
-                    state=resident_state.get(info.session_id),
-                    engine="claude", space=space,
-                    work_id=record.work_id if record else None,
-                    **self._session_presentation_fields("claude", info.session_id),
-                ))
-            if space == "code" and self._claude_broker_enabled:
+            profile_errors: dict[str, str] = {}
+            for profile, infos, blocked, profile_error in profile_reads:
+                if profile_error is not None:
+                    profile_errors[profile.id] = profile_error
+                for info in infos:
+                    wire_sid = self._claude_wire_sid(
+                        profile, info.session_id)
+                    record = work_records.get((profile.id, info.session_id))
+                    if ((record is not None) != (space == "work")
+                            or info.session_id in blocked
+                            or wire_sid in private_btw_ids):
+                        continue
+                    sessions.append(SessionInfo(
+                        session_id=wire_sid,
+                        summary=(
+                            (record.title if record else None)
+                            or (
+                                info.custom_title
+                                if hasattr(info, "custom_title") else None
+                            )
+                            or info.first_prompt
+                            or info.summary
+                            or ""
+                        )[:500] or None,
+                        last_modified=(
+                            str(info.last_modified)
+                            if info.last_modified else None),
+                        first_prompt=(info.first_prompt or "")[:2000] or None,
+                        git_branch=(info.git_branch or "")[:500] or None,
+                        cwd=(info.cwd or "")[:4096] or None,
+                        tag=("archived" if record and record.archived else
+                             (info.tag or "")[:128] or None),
+                        pinned=wire_sid in pinned_ids,
+                        state=resident_state.get(wire_sid),
+                        engine="claude", space=space,
+                        work_id=record.work_id if record else None,
+                        native_session_id=info.session_id,
+                        claude_profile_id=profile.id,
+                        claude_profile_label=profile.label,
+                        **self._session_presentation_fields(
+                            "claude", wire_sid),
+                    ))
+            sessions.sort(
+                key=lambda item: float(item.last_modified or 0), reverse=True)
+            sessions = sessions[:200]
+            if (space == "code" and self._claude_broker_enabled
+                    and not self._claude_profiles.is_multi_profile):
                 # `claude-remote new` reserves the native session UUID before
                 # Claude writes its first transcript row. Merge live broker
                 # metadata so the TUI is immediately selectable in the sidebar;
@@ -22139,6 +23675,14 @@ class WrapperMachine:
                 space=space,
                 request_id=getattr(cmd, "cmd_id", None),
                 sessions=sessions,
+                claude_profiles=[{
+                    **profile.public(),
+                    **(
+                        {"error": profile_errors[profile.id]}
+                        if profile.id in profile_errors else {}
+                    ),
+                } for profile in self._claude_profiles],
+                default_claude_profile_id=self._claude_profiles.default.id,
                 to=getattr(cmd, "client_id", None),
             )
             await self.transport.send(event)
@@ -23239,9 +24783,23 @@ class WrapperMachine:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         engine = getattr(cmd, "engine", None) or "claude"
         requested_space = getattr(cmd, "space", "code")
+        claude_profile = None
         codex_profile = None
         native_sid = sid
-        if engine == "codex":
+        if engine == "claude":
+            try:
+                claude_profile, native_sid = self._claude_target(sid)
+            except (RuntimeError, ValueError):
+                error = Error(
+                    code=ERR_AUTH,
+                    message="Claude 账号或会话标识无效",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        elif engine == "codex":
             try:
                 codex_profile, native_sid = self._codex_target(sid)
             except ValueError:
@@ -23254,11 +24812,15 @@ class WrapperMachine:
                 )
                 await self.transport.send(error)
                 return error
-        work_profile_id = codex_profile.id if codex_profile is not None else None
+        claude_work_profile_id = (
+            claude_profile.id if claude_profile is not None else None)
+        codex_work_profile_id = (
+            codex_profile.id if codex_profile is not None else None)
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session,
             native_sid,
-            codex_profile_id=work_profile_id,
+            claude_profile_id=claude_work_profile_id,
+            codex_profile_id=codex_work_profile_id,
         )
         actual_space = "work" if work_record is not None else "code"
         if requested_space != actual_space:
@@ -23271,9 +24833,11 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self.sessions.get(sid)
-        if ctx is None and engine != "codex":
+        if (ctx is None and engine == "claude"
+                and not self._claude_profiles.is_multi_profile):
             ctx = next((c for c in self.sessions.values()
-                        if c.session_id == sid), None)
+                        if c.engine == "claude"
+                        and c.session_id == native_sid), None)
         if ctx is None and engine == "claude" and actual_space == "code":
             # Claude's catalog accepts metadata-only JSONL files (for example,
             # an ai-title row) even though the native CLI cannot resume them:
@@ -23281,9 +24845,15 @@ class WrapperMachine:
             # that exact on-disk state before _spawn so one click produces one
             # session-scoped error instead of both _spawn's focused error and
             # this handler's fallback error.
-            info = await asyncio.to_thread(get_session_info, sid)
+            assert claude_profile is not None
+            info = await asyncio.to_thread(
+                self._claude_catalog_session_info,
+                claude_profile,
+                native_sid,
+            )
             if (info is not None and not getattr(info, "cwd", None)
-                    and transcript_path(sid) is not None):
+                    and self._claude_catalog_has_session_file(
+                        claude_profile, native_sid)):
                 error = Error(
                     code=ERR_NOT_RUNNING,
                     message=(
@@ -23311,6 +24881,8 @@ class WrapperMachine:
                 "space": actual_space,
                 "work_id": work_record.work_id if work_record else None,
             }
+            spawn_kwargs.update(
+                self._claude_spawn_profile_kwargs(claude_profile))
             spawn_kwargs.update(
                 self._codex_spawn_profile_kwargs(codex_profile))
             ctx = await self._spawn(**spawn_kwargs)
@@ -23346,6 +24918,14 @@ class WrapperMachine:
             session_id=ctx.key or self.focused_sid or sid, cwd=ctx.cwd)
         await self._emit(ctx, focus)
         cached_responses = [snap, focus] if snap is not None else [focus]
+        if ctx.engine == "claude":
+            # This wrapper instance may have respawned the native Claude child
+            # without changing its generation.  Re-seed the exact current level
+            # on every focus so an empty replacement clears cards retained from
+            # the previous child/runtime.
+            background_event = self._background_process_sync(ctx)
+            await self._emit(ctx, background_event)
+            cached_responses.append(background_event)
         control_event = self._session_control(ctx)
         await self._emit(ctx, control_event)
         cached_responses.append(control_event)
@@ -23448,16 +25028,18 @@ class WrapperMachine:
             if ctx.engine == "codex":
                 ctx.btw_real_id = sid
                 return
+            wire_btw_sid = self._claude_wire_sid(
+                self._claude_profile_for_ctx(ctx), sid)
             try:
                 # Durably hide the real Claude transcript before publishing it
                 # even into the live ctx. A crash after this point remains safe.
-                self._remember_private_btw(sid, ctx.cwd)
+                self._remember_private_btw(wire_btw_sid, ctx.cwd)
             except Exception as persist_error:
                 # Keep a live guard while we fail-stop and delete the fork. This
                 # entry may not be durable, so the private session is not allowed
                 # to continue running after the persistence failure.
                 ctx.btw_real_id = sid
-                self._private_btw_sessions[sid] = {
+                self._private_btw_sessions[wire_btw_sid] = {
                     "cwd": ctx.cwd, "created_at": time.time(),
                 }
                 await self._discard_query_queue(ctx)
@@ -23477,7 +25059,11 @@ class WrapperMachine:
                 deleted = False
                 try:
                     await asyncio.to_thread(
-                        delete_session, sid, directory=ctx.cwd)
+                        self._claude_catalog_delete_session,
+                        self._claude_profile_for_ctx(ctx),
+                        sid,
+                        directory=ctx.cwd,
+                    )
                 except FileNotFoundError:
                     deleted = True
                 except Exception as delete_error:
@@ -23496,7 +25082,7 @@ class WrapperMachine:
                     # No live writer and no transcript remain. A stale tombstone may
                     # still exist on disk if replace succeeded before fsync failed;
                     # that is harmless and startup cleanup will remove it.
-                    self._private_btw_sessions.pop(sid, None)
+                    self._private_btw_sessions.pop(wire_btw_sid, None)
                 raise RuntimeError(
                     "private btw state persistence failed; fork terminated"
                 ) from persist_error
@@ -23506,7 +25092,10 @@ class WrapperMachine:
         ctx.session_id = sid
         route_sid = (
             self._codex_wire_sid(self._codex_profile_for_ctx(ctx), sid)
-            if ctx.engine == "codex" else sid
+            if ctx.engine == "codex"
+            else self._claude_wire_sid(
+                self._claude_profile_for_ctx(ctx), sid)
+            if ctx.engine == "claude" else sid
         )
         old_title = self._notification_titles.pop(old_key, None) if old_key else None
         if old_title:
@@ -23517,6 +25106,9 @@ class WrapperMachine:
                 store.bind_session,
                 ctx.work_id,
                 sid,
+                claude_profile_id=(
+                    self._claude_profile_for_ctx(ctx).id
+                    if ctx.engine == "claude" else None),
                 codex_profile_id=(
                     self._codex_profile_for_ctx(ctx).id
                     if ctx.engine == "codex" else None),
@@ -23534,7 +25126,19 @@ class WrapperMachine:
             rekey_goal = getattr(ctx.sdk, "rekey_goal", None)
             if rekey_goal is not None:
                 rekey_goal(sid)
-            save_session_id(self.cfg.state_dir, ctx.cwd, sid)
+            save_session_id(
+                self.cfg.state_dir,
+                ctx.cwd,
+                route_sid,
+                **(
+                    {
+                        "claude_profile_id": self._claude_profile_for_ctx(ctx).id,
+                        "claude_profile_revision": self._claude_profile_revision,
+                    }
+                    if ctx.engine == "claude"
+                    and self._claude_profiles_explicit else {}
+                ),
+            )
         if old_key and old_key != route_sid:
             if self._session_plans is not None:
                 try:
@@ -23559,7 +25163,8 @@ class WrapperMachine:
                         session_id=route_sid,
                     )
             await self._rekey_preview_session(ctx, old_key, route_sid)
-            self._remember_session_alias(old_key, route_sid, ctx.cwd)
+            self._remember_session_alias(
+                old_key, route_sid, ctx.cwd, engine=ctx.engine)
             self.sessions.pop(old_key, None)
             self.sessions[route_sid] = ctx
             ctx.key = route_sid
@@ -23585,7 +25190,7 @@ class WrapperMachine:
             # The real id becomes visible before the first turn necessarily ends.
             # Start ownership monitoring at capture so a terminal resume during
             # that first response cannot wait until the next Remote query.
-            self._watch_session(sid)
+            self._watch_session(route_sid)
             await self._persist_claude_session_controls(ctx)
             await self._flush_claude_client_message_ids(ctx)
         log.info(
@@ -23609,6 +25214,19 @@ class WrapperMachine:
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
         if (
+            engine == "claude"
+            and space == "work"
+            and not self._claude_work_profile_migration_ok
+        ):
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Claude Work 账号归属迁移未完成，请重启后重试。",
+                request_id=getattr(cmd, "request_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+        if (
             engine == "codex"
             and space == "work"
             and not self._codex_work_profile_migration_ok
@@ -23621,8 +25239,32 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        claude_profile = None
         codex_profile = None
-        if engine == "codex":
+        if engine == "claude":
+            requested_profile_id = getattr(cmd, "claude_profile_id", None)
+            try:
+                claude_profile = self._claude_profile(requested_profile_id)
+            except (RuntimeError, ValueError):
+                error = Error(
+                    code=ERR_AUTH,
+                    message="所选 Claude 账号不存在，请刷新后重试。",
+                    request_id=getattr(cmd, "request_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            if (self._claude_profiles_explicit
+                    and not claude_profile.config_dir.is_dir()):
+                error = Error(
+                    code=ERR_AUTH,
+                    message="所选 Claude 账号目录不存在或不可访问。",
+                    request_id=getattr(cmd, "request_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        elif engine == "codex":
             requested_profile_id = getattr(cmd, "codex_profile_id", None)
             try:
                 codex_profile = self._codex_profile(requested_profile_id)
@@ -23646,6 +25288,9 @@ class WrapperMachine:
                 work_record = await asyncio.to_thread(
                     self._work.for_engine(engine).create_session,
                     getattr(cmd, "project_id", None),
+                    claude_profile_id=(
+                        claude_profile.id
+                        if claude_profile is not None else None),
                     codex_profile_id=(
                         codex_profile.id if codex_profile is not None else None),
                 )
@@ -23684,6 +25329,8 @@ class WrapperMachine:
                 "work_id": work_record.work_id if work_record else None,
                 "raise_on_failure": True,
             }
+            spawn_kwargs.update(
+                self._claude_spawn_profile_kwargs(claude_profile))
             spawn_kwargs.update(
                 self._codex_spawn_profile_kwargs(codex_profile))
             ctx = await self._spawn(**spawn_kwargs)
@@ -24008,12 +25655,25 @@ class WrapperMachine:
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         native_sid = sid
+        claude_profile = None
         if is_codex:
             try:
                 _profile, native_sid = self._codex_target(sid)
             except ValueError:
                 is_codex = False
                 engine = "claude"
+        if not is_codex:
+            try:
+                claude_profile, native_sid = self._claude_target(sid)
+            except ValueError:
+                error = Error(
+                    code=ERR_AUTH,
+                    message="Claude 账号或会话标识无效",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit_to_sid(sid, error)
+                return error
         requested_engine = getattr(cmd, "engine", None)
         if requested_engine is not None and requested_engine != engine:
             error = Error(
@@ -24026,6 +25686,8 @@ class WrapperMachine:
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session,
             native_sid,
+            claude_profile_id=(
+                claude_profile.id if claude_profile is not None else None),
             codex_profile_id=codex_profile_id,
         )
         requested_space = getattr(cmd, "space", "code")
@@ -24068,11 +25730,20 @@ class WrapperMachine:
                 listing = await self._list_codex_sessions(cmd)
                 return error, listing
         try:
-            await asyncio.to_thread(rename_session, sid, cmd.title)
+            await asyncio.to_thread(
+                self._claude_catalog_rename_session,
+                claude_profile,
+                native_sid,
+                cmd.title,
+                directory=(work_record.cwd if work_record else None),
+            )
             if work_record is not None:
                 await asyncio.to_thread(
                     self._work.for_engine(engine).update_title,
-                    sid, cmd.title)
+                    native_sid,
+                    cmd.title,
+                    claude_profile_id=claude_profile.id,
+                )
             self._remember_notification_title(sid, cmd.title)
             # our own append -> re-baseline, else the watcher calls it an external write
             self._resync_watch(sid)
@@ -24291,12 +25962,25 @@ class WrapperMachine:
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         native_sid = sid
+        claude_profile = None
         if is_codex:
             try:
                 _profile, native_sid = self._codex_target(sid)
             except ValueError:
                 is_codex = False
                 engine = "claude"
+        if not is_codex:
+            try:
+                claude_profile, native_sid = self._claude_target(sid)
+            except ValueError:
+                error = Error(
+                    code=ERR_AUTH,
+                    message="Claude 账号或会话标识无效",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit_to_sid(sid, error)
+                return error
         requested_engine = getattr(cmd, "engine", None)
         if requested_engine is not None and requested_engine != engine:
             error = Error(
@@ -24309,6 +25993,8 @@ class WrapperMachine:
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session,
             native_sid,
+            claude_profile_id=(
+                claude_profile.id if claude_profile is not None else None),
             codex_profile_id=codex_profile_id,
         )
         requested_space = getattr(cmd, "space", "code")
@@ -24483,11 +26169,20 @@ class WrapperMachine:
             return await self._list_codex_sessions(cmd)
         try:
             tag = "archived" if cmd.archived else None
-            await asyncio.to_thread(tag_session, sid, tag)
+            await asyncio.to_thread(
+                self._claude_catalog_tag_session,
+                claude_profile,
+                native_sid,
+                tag,
+                directory=(work_record.cwd if work_record else None),
+            )
             if work_record is not None:
                 await asyncio.to_thread(
                     self._work.for_engine(engine).update_archived,
-                    sid, cmd.archived)
+                    native_sid,
+                    cmd.archived,
+                    claude_profile_id=claude_profile.id,
+                )
             # our own append -> re-baseline (see _resync_watch)
             self._resync_watch(sid)
             log.info("session archive toggled", session_id=sid, archived=cmd.archived)
@@ -24520,7 +26215,10 @@ class WrapperMachine:
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session,
             native_sid,
-            codex_profile_id=work_profile_id,
+            claude_profile_id=(
+                work_profile_id if engine == "claude" else None),
+            codex_profile_id=(
+                work_profile_id if engine == "codex" else None),
         )
         requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
@@ -24532,7 +26230,16 @@ class WrapperMachine:
             return error
         if (work_record is None and self._ctx_by_sid(sid) is None
                 and not is_codex):
-            info = await asyncio.to_thread(get_session_info, sid)
+            try:
+                claude_profile, claude_native_sid = self._claude_target(sid)
+            except ValueError:
+                info = None
+            else:
+                info = await asyncio.to_thread(
+                    self._claude_catalog_session_info,
+                    claude_profile,
+                    claude_native_sid,
+                )
             if info is None:
                 error = Error(
                     code=ERR_NOT_RUNNING, message="Claude 会话不存在",
@@ -24580,7 +26287,10 @@ class WrapperMachine:
         record = await asyncio.to_thread(
             store.get_by_session,
             native_sid,
-            codex_profile_id=work_profile_id,
+            claude_profile_id=(
+                work_profile_id if engine == "claude" else None),
+            codex_profile_id=(
+                work_profile_id if engine == "codex" else None),
         )
         if record is None:
             error = Error(
@@ -24638,15 +26348,20 @@ class WrapperMachine:
                     )
                     self._invalidate_codex_session_catalog()
             else:
+                claude_profile = self._claude_profiles.get(work_profile_id)
                 await asyncio.to_thread(
-                    delete_session,
-                    sid,
+                    self._claude_catalog_delete_session,
+                    claude_profile,
+                    native_sid,
                     directory=record.cwd,
                 )
             await asyncio.to_thread(
                 store.delete,
                 native_sid,
-                codex_profile_id=work_profile_id,
+                claude_profile_id=(
+                    work_profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    work_profile_id if engine == "codex" else None),
             )
         except Exception:
             log.exception("Work session deletion failed", engine=engine,
@@ -25853,7 +27568,12 @@ class WrapperMachine:
                 return None
             return states[native_sid]
         try:
-            info = await asyncio.to_thread(get_session_info, wire_sid)
+            profile, native_sid = self._claude_target(wire_sid)
+            info = await asyncio.to_thread(
+                self._claude_catalog_session_info,
+                profile,
+                native_sid,
+            )
         except Exception as exc:
             log.warning(
                 "Claude archive state lookup failed",
@@ -25861,6 +27581,7 @@ class WrapperMachine:
                 error_type=type(exc).__name__,
             )
             return None
+
         if info is None:
             return None
         return getattr(info, "tag", None) == "archived"
@@ -26754,11 +28475,19 @@ class WrapperMachine:
         try:
             native_sid, work_profile_id = self._work_session_identity(engine, sid)
         except ValueError:
-            native_sid, work_profile_id = sid, None
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_AUTH,
+                f"{engine.title()} 账号或会话标识无效",
+            )
         work_record = await asyncio.to_thread(
             self._work.for_engine(engine).get_by_session,
             native_sid,
-            codex_profile_id=work_profile_id,
+            claude_profile_id=(
+                work_profile_id if engine == "claude" else None),
+            codex_profile_id=(
+                work_profile_id if engine == "codex" else None),
         )
         if work_record is not None:
             error = Error(
@@ -26769,6 +28498,24 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        claude_profile: ClaudeProfile | None = None
+        if engine == "claude":
+            try:
+                claude_profile, resolved_native_sid = self._claude_target(sid)
+            except ValueError:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_AUTH,
+                    "Claude 账号或会话标识无效",
+                )
+            if resolved_native_sid != native_sid:
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_AUTH,
+                    "Claude 会话标识不一致",
+                )
         if engine == "codex":
             try:
                 profile, resolved_native_sid = self._codex_target(sid)
@@ -26879,14 +28626,23 @@ class WrapperMachine:
             except ValueError:
                 cwd = None
         if engine == "claude" and cwd is None:
-            info = await asyncio.to_thread(get_session_info, sid)
+            assert claude_profile is not None
+            info = await asyncio.to_thread(
+                self._claude_catalog_session_info,
+                claude_profile,
+                native_sid,
+            )
             cwd = info.cwd if info is not None else None
             # A metadata-only Claude transcript has no cwd but is still a real
             # exact-SID file in the SDK catalog. delete_session(directory=None)
             # safely searches all project roots for that UUID and deletes only
             # the matching transcript. Preserve the old not-found rejection
             # when no exact transcript exists.
-            if not cwd and transcript_path(sid) is None:
+            if (
+                not cwd
+                and self._claude_transcript_path(
+                    claude_profile, native_sid) is None
+            ):
                 error = Error(
                     code=ERR_NOT_RUNNING,
                     message="Claude 会话不存在",
@@ -26976,7 +28732,13 @@ class WrapperMachine:
                     ctx.preview_snapshot_token,
                 )
             try:
-                await asyncio.to_thread(delete_session, sid, directory=cwd)
+                assert claude_profile is not None
+                await asyncio.to_thread(
+                    self._claude_catalog_delete_session,
+                    claude_profile,
+                    native_sid,
+                    directory=cwd,
+                )
             except Exception:
                 log.exception(
                     "Code session deletion failed",
@@ -27178,8 +28940,21 @@ class WrapperMachine:
 
     async def _claude_code_context(self, cmd, action: str) -> SessionContext | Error:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        try:
+            profile, native_sid = self._claude_target(sid)
+        except ValueError:
+            error = Error(
+                code=ERR_AUTH,
+                message="Claude 账号或会话标识无效",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         work_record = await asyncio.to_thread(
-            self._work.for_engine("claude").get_by_session, sid
+            self._work.for_engine("claude").get_by_session,
+            native_sid,
+            claude_profile_id=profile.id,
         )
         if work_record is not None or getattr(cmd, "space", "code") != "code":
             error = Error(
@@ -27192,7 +28967,12 @@ class WrapperMachine:
             return error
         ctx = self._ctx_for(sid)
         if ctx is None:
-            ctx = await self._spawn(resume_id=sid, engine="claude", space="code")
+            ctx = await self._spawn(
+                resume_id=native_sid,
+                engine="claude",
+                space="code",
+                **self._claude_spawn_profile_kwargs(profile),
+            )
         if ctx is None or ctx.engine != "claude":
             error = Error(
                 code=ERR_NOT_RUNNING,
@@ -27228,7 +29008,7 @@ class WrapperMachine:
             ctx.needs_reload = False
             try:
                 await ctx.sdk.force_reconnect(
-                    resume_id=sid,
+                    resume_id=native_sid,
                     cwd=ctx.cwd,
                     reason=f"external transcript change before {action}",
                     preserve_model=False,
@@ -27290,16 +29070,25 @@ class WrapperMachine:
         the caller must preserve the original native rejection.
         """
 
+        profile, native_sid = self._claude_target(sid)
+
         def read_targets() -> list[str]:
-            path = transcript_path(sid)
+            path = self._claude_transcript_path(
+                profile, native_sid, directory=cwd)
             if (path
                     and os.path.getsize(path)
                     > self.cfg.history_source_max_bytes):
                 return []
-            messages = get_session_messages(sid, directory=cwd)
-            timestamps = transcript_timestamps(sid)
+            messages = self._claude_catalog_messages(
+                profile, native_sid, directory=cwd)
+            timestamps = (
+                transcript_timestamps(native_sid)
+                if self._claude_config_root(profile) is None
+                else transcript_timestamps(native_sid, path=path)
+                if path is not None else {}
+            )
             messages = recover_claude_delayed_retry_tail(
-                sid,
+                native_sid,
                 messages,
                 path=path,
                 index_store=self._history_index,
@@ -28101,16 +29890,26 @@ class WrapperMachine:
             # query already excludes them; never leak the nullable SQL column
             # into the strict public WorkScheduleInfo model.
             schedule.pop("deleted_at", None)
-            profile_id = schedule.pop("last_codex_profile_id", None)
+            last_claude_profile_id = schedule.pop(
+                "last_claude_profile_id", None)
+            last_codex_profile_id = schedule.pop(
+                "last_codex_profile_id", None)
+            profile_id = (
+                last_claude_profile_id
+                if engine == "claude" else last_codex_profile_id
+            )
             native_sid = schedule.get("last_session_id")
             if (
-                engine == "codex"
+                engine in {"claude", "codex"}
                 and isinstance(profile_id, str)
                 and isinstance(native_sid, str)
             ):
                 try:
-                    schedule["last_session_id"] = self._codex_wire_sid(
-                        profile_id, native_sid)
+                    schedule["last_session_id"] = (
+                        self._claude_wire_sid(profile_id, native_sid)
+                        if engine == "claude" else
+                        self._codex_wire_sid(profile_id, native_sid)
+                    )
                 except ValueError:
                     # A removed profile stays a durable local Work association,
                     # but it is not a routable browser session until reconfigured.
@@ -28145,7 +29944,10 @@ class WrapperMachine:
             artifacts = await asyncio.to_thread(
                 store.artifacts,
                 native_sid,
-                codex_profile_id=work_profile_id,
+                claude_profile_id=(
+                    work_profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    work_profile_id if engine == "codex" else None),
             )
             response = WorkArtifacts(
                 engine=engine, session_id=sid, artifacts=artifacts, to=client_id)
@@ -28203,7 +30005,15 @@ class WrapperMachine:
                 if cmd.next_run_at < time.time() - 60:
                     raise ValueError("schedule time is in the past")
                 schedule_profile_id = None
-                if engine == "codex":
+                if engine == "claude":
+                    if not self._claude_work_profile_migration_ok:
+                        raise RuntimeError(
+                            "Claude Work profile ownership migration is incomplete"
+                        )
+                    schedule_profile_id = self._claude_profile(
+                        getattr(cmd, "claude_profile_id", None)
+                    ).id
+                elif engine == "codex":
                     if not self._codex_work_profile_migration_ok:
                         raise RuntimeError(
                             "Codex Work profile ownership migration is incomplete"
@@ -28214,7 +30024,10 @@ class WrapperMachine:
                 await asyncio.to_thread(
                     store.create_schedule, cmd.title.strip(), cmd.prompt.strip(),
                     cmd.next_run_at, cmd.repeat_seconds, cmd.project_id,
-                    codex_profile_id=schedule_profile_id)
+                    claude_profile_id=(
+                        schedule_profile_id if engine == "claude" else None),
+                    codex_profile_id=(
+                        schedule_profile_id if engine == "codex" else None))
             elif cmd.type == "delete_work_schedule":
                 await asyncio.to_thread(store.delete_schedule, cmd.schedule_id)
             else:
@@ -28460,12 +30273,14 @@ class WrapperMachine:
         )
         if (model is None or effort is None) and ctx is None:
             try:
+                profile, native_sid = self._claude_target(sid)
                 native = await asyncio.to_thread(
                     last_completed_assistant_controls,
-                    sid,
+                    native_sid,
                     directory=cwd,
                     max_bytes=self.cfg.history_source_max_bytes,
                     index_store=self._history_index,
+                    config_dir=self._claude_config_root(profile),
                 )
                 model = model or native.model
                 effort = effort or native.effort
@@ -28729,7 +30544,10 @@ class WrapperMachine:
             is_work = await asyncio.to_thread(
                 self._work.for_engine(engine).get_by_session,
                 native_sid,
-                codex_profile_id=work_profile_id,
+                claude_profile_id=(
+                    work_profile_id if engine == "claude" else None),
+                codex_profile_id=(
+                    work_profile_id if engine == "codex" else None),
             ) is not None
         if is_work:
             return await self._send_session_fork_error(
@@ -28805,12 +30623,24 @@ class WrapperMachine:
         self, marker: str, sid: str, cutoff: str, cwd: str,
         attempts: int = 1,
     ) -> Optional[str]:
+        profile, native_sid = self._claude_target(sid)
+        config_root = self._claude_config_root(profile)
         for attempt in range(max(1, attempts)):
+            find_kwargs = (
+                {} if config_root is None
+                else {"config_dir": config_root}
+            )
             meta = await asyncio.to_thread(
-                find_claude_fork, marker, sid, cutoff, cwd)
+                find_claude_fork,
+                marker,
+                native_sid,
+                cutoff,
+                cwd,
+                **find_kwargs,
+            )
             child = meta.get("session_id") if isinstance(meta, dict) else None
             if isinstance(child, str) and child:
-                return child
+                return self._claude_wire_sid(profile, child)
             if attempt + 1 < attempts:
                 await asyncio.sleep(self.FORK_RECONCILE_DELAY)
         return None
@@ -28937,13 +30767,23 @@ class WrapperMachine:
         try:
             fork_entry = self._claude_forks.get(cmd.request_id) or {}
             marker = fork_entry.get("marker")
+            child_profile, native_child_sid = self._claude_target(
+                child_session_id)
             child_info = await asyncio.to_thread(
-                get_session_info, child_session_id, directory=cwd)
+                self._claude_catalog_session_info,
+                child_profile,
+                native_child_sid,
+                directory=cwd,
+            )
             current_title = getattr(child_info, "custom_title", None)
             if child_info is not None and marker and current_title == marker:
                 await asyncio.to_thread(
-                    rename_session, child_session_id,
-                    title or "派生会话 (fork)", directory=cwd)
+                    self._claude_catalog_rename_session,
+                    child_profile,
+                    native_child_sid,
+                    title or "派生会话 (fork)",
+                    directory=cwd,
+                )
         except Exception as exc:
             log.warning("Claude fork title finalization failed",
                         session_id=child_session_id, error=str(exc))
@@ -28996,6 +30836,11 @@ class WrapperMachine:
         if not getattr(cmd, "client_id", None):
             return await self._send_session_fork_error(
                 cmd, ERR_AUTH, "派生会话需要已绑定的客户端")
+        try:
+            claude_profile, native_sid = self._claude_target(sid)
+        except ValueError:
+            return await self._send_session_fork_error(
+                cmd, ERR_AUTH, "Claude 账号或会话标识无效")
         ctx = self._ctx_by_sid(sid)
         if ctx is not None and ctx.engine != "claude":
             return await self._send_session_fork_error(
@@ -29034,7 +30879,11 @@ class WrapperMachine:
             )
             try:
                 info = await asyncio.to_thread(
-                    get_session_info, sid, directory=lookup_cwd)
+                    self._claude_catalog_session_info,
+                    claude_profile,
+                    native_sid,
+                    directory=lookup_cwd,
+                )
             except Exception as exc:
                 log.warning("Claude fork source lookup failed", session_id=sid,
                             error=str(exc))
@@ -29148,8 +30997,9 @@ class WrapperMachine:
 
         try:
             result = await asyncio.to_thread(
-                fork_session,
-                sid,
+                self._claude_catalog_fork_session,
+                claude_profile,
+                native_sid,
                 directory=source_cwd,
                 up_to_message_id=cmd.last_turn_id,
                 title=marker,
@@ -29199,9 +31049,10 @@ class WrapperMachine:
             raise _ForkOutcomeUncertain(
                 "Claude fork response omitted the child session id")
 
+        wire_child = self._claude_wire_sid(claude_profile, child)
         event = await self._finish_claude_fork(
-            cmd, sid, source_cwd, child, title)
-        log.info("Claude session forked", parent=sid, session_id=child,
+            cmd, sid, source_cwd, wire_child, title)
+        log.info("Claude session forked", parent=sid, session_id=wire_child,
                  cutoff=cmd.last_turn_id)
         return event
 
@@ -30576,9 +32427,12 @@ class WrapperMachine:
         return base, parent, dirs
 
     @staticmethod
-    def _bg_blocked_session_ids() -> set[str]:
+    def _bg_blocked_session_ids(
+        config_dir: str | os.PathLike[str] | None = None,
+    ) -> set[str]:
         ids: set[str] = set()
-        jobs = str(claude_config_dir() / "jobs")
+        jobs = str(Path(config_dir) / "jobs") if config_dir is not None \
+            else str(claude_config_dir() / "jobs")
         if not os.path.isdir(jobs):
             return ids
         try:
@@ -30619,6 +32473,7 @@ class WrapperMachine:
 
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
+                     claude_profile_id: Optional[str] = None,
                      codex_profile_id: Optional[str] = None,
                      model: Optional[str] = None, effort: Optional[str] = None,
                      auto_compact_mode: Optional[str] = None,
@@ -30645,14 +32500,21 @@ class WrapperMachine:
         explicit_claude_model = engine == "claude" and model is not None
         explicit_codex_model = engine == "codex" and model is not None
         explicit_codex_effort = engine == "codex" and effort is not None
+        claude_profile = (
+            self._claude_profile(claude_profile_id)
+            if engine == "claude" else None
+        )
         codex_profile = (
             self._codex_profile(codex_profile_id)
             if engine == "codex" else None
         )
-        wire_resume_id = (
-            self._codex_wire_sid(codex_profile, resume_id)
-            if codex_profile is not None and resume_id else resume_id
-        )
+        if claude_profile is not None and resume_id:
+            wire_resume_id = self._claude_wire_sid(
+                claude_profile, resume_id)
+        elif codex_profile is not None and resume_id:
+            wire_resume_id = self._codex_wire_sid(codex_profile, resume_id)
+        else:
+            wire_resume_id = resume_id
         saved_codex_controls = CodexControls()
         if resume_id and engine == "codex" and space == "code":
             saved_codex_controls = await self._load_codex_session_controls(
@@ -30675,6 +32537,19 @@ class WrapperMachine:
                 await self._emit_focused(error)
 
         if (
+            engine == "claude"
+            and space == "work"
+            and not self._claude_work_profile_migration_ok
+        ):
+            await reject(
+                ERR_INTERNAL,
+                "Claude Work 账号归属迁移未完成，请重启后重试。",
+                route="sid",
+                sid=wire_resume_id,
+            )
+            return None
+
+        if (
             engine == "codex"
             and space == "work"
             and not self._codex_work_profile_migration_ok
@@ -30682,6 +32557,19 @@ class WrapperMachine:
             await reject(
                 ERR_INTERNAL,
                 "Codex Work 账号归属迁移未完成，请重启后重试。",
+                route="sid",
+                sid=wire_resume_id,
+            )
+            return None
+
+        if (
+            claude_profile is not None
+            and self._claude_profiles_explicit
+            and not claude_profile.config_dir.is_dir()
+        ):
+            await reject(
+                ERR_INTERNAL,
+                "所选 Claude 账号目录不存在或不可访问，未启动会话。",
                 route="sid",
                 sid=wire_resume_id,
             )
@@ -30709,12 +32597,12 @@ class WrapperMachine:
                 )
                 return None
 
-        if resume_id and resume_id in self._private_btw_sessions:
+        if wire_resume_id and wire_resume_id in self._private_btw_sessions:
             log.warning("refusing cold resume of private btw transcript",
-                        session_id=resume_id)
+                        session_id=wire_resume_id)
             await reject(
                 ERR_AUTH, "临时 btw 会话不可恢复",
-                route="sid", sid=resume_id)
+                route="sid", sid=wire_resume_id)
             return None
         broker_handle: Optional[ClaudeBrokerHandle] = None
         if (self._claude_broker_enabled
@@ -30815,7 +32703,12 @@ class WrapperMachine:
                 return None
         elif resume_id:
             try:
-                info = await asyncio.to_thread(get_session_info, resume_id)
+                assert claude_profile is not None
+                info = await asyncio.to_thread(
+                    self._claude_catalog_session_info,
+                    claude_profile,
+                    resume_id,
+                )
             except Exception as e:
                 log.warning("get_session_info failed", session_id=resume_id, error=str(e))
                 info = None
@@ -30829,7 +32722,7 @@ class WrapperMachine:
                     target_cwd = self.cfg.cc_cwd
                 else:
                     await reject(
-                        ERR_INTERNAL, f"session not found: {resume_id}")
+                        ERR_INTERNAL, f"session not found: {wire_resume_id}")
                     return None
             else:
                 target_cwd = info.cwd or self.cfg.cc_cwd
@@ -30858,10 +32751,22 @@ class WrapperMachine:
         work_record = None
         if space == "work":
             store = self._work.for_engine(engine)
+            if engine == "claude" and not self._claude_profiles.is_multi_profile:
+                # Old single-account Work rows predate profile ownership. The
+                # startup migration normally binds them once; keep embedded or
+                # hot-swapped stores compatible without weakening multi-account
+                # ownership checks.
+                await asyncio.to_thread(
+                    store.assign_legacy_claude_profile,
+                    self._claude_profiles.default.id,
+                )
             work_record = (
                 await asyncio.to_thread(
                     store.get_by_session,
                     resume_id,
+                    claude_profile_id=(
+                        claude_profile.id
+                        if claude_profile is not None else None),
                     codex_profile_id=(
                         codex_profile.id if codex_profile is not None else None),
                 )
@@ -30872,6 +32777,18 @@ class WrapperMachine:
                 await reject(
                     ERR_AUTH, "Work 会话注册信息不存在，已拒绝启动",
                     route="sid", sid=resume_id)
+                return None
+            if (
+                engine == "claude"
+                and claude_profile is not None
+                and work_record.claude_profile_id != claude_profile.id
+            ):
+                await reject(
+                    ERR_AUTH,
+                    "Claude Work 会话不属于所选账号",
+                    route="sid",
+                    sid=wire_resume_id,
+                )
                 return None
             if (
                 engine == "codex"
@@ -30958,7 +32875,8 @@ class WrapperMachine:
             # session override owned by Remote, never Claude's global settings.
             # Work restores only autocompact; its model and permission policy
             # remain owned by the isolated Work runtime.
-            saved_controls = await self._load_claude_session_controls(resume_id)
+            saved_controls = await self._load_claude_session_controls(
+                wire_resume_id)
             if space == "code":
                 model = model or saved_controls.model
                 effort = effort or saved_controls.effort
@@ -30974,7 +32892,9 @@ class WrapperMachine:
             # for an implicit choice; this read is local, current, and cannot be
             # stale across a settings/provider change.
             model, _default_effort = await self._claude_new_session_defaults(
-                target_cwd)
+                target_cwd,
+                claude_profile=claude_profile,
+            )
 
         codex_resume_model_reconcile: Optional[str] = None
         if engine == "codex":
@@ -31022,7 +32942,17 @@ class WrapperMachine:
                 codex_handle_kwargs["codex_home"] = codex_home
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
         else:
-            sdk = broker_handle or SdkHandle(self.cfg)
+            if broker_handle is not None:
+                sdk = broker_handle
+            else:
+                assert claude_profile is not None
+                claude_root = self._claude_config_root(claude_profile)
+                claude_handle_kwargs = {}
+                if claude_root is not None:
+                    claude_handle_kwargs["claude_config_dir"] = claude_root
+                if self._claude_profiles.is_multi_profile:
+                    claude_handle_kwargs["isolate_account_env"] = True
+                sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
         if engine == "claude" and broker_handle is None:
             checked_auto_mode, checked_auto_threshold = (
                 valid_claude_auto_compact(
@@ -31054,7 +32984,10 @@ class WrapperMachine:
                 sdk.work_mode = True
                 sdk.work_settings_path = await asyncio.to_thread(
                     self._work.for_engine("claude").ensure_claude_policy,
-                    work_record)
+                    work_record,
+                    claude_config_dir=self._claude_config_root(
+                        claude_profile),
+                )
                 sdk.permission_mode = "acceptEdits"
         elif (engine == "claude"
               and permission_mode in CLAUDE_PERMISSION_MODES):
@@ -31217,12 +33150,29 @@ class WrapperMachine:
                 codex_home = self._codex_home(codex_profile)
                 if codex_home is not None:
                     baseline_kwargs["codex_home"] = codex_home
-            recovered = await asyncio.to_thread(
-                recover_work_context_baseline,
-                engine,
-                resume_id,
-                **baseline_kwargs,
-            )
+            if engine == "claude":
+                assert claude_profile is not None
+                claude_path = self._claude_transcript_path(
+                    claude_profile,
+                    resume_id,
+                    directory=target_cwd,
+                )
+                recovered = (
+                    await asyncio.to_thread(
+                        recover_work_context_baseline,
+                        engine,
+                        resume_id,
+                        claude_path=claude_path,
+                    )
+                    if claude_path is not None else None
+                )
+            else:
+                recovered = await asyncio.to_thread(
+                    recover_work_context_baseline,
+                    engine,
+                    resume_id,
+                    **baseline_kwargs,
+                )
             if recovered is not None:
                 try:
                     work_context_baseline = await asyncio.to_thread(
@@ -31243,6 +33193,8 @@ class WrapperMachine:
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
             cwd=target_cwd,
             engine=engine,
+            claude_profile_id=(
+                claude_profile.id if claude_profile else None),
             codex_profile_id=(codex_profile.id if codex_profile else None),
             space=space,
             work_id=work_id,
@@ -31549,28 +33501,42 @@ class WrapperMachine:
         )
         if initial_effort:
             ctx.announced_effort = initial_effort
-        # Codex knows its real id at connect time. Claude still uses a temporary
-        # key until its first init/result message exposes the SDK session id.
+        # Resumed sessions know their native id. Fresh Claude sessions retain a
+        # temporary route until the first init/result exposes the UUID.
         key = (
             self._codex_wire_sid(codex_profile, ctx.session_id)
             if engine == "codex" and ctx.session_id and codex_profile is not None
+            else self._claude_wire_sid(claude_profile, ctx.session_id)
+            if engine == "claude" and ctx.session_id and claude_profile is not None
             else ctx.session_id or f"tmp-{uuid4().hex}"
         )
         self.sessions[key] = ctx
         ctx.key = key
         if resume_id:
-            route_sid = key if engine == "codex" else resume_id
+            route_sid = key if engine in {"claude", "codex"} else resume_id
             self._watch_session(route_sid)
             if engine == "codex":
                 await self._recover_codex_owned_turn(ctx, route_sid)
                 await self._prime_codex_ownership(route_sid)
             elif engine == "claude" and broker_handle is None:
-                await self._prime_claude_ownership(resume_id)
+                await self._prime_claude_ownership(route_sid)
             else:
                 await self._sync_external_control(
                     ctx, self._watch.get(resume_id))
-        if resume_id and engine != "codex":
-            save_session_id(self.cfg.state_dir, target_cwd, resume_id)
+        if resume_id and engine == "claude":
+            save_session_id(
+                self.cfg.state_dir,
+                target_cwd,
+                key,
+                **(
+                    {
+                        "claude_profile_id": claude_profile.id,
+                        "claude_profile_revision": self._claude_profile_revision,
+                    }
+                    if claude_profile is not None
+                    and self._claude_profiles_explicit else {}
+                ),
+            )
         await self._load_history(ctx, resume_id)
         if bootstrap:
             ctx.announced_perm = _session_permission_mode(ctx)
@@ -31627,6 +33593,13 @@ class WrapperMachine:
                 raise _BtwSpawnFailure(
                     ERR_AUTH, "Work 会话注册信息不存在，无法打开 btw")
             try:
+                if (engine == "claude"
+                        and not self._claude_profiles.is_multi_profile):
+                    await asyncio.to_thread(
+                        self._work.for_engine(engine)
+                        .assign_legacy_claude_profile,
+                        self._claude_profiles.default.id,
+                    )
                 work_record = await asyncio.to_thread(
                     self._work.for_engine(engine).get_by_work_id,
                     parent.work_id,
@@ -31654,6 +33627,26 @@ class WrapperMachine:
             self._codex_profile_for_ctx(parent)
             if engine == "codex" else None
         )
+        claude_profile = (
+            self._claude_profile_for_ctx(parent)
+            if engine == "claude" else None
+        )
+        if (
+            claude_profile is not None
+            and self._claude_profiles_explicit
+            and not claude_profile.config_dir.is_dir()
+        ):
+            raise _BtwSpawnFailure(
+                ERR_AUTH,
+                "当前 Claude 账号目录不存在或不可访问，无法打开 btw",
+            )
+        if (
+            work_record is not None
+            and engine == "claude"
+            and work_record.claude_profile_id != claude_profile.id
+        ):
+            raise _BtwSpawnFailure(
+                ERR_AUTH, "Claude Work 会话不属于当前账号，已拒绝打开 btw")
         if (
             work_record is not None
             and engine == "codex"
@@ -31706,7 +33699,14 @@ class WrapperMachine:
                 codex_handle_kwargs["codex_home"] = codex_home
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
         else:
-            sdk = SdkHandle(self.cfg)
+            assert claude_profile is not None
+            claude_handle_kwargs = {}
+            claude_root = self._claude_config_root(claude_profile)
+            if claude_root is not None:
+                claude_handle_kwargs["claude_config_dir"] = claude_root
+            if self._claude_profiles.is_multi_profile:
+                claude_handle_kwargs["isolate_account_env"] = True
+            sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
         if engine != "codex" and parent_space == "work":
             assert work_record is not None
             sdk.work_mode = True
@@ -31714,6 +33714,8 @@ class WrapperMachine:
                 sdk.work_settings_path = await asyncio.to_thread(
                     self._work.for_engine("claude").ensure_claude_policy,
                     work_record,
+                    claude_config_dir=self._claude_config_root(
+                        claude_profile),
                 )
             except Exception as exc:
                 log.warning(
@@ -31748,6 +33750,8 @@ class WrapperMachine:
             session_id=None, sdk=sdk,
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
             cwd=parent.cwd, engine=engine,
+            claude_profile_id=(
+                claude_profile.id if claude_profile else None),
             codex_profile_id=(codex_profile.id if codex_profile else None),
             space=parent_space,
             work_id=parent.work_id if parent_space == "work" else None,
@@ -31826,7 +33830,16 @@ class WrapperMachine:
     async def _load_history(self, ctx: SessionContext, session_id: Optional[str]) -> None:
         if not session_id or ctx.engine == "codex":
             return  # codex history replay (rollout files) is a later feature
-        path = transcript_path(session_id)
+        profile = self._claude_profile_for_ctx(ctx)
+        wire_sid = ctx.key or self._claude_wire_sid(profile, session_id)
+        path = self._claude_transcript_path(
+            profile, session_id, directory=ctx.cwd)
+        if self._claude_config_root(profile) is not None and path is None:
+            log.warning(
+                "history preload skipped: profile transcript unavailable",
+                session_id=session_id,
+            )
+            return
         try:
             if path and os.path.getsize(path) > self.cfg.history_source_max_bytes:
                 log.warning("history preload skipped: source too large",
@@ -31848,13 +33861,22 @@ class WrapperMachine:
                 ),
             )
             if compact_snapshot is not None:
-                msgs, timestamps, _internal_events = compact_snapshot
+                msgs, timestamps, internal_events = compact_snapshot
             else:
+                internal_events = {}
                 msgs = await asyncio.to_thread(
-                    get_session_messages, session_id, directory=ctx.cwd,
+                    self._claude_catalog_messages,
+                    profile,
+                    session_id,
+                    directory=ctx.cwd,
                 )
-                timestamps = await asyncio.to_thread(
-                    transcript_timestamps, session_id)
+                if self._claude_config_root(profile) is None:
+                    timestamps = await asyncio.to_thread(
+                        transcript_timestamps, session_id)
+                else:
+                    assert path is not None
+                    timestamps = await asyncio.to_thread(
+                        transcript_timestamps, session_id, path=path)
             msgs = await asyncio.to_thread(
                 recover_claude_delayed_retry_tail,
                 session_id,
@@ -31877,18 +33899,30 @@ class WrapperMachine:
         try:
             client_message_ids = await asyncio.to_thread(
                 self._claude_history_client_message_ids,
-                session_id,
-                path or transcript_path(session_id),
+                wire_sid,
+                path,
             )
             events = translate_history(
                 msgs,
                 self.cfg.tool_result_max,
                 timestamps=timestamps,
+                internal_user_events=internal_events,
                 **({"client_message_ids": client_message_ids}
                    if client_message_ids else {}),
             )
-            subagent_events = await asyncio.to_thread(
-                translate_subagent_history, session_id, self.cfg.tool_result_max)
+            if self._claude_config_root(profile) is None:
+                subagent_events = await asyncio.to_thread(
+                    translate_subagent_history,
+                    session_id,
+                    self.cfg.tool_result_max,
+                )
+            else:
+                subagent_events = await asyncio.to_thread(
+                    translate_subagent_history,
+                    session_id,
+                    self.cfg.tool_result_max,
+                    path=path,
+                )
             events = merge_subagent_history(events, subagent_events)
             mdl = last_assistant_model(msgs)
         except Exception as e:
@@ -31909,18 +33943,18 @@ class WrapperMachine:
                 ctx.announced_model = history_model
                 m = Model(model=history_model)
                 m.seq = ctx.next_seq()
-                m.sid = ctx.session_id
+                m.sid = wire_sid
                 ctx.buffer.append(m)
             effort = _session_effort(ctx)
             if effort and effort != ctx.announced_effort:
                 ctx.announced_effort = effort
                 e = Effort(effort=effort)
                 e.seq = ctx.next_seq()
-                e.sid = ctx.session_id
+                e.sid = wire_sid
                 ctx.buffer.append(e)
             for ev in events:
                 ev.seq = ctx.next_seq()
-                ev.sid = ctx.session_id
+                ev.sid = wire_sid
                 ctx.buffer.append(ev)
         log.info("history loaded", session_id=session_id, events=len(events),
                  model=mdl, head=ctx.buffer.head_seq, tail=ctx.buffer.tail_seq)
@@ -32296,11 +34330,13 @@ class WrapperMachine:
             if not ctx.session_id:
                 raise BrokerClientError(
                     "invalid_status", "broker session id is unavailable")
+            profile = self._claude_profile_for_ctx(ctx)
 
             # Establish the append boundary before the broker accepts input. A
             # very fast Claude response can otherwise finish before send()
             # returns and be mistaken for old history.
-            path = transcript_path(ctx.session_id)
+            path = self._claude_transcript_path(
+                profile, ctx.session_id, directory=ctx.cwd)
             if path:
                 try:
                     before = os.stat(path)
@@ -32372,7 +34408,8 @@ class WrapperMachine:
                             "official Claude TUI exited before the turn completed",
                         )
 
-                current_path = transcript_path(ctx.session_id)
+                current_path = self._claude_transcript_path(
+                    profile, ctx.session_id, directory=ctx.cwd)
                 if current_path:
                     path = current_path
                     try:
@@ -32502,6 +34539,7 @@ class WrapperMachine:
                               item_turns=ctx.claude_item_turns,
                               item_titles=ctx.claude_item_titles,
                               item_meta=ctx.claude_item_meta,
+                              item_commands=ctx.claude_item_commands,
                           ))
         if not is_codex:
             ctx.claude_client_alias_bound_msg_id = None
@@ -33359,7 +35397,7 @@ class WrapperMachine:
                     continue
                 if (
                     not is_codex
-                    and await self._observe_claude_rate_limit_message(msg)
+                    and await self._observe_claude_rate_limit_message(ctx, msg)
                 ):
                     continue
                 if notice_active or ctx.claude_progress_notice_active:

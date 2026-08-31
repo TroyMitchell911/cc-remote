@@ -1,4 +1,5 @@
 import type {
+  ClaudeProfileInfo,
   CodexProfileInfo,
   Engine,
   SessionInfo,
@@ -9,6 +10,8 @@ import type {
 
 export interface NormalizedSessionList {
   sessions: SessionInfo[];
+  claudeProfiles: ClaudeProfileInfo[];
+  defaultClaudeProfileId: string | null;
   codexProfiles: CodexProfileInfo[];
   defaultCodexProfileId: string | null;
 }
@@ -16,28 +19,28 @@ export interface NormalizedSessionList {
 /** Apply one authoritative/partial-success catalog response exactly once.
  * Every consumer (React state, surface caches, RelayWs ownership maps) must use
  * this same projection or A→B→A can resurrect a list that dropped the rows of
- * one temporarily unavailable Codex account. */
+ * one temporarily unavailable account. */
 export function normalizeSessionList(
   previousSessions: readonly SessionInfo[],
   previousProfiles: readonly CodexProfileInfo[],
   previousDefaultProfileId: string | null,
   event: SessionList,
+  previousClaudeProfiles: readonly ClaudeProfileInfo[] = [],
+  previousDefaultClaudeProfileId: string | null = null,
 ): NormalizedSessionList {
-  if (event.engine !== "codex") {
-    return {
-      sessions: [...event.sessions],
-      codexProfiles: [...previousProfiles],
-      defaultCodexProfileId: previousDefaultProfileId,
-    };
-  }
-  const codexProfiles = event.codex_profiles?.length
+  const codexProfiles = event.engine === "codex" && event.codex_profiles?.length
     ? [...event.codex_profiles]
     : [...previousProfiles];
+  const claudeProfiles = event.engine === "claude" && event.claude_profiles?.length
+    ? [...event.claude_profiles]
+    : [...previousClaudeProfiles];
+  const activeProfiles = event.engine === "codex"
+    ? codexProfiles : claudeProfiles;
   const configuredProfileIds = new Set(
-    codexProfiles.map((profile) => profile.id),
+    activeProfiles.map((profile) => profile.id),
   );
   const unavailableProfileIds = new Set(
-    codexProfiles
+    activeProfiles
       .filter((profile) => !!profile.error)
       .map((profile) => profile.id),
   );
@@ -49,17 +52,25 @@ export function normalizeSessionList(
     ? []
     : previousSessions.filter((session) =>
       !session.provisional_fork
-      && session.engine === "codex"
+      && session.engine === event.engine
       && (session.space ?? "code") === listedSpace
-      && !!session.codex_profile_id
-      && configuredProfileIds.has(session.codex_profile_id)
-      && unavailableProfileIds.has(session.codex_profile_id)
+      && !!(event.engine === "codex"
+        ? session.codex_profile_id : session.claude_profile_id)
+      && configuredProfileIds.has(event.engine === "codex"
+        ? session.codex_profile_id! : session.claude_profile_id!)
+      && unavailableProfileIds.has(event.engine === "codex"
+        ? session.codex_profile_id! : session.claude_profile_id!)
       && !incomingIds.has(session.session_id));
   return {
     sessions: [...event.sessions, ...retained],
+    claudeProfiles,
+    defaultClaudeProfileId: event.engine === "claude"
+      ? event.default_claude_profile_id ?? previousDefaultClaudeProfileId
+      : previousDefaultClaudeProfileId,
     codexProfiles,
-    defaultCodexProfileId: event.default_codex_profile_id
-      ?? previousDefaultProfileId,
+    defaultCodexProfileId: event.engine === "codex"
+      ? event.default_codex_profile_id ?? previousDefaultProfileId
+      : previousDefaultProfileId,
   };
 }
 

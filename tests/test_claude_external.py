@@ -45,6 +45,7 @@ def _fake_process(
     parent_pid: int = 1,
     cwd: Path | None = None,
     cmdline: tuple[str, ...] = (),
+    environ: tuple[str, ...] | None = None,
 ) -> Path:
     proc = root / str(pid)
     proc.mkdir(parents=True)
@@ -55,7 +56,81 @@ def _fake_process(
         b"\0".join(arg.encode() for arg in cmdline) + (b"\0" if cmdline else b""))
     if cwd is not None:
         (proc / "cwd").symlink_to(cwd)
+    if environ is not None:
+        (proc / "environ").write_bytes(
+            b"\0".join(item.encode() for item in environ)
+            + (b"\0" if environ else b"")
+        )
     return proc
+
+
+def test_claude_process_scan_scopes_identical_uuid_by_config_dir(tmp_path):
+    native_id = "11111111-1111-4111-8111-111111111111"
+    personal_sid = f"personal@{native_id}"
+    company_sid = f"company@{native_id}"
+    project = tmp_path / "project"
+    project.mkdir()
+    personal_root = tmp_path / "personal"
+    company_root = tmp_path / "company"
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        105,
+        1005,
+        cwd=project,
+        cmdline=("/usr/local/bin/claude", "--resume", native_id),
+        environ=(f"CLAUDE_CONFIG_DIR={company_root}",),
+    )
+
+    scan = claude_session_holders(
+        {personal_sid: "personal.jsonl", company_sid: "company.jsonl"},
+        {personal_sid: str(project), company_sid: str(project)},
+        wrapper_pid=900,
+        proc_root=str(proc_root),
+        config_dirs={
+            personal_sid: str(personal_root),
+            company_sid: str(company_root),
+        },
+        native_session_ids={
+            personal_sid: native_id,
+            company_sid: native_id,
+        },
+        default_config_dir=str(personal_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[personal_sid] == set()
+    assert scan.holders[company_sid] == {ProcessIdentity(105, 1005)}
+
+
+def test_claude_profile_scan_fails_closed_when_environment_is_unreadable(
+    tmp_path,
+):
+    native_id = "11111111-1111-4111-8111-111111111111"
+    sid = f"personal@{native_id}"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        106,
+        1006,
+        cwd=project,
+        cmdline=("claude", "--resume", native_id),
+    )
+
+    scan = claude_session_holders(
+        {sid: "personal.jsonl"},
+        {sid: str(project)},
+        wrapper_pid=900,
+        proc_root=str(proc_root),
+        config_dirs={sid: str(tmp_path / "personal")},
+        native_session_ids={sid: native_id},
+        default_config_dir=str(tmp_path / "personal"),
+    )
+
+    assert scan.complete is False
+    assert scan.holders[sid] == set()
 
 
 def test_claude_process_scan_tracks_explicit_owner_only(tmp_path):

@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import stat
 import threading
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from claude_agent_sdk import get_session_messages
@@ -18,6 +18,7 @@ from cc_remote.wrapper.stream import (
     recover_claude_delayed_retry_tail,
     transcript_path,
 )
+from cc_remote.wrapper import claude_catalog
 from cc_remote.protocol import (
     MAX_AUTO_COMPACT_TOKENS,
     MIN_AUTO_COMPACT_TOKENS,
@@ -71,13 +72,19 @@ class ClaudeControls:
 def _canonical_session_id(value: object) -> str:
     if not isinstance(value, str):
         raise ClaudeControlStoreError("Claude session id must be a UUID")
+    profile_id = None
+    native = value
+    if "@" in value:
+        profile_id, native = value.split("@", 1)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", profile_id):
+            raise ClaudeControlStoreError("invalid Claude profile id")
     try:
-        canonical = str(UUID(value))
+        canonical = str(UUID(native))
     except (ValueError, AttributeError) as exc:
         raise ClaudeControlStoreError("Claude session id must be a UUID") from exc
-    if value.lower() != canonical:
+    if native.lower() != canonical:
         raise ClaudeControlStoreError("Claude session id must be canonical")
-    return canonical
+    return f"{profile_id}@{canonical}" if profile_id is not None else canonical
 
 
 def valid_claude_model(value: object) -> str | None:
@@ -157,7 +164,38 @@ class ClaudeControlStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "claude-session-controls.json"
         self._lock = threading.RLock()
+        self._profile_revision = 0
         self._sessions = self._load()
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate keys once per Claude topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ClaudeControlStoreError("invalid Claude profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: dict[str, dict[str, Any]] = {}
+            migrated = 0
+            for session_id, controls in self._sessions.items():
+                target = _canonical_session_id(transform(session_id))
+                if target in updated and updated[target] != controls:
+                    raise ClaudeControlStoreError(
+                        "Claude control profile migration collides")
+                updated[target] = controls
+                migrated += target != session_id
+            self._persist(updated, profile_revision=profile_revision)
+            self._sessions = updated
+            self._profile_revision = profile_revision
+            return migrated
 
     def get(self, session_id: str) -> ClaudeControls:
         session_id = _canonical_session_id(session_id)
@@ -321,10 +359,19 @@ class ClaudeControlStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise ClaudeControlStoreError("Claude control store is unreadable") from exc
         sessions = raw.get("sessions") if isinstance(raw, dict) else None
-        if (not isinstance(raw, dict) or raw.get("version") != 1
+        if (not isinstance(raw, dict) or raw.get("version") not in {1, 2}
                 or not isinstance(sessions, dict)
                 or len(sessions) > _MAX_ENTRIES):
             raise ClaudeControlStoreError("Claude control store has invalid shape")
+        profile_revision = raw.get("profile_revision", 0)
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+        ):
+            raise ClaudeControlStoreError(
+                "Claude control profile revision is invalid")
+        self._profile_revision = profile_revision
         loaded: dict[str, dict[str, Any]] = {}
         for raw_id, values in sessions.items():
             if not isinstance(values, dict):
@@ -349,12 +396,24 @@ class ClaudeControlStore:
                 loaded[session_id] = controls
         return loaded
 
-    def _persist(self, sessions: dict[str, dict[str, Any]]) -> None:
+    def _persist(
+        self,
+        sessions: dict[str, dict[str, Any]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(parent, 0o700)
         payload = json.dumps(
-            {"version": 1, "sessions": sessions},
+            {
+                "version": 2,
+                "profile_revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+                "sessions": sessions,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -433,6 +492,7 @@ def last_completed_assistant_controls(
     directory: str,
     max_bytes: int,
     index_store=None,
+    config_dir: str | os.PathLike[str] | None = None,
 ) -> ClaudeControls:
     """Read controls from the latest completed native assistant turn.
 
@@ -442,7 +502,12 @@ def last_completed_assistant_controls(
     which SessionMessage currently drops.
     """
     _canonical_session_id(session_id)
-    path = transcript_path(session_id)
+    path = (
+        str(found) if config_dir is not None and (
+            found := claude_catalog.find_session_file(
+                config_dir, session_id, directory=directory)
+        ) is not None else None
+    ) if config_dir is not None else transcript_path(session_id)
     if path is None:
         return ClaudeControls()
     try:
@@ -454,7 +519,12 @@ def last_completed_assistant_controls(
 
     messages = recover_claude_delayed_retry_tail(
         session_id,
-        get_session_messages(session_id, directory=directory),
+        (
+            claude_catalog.get_session_messages(
+                config_dir, session_id, directory=directory)
+            if config_dir is not None else
+            get_session_messages(session_id, directory=directory)
+        ),
         path=path,
         index_store=index_store,
         snapshot_size=info.st_size,

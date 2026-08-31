@@ -107,6 +107,75 @@ now += 600;
 assert.equal(coordinator.request({ sid: "session-1", limit: 4 }, send), true);
 assert.equal(sends, 7);
 
+// A durable completion receipt is published after TurnEnd. A newest-page read
+// already in flight may have captured the pre-terminal transcript, so this
+// causal trigger must replace rather than share it. The reducer's build_seq
+// ordering decides which of the two same-cursor responses may install.
+const completionCoordinator = new HistoryRequestCoordinator(() => now, 500);
+let completionSends = 0;
+const sendCompletionHistory = () => { completionSends += 1; return true; };
+assert.equal(completionCoordinator.request({
+  sid: "completion-repair", limit: 4, generation: "generation-1",
+}, sendCompletionHistory, undefined, { causalKey: "completion-old" }), true);
+assert.equal(completionCoordinator.request({
+  sid: "completion-repair", limit: 4, generation: "generation-1",
+}, sendCompletionHistory, undefined, {
+  supersedePending: true, causalKey: "completion-new",
+}), true);
+assert.equal(completionSends, 2,
+  "post-terminal recovery must not coalesce into a pre-terminal read");
+assert.deepEqual(completionCoordinator.complete({
+  session_id: "completion-repair", generation: "generation-1",
+}), { matched: [], stale: [] },
+"the first indistinguishable response cannot release the replacement retry");
+assert.deepEqual(completionCoordinator.complete({
+  session_id: "completion-repair", generation: "generation-1",
+}), {
+  matched: [], stale: [],
+  settledCausalKey: "completion-new",
+}, "the last same-cursor response settles the newest causal boundary");
+
+const directCausalCoordinator = new HistoryRequestCoordinator(() => now, 500);
+assert.equal(directCausalCoordinator.request({
+  sid: "completion-direct", limit: 4,
+}, () => true, undefined, { causalKey: "completion-direct" }), true);
+assert.deepEqual(directCausalCoordinator.complete({
+  session_id: "completion-direct",
+}), {
+  matched: [], stale: [],
+  settledCausalKey: "completion-direct",
+}, "an unambiguous response settles its exact causal request immediately");
+
+const alreadyCausalCoordinator = new HistoryRequestCoordinator(
+  () => now, 500,
+);
+let alreadyCausalSends = 0;
+const sendAlreadyCausal = () => { alreadyCausalSends += 1; return true; };
+assert.equal(alreadyCausalCoordinator.request({
+  sid: "completion-current", limit: 4,
+}, sendAlreadyCausal, undefined, { causalKey: "completion-current" }), true);
+assert.equal(alreadyCausalCoordinator.request({
+  sid: "completion-current", limit: 4,
+}, sendAlreadyCausal, undefined, {
+  supersedePending: true, causalKey: "completion-current",
+}), false);
+assert.equal(alreadyCausalSends, 1,
+  "a focus read started after the same receipt already covers recovery");
+
+const rejectedCompletionReplacement = new HistoryRequestCoordinator(
+  () => now, 500,
+);
+assert.equal(rejectedCompletionReplacement.request({
+  sid: "completion-rejected", limit: 4,
+}, () => true, undefined, { causalKey: "completion-old" }), true);
+assert.equal(rejectedCompletionReplacement.request({
+  sid: "completion-rejected", limit: 4,
+}, () => false, undefined, {
+  supersedePending: true, causalKey: "completion-new",
+}), false);
+assert.equal(rejectedCompletionReplacement.size(), 1,
+  "a rejected terminal replacement keeps the original read authority");
+
 const rejectedSendCoordinator = new HistoryRequestCoordinator(() => now, 500);
 rejectedSendCoordinator.beginConnection();
 assert.equal(rejectedSendCoordinator.request(

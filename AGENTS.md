@@ -39,12 +39,15 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
   Text deltas still stream live via `StreamEvent`.
-- **Claude only — don't set `setting_sources=[]`**: we WANT
-  `~/.claude/settings.json` loaded so Claude inherits the model link
-  (`ANTHROPIC_BASE_URL`), model id, and
-  `bypassPermissions`. Note: settings.json's `env` block overrides the process
-  env, so redirecting the model backend from cc-remote is not possible — it's
-  the user's `settings.json` that decides.
+- **Claude only — don't set `setting_sources=[]` for Code**: legacy single-account
+  Code intentionally loads `~/.claude/settings.json`. Explicit account profiles
+  start under a mode-`0700` shadow HOME whose `.claude` is a symlink to the
+  selected `CLAUDE_CONFIG_DIR`: current Claude Code still resolves its user
+  setting source through HOME. A mode-`0600`, credential-free explicit settings
+  file restores the real HOME before tool subprocesses spawn. Never parse or
+  copy the selected account's settings/credentials into cc-remote state. Work
+  is the deliberate exception: it uses one wrapper-owned policy file with
+  `setting_sources=[]`.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -54,7 +57,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v42 is declared by
+- **Protocol version gate**: current wire protocol v44 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
