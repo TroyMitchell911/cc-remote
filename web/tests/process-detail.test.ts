@@ -355,7 +355,13 @@ try {
     clientMsgId: claudeHistoryGapMessage,
     prompt: "survive a lost user echo",
     done: false,
-    blocks: [],
+    blocks: [{
+      kind: "text" as const,
+      message_id: "claude-history-final",
+      text: "finished answer",
+      done: false,
+      channel: "final" as const,
+    }],
     detailEventCount: 0,
     detailLoaded: false,
   };
@@ -395,7 +401,30 @@ try {
     "History-only acceptance keeps the working spark on the submitted row");
   claudeHistoryGapState = reduce(claudeHistoryGapState, {
     type: "event", event: event({
-      type: "state", sid: claudeHistoryGapSid, seq: 13, state: "idle",
+      type: "turn_end", sid: claudeHistoryGapSid, seq: 13,
+      turn_id: claudeHistoryGapNative,
+      result: { subtype: "success", duration_ms: 20, is_error: false },
+    }),
+  });
+  claudeHistoryGapRuntime =
+    claudeHistoryGapState.runtimes[claudeHistoryGapSid];
+  assert.equal(claudeHistoryGapRuntime.turns[0].done, true,
+    "a live terminal closes the current turn recovered only from History");
+  const recoveredCompletionMarkup = renderToStaticMarkup(createElement(
+    ChatView,
+    {
+      sid: claudeHistoryGapSid,
+      turns: claudeHistoryGapRuntime.turns,
+      engine: "claude",
+      onEdit: () => {},
+      onGetDiff: () => {},
+    },
+  ));
+  assert.match(recoveredCompletionMarkup, /class="turn-done-mark"/,
+    "the recovered Claude terminal paints the final completion spark");
+  claudeHistoryGapState = reduce(claudeHistoryGapState, {
+    type: "event", event: event({
+      type: "state", sid: claudeHistoryGapSid, seq: 14, state: "idle",
     }),
   });
   assert.deepEqual(activeHistoryOwner(

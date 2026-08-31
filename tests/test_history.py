@@ -4310,6 +4310,88 @@ def test_codex_turn_detail_snapshot_cursor_survives_rollout_append(
     asyncio.run(go())
 
 
+def test_claude_turn_detail_snapshot_cursor_survives_transcript_append(
+    tmp_path,
+    monkeypatch,
+):
+    transcript = tmp_path / "snapshot-detail.jsonl"
+    transcript.write_text('{"type":"first"}\n')
+    original_events = (
+        {"type": "user_msg", "sid": "snapshot-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        *(
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": f"old-step-{index}", "kind": "command",
+             "phase": "end", "status": "succeeded"}
+            for index in range(5)
+        ),
+        {"type": "turn_end", "sid": "snapshot-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(
+            tmp_path / "state-claude-snapshot")
+        monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+        ctx = _mk_ctx("snapshot-detail", "snapshot-detail")
+        ctx.engine = "claude"
+        machine.sessions[ctx.key] = ctx
+        original = HistorySourceFingerprint.capture(transcript)
+        machine._history_index.put_turn_details(
+            ctx.key, "claude", original, original_events)
+        revision = machine._history_revision(ctx.key)
+
+        newest = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=2,
+        ))
+        assert newest.authoritative is True
+        assert newest.has_more is True
+        assert newest.oldest_cursor is not None
+        assert newest.oldest_cursor.startswith("td1.")
+        snapshot_cursor = newest.oldest_cursor
+        numeric_boundary = snapshot_cursor.rsplit(".", 1)[-1]
+
+        with transcript.open("a") as stream:
+            stream.write('{"type":"second"}\n')
+        appended = HistorySourceFingerprint.capture(transcript)
+        appended_events = (
+            *original_events[:-1],
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": "new-after-append", "kind": "command",
+             "phase": "end", "status": "succeeded"},
+            original_events[-1],
+        )
+        machine._history_index.put_turn_details(
+            ctx.key, "claude", appended, appended_events)
+
+        older = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        expected = mm._turn_detail_page(
+            list(original_events), before=numeric_boundary, limit=2)[0]
+        assert older.authoritative is True
+        assert older.events == expected
+        assert all(
+            row.get("item_id") != "new-after-append"
+            for row in older.events
+        )
+
+    asyncio.run(go())
+
+
 def test_codex_turn_detail_prefers_visible_index_and_resets_invalid_legacy_page(
     tmp_path,
 ):
@@ -6734,10 +6816,10 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
         assert types == [
-            "snapshot", "query_queue", "completion_state", "perm",
-            "auto_compact",
-            "snapshot", "query_queue", "completion_state", "perm",
-            "auto_compact",
+            "snapshot", "ask_user_sync", "query_queue",
+            "completion_state", "perm", "auto_compact",
+            "snapshot", "ask_user_sync", "query_queue",
+            "completion_state", "perm", "auto_compact",
         ]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
@@ -6761,8 +6843,9 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "replay_start", "user_msg", "replay_end", "session_control",
-            "query_queue", "completion_state", "perm", "auto_compact"]
+            "replay_start", "user_msg", "replay_end", "ask_user_sync",
+            "session_control", "query_queue", "completion_state", "perm",
+            "auto_compact"]
         assert tr.sent[1].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -6788,7 +6871,8 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 
         assert [msg.type for msg in tr.sent] == [
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
-            "query_queue", "completion_state", "perm", "auto_compact"]
+            "ask_user_sync", "query_queue", "completion_state", "perm",
+            "auto_compact"]
         assert tr.sent[2].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
@@ -8192,6 +8276,72 @@ def test_background_bash_notification_stays_an_ordinary_background_task(
     assert not any(
         isinstance(event, ProcessEvent) and event.kind == "agent"
         for event in events)
+
+
+def test_late_internal_task_notification_does_not_extend_completed_answer():
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    answer_id = "22222222-2222-4222-8222-222222222222"
+    notification_id = "33333333-3333-4333-8333-333333333333"
+    notification = """<task-notification>
+<task-id>stale-background-command</task-id>
+<status>stopped</status>
+<summary>No completion record was found after resume</summary>
+</task-notification>"""
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "finish the task"},
+        ),
+        SimpleNamespace(
+            uuid=answer_id,
+            type="assistant",
+            parent_tool_use_id=None,
+            message={
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ),
+        SimpleNamespace(
+            uuid=notification_id,
+            type="user",
+            message={"role": "user", "content": notification},
+        ),
+    ]
+    internal = {
+        notification_id: ProcessEvent(
+            item_id="stale-background-command",
+            kind="task",
+            phase="end",
+            status="cancelled",
+            title="后台任务",
+            summary="No completion record was found after resume",
+            background=True,
+        ),
+    }
+
+    events = translate_history(
+        messages,
+        10_000,
+        timestamps={
+            prompt_id: 1_000.0,
+            answer_id: 1_010.0,
+            notification_id: 40_000.0,
+        },
+        internal_user_events=internal,
+    )
+
+    process = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "stale-background-command"
+    )
+    assert process.ts == 40_000.0
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.turn_id == answer_id
+    assert terminal.ts == 1_010.0
+    assert terminal.result.duration_ms == 10_000
 
 
 def test_history_hides_cancelled_command_placeholders_without_hiding_real_text():

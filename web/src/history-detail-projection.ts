@@ -42,6 +42,44 @@ export function nextAutoLoadDetailTurn(
     : null;
 }
 
+function hasTurnIdentity(
+  turn: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+  identity: string,
+): boolean {
+  return [turn.id, turn.clientMsgId, turn.historyTurnId].includes(identity);
+}
+
+/** Select the next detail request for the one canonical active History head.
+ *
+ * Recency, array position, prompt text, and native task ids are deliberately
+ * insufficient: a reconnect may retain several unfinished local rows, while
+ * ``historyNewestId`` is the wrapper's exact source projection. Recovery loads
+ * only the bounded newest page. Once that canonical page is installed, older
+ * pages remain available through the existing explicit pagination controls;
+ * reconnect must not turn one long active turn into an unbounded DOM restore. */
+export function nextActiveDetailRequest(
+  turns: readonly Turn[],
+  historyNewestId: string | null | undefined,
+  active: boolean,
+): { turnId: string; before?: string } | null {
+  if (!active || !historyNewestId) return null;
+  const matches = turns.filter((turn) =>
+    !turn.done && hasTurnIdentity(turn, historyNewestId));
+  if (matches.length !== 1) return null;
+  const turn = matches[0];
+  if (turn.detailLoading === true
+      || turn.detailRestorePending === true
+      || turn.detailResetPending === true
+      || !!turn.detailError
+      || turn.detailProjection?.capped === true) return null;
+
+  const projection = turn.detailProjection;
+  if (projection && projection.segments.length > 0) {
+    return null;
+  }
+  return turn.detailLoaded === true ? null : { turnId: turn.id };
+}
+
 function pageKey(before: string | null | undefined): string {
   return before ?? LATEST_DETAIL_PAGE_KEY;
 }

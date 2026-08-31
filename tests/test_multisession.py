@@ -20,8 +20,8 @@ from pathlib import Path
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     serialize, deserialize, is_downstream,
-    Hello, SessionRekey, StateEvent, UserMsg, ReplayStart, ReplayEnd,
-    TurnEnd, TurnNotificationContext, TurnResult,
+    Delta, Hello, SessionRekey, StateEvent, UserMsg, ReplayStart, ReplayEnd,
+    TurnBinding, TurnEnd, TurnNotificationContext, TurnResult,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import SessionContext
@@ -156,6 +156,100 @@ def test_current_turn_replay_never_reuses_previous_turn_during_preflight():
 
     assert rb.current_turn_replay(
         generation="g", message_id="new-not-emitted") == []
+
+
+def test_current_turn_replay_reports_exact_evicted_active_boundary():
+    rb = RingBuffer(2, 10_000)
+    current = UserMsg(msg_id="current", prompt="current")
+    current.seq = 2
+    first = StateEvent(state="running")
+    first.seq = 3
+    second = StateEvent(state="running")
+    second.seq = 4
+    for event in (current, first, second):
+        rb.append(event)
+
+    frames = rb.current_turn_replay(
+        generation="g",
+        message_id="current",
+        boundary_seq=2,
+    )
+
+    assert [frame.type for frame in frames] == [
+        "replay_start", "state", "state", "replay_end",
+    ]
+    assert frames[0].truncated is True
+    assert frames[0].from_seq == rb.head_seq
+    assert frames[-1].to_seq == rb.tail_seq
+
+
+def test_current_turn_replay_reports_marker_evicted_before_retained_binding():
+    rb = RingBuffer(3, 10_000)
+    current = UserMsg(msg_id="current", prompt="current")
+    current.seq = 1
+    binding = TurnBinding(msg_id="current", turn_id="native")
+    binding.seq = 2
+    first = StateEvent(state="running")
+    first.seq = 3
+    second = StateEvent(state="running")
+    second.seq = 4
+    for event in (current, binding, first, second):
+        rb.append(event)
+
+    assert rb.head_seq == binding.seq
+    frames = rb.current_turn_replay(
+        generation="g",
+        message_id="current",
+        boundary_seq=binding.seq,
+    )
+
+    assert [frame.type for frame in frames] == [
+        "replay_start", "turn_binding", "state", "state", "replay_end",
+    ]
+    assert frames[0].truncated is True
+    assert frames[0].from_seq == binding.seq
+
+
+def test_current_turn_replay_keeps_and_compacts_retained_live_deltas():
+    rb = RingBuffer(10_001, 10_000_000)
+    current = UserMsg(msg_id="current", prompt="current")
+    current.seq = 1
+    binding = TurnBinding(msg_id="current", turn_id="native")
+    binding.seq = 2
+    rb.append(current)
+    rb.append(binding)
+    expected = []
+    for index in range(10_000):
+        text = f"{index % 10}" * 10
+        expected.append(text)
+        delta = Delta(
+            message_id="assistant",
+            turn_id="native",
+            text=text,
+            channel="commentary",
+        )
+        delta.seq = index + 3
+        rb.append(delta)
+
+    assert rb.head_seq == binding.seq
+    frames = rb.current_turn_replay(
+        generation="g",
+        message_id="current",
+        boundary_seq=binding.seq,
+    )
+
+    assert frames[0].type == "replay_start"
+    assert frames[0].truncated is True
+    assert frames[1].type == "turn_binding"
+    compacted = [frame for frame in frames if frame.type == "delta"]
+    assert 1 < len(compacted) < 10
+    assert all(len(frame.text) <= 64 * 1024 for frame in compacted)
+    assert "".join(frame.text for frame in compacted) == "".join(expected)
+    assert [frame.seq for frame in compacted] == sorted(
+        frame.seq for frame in compacted
+    )
+    assert compacted[-1].seq == rb.tail_seq
+    assert frames[-1].type == "replay_end"
 
 
 # ---- emit routing (sid = the context's browser routing key) ----
@@ -322,8 +416,8 @@ def test_lost_rekey_is_replayed_before_cursor_catchup():
 
         assert [message.type for message in transport.sent] == [
             "session_rekey", "replay_start", "state", "replay_end",
-            "session_control", "query_queue", "completion_state", "perm",
-            "auto_compact"]
+            "ask_user_sync", "session_control", "query_queue",
+            "completion_state", "perm", "auto_compact"]
         assert transport.sent[0].old_key == "tmp-lost"
         assert transport.sent[0].session_id == "real-1"
         assert all(message.to == "client-1" for message in transport.sent)

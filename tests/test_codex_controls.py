@@ -14,7 +14,8 @@ from pydantic import ValidationError
 from cc_remote import __version__
 from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
-    CollaborationMode, CommandAck, Delta, Effort, Error, GoalState, Interrupt, Model,
+    AnswerQuestion, CollaborationMode, CommandAck, Delta, Effort, Error,
+    GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
     TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
     SetPermissionProfile, SetWebSearch, WebSearch,
@@ -5202,6 +5203,7 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         ctx = _mk_ctx("claude-question", "claude-question")
         ctx.state = "running"
         ctx.active_msg_id = "claude-question-turn"
+        machine.sessions[ctx.key] = ctx
         tool_input = {
             "questions": [
                 {
@@ -5238,7 +5240,12 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert first_event.multi_select is False
         assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
-        ctx.pending_asks[first_id].set_result("Windows")
+        assert await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=first_id,
+            answer="Windows",
+            client_id="client-1",
+        )) is None
 
         while not ctx.pending_asks or first_id in ctx.pending_asks:
             await asyncio.sleep(0)
@@ -5249,7 +5256,12 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert second_event.header == "Checks"
         assert second_event.multi_select is True
         assert second_event.allow_text is True
-        ctx.pending_asks[second_id].set_result(["Tests", "Custom audit"])
+        assert await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=second_id,
+            answer=["Tests", "Custom audit"],
+            client_id="client-1",
+        )) is None
 
         result = await task
         assert isinstance(result, PermissionResultAllow)

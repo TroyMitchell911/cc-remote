@@ -76,7 +76,10 @@ import {
   updateScopedSessionLifecycle,
 } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
-import { nextAutoLoadDetailTurn } from "./history-detail-projection";
+import {
+  nextActiveDetailRequest,
+  nextAutoLoadDetailTurn,
+} from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectUnconfirmedQueries,
@@ -3702,7 +3705,7 @@ export default function App() {
 
   const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
     includeBrowseProjection = true,
   ): boolean => {
     const current = stateRef.current;
@@ -3768,14 +3771,42 @@ export default function App() {
   }, [focusedEngine, historyPageScopeFor, space]);
   const loadHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
   ) => requestHistoryTurnDetail(
     displayTurnId, before, autoLoad, true), [requestHistoryTurnDetail]);
   const loadRuntimeTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
   ) => requestHistoryTurnDetail(
     displayTurnId, before, autoLoad, false), [requestHistoryTurnDetail]);
+  useEffect(() => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime || current.newChat
+        || current.historyBrowse?.sid === sid
+        || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime.syncReady || !runtime.historyHeadKnown
+        || runtime.historyInvalidated || !runtime.historyRevision) return;
+    const request = nextActiveDetailRequest(
+      runtime.turns,
+      runtime.historyNewestId,
+      runtime.state !== "idle" || runtime.mirroredRunning,
+    );
+    if (!request) return;
+    // One newest page establishes the immutable source snapshot. Older pages
+    // stay behind the existing explicit pagination controls while live tail
+    // frames continue merging independently into the same turn.
+    loadRuntimeTurnDetail(request.turnId, request.before, false);
+  }, [
+    loadRuntimeTurnDetail,
+    state.connState,
+    state.focusedSid,
+    state.historyBrowse,
+    state.newChat,
+    state.runtimes,
+    state.wrapperOnline,
+  ]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;

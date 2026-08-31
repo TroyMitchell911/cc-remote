@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
 
-from cc_remote.protocol import State
+from cc_remote.protocol import AskUser, State
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.stream import StreamTranslator
@@ -67,6 +67,40 @@ class ActiveTurnBinding:
     turn_id: str
     seq: int
     generation: str
+
+
+@dataclass(frozen=True)
+class PendingAskResolution:
+    """One terminal outcome for an interactive question.
+
+    The Future always resolves normally with this value.  Keeping cancellation,
+    timeout, supersede, and answer on one result channel avoids un-retrieved
+    Future exceptions when the surrounding engine task is cancelled at the
+    same time as the question closes.
+    """
+
+    reason: str
+    answer: str | list[str] | None = None
+
+
+@dataclass
+class PendingAskState:
+    """Authoritative, reconnectable state for one still-open question.
+
+    ``event`` is an unsequenced template: it never enters the replay ring and
+    is copied independently for the original live emit and every eligible
+    client Hello.  ``deadline`` is the original monotonic deadline and is never
+    recomputed by reconnects.
+    """
+
+    event: AskUser
+    future: asyncio.Future[PendingAskResolution]
+    labels: frozenset[str]
+    allow_text: bool
+    multi_select: bool
+    created_at: float
+    deadline: float
+    target: Optional[str] = None
 
 
 @dataclass
@@ -326,10 +360,10 @@ class SessionContext:
     # stores only the broker generation needed to reject a stale PID/socket
     # record; it never owns or kills that process on an ordinary disconnect.
     claude_broker_generation: Optional[str] = None
-    pending_asks: dict = field(default_factory=dict)
-    # Semantic metadata stays separate from the Future map so every answer can
-    # be validated against the exact prompt that created it.
-    pending_ask_specs: dict = field(default_factory=dict)
+    # Questions are durable for the lifetime of this resident context rather
+    # than one-shot ring events. Registration and every terminal transition are
+    # serialized by ``emit_lock`` so Hello cannot resurrect a closed question.
+    pending_asks: dict[str, PendingAskState] = field(default_factory=dict)
     # The browser presents one question card per session. Serialize whole
     # batches so concurrent tools/subagents cannot overwrite that card.
     ask_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

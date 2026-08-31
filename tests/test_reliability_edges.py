@@ -66,8 +66,8 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
         replay_frames = [msg for msg in transport.sent if msg.sid == "s-replay"]
         assert [msg.type for msg in replay_frames] == [
             "replay_start", "delta", "turn_end", "replay_end",
-            "session_control", "query_queue", "completion_state", "perm",
-            "auto_compact",
+            "ask_user_sync", "session_control", "query_queue",
+            "completion_state", "perm", "auto_compact",
         ]
         assert all(msg.to == "client-1" for msg in replay_frames)
         assert all(msg.sid == "s-replay" for msg in replay_frames)
@@ -81,6 +81,44 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
         # Routed copies must not contaminate the shared ring event.
         assert delta.to is None and delta.route_id is None
         assert end.to is None and end.route_id is None
+
+    asyncio.run(run())
+
+
+def test_client_hello_does_not_retarget_another_clients_ring_frame():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s-private", "s-private")
+        private = Delta(message_id="a1", text="owner only", to="owner")
+        public = Delta(message_id="a1", text="everyone")
+        _buffer(ctx, private, public)
+        machine.sessions = {ctx.key: ctx}
+
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="other",
+            cursors={"s-private": 0},
+            generations={"s-private": machine.instance_id},
+        ))
+        deltas = [message for message in transport.sent
+                  if isinstance(message, Delta)]
+        assert [message.text for message in deltas] == ["everyone"]
+        assert deltas[0].to == "other"
+
+        transport.sent.clear()
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="owner",
+            cursors={"s-private": 0},
+            generations={"s-private": machine.instance_id},
+        ))
+        deltas = [message for message in transport.sent
+                  if isinstance(message, Delta)]
+        assert [message.text for message in deltas] == [
+            "owner only", "everyone",
+        ]
+        assert all(message.to == "owner" for message in deltas)
+        assert private.to == "owner"
 
     asyncio.run(run())
 
@@ -114,10 +152,10 @@ def test_client_hello_reseeds_binding_before_tail_after_cursor_passed_owner():
             generations={"s-replay": machine.instance_id},
         ))
 
-        replay = transport.sent[:6]
+        replay = transport.sent[:7]
         assert [event.type for event in replay] == [
             "replay_start", "turn_binding", "assistant_msg_start", "delta",
-            "replay_end", "session_control",
+            "replay_end", "ask_user_sync", "session_control",
         ]
         reseed = replay[1]
         assert reseed.msg_id == "item-51"
@@ -285,10 +323,13 @@ def test_fresh_hello_reseeds_owner_when_current_boundary_left_ring():
         await machine._handle_client_hello(Hello(
             role="client", client_id="client-1"))
 
-        assert [event.type for event in transport.sent[:2]] == [
-            "snapshot", "turn_binding",
+        assert [event.type for event in transport.sent[:7]] == [
+            "snapshot", "replay_start", "turn_binding",
+            "assistant_msg_start", "delta", "replay_end", "ask_user_sync",
         ]
-        assert transport.sent[1].seq is None
+        assert transport.sent[1].truncated is True
+        assert transport.sent[2].seq is None
+        assert transport.sent[4].text == "tail"
 
         await machine._emit_locked(ctx, TurnEnd(
             turn_id="native-turn",

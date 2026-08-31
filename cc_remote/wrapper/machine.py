@@ -111,7 +111,8 @@ from cc_remote.protocol import (
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, CodexTerminalFence, History, TurnDetail, AgentDetail,
     HistoryImage,
-    HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
+    HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserSync,
+    AskUserClosed,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
     State, TakeoverState, SessionControl,
     UserMsg, TurnSteered, Delta,
@@ -201,6 +202,8 @@ from cc_remote.wrapper.session_ctx import (
     ActiveTurnBinding,
     ClaudeClientAliasProbe,
     CodexGoalMutation,
+    PendingAskResolution,
+    PendingAskState,
     SessionContext,
 )
 from cc_remote.wrapper.history_store import (
@@ -9740,6 +9743,20 @@ class WrapperMachine:
                              if replay_end_index is not None else len(frames))
         return [*frames[:insert_at], seed, *frames[insert_at:]]
 
+    @staticmethod
+    def _hello_replay_frame_visible(frame, client_id: str | None) -> bool:
+        """Apply the original frame's audience before client-local routing.
+
+        Ask lifecycle frames are intentionally rebuilt from authoritative
+        ``pending_asks`` after the replay envelope. Replaying an old AskUser or
+        AskUserClosed would otherwise race that seed, while overwriting ``to``
+        here would leak any other targeted ring frame to a different client.
+        """
+        if isinstance(frame, (AskUser, AskUserClosed)):
+            return False
+        target = getattr(frame, "to", None)
+        return target is None or target == client_id
+
     async def _handle_client_hello(self, cmd) -> None:
         # A fresh client (no cursor for a sid) gets exactly one lightweight
         # Snapshot for that session. A reconnecting client explicitly names the
@@ -9783,9 +9800,20 @@ class WrapperMachine:
             if ctx.btw and ctx.owner_client_id != cmd.client_id:
                 continue  # ephemeral fork replay is private to its creating client
             sid = self._ctx_wire_sid(ctx) or key
-            tail = ctx.buffer.latest_tail_text()
-            st = ctx.buffer.latest_state() or ctx.state
             async with ctx.emit_lock:
+                # A sleeping timeout task must not let Hello revive an already
+                # expired prompt. The original monotonic deadline decides the
+                # race under the same lock used by answers and close events.
+                now = asyncio.get_running_loop().time()
+                for ask_id, ask_state in tuple(ctx.pending_asks.items()):
+                    if now >= ask_state.deadline:
+                        await self._close_pending_ask_locked(
+                            ctx,
+                            ask_id,
+                            reason="timeout",
+                        )
+                tail = ctx.buffer.latest_tail_text()
+                st = ctx.buffer.latest_state() or ctx.state
                 replay_cursor: Optional[int] = None
                 same_generation = True
                 if sid in cursors:
@@ -9811,13 +9839,21 @@ class WrapperMachine:
                         control=self._session_control(ctx),
                     )]
                     if st != "idle":
+                        binding = ctx.active_turn_binding
                         frames.extend(ctx.buffer.current_turn_replay(
                             generation=self.instance_id,
                             message_id=(
-                                ctx.active_turn_binding.msg_id
-                                if ctx.active_turn_binding is not None
+                                binding.msg_id
+                                if binding is not None
                                 else ctx.active_msg_id
-                            )))
+                            ),
+                            boundary_seq=(
+                                binding.seq
+                                if binding is not None
+                                and binding.generation == self.instance_id
+                                else None
+                            ),
+                        ))
                 frames = self._reseed_active_binding_for_hello(
                     ctx,
                     frames,
@@ -9825,6 +9861,10 @@ class WrapperMachine:
                     same_generation=same_generation,
                 )
                 for frame in frames:
+                    if not self._hello_replay_frame_visible(
+                        frame, getattr(cmd, "client_id", None)
+                    ):
+                        continue
                     # Never mutate a shared ring event with per-client routing.
                     await self.transport.send(frame.model_copy(
                         deep=True, update={
@@ -9832,6 +9872,31 @@ class WrapperMachine:
                             "sid": sid,
                             "route_id": getattr(cmd, "route_id", None),
                         }))
+                # Pending questions are current state, not replay history. Send
+                # an explicit baseline followed by fresh unsequenced copies
+                # after Snapshot/ReplayEnd. This is one emit-lock critical
+                # section with answer/timeout, so a closed ask cannot be revived
+                # between the baseline and its seed.
+                await self.transport.send(AskUserSync(
+                    sid=sid,
+                    to=cmd.client_id,
+                    route_id=getattr(cmd, "route_id", None),
+                ))
+                for ask_state in tuple(ctx.pending_asks.values()):
+                    if (
+                        ask_state.target is not None
+                        and ask_state.target != getattr(cmd, "client_id", None)
+                    ):
+                        continue
+                    await self.transport.send(ask_state.event.model_copy(
+                        deep=True,
+                        update={
+                            "seq": None,
+                            "to": cmd.client_id,
+                            "sid": sid,
+                            "route_id": getattr(cmd, "route_id", None),
+                        },
+                    ))
                 # ReplayStart's synthetic Snapshot predates protocol-v15 and is
                 # built by RingBuffer. Always follow replay with the current
                 # revisioned control value; same-revision delivery is idempotent.
@@ -13857,8 +13922,7 @@ class WrapperMachine:
             )
         if snapshot_cursor is not None:
             if (
-                not is_codex
-                or snapshot_cursor.visible_turn_hash
+                snapshot_cursor.visible_turn_hash
                 != history_turn_snapshot_hash(cmd.turn_id)
                 or self._history_index is None
             ):
@@ -13874,7 +13938,7 @@ class WrapperMachine:
                     snapshot = await asyncio.to_thread(
                         snapshot_reader,
                         sid,
-                        "codex",
+                        "codex" if is_codex else "claude",
                         snapshot_cursor.source_token,
                         snapshot_cursor.indexed_turn_hash,
                     )
@@ -13897,6 +13961,11 @@ class WrapperMachine:
                 )
             snapshot_rows: list[dict] = list(snapshot.events)
             if snapshot.turn_id != cmd.turn_id:
+                if not is_codex:
+                    return await send(
+                        error="详细过程已更新，请重新加载该轮",
+                        reset_required=True,
+                    )
                 try:
                     snapshot_rows = _rebind_turn_detail_visible_id(
                         snapshot_rows,
@@ -14244,8 +14313,7 @@ class WrapperMachine:
                     reset_required=True,
                 )
         if (
-            is_codex
-            and detail_snapshot is not None
+            detail_snapshot is not None
             and detail_snapshot.source_token is not None
         ):
             oldest = _encode_turn_detail_snapshot_cursor(
@@ -15555,29 +15623,35 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "打断")
-        # Reliable command retries and impatient second clicks are expected.
-        # Once the first interrupt has been accepted, another stop must be an
-        # idempotent no-op rather than a misleading `not_running` error that also
-        # leaves the browser's state machine stuck in interrupting.
-        if ctx.state in {"interrupting", "draining"}:
-            return
-        if ctx.state != "running":
-            error = Error(
-                code=ERR_NOT_RUNNING,
-                message="该会话没有正在运行的回合",
-                request_id=getattr(cmd, "cmd_id", None),
-                to=getattr(cmd, "client_id", None),
+        async with ctx.emit_lock:
+            # State transition and ask cancellation are one boundary. A second
+            # question waiting on ask_lock can only enter emit_lock afterwards,
+            # where _on_ask_locked observes this interrupt gate and fails closed.
+            # Reliable retries and impatient second clicks remain idempotent.
+            if ctx.state in {"interrupting", "draining"}:
+                return
+            if ctx.state != "running":
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message="该会话没有正在运行的回合",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit_locked(ctx, error)
+                return error
+            # Set the deadline and wake the turn consumer before releasing this
+            # lock: it may already be blocked in queue.get() from running state.
+            ctx.interrupt_deadline = (
+                asyncio.get_running_loop().time() + self.cfg.drain_timeout
             )
-            await self._emit(ctx, error)
-            return error
-        self._cancel_pending_asks(ctx)
-        # Set the deadline and wake the turn consumer before entering any await:
-        # it may already be blocked in the queue.get() that began while running.
-        ctx.interrupt_deadline = (
-            asyncio.get_running_loop().time() + self.cfg.drain_timeout
-        )
-        ctx.state = "interrupting"
-        ctx.interrupt_event.set()
+            ctx.state = "interrupting"
+            ctx.interrupt_event.set()
+            for ask_id in tuple(ctx.pending_asks):
+                await self._close_pending_ask_locked(
+                    ctx,
+                    ask_id,
+                    reason="cancelled",
+                )
         log.info(
             "interrupt accepted",
             session_id=self._ctx_wire_sid(ctx),
@@ -16188,9 +16262,11 @@ class WrapperMachine:
 
         previous_ask_id = ctx.pending_model_ask_id
         if previous_ask_id:
-            previous = ctx.pending_asks.get(previous_ask_id)
-            if previous is not None and not previous.done():
-                previous.set_exception(AskSuperseded())
+            await self._close_pending_ask(
+                ctx,
+                previous_ask_id,
+                reason="superseded",
+            )
 
         ask_id = f"ask-{uuid4().hex}"
         accept_label = f"是，切换到 {target}"
@@ -20697,12 +20773,76 @@ class WrapperMachine:
 
     # ---- ask_user MCP tool (agent asks the user a multiple-choice question) ----
 
-    @staticmethod
-    def _cancel_pending_asks(ctx: SessionContext) -> None:
+    async def _close_pending_ask_locked(
+        self,
+        ctx: SessionContext,
+        ask_id: str,
+        *,
+        reason: str,
+        answer: str | list[str] | None = None,
+    ) -> PendingAskState | None:
+        """Close one question while ``ctx.emit_lock`` is held.
+
+        Removing the authoritative state and publishing its close boundary are
+        one serialized transition with Hello seeding.  The waiter is released
+        even when the live transport send fails; the close is already retained
+        in the ring and a later AskUserSync clears stale client state.
+        """
+        state = ctx.pending_asks.pop(ask_id, None)
+        if state is None:
+            return None
+        self._mark_claude_activity(ctx)
+        try:
+            await self._emit_locked(
+                ctx,
+                AskUserClosed(
+                    ask_id=ask_id,
+                    reason=reason,
+                    to=state.target,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "ask_user close event delayed",
+                ask_id=ask_id,
+                reason=reason,
+                error_type=type(exc).__name__,
+            )
+        finally:
+            if not state.future.done():
+                state.future.set_result(PendingAskResolution(
+                    reason=reason,
+                    answer=answer,
+                ))
+        return state
+
+    async def _close_pending_ask(
+        self,
+        ctx: SessionContext,
+        ask_id: str,
+        *,
+        reason: str,
+        answer: str | list[str] | None = None,
+    ) -> PendingAskState | None:
+        async with ctx.emit_lock:
+            return await self._close_pending_ask_locked(
+                ctx,
+                ask_id,
+                reason=reason,
+                answer=answer,
+            )
+
+    async def _cancel_pending_asks(self, ctx: SessionContext) -> None:
         """Wake prompt handlers so interrupt can drain instead of waiting 30m."""
-        for future in tuple(ctx.pending_asks.values()):
-            if not future.done():
-                future.set_exception(AskCancelled())
+        async with ctx.emit_lock:
+            for ask_id in tuple(ctx.pending_asks):
+                await self._close_pending_ask_locked(
+                    ctx,
+                    ask_id,
+                    reason="cancelled",
+                )
 
     @staticmethod
     def _mark_claude_activity(ctx: SessionContext) -> None:
@@ -20786,21 +20926,47 @@ class WrapperMachine:
         # Validate model-originated text before registering a pending Future.
         # Otherwise a malformed/oversized AskUser raises during emit and leaves
         # an unreachable entry in pending_asks for the life of the session.
-        event = AskUser(ask_id=ask_id, question=question, options=options,
-                        header=header, allow_text=allow_text, secret=secret,
-                        multi_select=multi_select, to=to)
+        event = AskUser(
+            ask_id=ask_id,
+            question=question,
+            options=options,
+            header=header,
+            allow_text=allow_text,
+            secret=secret,
+            multi_select=multi_select,
+            to=to,
+        )
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        ctx.pending_asks[ask_id] = fut
-        ctx.pending_ask_specs[ask_id] = {
-            "labels": frozenset(option["label"] for option in options),
-            "allow_text": allow_text,
-            "multi_select": multi_select,
-        }
-        reason = "cancelled"
+        deadline = loop.time() + max(0.0, timeout)
+        fut: asyncio.Future[PendingAskResolution] = loop.create_future()
+        state = PendingAskState(
+            event=event.model_copy(deep=True),
+            future=fut,
+            labels=frozenset(option["label"] for option in options),
+            allow_text=allow_text,
+            multi_select=multi_select,
+            created_at=time.time(),
+            deadline=deadline,
+            target=to,
+        )
+        registered = False
         try:
-            self._mark_claude_activity(ctx)
-            await self._emit(ctx, event)
+            async with ctx.emit_lock:
+                if (
+                    ctx.interrupt_event.is_set()
+                    or ctx.state in {"interrupting", "draining"}
+                ):
+                    raise AskCancelled
+                if ask_id in ctx.pending_asks:
+                    await self._close_pending_ask_locked(
+                        ctx,
+                        ask_id,
+                        reason="superseded",
+                    )
+                ctx.pending_asks[ask_id] = state
+                registered = True
+                self._mark_claude_activity(ctx)
+                await self._emit_locked(ctx, event.model_copy(deep=True))
             log.info(
                 "ask_user emitted",
                 sid=ctx.session_id,
@@ -20808,36 +20974,46 @@ class WrapperMachine:
                 options=len(options),
                 multi_select=multi_select,
             )
-            answer = await asyncio.wait_for(fut, timeout=timeout)
-            reason = "answered"
-            return answer
-        except asyncio.TimeoutError:
-            reason = "timeout"
-            log.warning("ask_user timed out", ask_id=ask_id)
-            raise AskTimeout from None
-        except AskSuperseded:
-            reason = "superseded"
-            raise
-        except asyncio.CancelledError:
-            reason = "cancelled"
-            raise
-        finally:
-            if ctx.pending_asks.get(ask_id) is fut:
-                ctx.pending_asks.pop(ask_id, None)
-                ctx.pending_ask_specs.pop(ask_id, None)
-            self._mark_claude_activity(ctx)
             try:
-                await self._emit(
+                resolution = await asyncio.wait_for(
+                    asyncio.shield(fut),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+            except asyncio.TimeoutError:
+                await self._close_pending_ask(
                     ctx,
-                    AskUserClosed(ask_id=ask_id, reason=reason, to=to),
+                    ask_id,
+                    reason="timeout",
                 )
-            except Exception as exc:
-                log.warning(
-                    "ask_user close event delayed",
-                    ask_id=ask_id,
-                    reason=reason,
-                    error_type=type(exc).__name__,
+                resolution = await asyncio.shield(fut)
+            if resolution.reason == "answered":
+                assert resolution.answer is not None
+                return resolution.answer
+            if resolution.reason == "timeout":
+                log.warning("ask_user timed out", ask_id=ask_id)
+                raise AskTimeout
+            if resolution.reason == "superseded":
+                raise AskSuperseded
+            raise AskCancelled
+        except asyncio.CancelledError:
+            if registered:
+                await self._close_pending_ask(
+                    ctx,
+                    ask_id,
+                    reason="cancelled",
                 )
+            raise
+        except Exception:
+            # Validation happened before registration. If the initial transport
+            # send itself failed, retire the registered state rather than leave
+            # a question whose producer is no longer awaiting it.
+            if registered and ctx.pending_asks.get(ask_id) is state:
+                await self._close_pending_ask(
+                    ctx,
+                    ask_id,
+                    reason="cancelled",
+                )
+            raise
 
     async def _on_ask_optional(self, *args, **kwargs) -> str | list[str] | None:
         """Map a structured no-answer outcome for fail-closed integrations."""
@@ -21112,51 +21288,70 @@ class WrapperMachine:
         if ctx is None:
             return await self._missing_session_error(cmd, "回答交互问题")
 
-        async def reject(code: str, message: str):
+        async def reject_locked(code: str, message: str):
             error = Error(
                 code=code,
                 message=message,
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None),
             )
-            await self._emit(ctx, error)
+            await self._emit_locked(ctx, error)
             return error
 
-        fut = ctx.pending_asks.get(cmd.ask_id)
-        if fut is None:
-            log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
-            return await reject(
-                ERR_NOT_RUNNING, "该交互问题已经结束或不存在")
-        if fut.done():
-            log.warning("answer for already-done ask_id", ask_id=cmd.ask_id)
-            return await reject(
-                ERR_NOT_RUNNING, "该交互问题已经由其他客户端回答")
+        async with ctx.emit_lock:
+            state = ctx.pending_asks.get(cmd.ask_id)
+            if state is None:
+                log.warning("answer for unknown ask_id", ask_id=cmd.ask_id)
+                return await reject_locked(
+                    ERR_NOT_RUNNING, "该交互问题已经结束或不存在")
+            client_id = getattr(cmd, "client_id", None)
+            if state.target is not None and client_id != state.target:
+                log.warning(
+                    "answer rejected for non-target client",
+                    ask_id=cmd.ask_id,
+                    client_id=client_id,
+                )
+                return await reject_locked(
+                    ERR_AUTH, "该交互问题不属于当前客户端")
+            if asyncio.get_running_loop().time() >= state.deadline:
+                await self._close_pending_ask_locked(
+                    ctx,
+                    cmd.ask_id,
+                    reason="timeout",
+                )
+                return await reject_locked(
+                    ERR_NOT_RUNNING, "该交互问题已经超时")
 
-        spec = ctx.pending_ask_specs.get(cmd.ask_id)
-        if spec is None:
-            return await reject(ERR_INTERNAL, "交互问题状态不完整，请重新操作")
-        answer = cmd.answer
-        labels = spec["labels"]
-        if isinstance(answer, list):
-            if not spec["multi_select"]:
-                return await reject(ERR_BAD_PROMPT, "该问题不支持多选")
-            if len(set(answer)) != len(answer):
-                return await reject(ERR_BAD_PROMPT, "多选答案不能包含重复选项")
-            normalized: str | list[str] = answer
-            values = answer
-        else:
-            if not answer.strip():
-                return await reject(ERR_BAD_PROMPT, "回答不能为空")
-            normalized = [answer] if spec["multi_select"] else answer
-            values = [answer]
-        if not spec["allow_text"] and any(value not in labels for value in values):
-            return await reject(ERR_BAD_PROMPT, "回答不属于该问题的可选项")
+            answer = cmd.answer
+            if isinstance(answer, list):
+                if not state.multi_select:
+                    return await reject_locked(
+                        ERR_BAD_PROMPT, "该问题不支持多选")
+                if len(set(answer)) != len(answer):
+                    return await reject_locked(
+                        ERR_BAD_PROMPT, "多选答案不能包含重复选项")
+                normalized: str | list[str] = answer
+                values = answer
+            else:
+                if not answer.strip():
+                    return await reject_locked(
+                        ERR_BAD_PROMPT, "回答不能为空")
+                normalized = [answer] if state.multi_select else answer
+                values = [answer]
+            if not state.allow_text and any(
+                value not in state.labels for value in values
+            ):
+                return await reject_locked(
+                    ERR_BAD_PROMPT, "回答不属于该问题的可选项")
 
-        # No await occurs between the done check and set_result: the event loop
-        # makes this the single atomic winner when multiple clients race.
-        fut.set_result(normalized)
-        log.info("ask_user answered", ask_id=cmd.ask_id)
-        return None
+            await self._close_pending_ask_locked(
+                ctx,
+                cmd.ask_id,
+                reason="answered",
+                answer=normalized,
+            )
+            log.info("ask_user answered", ask_id=cmd.ask_id)
+            return None
 
     @staticmethod
     def _read_session_file(

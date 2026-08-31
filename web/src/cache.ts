@@ -63,7 +63,9 @@ const SCHEMA = 1;
 // process start. The wrapper now overlays an exact source-bound live clock.
 // v23 discards Codex projections which may contain a prompt-less leading
 // compaction row split from the real user message that owns the turn.
-const CACHE_VER = 23;
+// v24 discards Claude rows whose completion clock could include late internal
+// resume bookkeeping, and projections bloated by automatic full-detail paging.
+const CACHE_VER = 24;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

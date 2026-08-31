@@ -405,6 +405,7 @@ def test_remote_broker_model_switch_waits_for_visible_confirmation(tmp_path):
             sid=SESSION_ID,
             ask_id=question.ask_id,
             answer=question.options[0]["label"],
+            client_id="client-1",
         ))
         async with asyncio.timeout(1.0):
             while machine._interactive_control_tasks:

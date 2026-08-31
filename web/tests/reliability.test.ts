@@ -1322,8 +1322,14 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 23/,
-  "leading-compaction history repair must invalidate polluted browser rows");
+assert.match(historyAppSource,
+  /loadRuntimeTurnDetail\(request\.turnId, request\.before, false\)/,
+  "active-turn recovery must install one bounded detail page without cascading");
+assert.match(historyAppSource,
+  /requestHistoryTurnDetail = useCallback\([\s\S]{0,120}autoLoad = false/,
+  "every detail entry point must default to one bounded page");
+assert.match(cacheSource, /const CACHE_VER = 24/,
+  "Claude terminal-time and oversized detail repair must invalidate polluted browser rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");

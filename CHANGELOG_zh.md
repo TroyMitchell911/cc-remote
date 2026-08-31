@@ -4,6 +4,12 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v42。Claude 与 Codex 的
+  待回答问题现在是会话权威状态，每次客户端 Hello 都会独立于 replay ring 恢复；
+  超长活动回合即使淘汰开头标记，也会保留压缩后的 live 后缀，并只自动安装一页
+  有界 canonical detail，更早过程继续通过现有分页显式加载；中断边界之后也不会
+  发布排队中的旧问题。Claude 冷恢复时晚到的内部任务通知不再推进已完成答案的
+  终态时钟，受影响的服务端与浏览器投影会一次性重建。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v41。Claude 上下文的自动
   读取不再发起可能阻塞的原生控制请求；用户显式执行 `/context` 时会优先读取精确
   明细，若可选控制面超时则保留并明确标注最近一次缓存或最近一轮 token 总量。

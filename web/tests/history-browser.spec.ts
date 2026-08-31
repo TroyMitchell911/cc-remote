@@ -1360,7 +1360,7 @@ test("older history becoming available under touch waits for release", async ({
   await expect(page.getByTestId("load-count")).toHaveText("1");
 });
 
-test("one click loads every turn-detail page without collapsing or jumping", async ({
+test("turn detail stays bounded and older pages load explicitly without jumping", async ({
   page,
 }) => {
   await page.goto(
@@ -1375,9 +1375,9 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
   await expect(page.locator(".thread"))
     .toHaveAttribute("data-detail-anchor-active", "true");
   await expect(page.getByText("较新命令 1")).toBeVisible();
-  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "加载更早过程" }))
-    .toHaveCount(0);
+    .toBeVisible();
   await expect(page.getByRole("button", { name: "返回较新过程" }))
     .toHaveCount(0);
   await page.waitForTimeout(500);
@@ -1385,6 +1385,22 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
     .toBeLessThan(2);
   await expect(page.locator(".thread"))
     .toHaveAttribute("data-detail-anchor-active", "false");
+  expect(await page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("1");
+
+  const beforeOlderPage = await processDetailEdge(page, "start");
+  await page.getByRole("button", { name: "加载更早过程" }).click();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect.poll(() => page.evaluate(
+    () => document.documentElement.dataset.detailRequests,
+  )).toBe("2");
+  await expect(page.getByRole("button", { name: "加载更早过程" }))
+    .toHaveCount(0);
+  await page.waitForTimeout(500);
+  expect(Math.abs(
+    await processDetailEdge(page, "start") - beforeOlderPage,
+  )).toBeLessThan(2);
 });
 
 test("a loading process can collapse and reopen without issuing a duplicate read", async ({
@@ -1421,6 +1437,7 @@ test("a failed process detail stays open and retries in place", async ({ page })
   await expect(header).toHaveAttribute("aria-expanded", "true");
   await expect(header).toHaveAttribute("aria-busy", "true");
   await expect(page.getByText("较新命令 1")).toBeVisible();
+  await page.getByRole("button", { name: "加载更早过程" }).click();
   await expect(page.getByText("较早命令 1")).toBeVisible();
 });
 
@@ -1434,6 +1451,7 @@ test("a failed older process page retries the exact cursor in place", async ({
   const header = page.locator(".turn-process-head");
   await header.click();
   await expect(page.getByText("较新命令 1")).toBeVisible();
+  await page.getByRole("button", { name: "加载更早过程" }).click();
   await expect(page.getByRole("alert")).toContainText(
     "详细过程暂时不可用，请稍后重试",
   );
@@ -1464,7 +1482,9 @@ test("retained truncated process still fetches its authoritative first detail pa
   await expect(header).toHaveAttribute("aria-busy", "true");
   await expect(page.getByText("较早过程已省略")).toHaveCount(0);
   await expect(page.getByText("较新命令 1")).toBeVisible();
-  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect(page.getByText("较早命令 1")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "加载更早过程" }))
+    .toBeVisible();
 });
 
 test("user scrolling cancels a pending turn-detail anchor", async ({ page }) => {
@@ -1482,7 +1502,7 @@ test("user scrolling cancels a pending turn-detail anchor", async ({ page }) => 
   await page.waitForTimeout(40);
   const userOffset = await processDetailEdge(page, "start");
 
-  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect(page.getByText("较新命令 1")).toBeVisible();
   await page.waitForTimeout(450);
   expect(Math.abs(await processDetailEdge(page, "start") - userOffset))
     .toBeLessThan(2);
@@ -1879,7 +1899,7 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
         savedAt: Date.now(),
       }, pollutedAliasV20Sid);
       tx.objectStore("sessions").put({
-        v: 23,
+        v: 24,
         turns: [{
           id: "active-before-steer",
           prompt: "first prompt",

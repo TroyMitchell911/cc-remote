@@ -472,6 +472,9 @@ export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; 
 export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; codex_profile_id?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+/** Authoritative Hello baseline: following AskUser frames are the complete
+ * still-open set visible to this client for the same session. */
+export interface AskUserSync extends Base { type: "ask_user_sync" }
 export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string | string[] }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
@@ -609,14 +612,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 41;
+export const PROTOCOL_VERSION = 42;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

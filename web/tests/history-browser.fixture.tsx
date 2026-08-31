@@ -345,6 +345,7 @@ function detailPagingTurn(
   page: DetailFixturePage,
   expanded = false,
   retainedPreview = false,
+  autoLoad = false,
 ): Turn {
   const finalBlock = finalTurn("detail-page", 2).blocks[0];
   if (page === "deferred") {
@@ -418,7 +419,7 @@ function detailPagingTurn(
     detailOldestCursor: page === "latest" ? "detail-older" : undefined,
     detailHasNewer: false,
     detailNewerCursor: undefined,
-    detailAutoLoad: page === "latest",
+    detailAutoLoad: page === "latest" && autoLoad,
   };
 }
 
@@ -1447,6 +1448,7 @@ function HistoryConversationBrowserFixture() {
   const loadDetail = useCallback((
     turnId: string,
     before?: string | null,
+    autoLoad = false,
   ): boolean => {
     if (!detailPaging || turnId !== "detail-page") return false;
     detailRequestCountRef.current += 1;
@@ -1498,7 +1500,8 @@ function HistoryConversationBrowserFixture() {
         [requestSid]: {
           ...current[requestSid],
           turns: current[requestSid].turns.map((turn) =>
-            turn.id === turnId ? detailPagingTurn(page) : turn),
+            turn.id === turnId
+              ? detailPagingTurn(page, false, false, autoLoad) : turn),
         },
       }));
       window.setTimeout(() => {
@@ -1510,7 +1513,7 @@ function HistoryConversationBrowserFixture() {
               turn.id === turnId
                   && (page !== "latest"
                     || turn.detailOldestCursor === "detail-older")
-                ? detailPagingTurn(page, true) : turn),
+                ? detailPagingTurn(page, true, false, autoLoad) : turn),
           },
         }));
       }, growthDelayMs);

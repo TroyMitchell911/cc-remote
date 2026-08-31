@@ -20,6 +20,7 @@ import {
 } from "../src/history-merge.ts";
 import { protectedHistoryTurnIds } from "../src/history-selection-guard.ts";
 import {
+  nextActiveDetailRequest,
   installTurnDetailProjectionPage,
   nextAutoLoadDetailTurn,
 } from "../src/history-detail-projection.ts";
@@ -183,6 +184,87 @@ assert.equal(nextAutoLoadDetailTurn([
     detailOldestCursor: "manual-only",
   }),
 ]), null, "manual/cancelled detail cannot restart automatic paging");
+
+const activeDetail = turn("active-native", {
+  clientMsgId: "active-browser",
+  done: false,
+  detailLoaded: false,
+});
+assert.deepEqual(nextActiveDetailRequest(
+  [turn("older-open", { done: false }), activeDetail],
+  "active-browser",
+  true,
+), { turnId: "active-native" },
+"the exact authoritative unfinished head requests its initial detail page");
+assert.equal(nextActiveDetailRequest(
+  [activeDetail, { ...activeDetail, id: "duplicate-active" }],
+  "active-browser",
+  true,
+), null, "ambiguous aliases cannot trigger an authoritative detail read");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: false,
+        oldestCursor: null, hasNewer: false, newerCursor: null,
+        encodedChars: 0,
+      }],
+      blocks: [], capped: false, hasMore: false, oldestCursor: null,
+      hasNewer: false, newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null, "an installed canonical page suppresses duplicate initial loading");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailAutoLoad: false,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: true,
+        oldestCursor: "active-detail-before", hasNewer: false,
+        newerCursor: null, encodedChars: 0,
+      }],
+      blocks: [], capped: false, hasMore: true,
+      oldestCursor: "active-detail-before", hasNewer: false,
+      newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null,
+"an installed active detail page leaves older pages to explicit pagination");
+assert.deepEqual(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailHasMore: true,
+    detailOldestCursor: "stale-active-detail-before",
+  }],
+  "active-browser",
+  true,
+), { turnId: "active-native" },
+"active recovery starts from the bounded newest page without a projection");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: true,
+        oldestCursor: "capped-before", hasNewer: false, newerCursor: null,
+        encodedChars: 0,
+      }],
+      blocks: [], capped: true, hasMore: true,
+      oldestCursor: "capped-before", hasNewer: false, newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null, "a capped active projection cannot start an automatic paging loop");
+assert.equal(nextActiveDetailRequest(
+  [activeDetail], "active-browser", false,
+), null, "an idle runtime cannot infer activity from an open-looking row");
 
 const olderPage: HistoryBrowsePage = {
   pageKey: "page-older",

@@ -44,8 +44,10 @@ from cc_remote.protocol import ConversationTurn
 # v24 rebuilds Codex pages after source-bound live process clocks become an
 # independent input which can change without modifying rollout bytes. v25
 # rebuilds Codex pages whose leading compact marker was projected as a separate
-# prompt-less turn before the owning user item reached the full snapshot.
-_SCHEMA_VERSION = 25
+# prompt-less turn before the owning user item reached the full snapshot. v26
+# rebuilds Claude pages/details whose terminal clock could be extended by a
+# cold-resume task notification appended after the final answer.
+_SCHEMA_VERSION = 26
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -1162,13 +1164,12 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
-            if current in range(10, 22):
-                # v22 changes Claude turn identity without changing transcript
-                # bytes: an old browser alias bound to the synthetic interrupt
-                # marker is transferred to the immediately following real SDK
-                # user row.  Rebuild only Claude narrative projections so the
-                # corrected client_msg_id reaches History; source-bound images,
-                # compact ancestry, and Agent detail payloads stay valid.
+            if current in range(10, 26):
+                # v22 changes Claude turn identity and v26 changes its terminal
+                # clock without changing transcript bytes. Rebuild only Claude
+                # narrative projections so both repairs reach History;
+                # source-bound images, compact ancestry, and Agent detail
+                # payloads stay valid.
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
@@ -1212,8 +1213,8 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24):
-                # The independent v22/v23/v24/v25 invalidations above suffice.
+            elif current in (21, 22, 23, 24, 25):
+                # The independent v22/v23/v24/v25/v26 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows

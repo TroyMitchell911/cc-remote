@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 41
+PROTOCOL_VERSION = 42
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -2350,6 +2350,17 @@ class AskUser(_Base):
         return self
 
 
+class AskUserSync(_Base):
+    """Wrapper -> one client: authoritative pending-question baseline.
+
+    This unsequenced Hello frame means that every AskUser immediately following
+    it for the same ``sid`` is the complete set visible to that client. It is
+    deliberately independent of the replay ring: a retained historical ask is
+    not evidence that the question is still open.
+    """
+    type: Literal["ask_user_sync"] = "ask_user_sync"
+
+
 class AskUserClosed(_Base):
     """wrapper -> client: replayable terminal boundary for an AskUser card."""
     type: Literal["ask_user_closed"] = "ask_user_closed"
@@ -2461,7 +2472,7 @@ class CompletionState(_Base):
 
 AnyMessage = Union[
     Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2472,8 +2483,9 @@ AnyMessage = Union[
 ]
 
 # Session-narrative events the wrapper seqs and buffers. Replay/snapshot/
-# control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
-# wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
+# control frames (replay_start, replay_end, snapshot, ask_user_sync,
+# wrapper_disconnected, wrapper_reconnected) are synthesized per-reconnect and
+# are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
     "user_msg", "turn_steered", "state", "model", "effort", "auto_compact", "perm",
     "permission_profile", "web_search", "fast",
@@ -2591,6 +2603,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,
+    "ask_user_sync": AskUserSync,
     "ask_user_closed": AskUserClosed,
     "answer_question": AnswerQuestion,
     "get_goal": GetGoal,

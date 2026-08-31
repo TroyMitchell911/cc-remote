@@ -952,6 +952,9 @@ class Tui:
             self._line(RED(
                 f"!! {_safe_remote_text(d.get('code'))}: "
                 f"{_safe_remote_text(d.get('message'))}"))
+        elif t == "ask_user_sync":
+            if isinstance(sid, str):
+                self.pending_asks.pop(sid, None)
         elif t == "ask_user":
             if isinstance(sid, str):
                 ask = {

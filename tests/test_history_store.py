@@ -466,7 +466,7 @@ def test_v19_migration_rebuilds_history_and_adds_agent_details(tmp_path):
     assert migrated.get_page(
         "session-1", "claude", source, before=None, limit=4) is None
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         assert connection.execute(
             "SELECT COUNT(*) FROM history_agent_details").fetchone()[0] == 0
 
@@ -494,7 +494,7 @@ def test_v20_migration_rebuilds_codex_and_claude_identity_projections(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in ("history_pages", "history_turn_details"):
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
@@ -555,7 +555,7 @@ def test_v21_migration_rebuilds_claude_alias_and_codex_process_projections(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in ("history_pages", "history_turn_details"):
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
@@ -575,7 +575,7 @@ def test_v21_migration_rebuilds_claude_alias_and_codex_process_projections(
     ) is None
 
 
-def test_v22_migration_rebuilds_only_codex_boundary_time_projections(
+def test_v22_migration_applies_codex_and_claude_projection_repairs(
     tmp_path,
 ):
     source_path = tmp_path / "transcript.jsonl"
@@ -612,11 +612,11 @@ def test_v22_migration_rebuilds_only_codex_boundary_time_projections(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in ("history_pages", "history_turn_details"):
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == 0
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
             ).fetchone()[0] == 0
@@ -626,14 +626,14 @@ def test_v22_migration_rebuilds_only_codex_boundary_time_projections(
 
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
-    ) == _page("claude-session")
+    ) is None
     assert migrated.get_page(
         "codex-session", "codex", source, before=None, limit=4,
     ) is None
 
 
 @pytest.mark.parametrize("old_version", [23, 24])
-def test_recent_migration_rebuilds_only_codex_projections(
+def test_recent_migration_applies_codex_and_claude_projection_repairs(
     tmp_path,
     old_version,
 ):
@@ -674,11 +674,11 @@ def test_recent_migration_rebuilds_only_codex_projections(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in ("history_pages", "history_turn_details"):
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == 0
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
             ).fetchone()[0] == 0
@@ -691,7 +691,7 @@ def test_recent_migration_rebuilds_only_codex_projections(
 
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
-    ) == _page("claude-session")
+    ) is None
     assert migrated.get_page(
         "codex-session", "codex", source, before=None, limit=4,
     ) is None
@@ -699,6 +699,74 @@ def test_recent_migration_rebuilds_only_codex_projections(
         "codex-session", "codex", source,
         "codex-session", "codex-image", "thumbnail",
     ) == ("image/png", 1, 1, b"codex")
+    assert migrated.get_agent_detail(
+        "claude-session", source, "agent-run",
+    ) == agent_events
+
+
+def test_v25_migration_rebuilds_only_claude_terminal_projections(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+    agent_events = ({"type": "delta", "text": "agent output"},)
+    store.put_agent_detail(
+        "claude-session", source, "agent-run", agent_events)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=25")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_agent_details"
+        ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) == _page("codex-session")
+    assert migrated.get_image_asset(
+        "claude-session", "claude", source,
+        "claude-session", "claude-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"claude")
     assert migrated.get_agent_detail(
         "claude-session", source, "agent-run",
     ) == agent_events
@@ -740,7 +808,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in (
             "history_pages",
             "history_turn_details",
@@ -787,7 +855,7 @@ def test_v10_migration_invalidates_changed_projection_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -838,7 +906,7 @@ def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
         "claude-session", "claude", source, before=None, limit=4,
     ) is None
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         tables = {
             row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -884,7 +952,7 @@ def test_recent_migration_invalidates_changed_projection_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -926,7 +994,7 @@ def test_owner_and_interrupt_alias_migration_invalidates_both_projections(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         for table in ("history_pages", "history_turn_details"):
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
@@ -990,7 +1058,7 @@ def test_recent_summary_migration_rebuilds_pages_but_preserves_source_assets(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         assert connection.execute(
             "SELECT COUNT(*) FROM history_pages"
         ).fetchone()[0] == 0

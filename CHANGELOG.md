@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v42. Pending
+  Claude and Codex questions are now authoritative session state restored on
+  every client Hello, independent of the replay ring. Fresh clients retain a
+  compacted live suffix when a long active turn has evicted its opening marker,
+  install one bounded canonical-detail head while older process pages remain
+  explicitly pageable, and cannot publish a queued question after an interrupt
+  boundary. Late Claude resume bookkeeping no longer moves a completed answer's
+  terminal clock; affected server and browser projections rebuild once.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v41. Automatic
   Claude context reads no longer issue a blocking native control request;
   explicit `/context` reads prefer the exact native breakdown and otherwise

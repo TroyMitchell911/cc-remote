@@ -2791,14 +2791,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 externalPlanItemId={externalPlanItemId}
                 onLoadDetail={onLoadDetail
                   ? () => requestProcessDetail(
-                      t.id, undefined, "initial", true)
+                      t.id, undefined, "initial", false)
                   : undefined}
                 onRetryDetail={onLoadDetail && detailRetryDirection
                   ? () => requestProcessDetail(
                       t.id,
                       detailRetryBefore,
                       detailRetryDirection,
-                      detailRetryDirection === "initial")
+                      false)
                   : undefined}
                 canLoadEarlier={
                   !!t.detailHasMore && !!t.detailOldestCursor
@@ -2888,7 +2888,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                       t.id,
                       detailRetryDirection ? detailRetryBefore : undefined,
                       detailRetryDirection ?? "initial",
-                      true,
+                      false,
                     )}>
                     {t.detailLoading
                       ? <span className="process-spin" aria-hidden="true" />

@@ -603,6 +603,7 @@ async def test_machine_broker_controls_reach_native_tui_and_use_footer_confirmat
         sid=sid,
         ask_id=question.ask_id,
         answer=question.options[0]["label"],
+        client_id="client-1",
     ))
     await model_task
     await machine._process_command(SetEffort(

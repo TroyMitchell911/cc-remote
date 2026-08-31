@@ -2174,7 +2174,9 @@ def translate_history(
     The transcript carries no ResultMessage, so synthetic TurnEnd frames delimit
     turns. `timestamps` (uuid -> epoch seconds, from transcript_timestamps) stamps
     each UserMsg with its real ask-time and each TurnEnd with the turn's last
-    message time (answer-done time) — otherwise history shows "now". Rich
+    conversational message time (answer-done time) — otherwise history shows
+    "now". Late internal task bookkeeping remains visible in the process view,
+    but cannot move an already-settled answer's terminal clock. Rich
     assistant blocks retain the same thinking/commentary/final and semantic tool
     structure as the live stream. Non-conversational user turns (compact summaries,
     slash-command envelopes, local-command stdout) remain hidden.
@@ -2190,6 +2192,7 @@ def translate_history(
     history_plan_id: str | None = None
     ambiguous_final_mid: str | None = None
     ambiguous_final_start: int | None = None
+    settled_answer_seen = False
     turn_failed = False
     # Older wrappers could bind a replacement query's browser id to Claude's
     # late ``[Request interrupted by user]`` record.  The marker terminates the
@@ -2246,7 +2249,7 @@ def translate_history(
     ):
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
-        nonlocal turn_start_ts, turn_failed
+        nonlocal turn_start_ts, settled_answer_seen, turn_failed
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
@@ -2290,9 +2293,11 @@ def translate_history(
             ambiguous_final_mid = None
             ambiguous_final_start = None
             turn_start_ts = None
+            settled_answer_seen = False
             turn_failed = False
 
     for message_index, m in enumerate(messages):
+        advance_terminal_clock = True
         if (
             pending_interrupted_alias is not None
             and pending_interrupted_alias[0] < message_index
@@ -2310,6 +2315,12 @@ def translate_history(
             if isinstance(content, str):
                 internal_event = (internal_user_events or {}).get(source_uid)
                 if internal_event is not None:
+                    # Claude may append a task-notification hours after an
+                    # ``end_turn`` while cold-resuming old background work.
+                    # Keep the lifecycle update in detail, but the already
+                    # completed answer remains the turn's terminal boundary.
+                    if settled_answer_seen or ambiguous_final_mid is not None:
+                        advance_terminal_clock = False
                     event = internal_event.model_copy(deep=True)
                     parent_name = (
                         history_tool_names.get(event.parent_id or "") or ""
@@ -2455,6 +2466,16 @@ def translate_history(
                         or (isinstance(b.get("type"), str)
                             and b.get("type").endswith("_tool_result")))
                     for b in content)
+            )
+            # Any later assistant activity re-opens the conversational tail.
+            # A top-level end_turn text settles it again; nested Agent answers
+            # and tool-bearing messages are not enclosing-turn boundaries.
+            settled_answer_seen = (
+                parent is None
+                and not has_tool_activity
+                and text_channel == "final"
+                and has_text
+                and msg.get("stop_reason") == "end_turn"
             )
             if has_tool_activity:
                 ambiguous_final_mid = None
@@ -2610,7 +2631,7 @@ def translate_history(
         # msg) stamps the PRIOR turn's tail; the final close_turn stamps this turn's
         # last (assistant) message = answer-done time.
         mts = _ts(source_uid)
-        if mts is not None:
+        if mts is not None and advance_terminal_clock:
             last_ts = mts
     # Claude's transcript does not persist the SDK ResultMessage. EOF normally
     # acts as a synthetic completed boundary for an idle historical snapshot,

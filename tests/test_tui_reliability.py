@@ -505,6 +505,50 @@ def test_tui_keeps_and_answers_ask_user_per_session():
     asyncio.run(run())
 
 
+def test_tui_reconnect_baseline_replaces_pending_question_authoritatively():
+    tui = Tui("ws://127.0.0.1:8765/ws", "password", "", "claude", "A")
+    tui._line = lambda _line: None
+    old = {
+        "type": "ask_user", "sid": "A", "seq": 7,
+        "ask_id": "old", "question": "Old?",
+        "options": [{"label": "Yes"}, {"label": "No"}],
+    }
+    tui._handle(old)
+    assert tui.pending_asks["A"]["ask_id"] == "old"
+
+    tui._handle({
+        "type": "snapshot", "sid": "A", "state": "running",
+        "generation": "g-1",
+    })
+    assert tui.pending_asks["A"]["ask_id"] == "old"
+    tui._handle({
+        "type": "ask_user_sync", "sid": "A", "seq": None,
+    })
+    assert "A" not in tui.pending_asks
+    tui._handle({
+        "type": "ask_user", "sid": "A", "seq": None,
+        "ask_id": "current", "question": "Current?",
+        "options": [{"label": "Yes"}, {"label": "No"}],
+    })
+    assert tui.pending_asks["A"]["ask_id"] == "current"
+
+    tui._handle({
+        "type": "replay_start", "sid": "A", "from_seq": 8,
+        "to_seq": 9, "truncated": False, "generation": "g-1",
+    })
+    assert tui.pending_asks["A"]["ask_id"] == "current"
+    tui._handle({
+        "type": "ask_user_sync", "sid": "A", "seq": None,
+    })
+    assert "A" not in tui.pending_asks
+    tui._handle({
+        "type": "ask_user", "sid": "A", "seq": None,
+        "ask_id": "current", "question": "Current?",
+        "options": [{"label": "Yes"}, {"label": "No"}],
+    })
+    assert tui.pending_asks["A"]["ask_id"] == "current"
+
+
 @pytest.mark.parametrize("url", [
     "ws://relay.example.com/ws",
     "wss://user:secret@relay.example.com/ws",

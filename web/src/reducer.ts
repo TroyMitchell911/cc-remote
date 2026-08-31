@@ -5091,6 +5091,8 @@ function reduceEvent(
           rt.contextError = null;
         }
       });
+    case "ask_user_sync":
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = null; });
     case "ask_user":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select }; });
     case "ask_user_closed":
@@ -5222,7 +5224,6 @@ function reduceEvent(
               ),
             };
           }
-          rt.pendingQuestion = null;
           rt.hasMore = false;
           rt.oldestId = null;
           rt.historyHeadKnown = false;

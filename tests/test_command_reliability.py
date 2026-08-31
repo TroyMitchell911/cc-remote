@@ -488,6 +488,7 @@ def test_duplicate_claude_broker_model_and_permission_controls_replay_without_re
             sid="session-1",
             ask_id=question.ask_id,
             answer=question.options[0]["label"],
+            client_id="client-1",
         ))
         await model_task
         await machine._process_command(model)

@@ -11,7 +11,10 @@ from __future__ import annotations
 from collections import deque
 from typing import Optional
 
-from cc_remote.protocol import ReplayStart, ReplayEnd, Snapshot, StateEvent
+from cc_remote.protocol import Delta, ReplayStart, ReplayEnd, Snapshot, StateEvent
+
+
+_CURRENT_TURN_DELTA_CHUNK_CHARS = 64 * 1024
 
 
 class RingBuffer:
@@ -122,9 +125,76 @@ class RingBuffer:
         frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
         return frames
 
+    @staticmethod
+    def _delta_replay_key(message: Delta) -> tuple:
+        """Fields which must agree before adjacent deltas may be coalesced."""
+        return (
+            message.message_id,
+            message.turn_id,
+            message.background,
+            message.channel,
+            message.sid,
+            message.to,
+            message.route_id,
+        )
+
+    @classmethod
+    def _compact_current_turn_suffix(
+        cls,
+        retained: list[tuple[int, object]],
+    ) -> list:
+        """Compact adjacent compatible deltas without changing their order.
+
+        A fresh client needs the retained live suffix because canonical History
+        can lag partial stream events. Sending thousands of one-token frames is
+        unnecessary, though. Each compacted frame keeps the last source seq it
+        covers, so the reconnect cursor still advances across the exact source
+        range. Individual source deltas are never split (which would create two
+        frames with the same seq and make the latter look stale).
+        """
+        compacted: list = []
+        run: list[tuple[int, Delta]] = []
+        run_chars = 0
+        run_key: tuple | None = None
+
+        def flush() -> None:
+            nonlocal run, run_chars, run_key
+            if not run:
+                return
+            first = run[0][1]
+            compacted.append(first.model_copy(
+                deep=True,
+                update={
+                    "text": "".join(message.text for _, message in run),
+                    "seq": run[-1][0],
+                },
+            ))
+            run = []
+            run_chars = 0
+            run_key = None
+
+        for seq, message in retained:
+            if not isinstance(message, Delta):
+                flush()
+                compacted.append(message)
+                continue
+            key = cls._delta_replay_key(message)
+            next_chars = len(message.text)
+            if run and (
+                key != run_key
+                or run_chars + next_chars > _CURRENT_TURN_DELTA_CHUNK_CHARS
+            ):
+                flush()
+            run.append((seq, message))
+            run_chars += next_chars
+            run_key = key
+        flush()
+        return compacted
+
     def current_turn_replay(
         self, *, generation: Optional[str] = None,
         message_id: Optional[str] = None,
+        boundary_seq: Optional[int] = None,
     ) -> list:
         """Bounded replay of only the latest in-flight turn for a fresh client."""
         start = next(
@@ -139,7 +209,45 @@ class RingBuffer:
         if start is None:
             if message_id is not None:
                 # This turn is still in preflight and has not emitted its user
-                # marker. Never replay the previous turn as if it were current.
+                # marker, unless the resident exact owner proves that the turn
+                # already crossed its binding boundary. The user marker can be
+                # evicted one frame before that binding, so requiring the
+                # binding itself to have fallen out would leave a narrow silent
+                # gap. Return an explicit empty truncated envelope whenever the
+                # exact binding exists but its marker does not, so clients fetch
+                # canonical current-turn history.
+                if (
+                    boundary_seq is not None
+                    and boundary_seq > 0
+                ):
+                    # The exact resident binding proves every retained frame at
+                    # or after its sequence belongs to this active turn. Keep
+                    # that suffix: canonical History may not yet contain the
+                    # newest partial delta. The truncated envelope still tells
+                    # Web to fetch the missing canonical prefix.
+                    retained = [
+                        (seq, message) for seq, message in self._buf
+                        if seq >= boundary_seq
+                    ]
+                    from_seq = (
+                        retained[0][0] if retained else self.head_seq
+                        or min(self.tail_seq, boundary_seq + 1)
+                    )
+                    frames = [
+                        ReplayStart(
+                            from_seq=from_seq,
+                            to_seq=self.tail_seq,
+                            truncated=True,
+                            generation=generation,
+                        ),
+                    ]
+                    frames.extend(self._compact_current_turn_suffix(retained))
+                    frames.append(ReplayEnd(
+                        to_seq=self.tail_seq,
+                        truncated=True,
+                    ))
+                    return frames
+                # Never replay the previous turn as if it were current.
                 return []
             if not self._logical_tail_seq:
                 return []
