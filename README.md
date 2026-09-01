@@ -427,6 +427,25 @@ Wrapper 已有设备凭据时只需：
 协议大版本升级仍应在同一维护窗口完成 Relay、Web 和所有 Wrapper；已经打开的页面要
 硬刷新。安装器保留上一 release，服务验活失败会把 `current` 和服务定义恢复到旧版。
 
+### 中国大陆网络加速（可选）
+
+`install.sh` 从 GitHub Release 下载角色包、内置的 `uv` 再下载 Python 运行时，
+两者在国内默认路径都可能很慢。可用镜像加速：
+
+```bash
+# 1) 加速 uv 安装 PyPI 依赖（阿里云 PyPI 镜像）
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
+# 2) 加速 uv 下载 python-build-standalone 运行时（npmmirror）
+export UV_PYTHON_INSTALL_MIRROR=https://registry.npmmirror.com/-/binary/python-build-standalone
+./install.sh wrapper --relay https://remote.example.com --pair XXXXX-XXXXX-XXXXX-XXXXX --name "MacBook Pro"
+```
+
+若 `install.sh` 下载角色包超时：脚本每次都会从
+`CC_REMOTE_RELEASE_BASE_URL`（默认 GitHub Release）重新下载、没有本地缓存，
+可把该变量指向镜像源或本地 `file://` 路径后重试。Relay 用 Docker 容器部署时，
+构建阶段同样可用 `--build-arg PIP_INDEX_URL=...` 加速（见 deploy/README.md 的
+容器章节）。
+
 ## 生产部署（公网 VPS 中继 + 你机器上的 wrapper）
 
 以下保留源码 staging / 手工配置路径，适合开发、自定义部署和故障恢复。普通正式安装

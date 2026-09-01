@@ -1,0 +1,44 @@
+# cc-remote Relay container.
+#
+# The official deploy is a systemd venv + managed Caddy (see deploy/README.md).
+# This compose file runs the same relay inside a container for isolated,
+# memory-bounded VPSes, or for any host that already terminates TLS itself.
+#
+# Public TLS/WebSocket termination is expected to stay with nginx or another
+# host reverse proxy: the relay is published only to the host loopback here,
+# and the relay only trusts forwarded transport metadata from loopback peers.
+# See nginx-reverse-proxy.conf.example for the nginx alternative to Caddy.
+#
+# Usage (from this deploy/ directory):
+#   cp env.relay.docker.example env.relay   # then fill in the secrets
+#   docker compose up -d --build
+#   curl https://your-domain/healthz        # -> {"ok":true,...}
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: cc-remote-relay:latest
+    container_name: cc-remote-relay
+    restart: unless-stopped
+    # Host networking so the relay sees loopback peers. The relay only trusts
+    # forwarded transport metadata (X-Forwarded-Proto / X-Forwarded-For) from
+    # 127.0.0.1 and ::1; the Docker bridge gateway is not one of those, so a
+    # normal `ports:` mapping would make it ignore the proxy headers and reject
+    # the HTTPS PUBLIC_ORIGIN. With host networking the relay binds loopback
+    # only (RELAY_HOST=127.0.0.1), which the host nginx/Caddy reaches directly.
+    # Linux hosts only; the `ports:` mapping is ignored under host networking.
+    network_mode: host
+    env_file:
+      - env.relay
+    volumes:
+      # Persistent device registry + Web Push subscription databases. The named
+      # volume inherits /app/state ownership from the image (the ccremote
+      # user), so no host-side chown is needed.
+      - relay-state:/app/state
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  relay-state:

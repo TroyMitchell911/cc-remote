@@ -505,6 +505,27 @@ window, then hard-refresh open browser tabs. The installers retain the previous
 release and restore both `current` and the service definition if activation
 does not become healthy.
 
+### Faster installs behind the GFW (optional)
+
+`install.sh` downloads the role bundle from the GitHub Release and the bundled
+`uv` then downloads the Python runtime — both default paths can be slow from
+mainland China. Point uv at mirrors to speed it up:
+
+```bash
+# 1) Faster PyPI dependencies (Aliyun PyPI mirror)
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
+# 2) Faster python-build-standalone runtime downloads (npmmirror)
+export UV_PYTHON_INSTALL_MIRROR=https://registry.npmmirror.com/-/binary/python-build-standalone
+./install.sh wrapper --relay https://remote.example.com --pair XXXXX-XXXXX-XXXXX-XXXXX --name "MacBook Pro"
+```
+
+If `install.sh` times out fetching the role bundle, note that it always
+re-downloads from `CC_REMOTE_RELEASE_BASE_URL` (GitHub Release by default) with
+no local cache - point that variable at a mirror or a local `file://` path and
+retry. When deploying the Relay in a Docker container, the build stage can use
+the same mirror idea via `--build-arg PIP_INDEX_URL=...` (see the container
+section of [deploy/README.md](deploy/README.md)).
+
 ## Production deploy (public VPS relay + wrapper on your machine)
 
 The source-staging/manual path below remains available for development, custom

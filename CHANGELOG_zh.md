@@ -4,6 +4,12 @@
 
 ## 未发布
 
+- 新增 Relay 的官方容器化部署：`deploy/Dockerfile` 分阶段构建——Node 阶段从源码
+  编译 `web/dist`，Python 阶段以非 root 的 `ccremote` 用户按哈希锁安装依赖；附
+  `docker-compose.yml` 与 Docker 版 `env.relay.docker.example`。compose 只把端口
+  发布到宿主机 loopback，TLS/WebSocket 终止仍交给现有 nginx；
+  `deploy/nginx-reverse-proxy.conf.example` 记录该反代前端。Docker 构建支持
+  `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` 构建参数，并补充大陆镜像加速指引。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v35。Codex app-server 的
   精确终态与通过源文件校验的 rollout 终态现在独立于 History 正文投影下发；数百
   MiB 的 rollout 即使仍在补建内容索引，也不会让已经完成的回合继续转圈。终态事实

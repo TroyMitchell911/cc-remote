@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Add an official container deploy for the Relay: a multi-stage
+  `deploy/Dockerfile` builds `web/dist` from source and installs the
+  hash-locked wheels as a non-root `ccremote` user, with `docker-compose.yml`,
+  a Docker-oriented `env.relay.docker.example`, and a compose layout that only
+  publishes the relay to the host loopback so an existing nginx can keep TLS
+  and WebSocket termination. `deploy/nginx-reverse-proxy.conf.example`
+  documents that alternative front, and the Docker build exposes
+  `PIP_INDEX_URL` / `PIP_EXTRA_INDEX_URL` build args plus documented
+  mainland-China mirror guidance.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v35. Exact Codex
   app-server and source-validated rollout terminals now travel independently of
   the narrative History projection, so a multi-hundred-MiB rollout cannot keep

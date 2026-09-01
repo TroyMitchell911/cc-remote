@@ -59,6 +59,13 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
 - `com.muggle.cc-remote.wrapper.plist.in` — secret-free macOS LaunchAgent
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
+- `Dockerfile` / `docker-compose.yml` / `env.relay.docker.example` — the same
+  relay release as a container (build `web/dist` in a Node stage, install the
+  hash-locked wheels, run as the `ccremote` user). See the container section
+  below; this is an alternative to the systemd + Caddy path, not a fork of it.
+- `nginx-reverse-proxy.conf.example` — a WebSocket reverse-proxy front for
+  hosts that already run nginx instead of the managed Caddy. Loopback-only
+  requirement is documented in the file header.
 - `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
   through SQLite's backup API, restores the matching pre-release images before
   an older wrapper is restarted, and verifies the v34 Codex ownership backfill.
@@ -86,6 +93,43 @@ also restores pre-release Work metadata: sessions, projects, or schedule state
 created after activation will no longer be registered (their private files are
 not deleted). Use this for immediate failed activation; after normal use,
 prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
+
+## Container deploy (Docker) and the nginx alternative
+
+The official relay install is a systemd venv staged by `setup-vps.sh` behind a
+managed Caddy. Two alternative topologies are supported for hosts that already
+manage their own services or TLS:
+
+**Docker container.** `Dockerfile` builds the same relay release as a
+multi-stage image: the Node stage compiles `web/dist` from source, the Python
+stage installs the same hash-locked wheels `setup-vps.sh` pins and runs
+`python -m cc_remote.relay` as a non-root `ccremote` user. From the `deploy/`
+directory:
+
+```bash
+cp env.relay.docker.example env.relay   # then fill in the secrets
+docker compose up -d --build
+curl https://your-domain/healthz        # -> {"ok":true,...}
+```
+
+The compose file publishes the relay only to the host loopback
+(`127.0.0.1:8765`) and mounts a named volume for the SQLite device/Web Push
+state. Public TLS + WebSocket termination stays with your existing front.
+
+**nginx instead of Caddy.** `nginx-reverse-proxy.conf.example` terminates TLS
+and proxies the `/ws` WebSocket to `127.0.0.1:8765`. Keep it loopback-only:
+the relay trusts forwarded transport metadata only from loopback peers.
+
+**Mainland-China mirrors.** The Docker build defaults to PyPI.org. Behind the
+GFW, build with Aliyun as the primary index and TUNA as the fallback (both
+carry the sdist-only `http-ece` wheel):
+
+```bash
+docker build -f deploy/Dockerfile \
+  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+  --build-arg PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  -t cc-remote-relay .
+```
 
 ## Native terminal coordination
 

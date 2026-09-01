@@ -1,0 +1,62 @@
+# cc-remote Relay behind nginx.
+#
+# The official deploy uses a managed Caddy that terminates TLS and reverse
+# proxies the WebSocket (deploy/Caddyfile). If you already run nginx as the
+# only front on this host, use this file as the alternative. The relay
+# deliberately trusts forwarded transport metadata only from loopback peers, so
+# nginx MUST run on the same host and proxy to the relay's loopback address
+# (with the Docker compose file, that is 127.0.0.1:8765 on host networking).
+#
+# Bootstrap on a fresh host:
+#   1. Point an A/AAAA record for cc-remote.example.com at this VPS and open
+#      80/443.
+#   2. Install this file with ONLY the HTTP block active (the 443 block below
+#      is commented out until a certificate exists - otherwise `nginx -t`
+#      fails before the ACME challenge can even be served).
+#   3. Issue the certificate: `certbot certonly --webroot -w /var/www/html
+#      -d cc-remote.example.com`, then uncomment the 443 block (or let
+#      `certbot --nginx` fill it in once the challenge can be served).
+#   4. `nginx -t && systemctl reload nginx`.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name cc-remote.example.com;
+
+    # Serves the ACME challenge so certbot can complete the certificate
+    # issuance before the TLS block below is enabled.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# TLS block. Keep it commented out until the certificate exists (see the
+# bootstrap steps above), then uncomment it - or let certbot --nginx manage it.
+#server {
+#    listen 443 ssl;
+#    listen [::]:443 ssl;
+#    server_name cc-remote.example.com;
+#
+#    ssl_certificate     /etc/letsencrypt/live/cc-remote.example.com/fullchain.pem;
+#    ssl_certificate_key /etc/letsencrypt/live/cc-remote.example.com/privkey.pem;
+#
+#    # The /ws WebSocket carries wrapper and browser connections, so the upgrade
+#    # headers and long timeouts are required - keep-alive settings alone are
+#    # not enough.
+#    location / {
+#        proxy_pass http://127.0.0.1:8765;
+#        proxy_http_version 1.1;
+#        proxy_set_header Upgrade $http_upgrade;
+#        proxy_set_header Connection "upgrade";
+#        proxy_set_header Host $host;
+#        proxy_set_header X-Real-IP $remote_addr;
+#        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#        proxy_set_header X-Forwarded-Proto $scheme;
+#        proxy_read_timeout 3600s;
+#        proxy_send_timeout 3600s;
+#    }
+#}

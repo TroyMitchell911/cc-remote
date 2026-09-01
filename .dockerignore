@@ -1,0 +1,17 @@
+# Keep the relay Docker build context lean and free of machine-local state.
+# web/dist is built inside the image (stage 1); web/node_modules would bloat
+# the context and is never committed upstream.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+web/node_modules/
+web/dist/
+web/test-results/
+*.log
+# Never leak a populated env file into the image. `cp env.relay.docker.example
+# env.relay` is the documented first step; the real env holds the login
+# password, session secret, and wrapper token, so it must never reach the
+# build context.
+deploy/env.relay

@@ -124,6 +124,14 @@ if [ "$system" = linux ] && [ "$(id -u)" -ne 0 ]; then
   if [ -n "${CC_REMOTE_LOGIN_PASSWORD_FILE:-}" ]; then
     sudo_env+=(CC_REMOTE_LOGIN_PASSWORD_FILE="$CC_REMOTE_LOGIN_PASSWORD_FILE")
   fi
+  # Preserve mirror-acceleration variables for the bundled uv across sudo.
+  # Without this, `export UV_DEFAULT_INDEX=... ./install.sh wrapper ...` on
+  # Linux silently loses the mirror because sudo filters the environment.
+  for uv_var in UV_DEFAULT_INDEX UV_PYTHON_INSTALL_MIRROR; do
+    if [ -n "${!uv_var:-}" ]; then
+      sudo_env+=("$uv_var=${!uv_var}")
+    fi
+  done
   sudo env "${sudo_env[@]}" \
     "$installer" "$bundle" "$@"
 else
