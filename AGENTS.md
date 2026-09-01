@@ -41,13 +41,15 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   Text deltas still stream live via `StreamEvent`.
 - **Claude only — don't set `setting_sources=[]` for Code**: legacy single-account
   Code intentionally loads `~/.claude/settings.json`. Explicit account profiles
-  start under a mode-`0700` shadow HOME whose `.claude` is a symlink to the
-  selected `CLAUDE_CONFIG_DIR`: current Claude Code still resolves its user
-  setting source through HOME. A mode-`0600`, credential-free explicit settings
-  file restores the real HOME before tool subprocesses spawn. Never parse or
-  copy the selected account's settings/credentials into cc-remote state. Work
-  is the deliberate exception: it uses one wrapper-owned policy file with
-  `setting_sources=[]`.
+  keep the real HOME, select their native storage boundary with
+  `CLAUDE_CONFIG_DIR`, clear ambient provider variables, and use
+  `setting_sources=["user"]`. Project/local settings may contain provider env or
+  auth helpers and must not participate in an account-isolated child. Never pass
+  the selected profile's complete settings file through `--settings`: that
+  promotes every user setting above project/local precedence. Never parse or
+  copy account credentials into cc-remote state. Single-account behavior stays
+  native; Work is the deliberate exception with one wrapper-owned policy file,
+  `setting_sources=[]`, and safe mode.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -57,7 +59,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v44 is declared by
+- **Protocol version gate**: current wire protocol v46 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -68,6 +70,16 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   is scoped by `machine_id`; a credential for one enrolled device must never be
   accepted for another. Keep `cc_remote/device.py`, `relay/devices.py`, relay
   routing, and the Web device selector aligned when this contract changes.
+- **Managed-browser SSRF/account boundary**: Playwright routing is only a
+  defense-in-depth URL check. Chromium must keep using the authenticated loopback proxy in
+  `wrapper/browser_proxy.py`, which resolves, vets, and connects to the same
+  numeric IP; never replace it with a boolean hostname allow-cache or restore
+  Chrome's implicit loopback bypass. Each Codex profile owns a separately
+  derived persistent Chrome directory. Browser pages, cookies, control leases,
+  screenshots, and dynamic-tool callbacks must never cross profile/thread keys.
+  Shared-daemon `item/tool/call` requests are multicast: answer only an exact
+  namespace/tool declared by this handle, and stay silent for another client's
+  dynamic tools so an unrelated subscriber cannot win the response race.
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
@@ -142,7 +154,9 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `codex_lifecycle.py` owns the
   source-bound exact-terminal ledger; `history_store.py` owns the rebuildable
-  SQLite projection; `machine.py`, `command_router.py`,
+  SQLite projection; `browser.py` and `browser_proxy.py` own the optional
+  account-isolated Codex browser and its pinned-IP network boundary;
+  `machine.py`, `command_router.py`,
   `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
   the shared session pool, command dispatch, live replay, relay transport, and
   persistence.

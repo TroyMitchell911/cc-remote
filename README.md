@@ -4,7 +4,7 @@
 
 自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v44
+**当前版本：v3.0.0** · Wire protocol v46
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -58,7 +58,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v44。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v46。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -76,6 +76,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用工作模板；创建工作时会把选定上下文物化到专属目录。 |
 | **Work 定时任务与隔离** | 支持一次、每日、每周任务；执行记录、租约、失败重试和防重叠状态均持久化。每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
 | **远程操作** | 手机、平板或桌面浏览器实时看流式回复并发送附件。Codex 忙碌时默认把新输入作为原生引导追加到当前任务，也可改为排队；Claude 保留打断并发送。停止始终是独立操作。 |
+| **Codex 共享浏览器** | 可选地让 Codex Code 与用户共享 wrapper 本机的独立 Chrome Profile。Agent 通过 app-server `dynamicTools` 操作同一页面，用户用 `/browser` 查看 JPEG 画面并接管/交还鼠标键盘；Cookie 和站点存储不离开 wrapper。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
 | **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
@@ -139,11 +140,29 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   `CC_REMOTE_CLAUDE_PROFILES_FILE` 注册最多 32 个完整、互相隔离的
   `CLAUDE_CONFIG_DIR`。每个 Profile 使用自己的登录/供应商配置、settings、
   session/transcript、模型和扩展目录；Code、Work 与定时任务都可选择账号，并冻结
-  该归属。wrapper 只给对应 Claude 子进程注入所选目录，不修改自身或其他会话的
-  全局环境。空配置继续使用当前 `CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`），
+  该归属。wrapper 只给对应 Claude 子进程注入所选目录；显式多账号只加载所选
+  Profile 的 user settings，不允许项目级或 local settings 改写账号供应商。wrapper
+  不会读取、复制或通过命令行提升其中的凭据，也不修改自身或其他会话的全局环境。
+  Claude 仍原生发现项目说明文件；需要账号相关的 provider/env/helper 配置时，必须
+  放进对应 Profile。空配置继续使用当前
+  `CLAUDE_CONFIG_DIR`（未设置时为 `~/.claude`），
   保持原生 session ID 且不增加账号 UI；多账号才使用
   `<profile>@<native-session-id>` 作为 cc-remote 内部路由。同一原生 UUID 因此可在
   两个账号中安全并存。
+- **Codex 共享浏览器（可选）：**设置 `CC_REMOTE_CODEX_BROWSER=auto` 后，wrapper
+  会懒启动系统已安装的 Chrome/Chromium，按 Codex 账号使用独立的 wrapper 专用
+  Profile，并为每个 Codex Code thread 创建独立页面。Codex 通过官方
+  [app-server 协议](https://learn.chatgpt.com/docs/app-server)中的实验性
+  `dynamicTools` 操作页面，用户
+  在 Web 输入 `/browser` 查看画面、接管或交还控制。面板打开时会按 Agent 每一步产生的
+  画面 revision 自动同步，而不会在页面静止时持续传输 JPEG；地址栏支持完整 URL、自动给
+  裸域名补 `https://`，也可把普通文字作为 Google 搜索。这个实现复用了 OpenAI 官方
+  app-server 的动态工具协议，但不是 Codex App 内部未公开的 WebView。默认不下载
+  Playwright 浏览器，Cookie、登录态和站点存储只保存在 wrapper 主机；relay 只转发
+  有界 JPEG 与类型化输入。Agent 截图会作为工具结果发送给当前 Codex 模型，Web
+  截图会经 relay 只发给提出请求的已授权客户端，因此不要在这个专用 Profile 中
+  打开不希望模型或远程客户端看到的页面。只有启用后新建的 Code thread 会声明 Agent 工具；旧
+  thread 仍可由用户手工浏览，要让 Agent 操作需新建 thread。Codex Work 不开放。
 - **同时使用多个 Codex 账号：**可通过 `CC_REMOTE_CODEX_PROFILES_JSON` 或
   `CC_REMOTE_CODEX_PROFILES_FILE` 注册最多 32 个完整、互相隔离的 `CODEX_HOME`。
   每个 Profile 使用自己的登录状态、配置、
@@ -209,7 +228,7 @@ daemon 时严格校验当前官方 managed CLI，并只把它的 `current` 入�
 登录、配置、rollout、socket 和 daemon 进程仍各自隔离。已有自定义安装或不明确的
 目录绝不会被覆盖。
 配置中必须且只能有一个 `default: true`。Relay 和 Web 只收到 Profile id、标签与
-可用状态，不会收到 `CODEX_HOME` 路径或凭据。修改后需重启 wrapper；protocol v44
+可用状态，不会收到 `CODEX_HOME` 路径或凭据。修改后需重启 wrapper；protocol v46
 必须让 wrapper、relay 和 Web 同批升级。
 Profile id 调整、单账号与多账号切换会按 `CODEX_HOME` 的真实路径迁移本地控制和
 恢复状态；迁移被异常中断时，请保持同一份目标配置并重启 wrapper 继续完成。为避免
@@ -512,12 +531,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v44**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v46**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v44 relay 和
-> v44 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v46 relay 和
+> v46 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
 > 版本跨级升级，仍须执行 v34 引入的 Work SQLite 迁移保护：启动新 wrapper 前用
 > `deploy/work_registry_snapshot.py snapshot` 保存两个注册表。回滚时先停新版本、恢复
 > 该快照，再切回旧代码；不要在 wrapper 运行时只复制主 `.sqlite3` 文件而漏掉 WAL。
@@ -574,7 +593,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v44 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v46 wrapper。
 
 验证：
 
@@ -702,6 +721,10 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CC_REMOTE_CLAUDE_PROFILES_FILE` | 空（macOS LaunchAgent 为 `~/.cc-remote/claude-profiles.json`） | 可选注册表 JSON 文件；必须是有上限的普通文件。文件不存在等同单账号，便于先安装再配置。 |
 | `CC_REMOTE_CODEX_PROXY` | 空 | 仅注入 wrapper 启动的 Codex 子进程的 HTTP(S)/SOCKS5 代理；不改 wrapper 到 relay 的连接，也不影响用户终端里的 `codex`。例如 nono 可填 `http://127.0.0.1:7897`。 |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server，并失去与原生 Codex CLI/App 的实时双向协同。Work 始终私有，不受此项影响。 |
+| `CC_REMOTE_CODEX_BROWSER` | `off` | Codex Code 托管浏览器：`off` 关闭，`auto` 在系统 Chrome/Chromium 与 Playwright 可用时启用，`required` 在依赖缺失时以明确错误拒绝 wrapper 启动。修改后只对新建 Code thread 注入 Agent 工具。 |
+| `CC_REMOTE_BROWSER_BIN` | 空（自动发现） | 可选的 Chrome/Chromium 绝对路径；cc-remote 不下载 Playwright 自带浏览器。 |
+| `CC_REMOTE_BROWSER_PROFILE_DIR` | `~/.cc-remote/browser/profiles` | wrapper 本机浏览器 Profile 的父目录；cc-remote 会按 Codex 账号派生稳定的哈希子目录，Cookie 不会跨账号共享。该目录不能指向根目录或用户主目录，Cookie 与登录态不会发往 relay。 |
+| `CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK` | `0` | wrapper 本地、每次运行随机认证的代理会解析并审查目标，再直接连接同一个已钉住的 IP；默认拒绝 localhost、私网、链路本地及其他非公网目标。仅在明确需要操作可信内网页面时设为 `1`；浏览器网络不受 Codex shell sandbox 约束。 |
 | `CC_REMOTE_CODEX_PROFILES_JSON` | 空 | 可选 Codex 多账号注册表；格式为 `{profile_id:{"label":"…","home":"/绝对/CODEX_HOME","default":true}}`。最多 32 项、home 必须唯一，且必须且只能有一个默认项。每项使用独立 daemon；Code 合并展示并按标签区分，Codex Work 新会话和定时任务可选择任一项。空值保持单账号兼容。显式 JSON 优先于文件。 |
 | `CC_REMOTE_CODEX_PROFILES_FILE` | 空（macOS LaunchAgent 为 `~/.cc-remote/codex-profiles.json`） | 可选注册表 JSON 文件；必须是有上限的普通文件。文件不存在等同单账号，便于先安装再配置。 |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | 本机 wrapper 状态目录。账号切换 hook 与 wrapper 必须使用同一个值，daemon 代际屏障保存在其中；不包含 Codex 凭据。 |

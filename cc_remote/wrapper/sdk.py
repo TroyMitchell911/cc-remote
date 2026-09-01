@@ -2,15 +2,14 @@
 
 Isolates the one version-sensitive call site (`include_partial_messages` on
 ClaudeAgentOptions) so an SDK upgrade touches only this file. Code sessions use
-Claude's ordinary setting sources. An explicit multi-account profile starts
-under a private shadow HOME whose ``.claude`` symlink selects that profile's
-user source; a secret-free settings file restores the real HOME before tools
-spawn. This prevents the ambient home account from overriding
-``CLAUDE_CONFIG_DIR`` without cc-remote opening model credentials. Work
-sessions use one wrapper-owned settings file containing only provider
-connectivity and the fail-closed sandbox; they must never inherit user/project
-memory, hooks or skills. Permission mode is explicit live session state and
-survives reconnects.
+Claude's ordinary setting sources. An explicit multi-account profile keeps the
+real HOME, selects its native storage boundary with ``CLAUDE_CONFIG_DIR``, and
+loads only that profile's user settings. Project/local settings cannot silently
+replace the selected provider, and cc-remote never opens or promotes the
+profile's credential-bearing file. Work sessions use one wrapper-owned settings
+file containing only provider connectivity and the fail-closed sandbox; they
+must never inherit user/project memory, hooks or skills. Permission mode is
+explicit live session state and survives reconnects.
 """
 from __future__ import annotations
 
@@ -36,10 +35,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.log import logger
 from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
 from cc_remote.wrapper.child_env import claude_profile_child_env
-from cc_remote.wrapper.claude_profile_home import (
-    ClaudeProfileHomeBoundary,
-    materialize_claude_profile_home,
-)
+from cc_remote.wrapper.claude_transport import account_isolated_transport
 from cc_remote.wrapper.claude_rewind import (
     ClaudeConversationRewindCapability,
     ClaudeConversationRewindResult,
@@ -128,35 +124,12 @@ def _explicit_cli_path(value: str) -> str | None:
 
 def _claude_profile_settings_path(
     config_dir: str | None,
-    *,
-    isolate_account_env: bool,
 ) -> str | None:
-    """Return a legacy explicit profile settings path when not isolated."""
-    if isolate_account_env:
-        return None
+    """Return the selected native settings path without reading its contents."""
     if config_dir is None:
         return None
     path = os.path.join(config_dir, "settings.json")
     return path if os.path.isfile(path) else None
-
-
-def _claude_profile_home_boundary(
-    config_dir: str | None,
-    *,
-    state_dir: os.PathLike[str],
-    isolate_account_env: bool,
-) -> ClaudeProfileHomeBoundary | None:
-    """Build the credential-opaque user-settings boundary when required.
-
-    ``CLAUDE_CONFIG_DIR`` redirects transcripts and account storage, but Claude
-    Code still resolves its user source from ``HOME/.claude``.  Multi-profile
-    callers must never fall back to an unbounded ambient HOME.
-    """
-    if not isolate_account_env:
-        return None
-    if config_dir is None:
-        raise ValueError("isolated Claude profile requires a config directory")
-    return materialize_claude_profile_home(config_dir, state_dir)
 
 
 def _is_control_request_timeout(
@@ -364,29 +337,28 @@ class SdkHandle:
             # A Code session restored while currently in a safer mode must still
             # retain Claude's native ability to cycle back to bypass later.
             extra_args["allow-dangerously-skip-permissions"] = None
-        code_profile_home = (
-            None
-            if self.work_mode
-            else _claude_profile_home_boundary(
-                self.claude_config_dir,
-                state_dir=self.cfg.state_dir,
-                isolate_account_env=self.isolate_account_env,
-            )
-        )
+        if (
+            not self.work_mode
+            and self.isolate_account_env
+            and self.claude_config_dir is None
+        ):
+            raise ValueError(
+                "isolated Claude profile requires a config directory")
+        session_cwd = cwd or self.cfg.cc_cwd
         code_profile_settings = (
-            code_profile_home.restore_settings
-            if code_profile_home is not None
-            else _claude_profile_settings_path(
-                self.claude_config_dir,
-                isolate_account_env=self.isolate_account_env,
-            )
+            None
+            if self.isolate_account_env
+            else _claude_profile_settings_path(self.claude_config_dir)
+        )
+        code_setting_sources = (
+            ["user"]
+            if self.isolate_account_env and not self.work_mode
+            else None
         )
         code_child_env = claude_profile_child_env(
             self.claude_config_dir,
             isolate_account_env=self.isolate_account_env,
         )
-        if code_profile_home is not None:
-            code_child_env["HOME"] = code_profile_home.launch_home
         return ClaudeAgentOptions(
             tools=list(CLAUDE_WORK_TOOLS) if self.work_mode else None,
             include_partial_messages=True,        # StreamEvent with content_block_delta
@@ -410,7 +382,7 @@ class SdkHandle:
             include_hook_events=True,
             permission_mode=self.permission_mode,
             can_use_tool=self._can_use_tool,
-            cwd=cwd or self.cfg.cc_cwd,           # dynamic: must match the resumed session's cwd
+            cwd=session_cwd,                      # dynamic: must match the resumed session's cwd
             cli_path=_explicit_cli_path(self.cfg.claude_bin),
             resume=resume_id or None,
             # fork_session=True resumes `resume_id`'s context but writes new turns to
@@ -423,14 +395,21 @@ class SdkHandle:
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
             env=code_child_env,
             stderr=self._on_stderr,               # surface cc subprocess errors
-            # Work uses only a wrapper-owned policy that the writable workspace
-            # cannot edit. [] is the SDK's filesystem-settings isolation mode:
-            # no user/project/local settings, CLAUDE.md, hooks or skills leak in.
+            # Explicit Code profiles load only the selected native user source.
+            # Project/local settings may contain provider env or helpers and
+            # therefore cannot participate in an account-isolated process. Do
+            # not promote the complete user file through --settings: that would
+            # invert Claude's precedence for model, permissions and sandbox.
+            # Work instead uses only a wrapper-owned policy that the writable
+            # workspace cannot edit. [] plus safe mode is Work's complete
+            # customization boundary.
             settings=(
                 self.work_settings_path
                 if self.work_mode else code_profile_settings
             ),
-            setting_sources=[] if self.work_mode else None,
+            setting_sources=(
+                [] if self.work_mode else code_setting_sources
+            ),
             skills=[] if self.work_mode else None,
             # The wrapper-owned Work settings file already contains the complete
             # fail-closed sandbox including its filesystem allowlist. SDK 0.2.142
@@ -474,7 +453,13 @@ class SdkHandle:
                       _suppress_context_probe: bool = False) -> None:
         opts = self._options(
             resume_id, cwd, fork=fork, model_override=model_override)
-        self.client = ClaudeSDKClient(options=opts)
+        if self.isolate_account_env:
+            self.client = ClaudeSDKClient(
+                options=opts,
+                transport=account_isolated_transport(opts),
+            )
+        else:
+            self.client = ClaudeSDKClient(options=opts)
         self._conversation_rewind_capability = None
         await self.client.connect()
         if fork:

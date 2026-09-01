@@ -3,13 +3,14 @@
 import json
 import os
 from pathlib import Path
-import stat
 import subprocess
 import sys
 import textwrap
 from types import SimpleNamespace
 
 import pytest
+from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk._internal.transport import subprocess_cli as sdk_subprocess_cli
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     SubprocessCLITransport,
 )
@@ -21,8 +22,13 @@ from cc_remote.wrapper.child_env import (
     CONTROL_PLANE_SECRET_KEYS,
     claude_profile_child_env,
     claude_profile_process_env,
+    claude_sdk_process_env,
     sanitized_child_env,
     scrub_parent_control_secrets,
+)
+from cc_remote.wrapper.claude_transport import (
+    AccountIsolatedSubprocessCLITransport,
+    account_isolated_transport,
 )
 from cc_remote.wrapper.codex_handle import _codex_env
 from cc_remote.wrapper.sdk import CLAUDE_WORK_TOOLS, SdkHandle
@@ -87,8 +93,121 @@ def test_claude_profile_child_environment_is_request_local(monkeypatch):
         "/profiles/company", isolate_account_env=True)
 
     assert isolated["CLAUDE_CONFIG_DIR"] == "/profiles/company"
-    assert all(isolated[key] == "" for key in CLAUDE_ACCOUNT_ENV_KEYS)
+    assert all(key not in isolated for key in CLAUDE_ACCOUNT_ENV_KEYS)
     assert dict(os.environ) == before
+
+
+def test_isolated_claude_profile_child_environment_requires_config_dir():
+    with pytest.raises(
+        ValueError,
+        match="isolated Claude profile requires a config directory",
+    ):
+        claude_profile_child_env(None, isolate_account_env=True)
+
+
+def test_claude_sdk_process_environment_really_unsets_account_sources(
+    monkeypatch,
+):
+    for key in CLAUDE_ACCOUNT_ENV_KEYS:
+        monkeypatch.setenv(key, f"ambient-{key}")
+    monkeypatch.setenv("CLAUDECODE", "nested")
+    before = dict(os.environ)
+
+    child = claude_sdk_process_env({
+        "CLAUDE_CONFIG_DIR": "/profiles/company",
+        "ANTHROPIC_PROFILE": "company",
+    })
+
+    assert child["CLAUDE_CONFIG_DIR"] == "/profiles/company"
+    assert child["ANTHROPIC_PROFILE"] == "company"
+    assert "CLAUDECODE" not in child
+    assert all(
+        key not in child
+        for key in CLAUDE_ACCOUNT_ENV_KEYS
+        if key not in {"CLAUDE_CONFIG_DIR", "ANTHROPIC_PROFILE"}
+    )
+    assert dict(os.environ) == before
+
+
+@pytest.mark.asyncio
+async def test_account_isolated_transport_scrubs_only_its_child_environment(
+    monkeypatch,
+):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.invalid")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-aws")
+    monkeypatch.setenv("WRAPPER_TOKEN", "control-secret")
+    monkeypatch.setenv("CLAUDECODE", "nested")
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+    parent = dict(os.environ)
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+
+    process = FakeProcess()
+
+    async def fake_open_process(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return process
+
+    monkeypatch.setattr(
+        "claude_agent_sdk._internal.transport.subprocess_cli.anyio.open_process",
+        fake_open_process,
+    )
+    options = ClaudeAgentOptions(
+        cli_path="/fake/claude",
+        env={
+            "CLAUDE_CONFIG_DIR": "/profiles/company",
+            "WRAPPER_TOKEN": "",
+        },
+    )
+    transport = account_isolated_transport(options)
+
+    try:
+        await transport.connect()
+    finally:
+        sdk_subprocess_cli._ACTIVE_CHILDREN.discard(process)
+
+    child = captured["env"]
+    assert isinstance(child, dict)
+    assert child["CLAUDE_CONFIG_DIR"] == "/profiles/company"
+    assert child["WRAPPER_TOKEN"] == ""
+    assert child["CLAUDE_CODE_ENTRYPOINT"] == "sdk-py"
+    assert "ANTHROPIC_BASE_URL" not in child
+    assert "AWS_ACCESS_KEY_ID" not in child
+    assert "CLAUDECODE" not in child
+    assert dict(os.environ) == parent
+
+
+@pytest.mark.asyncio
+async def test_isolated_sdk_handle_uses_the_child_only_transport(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeClaudeClient:
+        def __init__(self, *, options, transport):
+            captured["options"] = options
+            captured["transport"] = transport
+
+        async def connect(self):
+            return None
+
+    monkeypatch.setattr(sdk_module, "ClaudeSDKClient", FakeClaudeClient)
+    handle = SdkHandle(
+        WrapperConfig(),
+        claude_config_dir="/profiles/company",
+        isolate_account_env=True,
+    )
+    monkeypatch.setattr(handle, "_start_message_pump", lambda: None)
+
+    await handle.connect(cwd="/tmp", _suppress_context_probe=True)
+
+    assert isinstance(
+        captured["transport"],
+        AccountIsolatedSubprocessCLITransport,
+    )
 
 
 def test_single_claude_account_preserves_ambient_provider_configuration(
@@ -195,7 +314,7 @@ def test_claude_work_passes_complete_policy_path_without_sdk_replacement(
     assert "--mcp-config" not in command
 
 
-def test_claude_code_profile_explicitly_loads_its_provider_settings(tmp_path):
+def test_claude_code_profile_loads_only_its_native_user_settings(tmp_path):
     profile = tmp_path / "company"
     profile.mkdir()
     settings = profile / "settings.json"
@@ -214,48 +333,30 @@ def test_claude_code_profile_explicitly_loads_its_provider_settings(tmp_path):
         isolate_account_env=True,
     )._options(None, str(tmp_path / "workspace"))
 
-    assert options.settings is not None
-    restore = Path(options.settings)
-    assert restore != settings
-    assert restore.name == "restore-home.json"
-    assert restore.parents[1].name == "claude-profile-homes-v1"
-    assert stat.S_IMODE(restore.stat().st_mode) == 0o600
-    restore_payload = json.loads(restore.read_text(encoding="utf-8"))
-    assert restore_payload["env"]["CLAUDE_CONFIG_DIR"] == str(profile)
-    assert restore_payload["env"]["HOME"] == os.environ.get(
-        "HOME", str(Path.home())
-    )
-    assert restore_payload["env"]["WRAPPER_TOKEN"] == ""
-    serialized_restore = restore.read_text(encoding="utf-8")
-    assert "profile-secret-not-for-argv" not in serialized_restore
-    assert "http://127.0.0.1:19195" not in serialized_restore
-
-    launch_home = Path(options.env["HOME"])
-    assert stat.S_IMODE(launch_home.stat().st_mode) == 0o700
-    assert (launch_home / ".claude").is_symlink()
-    assert (launch_home / ".claude").resolve() == profile.resolve()
+    # CLAUDE_CONFIG_DIR makes this the native user source. Do not also promote
+    # the whole file through --settings, which would invert normal precedence
+    # for every non-provider setting it contains.
+    assert options.settings is None
+    assert "HOME" not in options.env
     # cc-remote never opens, copies, or rewrites the user's source file.
     assert json.loads(settings.read_text(encoding="utf-8"))["env"][
         "WRAPPER_TOKEN"
     ] == "must-never-reach-claude"
-    assert options.setting_sources is None
+    assert options.setting_sources == ["user"]
     assert options.env["CLAUDE_CONFIG_DIR"] == str(profile)
-    assert all(options.env[key] == "" for key in CLAUDE_ACCOUNT_ENV_KEYS)
+    assert all(key not in options.env for key in CLAUDE_ACCOUNT_ENV_KEYS)
 
     transport = SubprocessCLITransport(prompt="", options=options)
     transport._cli_path = "/verified/bundled/claude"
     command = transport._build_command()
-    settings_index = command.index("--settings")
 
-    assert command[settings_index + 1] == str(restore)
-    assert not any(
-        argument.startswith("--setting-sources") for argument in command
-    )
+    assert "--settings" not in command
+    assert "--setting-sources=user" in command
     assert "profile-secret-not-for-argv" not in "\0".join(command)
     assert "must-never-reach-claude" not in "\0".join(command)
 
 
-def test_claude_code_profile_without_settings_is_still_fail_closed(tmp_path):
+def test_claude_code_profile_without_settings_keeps_one_native_boundary(tmp_path):
     profile = tmp_path / "subscription"
     profile.mkdir()
 
@@ -265,15 +366,11 @@ def test_claude_code_profile_without_settings_is_still_fail_closed(tmp_path):
         isolate_account_env=True,
     )._options(None, str(tmp_path / "workspace"))
 
-    assert options.settings is not None
-    payload = json.loads(Path(options.settings).read_text(encoding="utf-8"))
-    assert payload["env"]["CLAUDE_CONFIG_DIR"] == str(profile)
-    assert not any(key in payload["env"] for key in CLAUDE_ACCOUNT_ENV_KEYS)
-    assert (Path(options.env["HOME"]) / ".claude").resolve() == (
-        profile.resolve()
-    )
-    assert options.setting_sources is None
+    assert options.settings is None
+    assert "HOME" not in options.env
+    assert options.setting_sources == ["user"]
     assert options.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert all(key not in options.env for key in CLAUDE_ACCOUNT_ENV_KEYS)
 
 
 def test_explicit_single_profile_keeps_legacy_setting_sources(tmp_path):
@@ -298,7 +395,7 @@ def test_explicit_single_profile_keeps_legacy_setting_sources(tmp_path):
     assert not (state / "claude-profile-homes-v1").exists()
 
 
-def test_claude_profile_home_never_reads_or_copies_account_settings(tmp_path):
+def test_claude_profile_boundary_never_reads_or_copies_account_settings(tmp_path):
     profile = tmp_path / "company"
     profile.mkdir()
     source = profile / "settings.json"
@@ -315,23 +412,22 @@ def test_claude_profile_home_never_reads_or_copies_account_settings(tmp_path):
         claude_config_dir=str(profile),
         isolate_account_env=True,
     )._options(None, str(tmp_path / "workspace"))
-    assert first.settings is not None
-    restore = Path(first.settings)
-    first_mtime = restore.stat().st_mtime_ns
 
     unchanged = SdkHandle(
         cfg,
         claude_config_dir=str(profile),
         isolate_account_env=True,
     )._options(None, str(tmp_path / "workspace"))
-    assert unchanged.settings == first.settings
-    assert restore.stat().st_mtime_ns == first_mtime
+    assert first.settings is None
+    assert unchanged.settings is None
+    assert first.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert unchanged.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert "HOME" not in first.env and "HOME" not in unchanged.env
     assert source.read_bytes() == source_before
     assert source.stat().st_mtime_ns == source_mtime
-    assert all(
-        secret not in path.read_text(encoding="utf-8")
-        for path in (tmp_path / "state").rglob("*.json")
-    )
+    assert not (tmp_path / "state" / "claude-profile-homes-v1").exists()
+    assert secret not in repr(first.env)
+    assert secret not in repr(unchanged.env)
 
 
 @pytest.mark.parametrize("payload", ["not-json", "[]", '{"env": []}'])
@@ -348,11 +444,121 @@ def test_claude_profile_settings_validation_stays_owned_by_claude(
         isolate_account_env=True,
     )._options(None, str(tmp_path / "workspace"))
 
-    assert (Path(options.env["HOME"]) / ".claude").resolve() == (
-        profile.resolve()
-    )
-    assert options.settings is not None
-    assert payload not in Path(options.settings).read_text(encoding="utf-8")
+    assert options.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert "HOME" not in options.env
+    assert options.settings is None
+    assert payload not in repr(options.env)
+
+
+def test_secondary_claude_profile_does_not_load_primary_as_home_project(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    primary = home / ".claude"
+    profile = home / ".claude-stack"
+    primary.mkdir(parents=True)
+    profile.mkdir()
+    primary_settings = primary / "settings.json"
+    selected_settings = profile / "settings.json"
+    primary_settings.write_text(json.dumps({
+        "env": {"ANTHROPIC_BASE_URL": "https://primary.invalid"},
+    }), encoding="utf-8")
+    selected_settings.write_text(json.dumps({
+        "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:19195"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    options = SdkHandle(
+        WrapperConfig(state_dir=tmp_path / "state"),
+        claude_config_dir=str(profile),
+        isolate_account_env=True,
+    )._options(None, str(home))
+
+    # With cwd=HOME, project/local resolve under HOME/.claude and therefore
+    # belong to the primary account, not to this selected Stack profile.
+    assert options.setting_sources == ["user"]
+    assert options.settings is None
+    transport = SubprocessCLITransport(prompt="", options=options)
+    transport._cli_path = "/verified/bundled/claude"
+    command = transport._build_command()
+    assert "--setting-sources=user" in command
+    assert str(primary_settings) not in command
+    assert "primary.invalid" not in "\0".join(command)
+
+
+def test_primary_claude_profile_is_also_isolated_from_project_settings(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    profile = home / ".claude"
+    profile.mkdir(parents=True)
+    (profile / "settings.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    options = SdkHandle(
+        WrapperConfig(state_dir=tmp_path / "state"),
+        claude_config_dir=str(profile),
+        isolate_account_env=True,
+    )._options(None, str(home))
+
+    assert options.setting_sources == ["user"]
+
+
+def test_secondary_oauth_profile_without_settings_still_blocks_home_collision(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    profile = home / ".claude-subscription"
+    profile.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    options = SdkHandle(
+        WrapperConfig(state_dir=tmp_path / "state"),
+        claude_config_dir=str(profile),
+        isolate_account_env=True,
+    )._options(None, str(home))
+
+    assert options.settings is None
+    assert options.setting_sources == ["user"]
+
+
+def test_isolated_profile_never_loads_project_provider_settings(tmp_path):
+    profile = tmp_path / "profile"
+    project = tmp_path / "workspace"
+    project_settings = project / ".claude" / "settings.json"
+    profile.mkdir()
+    project_settings.parent.mkdir(parents=True)
+    (profile / "settings.json").write_text(json.dumps({
+        "env": {"ANTHROPIC_BASE_URL": "http://selected.invalid"},
+    }), encoding="utf-8")
+    project_settings.write_text(json.dumps({
+        "env": {
+            "ANTHROPIC_BASE_URL": "https://project.invalid",
+            "ANTHROPIC_AUTH_TOKEN": "project-secret",
+        },
+        "model": "project-model",
+    }), encoding="utf-8")
+
+    options = SdkHandle(
+        WrapperConfig(state_dir=tmp_path / "state"),
+        claude_config_dir=str(profile),
+        isolate_account_env=True,
+    )._options(None, str(project))
+    transport = SubprocessCLITransport(prompt="", options=options)
+    transport._cli_path = "/verified/bundled/claude"
+    command = transport._build_command()
+
+    assert options.settings is None
+    assert options.setting_sources == ["user"]
+    assert "--setting-sources=user" in command
+    serialized = "\0".join(command)
+    assert "project.invalid" not in serialized
+    assert "project-secret" not in serialized
+    assert "project-model" not in serialized
 
 
 def test_isolated_claude_profile_never_falls_back_without_config_dir(tmp_path):

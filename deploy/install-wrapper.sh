@@ -495,6 +495,8 @@ else
       printf 'CODEX_WORK_ROOT=%s/.codex/cc-remote/work\n' "$target_home"
       printf '%s\n' \
         'CC_REMOTE_CODEX_DAEMON=auto' \
+        'CC_REMOTE_CODEX_BROWSER=off' \
+        'CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK=0' \
         'WRAPPER_INBOX_CAP=1024' \
         'WRAPPER_SEND_QUEUE_CAP=8192' \
         'LOG_LEVEL=INFO'

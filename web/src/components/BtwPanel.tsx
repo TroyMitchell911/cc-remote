@@ -9,7 +9,7 @@ import {
 import { ChatView } from "./ChatView";
 import { CommandSheet } from "./CommandSheet";
 import { Icon } from "../icons";
-import { PanelTabs } from "./PanelTabs";
+import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { NoticeStack } from "./NoticeStack";
 import type {
   Artifact,
@@ -56,8 +56,9 @@ interface Props {
   rt: SessionRuntime | undefined;
   engine?: string;
   opening?: boolean;
-  active: "diff" | "btw";
+  active: RightPanelView;
   hasArtifact: boolean;
+  hasBrowser?: boolean;
   artifactKind?: Artifact["kind"];
   catalog: Catalog;
   draftKey: string;
@@ -67,7 +68,7 @@ interface Props {
   unconfirmedReplaceable: PendingQuery[];
   queueCapacity: QueueCapacity;
   replaceQueueCapacity: QueueCapacity;
-  onTab: (v: "diff" | "btw") => void;
+  onTab: (v: RightPanelView) => void;
   onSend: (prompt: string) => boolean;
   onSteer: (prompt: string) => boolean;
   onInterrupt: () => void;
@@ -316,8 +317,9 @@ export function BtwPanel(p: Props) {
     <div className="btw-panel" data-lock-horizontal-swipe="true">
       <PanelResizer ariaLabel="调整 BTW 面板宽度" />
       <div className="btw-head">
-        {p.hasArtifact
+        {(p.hasArtifact || p.hasBrowser)
           ? <PanelTabs active={p.active} artifactKind={p.artifactKind}
+              hasArtifact={p.hasArtifact} hasBtw hasBrowser={p.hasBrowser}
               onTab={p.onTab} />
           : <div className="btw-titles">
               <span className="btw-title">

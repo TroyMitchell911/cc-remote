@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 test("mounted message image retries once when cache capacity is released", async ({
@@ -76,6 +77,36 @@ async function applyProductionCsp(
     meta.content = policy;
     document.head.append(meta);
   }, productionCsp);
+}
+
+async function gotoWithProductionCsp(
+  page: import("@playwright/test").Page,
+  path: string,
+): Promise<void> {
+  await page.route("**/tests/history-browser.html*", async (route) => {
+    const response = await route.fetch();
+    const body = await response.text();
+    const inlineModule = body.match(
+      /<script type="module">([\s\S]*?)<\/script>/,
+    )?.[1];
+    const policy = inlineModule
+      ? productionCsp.replace(
+        "script-src 'self'",
+        `script-src 'self' 'sha256-${createHash("sha256")
+          .update(inlineModule)
+          .digest("base64")}'`,
+      )
+      : productionCsp;
+    await route.fulfill({
+      response,
+      body,
+      headers: {
+        ...response.headers(),
+        "content-security-policy": policy,
+      },
+    });
+  });
+  await page.goto(path);
 }
 
 test("HTML preview retains head CSS and runs scripts only after explicit consent", async ({
@@ -168,6 +199,32 @@ test("Codex visualize output opens its local HTML through the preview callback",
   );
 });
 
+test("Codex file citations stay inline and open PDF or GIF artifacts", async ({
+  page,
+}) => {
+  await gotoWithProductionCsp(
+    page,
+    "/tests/history-browser.html?codex-file-citation=1",
+  );
+  const pdf = page.getByRole("button", { name: /final report\.pdf/ });
+  const gif = page.getByRole("button", { name: /demo} final\.gif/ });
+  await expect(pdf).toBeVisible();
+  await expect(gif).toBeVisible();
+  await expect(page.getByTestId("valid-citations"))
+    .not.toContainText("codex-file-citation");
+  await expect(page.getByTestId("invalid-citation"))
+    .toContainText("codex-file-citation");
+  await expect(page.getByTestId("invalid-citation")).toContainText("invalid tail");
+  await pdf.click();
+  await expect(page.getByTestId("citation-opened-path")).toHaveText(
+    "/tmp/reports/final report.pdf",
+  );
+  await gif.click();
+  await expect(page.getByTestId("citation-opened-path")).toHaveText(
+    "/tmp/demo} final.gif",
+  );
+});
+
 for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
   test(`${fixture} sanitizes SVG before creating a blob URL`, async ({
     page,
@@ -192,6 +249,79 @@ for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
     await expect(image).toBeVisible();
   });
 }
+
+test("artifact-pdf renders paged PDF content under the production CSP", async ({
+  page,
+}) => {
+  await gotoWithProductionCsp(page, "/tests/history-browser.html?artifact-pdf=1");
+
+  const canvas = page.locator(".artifact-pdf-page canvas");
+  await expect(page.locator(".artifact-pdf-controls")).toContainText("1 / 2 页");
+  await expect(canvas).toBeVisible();
+  await expect.poll(() => canvas.evaluate((node) => {
+    const target = node as HTMLCanvasElement;
+    const context = target.getContext("2d");
+    if (!context || target.width === 0 || target.height === 0) return false;
+    const pixel = context.getImageData(
+      Math.floor(target.width / 2),
+      Math.floor(target.height / 2),
+      1,
+      1,
+    ).data;
+    return pixel[2] > pixel[0] && pixel[3] === 255;
+  })).toBe(true);
+  await expect(page.getByRole("button", { name: "下一页" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "下一页" }).click();
+  await expect(page.locator(".artifact-pdf-controls")).toContainText("2 / 2 页");
+  await expect.poll(() => canvas.evaluate((node) => {
+    const target = node as HTMLCanvasElement;
+    const context = target.getContext("2d");
+    if (!context || target.width === 0 || target.height === 0) return false;
+    const pixel = context.getImageData(
+      Math.floor(target.width / 2),
+      Math.floor(target.height / 2),
+      1,
+      1,
+    ).data;
+    return pixel[0] > pixel[2] && pixel[3] === 255;
+  })).toBe(true);
+  await expect(page.locator(".artifact-pdf-stage iframe")).toHaveCount(0);
+  await expect(page.locator(".artifact-pdf-stage .preview-error")).toHaveCount(0);
+});
+
+test("artifact-gif preserves native animation under the production CSP", async ({
+  page,
+}) => {
+  await gotoWithProductionCsp(page, "/tests/history-browser.html?artifact-gif=1");
+  const image = page.getByRole("img", { name: "animation.gif" });
+  await expect(image).toBeVisible();
+  await expect.poll(() => image.evaluate((node) => ({
+    width: (node as HTMLImageElement).naturalWidth,
+    height: (node as HTMLImageElement).naturalHeight,
+  }))).toEqual({ width: 16, height: 16 });
+
+  const frames = new Set<string>();
+  for (let index = 0; index < 8; index += 1) {
+    const screenshot = await image.screenshot({ animations: "allow" });
+    frames.add(createHash("sha256").update(screenshot).digest("hex"));
+    await page.waitForTimeout(70);
+  }
+  expect(frames.size).toBeGreaterThan(1);
+});
+
+test("artifact-invalid-gif reports a decode error instead of a broken image", async ({
+  page,
+}) => {
+  await gotoWithProductionCsp(
+    page,
+    "/tests/history-browser.html?artifact-invalid-gif=1",
+  );
+  await expect(page.locator(".preview-error")).toContainText(
+    "图片无法解码或格式不受支持",
+  );
+  await expect(page.getByRole("img", { name: "animation.gif" })).toHaveCount(0);
+});
 
 test("mobile Markdown source editor fills the available artifact body", async ({
   page,
@@ -533,6 +663,276 @@ test("Codex settings opens the responsive daily usage activity view", async ({
   await busiest.click();
   await expect(dialog.locator(".usage-activity-caption"))
     .toContainText("Token");
+});
+
+test("managed browser panel shares frames and arbitrates user control", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?browser-panel=1");
+
+  const frame = page.getByRole("img", { name: "Example Domain" });
+  await expect(frame).toBeVisible();
+  await expect(page.locator(".browser-control-state"))
+    .toHaveText("共享浏览器");
+  const address = page.getByLabel("浏览器地址");
+  await expect(address).toBeDisabled();
+
+  await page.getByRole("button", { name: "接管" }).click();
+  await expect(page.locator(".browser-control-state"))
+    .toHaveText("你正在浏览");
+  await expect(address).toBeEnabled();
+
+  await page.getByLabel("后退").dispatchEvent("click");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+  await page.getByLabel("前进").dispatchEvent("click");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await address.fill("");
+  await address.pressSequentially("https://openai.com/", { delay: 80 });
+  await expect(address).toHaveValue("https://openai.com/");
+  await address.press("Enter");
+  const commands = page.getByTestId("browser-commands");
+  await expect(commands).toContainText('"action":"navigate"');
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await address.fill("site:openai.com");
+  await address.press("Enter");
+  await expect(commands).toContainText(
+    '"url":"https://www.google.com/search?q=site%3Aopenai.com"',
+  );
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await address.fill("baidu.com");
+  await address.press("Enter");
+  await expect(commands).toContainText('"url":"https://baidu.com/"');
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await address.fill("OpenAI browser documentation");
+  await address.press("Enter");
+  await expect(commands).toContainText(
+    '"url":"https://www.google.com/search?q=OpenAI%20browser%20documentation"',
+  );
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await address.fill("http://127.0.0.1/");
+  await address.press("Enter");
+  await expect(page.getByRole("alert"))
+    .toContainText("目标 URL 被浏览器网络策略拒绝");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await frame.click({ position: { x: 120, y: 100 } });
+  await expect(commands).toContainText('"action":"click"');
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+  await page.keyboard.press("ArrowDown");
+  await expect(commands).toContainText('"action":"press"');
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await page.getByLabel("输入到当前网页").fill("hello from cc-remote");
+  await page.getByLabel("输入文本").click();
+  await expect(commands).toContainText('"action":"type"');
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "交还" }).click();
+  await expect(page.locator(".browser-control-state"))
+    .toHaveText("共享浏览器");
+  await expect(commands).toContainText('"type":"release"');
+  await expect(commands).toContainText('"action":"back"');
+  await expect(commands).toContainText('"action":"forward"');
+});
+
+test("managed browser serializes rapid direct keyboard input", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?browser-panel=1");
+  const frame = page.getByRole("img", { name: "Example Domain" });
+  await expect(frame).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  await frame.click({ position: { x: 120, y: 100 } });
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+
+  await page.keyboard.type("abcdefghij");
+  const commands = page.getByTestId("browser-commands");
+  await expect.poll(() => commands.evaluate((node) => {
+    const rows = JSON.parse(node.textContent || "[]") as Array<{
+      type?: string;
+      action?: string;
+      text?: string;
+    }>;
+    return rows.filter((row) => (
+      row.type === "action" && row.action === "type"
+    )).map((row) => row.text ?? "").join("");
+  })).toBe("abcdefghij");
+});
+
+test("managed browser keeps failed footer text for retry", async ({ page }) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-type-error=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  const input = page.getByLabel("输入到当前网页");
+  await input.fill("keep this retryable text");
+  await page.getByLabel("输入文本").click();
+
+  await expect(page.getByRole("alert")).toContainText("浏览器输入失败");
+  await expect(input).toHaveValue("keep this retryable text");
+});
+
+test("managed browser resumes polling after its surface is rebuilt", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-surface-recreate=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await expect(page.getByLabel("浏览器地址"))
+    .toHaveValue("https://openai.com/recovered");
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+});
+
+test("managed browser ignores a retired frame error after a newer frame", async ({
+  page,
+}) => {
+  test.setTimeout(12_000);
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-frame-error-race=1",
+  );
+  const frame = page.getByRole("img", { name: "Example Domain" });
+  await expect(frame).toBeVisible({ timeout: 7_000 });
+  await page.waitForTimeout(800);
+  await expect(frame).toBeVisible();
+});
+
+test("managed browser panel exposes agent activity and terminal request errors", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-agent=1",
+  );
+  await expect(page.locator(".browser-control-state"))
+    .toHaveText("Codex 正在浏览");
+
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-surface-error=1",
+  );
+  await expect(page.getByText("该会话未启动，无法读取浏览器", { exact: true }))
+    .toBeVisible();
+  await expect(page.getByText("正在连接浏览器…", { exact: false }))
+    .toHaveCount(0);
+});
+
+test("managed browser does not preserve stale Agent ownership from a frame", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-stale-agent-frame=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await expect(page.locator(".browser-control-state"))
+    .toHaveText("共享浏览器");
+});
+
+test("managed browser pulls changed Agent frames without idle JPEG polling", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-agent=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  const commands = page.getByTestId("browser-commands");
+  const frameCount = async () => commands.evaluate((node) => {
+    const rows = JSON.parse(node.textContent || "[]") as Array<{
+      type?: string;
+    }>;
+    return rows.filter((row) => row.type === "frame").length;
+  });
+  const idleFrames = await frameCount();
+  await page.waitForTimeout(1_200);
+  expect(await frameCount()).toBe(idleFrames);
+
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-agent=1&browser-agent-update=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  const beforeUpdate = await frameCount();
+  await expect(page.getByLabel("浏览器地址"))
+    .toHaveValue("https://openai.com/agent-step");
+  await expect.poll(frameCount).toBeGreaterThan(beforeUpdate);
+});
+
+test("managed browser action settles behind a newer status poll", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-action-race=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  const address = page.getByLabel("浏览器地址");
+  await address.fill("http://127.0.0.1/");
+  await address.press("Enter");
+
+  await expect(page.getByRole("alert"))
+    .toContainText("目标 URL 被浏览器网络策略拒绝");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+});
+
+test("managed browser refreshes after an overtaken successful action", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-success-action-race=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  const commands = page.getByTestId("browser-commands");
+  const frameCount = async () => commands.evaluate((node) => {
+    const rows = JSON.parse(node.textContent || "[]") as Array<{
+      type?: string;
+    }>;
+    return rows.filter((row) => row.type === "frame").length;
+  });
+  const beforeAction = await frameCount();
+  const address = page.getByLabel("浏览器地址");
+  await address.fill("openai.com");
+  await address.press("Enter");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+  await expect.poll(frameCount).toBeGreaterThan(beforeAction);
+  await expect(address).toHaveValue("https://openai.com/");
+});
+
+test("managed browser preserves an in-flight action across reconnect", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-reconnect-action=1",
+  );
+  await expect(page.getByRole("img", { name: "Example Domain" })).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  const address = page.getByLabel("浏览器地址");
+  await address.fill("http://127.0.0.1/");
+  await address.press("Enter");
+
+  await expect(page.getByRole("alert"))
+    .toContainText("目标 URL 被浏览器网络策略拒绝");
+  await expect(page.getByLabel("正在执行浏览器操作")).toHaveCount(0);
+});
+
+test("managed browser drops a retired generation frame before replacement", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?browser-panel=1&browser-generation-swap=1",
+  );
+  const frame = page.getByRole("img", { name: "Example Domain" });
+  await expect(frame).toBeVisible();
+  await page.getByRole("button", { name: "接管" }).click();
+  const address = page.getByLabel("浏览器地址");
+  await address.fill("https://openai.com/");
+  await address.press("Enter");
+
+  await expect(frame).toHaveCount(0);
+  await expect(frame).toBeVisible();
 });
 
 test("Claude settings does not expose Codex usage activity", async ({ page }) => {
@@ -5045,8 +5445,13 @@ test("new-chat controls fit the default permission picker on a short phone", asy
     const searchButtons = Array.from(
       sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
     );
+    const descriptions = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".permission-options .cmd-ds"),
+    );
     const live = searchButtons.find((button) => button.textContent === "Live");
-    if (!scroll || optionButtons.length !== 6 || !live) {
+    if (
+      !scroll || optionButtons.length !== 6 || descriptions.length !== 6 || !live
+    ) {
       throw new Error("compact permission controls are incomplete");
     }
     const sheetRect = sheet.getBoundingClientRect();
@@ -5066,6 +5471,12 @@ test("new-chat controls fit the default permission picker on a short phone", asy
       minSearchHeight: Math.min(...searchButtons.map(
         (button) => button.getBoundingClientRect().height,
       )),
+      minDescriptionWidth: Math.min(...descriptions.map(
+        (description) => description.getBoundingClientRect().width,
+      )),
+      minDescriptionHeight: Math.min(...descriptions.map(
+        (description) => description.getBoundingClientRect().height,
+      )),
     };
   });
 
@@ -5078,7 +5489,59 @@ test("new-chat controls fit the default permission picker on a short phone", asy
   expect(layout.liveBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
   expect(layout.minOptionHeight).toBeGreaterThanOrEqual(44);
   expect(layout.minSearchHeight).toBeGreaterThanOrEqual(44);
+  expect(layout.minDescriptionWidth).toBeGreaterThan(1);
+  expect(layout.minDescriptionHeight).toBeGreaterThan(1);
   expect(layout.pageScrollWidth).toBeLessThanOrEqual(layout.viewportWidth);
+});
+
+test("default permission picker stays compact on a tall phone", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 430, height: 852 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.locator(".newchat-access").click();
+  const dialog = page.getByRole("dialog", {
+    name: "权限与执行环境",
+  });
+  await expect(dialog).toBeVisible();
+
+  const layout = await dialog.evaluate((sheet) => {
+    const scroll = sheet.querySelector<HTMLElement>(".sheet-scroll");
+    const options = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".permission-options .cmd"),
+    );
+    const live = Array.from(
+      sheet.querySelectorAll<HTMLElement>(".cmd-search button"),
+    ).find((button) => button.textContent === "Live");
+    if (!scroll || options.length !== 6 || !live) {
+      throw new Error("compact permission controls are incomplete");
+    }
+    return {
+      scrollHeight: scroll.scrollHeight,
+      clientHeight: scroll.clientHeight,
+      liveBottom: live.getBoundingClientRect().bottom,
+      sheetBottom: sheet.getBoundingClientRect().bottom,
+      minOptionHeight: Math.min(...options.map(
+        (button) => button.getBoundingClientRect().height,
+      )),
+    };
+  });
+
+  expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight + 1);
+  expect(layout.liveBottom).toBeLessThanOrEqual(layout.sheetBottom + 1);
+  expect(layout.minOptionHeight).toBeGreaterThanOrEqual(44);
+
+  await page.setViewportSize({ width: 1200, height: 800 });
+  const desktopDescriptions = await dialog.locator(".permission-options .cmd-ds")
+    .evaluateAll((nodes) => nodes.map((node) => {
+      const rect = node.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    }));
+  expect(desktopDescriptions).toHaveLength(6);
+  expect(desktopDescriptions.every(
+    ({ width, height }) => width > 1 && height > 1,
+  )).toBe(true);
 });
 
 test("new-chat controls keep scrolling for many custom permission profiles", async ({

@@ -190,6 +190,7 @@ def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
 
         async def connect(self, **_kwargs):
             self.thread_id = "forked-code"
+            self.thread_started_callback(self.thread_id)
 
         async def disconnect(self):
             return None
@@ -217,6 +218,11 @@ def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
         assert "work_mode" not in handle.init
         assert "codex_home" not in handle.init
         assert fork.space == "code" and fork.work_id is None
+        assert fork.btw_real_id == "forked-code"
+        assert ("primary", "forked-code") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "forked-code") not in (
+            machine._codex_thread_started_hints)
         assert handle.approval == handle.approval_policy == "on-request"
         assert handle.permission_profile == ":read-only"
         assert handle.web_search_override == handle.web_search == "live"
@@ -255,6 +261,7 @@ def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
 
         async def connect(self, **_kwargs):
             self.thread_id = "partial-fork"
+            self.thread_started_callback(self.thread_id)
 
         async def disconnect(self):
             self.disconnected = True
@@ -283,6 +290,10 @@ def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
 
         assert created[-1].disconnected is True
         assert list(machine.sessions) == ["parent-code"]
+        assert ("primary", "partial-fork") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "partial-fork") not in (
+            machine._codex_thread_started_hints)
 
     asyncio.run(run())
 

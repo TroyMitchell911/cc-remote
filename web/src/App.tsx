@@ -109,7 +109,9 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space,
-  type SessionControl, type History, sessionControlLocksInput } from "./protocol";
+  type SessionControl, type History, type BrowserFrame, type BrowserSurface,
+  type ErrorMsg,
+  sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { parseGitDiff } from "./diff";
@@ -241,9 +243,11 @@ import {
 } from "./process-blocks";
 import type { AgentDetail } from "./protocol";
 import type { AgentDetailSelection } from "./components/AgentDetailController";
+import type { RightPanelView } from "./components/PanelTabs";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
+const BROWSER_REQUEST_TOMBSTONE_CAP = 256;
 const MACHINE_KEY = "cc_remote_machine";
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
@@ -253,6 +257,9 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
+const BrowserPanel = lazy(() => import("./components/BrowserPanel").then(
+  ({ BrowserPanel: Panel }) => ({ default: Panel }),
 ));
 const StatusSheet = lazy(() => import("./components/StatusSheet").then(
   ({ StatusSheet: Sheet }) => ({ default: Sheet }),
@@ -321,8 +328,27 @@ export default function App() {
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
-  // right slot is shared by diff + /btw; rightView picks which shows.
-  const [rightView, setRightView] = useState<"diff" | "btw">("diff");
+  // The right slot is shared by artifacts, /btw, and the managed browser.
+  const [rightView, setRightView] = useState<RightPanelView>("diff");
+  const [browserPanelSid, setBrowserPanelSid] = useState<string | null>(null);
+  const browserEventListenerRef = useRef<(
+    (message: BrowserSurface | BrowserFrame | ErrorMsg) => boolean
+  ) | null>(null);
+  const browserRequestIdsRef = useRef(new Set<string>());
+  const setBrowserEventListener = useCallback((listener: (
+    (message: BrowserSurface | BrowserFrame | ErrorMsg) => boolean
+  ) | null) => {
+    browserEventListenerRef.current = listener;
+  }, []);
+  const rememberBrowserRequest = useCallback((requestId: string) => {
+    const requests = browserRequestIdsRef.current;
+    requests.add(requestId);
+    while (requests.size > BROWSER_REQUEST_TOMBSTONE_CAP) {
+      const oldest = requests.values().next().value;
+      if (typeof oldest !== "string") break;
+      requests.delete(oldest);
+    }
+  }, []);
   const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
   const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
   const setAgentDetailListener = useCallback(
@@ -725,7 +751,7 @@ export default function App() {
   const shortcutRef = useRef<{
     artifact: typeof state.artifact;
     btwSid: string | null;
-    rightView: "diff" | "btw";
+    rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
     closeBtw: () => void;
@@ -761,6 +787,8 @@ export default function App() {
     discardedBtwSidsRef.current.clear();
     setBtwOpeningByParentSid({});
     setBtwSendModeBySid({});
+    setBrowserPanelSid(null);
+    browserEventListenerRef.current = null;
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
@@ -926,6 +954,23 @@ export default function App() {
     (session) => session.session_id === focusedSid);
   const archivedBrowse = focusedSession?.tag === "archived";
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const focusedCanBrowse = !!focusedSid
+    && focusedEngine === "codex" && space === "code"
+    && !state.newChat && !archivedBrowse;
+  const btwCanBrowse = !!activeBtwSid
+    && activeBtw?.engine === "codex" && space === "code"
+    && !state.newChat;
+  const artifactBrowserSid = (
+    activeBtwSid && state.artifact?.sid === activeBtwSid
+      ? activeBtwSid : focusedSid
+  );
+  const artifactCanBrowse = (
+    !!activeBtwSid && artifactBrowserSid === activeBtwSid
+  ) ? btwCanBrowse : focusedCanBrowse;
+  const browserShowing = !!browserPanelSid && (
+    (browserPanelSid === focusedSid && focusedCanBrowse)
+    || (browserPanelSid === activeBtwSid && btwCanBrowse)
+  );
   useEffect(() => {
     if (!focusedSid || state.newChat) {
       archivedBrowseRef.current = null;
@@ -1223,7 +1268,8 @@ export default function App() {
         let next = acknowledgeCompletion(
           receipts, parentSid, { main: mainAcknowledgementQueued });
         if (binding
-            && (rightViewRef.current === "btw" || !current.artifact)) {
+            && (rightViewRef.current === "btw"
+              || (!current.artifact && rightViewRef.current !== "browser"))) {
           next = acknowledgeCompletion(
             next, parentSid, { btwSid: binding.sid });
         }
@@ -2402,7 +2448,9 @@ export default function App() {
                 && current.focusedSid === parentSid;
               const btwPanelVisible = isBtw
                 && sameVisibleParent
-                && (rightViewRef.current === "btw" || !current.artifact);
+                && (rightViewRef.current === "btw"
+                  || (!current.artifact
+                    && rightViewRef.current !== "browser"));
               const alreadySeen = isBtw ? btwPanelVisible : sameVisibleParent;
               if (!alreadySeen) {
                 setCompletionReceipts((receipts) => markCompletionUnread(
@@ -3324,6 +3372,28 @@ export default function App() {
             // reducer or another browser's side panel.
             return;
           }
+          if (msg.type === "browser_surface" || msg.type === "browser_frame") {
+            browserRequestIdsRef.current.delete(msg.request_id);
+            browserEventListenerRef.current?.(msg);
+            // Screenshot bytes and user-local lease state never enter the
+            // conversation reducer or IndexedDB cache.
+            return;
+          }
+          if (msg.type === "error") {
+            const handledByBrowser = browserEventListenerRef.current?.(msg)
+              ?? false;
+            const wasBrowserRequest = typeof msg.request_id === "string"
+              && browserRequestIdsRef.current.delete(msg.request_id);
+            if (
+              msg.code !== "wrapper_offline"
+              && (handledByBrowser || wasBrowserRequest)
+            ) {
+              // A requester-scoped browser failure completes the panel request.
+              // Keep a bounded request tombstone so a response arriving after
+              // panel teardown cannot become an unrelated chat banner.
+              return;
+            }
+          }
           if (msg.type === "session_list" && normalizedListedSessions) {
             dispatch({ type: "event", event: {
               ...msg, sessions: normalizedListedSessions,
@@ -3505,6 +3575,8 @@ export default function App() {
           void historyPageCacheRef.current.clear();
           setBtwOpeningByParentSid({});
           setBtwSendModeBySid({});
+          setBrowserPanelSid(null);
+          browserEventListenerRef.current = null;
           btwDraftsRef.current.clear();
           setForkingPointId(null);
           setForkWorktreeSession(null);
@@ -3536,6 +3608,8 @@ export default function App() {
           if (!acceptsLifecycle()) return;
           setAgentPanel(null);
           agentDetailListenerRef.current = null;
+          setBrowserPanelSid(null);
+          browserEventListenerRef.current = null;
           clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
@@ -4822,6 +4896,16 @@ export default function App() {
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid, requestId });
   };
+  const openBrowser = (targetSid: string | null = focusedSid) => {
+    const validTarget = (
+      targetSid === focusedSid && focusedCanBrowse
+    ) || (
+      targetSid === activeBtwSid && btwCanBrowse
+    );
+    if (!targetSid || !validTarget || !confirmArtifactDiscard()) return;
+    setBrowserPanelSid(targetSid);
+    setRightView("browser");
+  };
   const openTurnDiff = (files: string[], diff: string) => {
     if (!diff || !confirmArtifactDiscard()) return;
     setRightView("diff");
@@ -5049,11 +5133,24 @@ export default function App() {
     }
   };
   // Header tab switch between the two right-slot views (opening the target lazily).
-  const switchRight = (v: "diff" | "btw") => {
+  const closeBrowser = () => {
+    setBrowserPanelSid(null);
+    setRightView(state.artifact ? "diff" : activeBtw ? "btw" : "diff");
+  };
+  const switchRight = (v: RightPanelView) => {
     if (v === "diff") {
       setRightView("diff");
       if (!state.artifact) getDiff("");
-    } else openBtw();
+    } else if (v === "btw") {
+      openBtw();
+    } else {
+      if (rightView === "browser" && browserShowing) return;
+      openBrowser(
+        rightView === "btw" && btwCanBrowse
+          ? activeBtwSid
+          : rightView === "diff" ? artifactBrowserSid : focusedSid,
+      );
+    }
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
@@ -5097,6 +5194,8 @@ export default function App() {
       setForkWorktreeCreating(false);
       setForkWorktreeError(null);
       setBtwOpeningByParentSid({});
+      setBrowserPanelSid(null);
+      browserEventListenerRef.current = null;
       setCompletionReceipts({});
       dispatch({ type: "reset" });
       setRestoringSurfaceScope(null);
@@ -5155,7 +5254,7 @@ export default function App() {
     ? activeTurnCandidates : [];
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening || agentPanel) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening || agentPanel || browserShowing) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         engine={engine}
@@ -5554,6 +5653,7 @@ export default function App() {
           })}
           onContext={requestContext}
           onOpenBtw={openBtw}
+          onBrowser={openBrowser}
           onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
           onGoal={runGoal}
@@ -5625,13 +5725,33 @@ export default function App() {
           </Suspense>;
         }
         const btwShowing = !!activeBtw || btwOpening;
-        const view = rightView === "btw" && btwShowing ? "btw"
-          : state.artifact ? "diff" : btwShowing ? "btw" : null;
+        const view = rightView === "browser" && browserShowing ? "browser"
+          : rightView === "btw" && btwShowing ? "btw"
+            : rightView === "diff" && state.artifact ? "diff"
+              : browserShowing ? "browser"
+                : state.artifact ? "diff" : btwShowing ? "btw" : null;
+        if (view === "browser" && focusedSid)
+          return <Suspense fallback={
+            <div className="browser-panel empty" role="status">
+              <div className="spinner" aria-hidden="true" />
+              <p className="loading-tx">加载浏览器…</p>
+            </div>
+          }>
+            <BrowserPanel key={browserPanelSid} sid={browserPanelSid ?? focusedSid}
+              ws={wsRef.current}
+              online={state.connState === "connected" && state.wrapperOnline}
+              active="browser" hasArtifact={!!state.artifact}
+              hasBtw={btwShowing} onTab={switchRight}
+              onListen={setBrowserEventListener}
+              onRequest={rememberBrowserRequest} onClose={closeBrowser} />
+          </Suspense>;
         if (view === "btw")
           return <Suspense fallback={null}>
             <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
             engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
-            active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
+            active="btw" hasArtifact={!!state.artifact}
+            hasBrowser={btwCanBrowse} artifactKind={state.artifact?.kind}
+            onTab={switchRight}
             catalog={focusedCatalog}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
             sendMode={activeBtwSendMode}
@@ -5684,7 +5804,8 @@ export default function App() {
               <p className="loading-tx">加载预览…</p>
             </div>
           }>
-            <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
+            <ArtifactPanel artifact={state.artifact} active="diff"
+              hasBtw={!!activeBtw} hasBrowser={artifactCanBrowse}
               theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}

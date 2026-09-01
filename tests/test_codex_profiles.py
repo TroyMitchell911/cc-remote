@@ -118,6 +118,110 @@ def test_cli_thread_catalog_hint_dedupe_is_profile_scoped(tmp_path: Path) -> Non
     asyncio.run(run())
 
 
+def test_private_btw_thread_never_becomes_a_catalog_hint(
+    tmp_path: Path,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    btw = _context("btw-private", "private-native", "primary")
+    btw.btw = True
+
+    machine._on_codex_thread_started_hint(btw, "private-native")
+
+    assert machine._codex_thread_started_hints == {}
+    assert machine._codex_catalog_hint_tasks == set()
+
+
+def test_native_catalog_filters_exact_private_btw_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        machine, _transport = _machine(tmp_path)
+        btw = _context("btw-private", "private-native", "primary")
+        btw.btw = True
+        machine._register_private_codex_btw_thread(btw, "private-native")
+
+        async def list_rows(_limit, *, codex_home=None):
+            profile_id = Path(codex_home).name
+            if profile_id != "primary":
+                return []
+            return [
+                {
+                    "session_id": "private-native",
+                    "summary": None,
+                    "first_prompt": None,
+                    "cwd": "/repo/private",
+                    "last_modified": "20",
+                    "git_branch": None,
+                    "forked_from_id": None,
+                    "status": None,
+                    "tag": None,
+                },
+                {
+                    "session_id": "ordinary-native",
+                    "summary": "Ordinary",
+                    "first_prompt": "Ordinary",
+                    "cwd": "/repo/ordinary",
+                    "last_modified": "10",
+                    "git_branch": None,
+                    "forked_from_id": None,
+                    "status": None,
+                    "tag": None,
+                },
+            ]
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", list_rows)
+        rows = await machine._read_all_codex_profile_sessions()
+
+        assert [row["session_id"] for row in rows] == [
+            "primary@ordinary-native",
+        ]
+        assert btw.btw_real_id == "private-native"
+
+    asyncio.run(run())
+
+
+def test_inflight_catalog_send_cannot_publish_newly_private_btw(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        machine, transport = _machine(tmp_path)
+        btw = _context("btw-private", "private-native", "primary")
+        btw.btw = True
+        raw = [{
+            "session_id": "primary@private-native",
+            "native_session_id": "private-native",
+            "summary": "新会话",
+            "first_prompt": None,
+            "cwd": "/repo/private",
+            "last_modified": "20",
+            "git_branch": None,
+            "forked_from_id": None,
+            "status": "idle",
+            "tag": None,
+            "codex_profile_id": "primary",
+            "codex_profile_label": "主账号",
+        }]
+
+        async def register_while_claiming(_rows):
+            machine._register_private_codex_btw_thread(
+                btw, "private-native")
+
+        machine._claim_legacy_presentation_from_codex_catalog = (
+            register_while_claiming)
+        event = await machine._send_codex_session_list(
+            SimpleNamespace(
+                space="code", client_id="client-1", cmd_id="list-1"),
+            raw,
+        )
+
+        assert isinstance(event, SessionList)
+        assert event.sessions == []
+        assert transport.sent[-1] is event
+        assert "primary@private-native" not in machine._codex_sidebar_watches
+
+    asyncio.run(run())
+
+
 def test_cli_thread_catalog_hint_survives_placeholder_ttl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

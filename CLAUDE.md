@@ -40,11 +40,13 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
   Text deltas still stream live via `StreamEvent`.
-- **Claude only — don't set `setting_sources=[]`**: we WANT `~/.claude/settings.json` loaded so
-  `claude` inherits the model link (`ANTHROPIC_BASE_URL`), model id, and
-  `bypassPermissions`. Note: settings.json's `env` block overrides the process
-  env, so redirecting the model backend from cc-remote is not possible — it's
-  the user's `settings.json` that decides.
+- **Claude only — don't set `setting_sources=[]` for Code**: single-account Code
+  intentionally loads the user's native settings. Explicit multi-account
+  profiles keep their own `CLAUDE_CONFIG_DIR` and load only the selected user
+  settings source. Project/local settings cannot replace the selected model
+  link, and the complete user file is never promoted through `--settings`.
+  Single-account Code retains Claude's normal source precedence. Work remains
+  isolated with one wrapper-owned settings policy and `setting_sources=[]`.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -66,7 +68,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v44 is declared by
+- **Protocol version gate**: current wire protocol v46 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -77,6 +79,16 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   is scoped by `machine_id`; a credential for one enrolled device must never be
   accepted for another. Keep `cc_remote/device.py`, `relay/devices.py`, relay
   routing, and the Web device selector aligned when this contract changes.
+- **Managed-browser SSRF/account boundary**: Playwright routing is only a
+  defense-in-depth URL check. Chromium must keep using the authenticated loopback proxy in
+  `wrapper/browser_proxy.py`, which resolves, vets, and connects to the same
+  numeric IP; never replace it with a boolean hostname allow-cache or restore
+  Chrome's implicit loopback bypass. Each Codex profile owns a separately
+  derived persistent Chrome directory. Browser pages, cookies, control leases,
+  screenshots, and dynamic-tool callbacks must never cross profile/thread keys.
+  Shared-daemon `item/tool/call` requests are multicast: answer only an exact
+  namespace/tool declared by this handle, and stay silent for another client's
+  dynamic tools so an unrelated subscriber cannot win the response race.
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
@@ -245,6 +257,8 @@ Codex:
   `thread/rollback` prunes conversation only and leaves the filesystem to us.
 - `codex_provider_repair.py` — repair process-local HTTP provider aliases left in
   durable thread state by the oversized-resume compatibility path.
+- `browser.py` / `browser_proxy.py` — optional account-isolated managed Chrome,
+  bounded per-thread surfaces, and the pinned-IP loopback network boundary.
 
 ### Local Claude PTY broker (`cc_remote/claude_broker/`)
 Same-user Unix socket server holding persistent official `claude` PTYs, driven

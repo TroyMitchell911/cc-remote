@@ -8,7 +8,7 @@ import type {
   PreviewAuthorizationState,
 } from "../reducer";
 import { Icon } from "../icons";
-import { PanelTabs } from "./PanelTabs";
+import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
@@ -27,6 +27,7 @@ import {
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { PanelResizer } from "./PanelResizer";
+import { PdfArtifactPreview } from "./PdfArtifactPreview";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -192,14 +193,14 @@ function HtmlArtifactPreview({ content, theme }: {
   </div>;
 }
 
-function BinaryArtifactPreview({ data, mediaType, kind, title }: {
+function ImageArtifactPreview({ data, mediaType, title }: {
   data?: string;
   mediaType?: string;
-  kind: "image" | "pdf";
   title: string;
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [decodeError, setDecodeError] = useState<string | null>(null);
   const svg = useSanitizedSvgUrl(data, mediaType);
 
   useEffect(() => {
@@ -231,12 +232,12 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
 
   const resolvedUrl = mediaType === "image/svg+xml" ? svg.url : objectUrl;
   const resolvedError = mediaType === "image/svg+xml" ? svg.error : error;
-  if (resolvedError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError}</div>;
+  useEffect(() => setDecodeError(null), [resolvedUrl]);
+  if (resolvedError || decodeError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError || decodeError}</div>;
   if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
-  if (kind === "image") {
-    return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
-  }
-  return <iframe className="artifact-pdf-preview" src={resolvedUrl} title={`${title} PDF 预览`} />;
+  return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title}
+    onLoad={() => setDecodeError(null)}
+    onError={() => setDecodeError("图片无法解码或格式不受支持")} /></div>;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
@@ -351,13 +352,14 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
   return <span className="preview-image-loading"><span className="thinking"><span/><span/><span/></span> {alt || "正在加载图片"}</span>;
 }
 
-export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
+export function ArtifactPanel({ artifact, active, hasBtw, hasBrowser, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
   onSaveMarkdown, onDirtyChange, theme }: {
   artifact: Artifact;
-  active: "diff" | "btw";
+  active: RightPanelView;
   hasBtw: boolean;
-  onTab: (v: "diff" | "btw") => void;
+  hasBrowser?: boolean;
+  onTab: (v: RightPanelView) => void;
   onClose: () => void;
   onRefresh?: (path: string, line?: number) => void;
   onOpenFile?: (path: string, line?: number) => void;
@@ -477,7 +479,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     onClose();
   }, [confirmDiscard, onClose, onDirtyChange]);
 
-  const switchPanelTab = useCallback((next: "diff" | "btw") => {
+  const switchPanelTab = useCallback((next: RightPanelView) => {
     if (next !== active && !confirmDiscard()) return;
     if (next !== active) onDirtyChange?.(false);
     onTab(next);
@@ -570,7 +572,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
       onKeyDown={handlePanelKeyDown}>
       <PanelResizer ariaLabel="调整文件面板宽度" />
       <div className="artifact-head">
-        {hasBtw ? <PanelTabs active={active} artifactKind={artifact.kind} onTab={switchPanelTab} />
+        {(hasBtw || hasBrowser) ? <PanelTabs active={active}
+            artifactKind={artifact.kind} hasArtifact hasBtw={hasBtw}
+            hasBrowser={hasBrowser} onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
         {["md", "html"].includes(artifact.kind) && !loading && !artifact.error && <div
@@ -665,11 +669,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
             ? <SourceFile content={artifact.content || ""} artifactKey={artifactKey} />
             : <HtmlArtifactPreview content={artifact.content || ""} theme={theme} />
         ) : artifact.kind === "image" ? (
-          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="image" title={title} />
+          <ImageArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
+            title={title} />
         ) : artifact.kind === "pdf" ? (
-          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="pdf" title={title} />
+          <PdfArtifactPreview data={artifact.data} title={title} />
         ) : artifact.kind === "file" ? (
           <>
             {artifact.truncated && <div className="preview-truncated">文件共 {artifact.size?.toLocaleString()} 字节，仅预览前 512 KiB。</div>}

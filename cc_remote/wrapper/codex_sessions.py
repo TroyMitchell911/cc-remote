@@ -119,9 +119,9 @@ async def list_codex_sessions(
     for archived in (False, True):
         cursor: Optional[str] = None
         seen_cursors: set[str] = set()
-        received = 0
+        accepted_ids: set[str] = set()
         for _ in range(_LIST_MAX_PAGES):
-            remaining = per_state_limit - received
+            remaining = per_state_limit - len(accepted_ids)
             if remaining <= 0:
                 break
             params: dict[str, Any] = {
@@ -146,11 +146,11 @@ async def list_codex_sessions(
             if not isinstance(response, dict) or not isinstance(response.get("data"), list):
                 raise RuntimeError("codex thread/list returned an invalid response")
             page = response["data"][:remaining]
-            received += len(page)
             for thread in page:
                 normalized = _normalize_thread(thread, archived=archived)
                 if normalized is not None:
                     by_id[normalized["session_id"]] = normalized
+                    accepted_ids.add(normalized["session_id"])
 
             next_cursor = response.get("nextCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
@@ -168,6 +168,11 @@ async def list_codex_sessions(
 
 def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]]:
     if not isinstance(thread, dict):
+        return None
+    # Ephemeral threads are native scratch state (including cc-remote /btw and
+    # Codex subagent work), not resumable user sessions. Never project them into
+    # the public catalog even if a shared app-server briefly lists them.
+    if thread.get("ephemeral") is True:
         return None
     session_id = thread.get("id")
     if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):

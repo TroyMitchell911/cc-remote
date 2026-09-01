@@ -4,6 +4,18 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v46，托管浏览器的前进/后退
+  改用原生历史导航。Web 画面会跨 renderer 重建持续探测，突发输入按顺序发送而不再
+  吞键，操作被拒绝时保留可重试文本，并忽略属于旧请求的迟到画面错误。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v45，并新增可选的 Codex
+  Code 托管浏览器。新 Code thread 可通过 app-server 官方实验性 `dynamicTools`
+  获得浏览器工具；用户可用 `/browser` 打开只回给请求端的 JPEG 画面，并通过有界
+  租约接管或交还控制。浏览器 Profile 按 Codex 账号隔离，截图不进入重放缓冲；
+  每次运行随机认证的本地策略代理会把获准域名钉到已审查的公网 IP，DNS 重绑定不能绕过默认私网拒绝。
+  画面请求会合并，空闲或被淘汰的页面会回收。共享面板现在与桌面浏览器交互对齐：
+  Omnibox 可接受完整 URL、裸域名或 Google 搜索，标签与控制栏明确区分 Codex、当前用户
+  和其他设备；Web 只在 Agent 推进权威画面 revision 或用户操作需要结果时拉取新 JPEG。
+  Codex Work 不开放此能力。升级前已经创建的 thread 仍可手工浏览，但要让 Agent 使用浏览器必须新建 thread。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v44，并新增 Claude 多账号
   Profile。每个用户自定义 Profile 独占一个明确的 `CLAUDE_CONFIG_DIR`；Code、Work、
   定时任务、模型、Skills、扩展、历史、外部进程归属和 fork 都保持账号绑定。空配置

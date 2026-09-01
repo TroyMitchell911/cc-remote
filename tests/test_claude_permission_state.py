@@ -708,6 +708,47 @@ def test_claude_new_session_defaults_use_settings_without_sdk_probe(
     asyncio.run(go())
 
 
+def test_claude_multi_profile_default_ignores_project_and_ambient_models(
+    monkeypatch,
+    tmp_path,
+):
+    profile = tmp_path / "profile"
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / ".claude").mkdir()
+    profile.mkdir()
+    profile_settings = profile / "settings.json"
+    project_settings = project / ".claude" / "settings.json"
+    local_settings = project / ".claude" / "settings.local.json"
+    profile_settings.write_text(
+        '{"model":"profile-model"}', encoding="utf-8")
+    project_settings.write_text(
+        '{"model":"project-model"}', encoding="utf-8")
+    local_settings.write_text(
+        '{"env":{"ANTHROPIC_MODEL":"local-env-model"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ANTHROPIC_MODEL", "ambient-model")
+    monkeypatch.setattr(
+        machine_module.WrapperMachine,
+        "_claude_managed_settings_paths",
+        staticmethod(lambda: []),
+    )
+
+    assert machine_module.WrapperMachine._claude_configured_model(
+        str(project),
+        config_dir=str(profile),
+        isolate_account_env=True,
+    ) == "profile-model"
+
+    profile_settings.write_text("{}", encoding="utf-8")
+    assert machine_module.WrapperMachine._claude_configured_model(
+        str(project),
+        config_dir=str(profile),
+        isolate_account_env=True,
+    ) is None
+
+
 def test_fresh_claude_spawn_applies_the_resolved_default_model(
     monkeypatch,
     tmp_path,

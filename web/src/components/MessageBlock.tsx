@@ -40,8 +40,28 @@ type MessagePart =
 
 const CODEX_VISUALIZATION_PREFIX = "visualize";
 const CODEX_VISUALIZATION_SUFFIX = "";
+const CODEX_FILE_CITATION_PREFIX = ":codex-file-citation{";
 const MAX_VISUALIZATION_PATH_CHARS = 4096;
 const MAX_VISUALIZATION_TITLE_CHARS = 240;
+
+type FileCitationSupport = typeof import("../codex-file-citation");
+let fileCitationSupport: FileCitationSupport | null = null;
+
+function useFileCitationSupport(source: string): FileCitationSupport | null {
+  const [support, setSupport] = useState<FileCitationSupport | null>(
+    () => fileCitationSupport,
+  );
+  useEffect(() => {
+    if (support || !source.includes(CODEX_FILE_CITATION_PREFIX)) return;
+    let mounted = true;
+    void import("../codex-file-citation").then((loaded) => {
+      fileCitationSupport = loaded;
+      if (mounted) setSupport(loaded);
+    }, () => {});
+    return () => { mounted = false; };
+  }, [source, support]);
+  return support;
+}
 
 function parseCodexVisualization(line: string): MessagePart | null {
   const value = line.trim();
@@ -639,6 +659,11 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
     onPreviewImage,
   ]);
   const math = useMarkdownMathPlugins(shown, true);
+  const fileCitations = useFileCitationSupport(shown);
+  const remarkPlugins = useMemo(() => [
+    ...(math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS),
+    ...(fileCitations ? [fileCitations.remarkCodexFileCitations] : []),
+  ], [fileCitations, math.plugins?.remarkPlugins]);
   const parts = useMemo(
     () => splitCodexRichContent(math.normalizedSource),
     [math.normalizedSource],
@@ -650,8 +675,7 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
       <div className="prose">
         {parts.map((part, index) => {
           if (part.kind === "markdown") return <ReactMarkdown key={`markdown-${index}`}
-              remarkPlugins={
-                math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+              remarkPlugins={remarkPlugins}
               rehypePlugins={math.plugins?.rehypePlugins}
               components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>;
           if (part.kind === "visualization") return <CodexVisualizationCard

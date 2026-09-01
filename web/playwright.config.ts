@@ -3,9 +3,9 @@ import { defineConfig, devices } from "@playwright/test";
 const NEW_CHAT_CONTROL_TESTS =
   /new-chat controls|256-character profile id|Work multi-account controls/;
 const WEBKIT_LIVE_INTERACTION_TESTS =
-  /live append follows|returning to a background-grown live turn|iOS pointercancel releases process interactions|multi-line IME growth|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
+  /live append follows|returning to a background-grown live turn|iOS pointercancel releases process interactions|multi-line IME growth|long paste|oversized edited paste|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =
-  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image|profile keycaps|profile session card edges/;
+  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg|pdf|gif|invalid-gif)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|managed browser panel|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image|profile keycaps|profile session card edges/;
 const WEBKIT_GOAL_PLAN_TESTS = /[Pp]lan|[Gg]oal/;
 
 export default defineConfig({

@@ -17,6 +17,7 @@ from cc_remote.claude_profiles import (
     ClaudeProfileTopologyTransition,
     ClaudeProfileTopologyStore,
 )
+from cc_remote import config as config_module
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     ClaudeProfileInfo,
@@ -296,6 +297,43 @@ def test_profile_file_is_separate_and_inline_configuration_wins(
     })
     monkeypatch.setenv("CC_REMOTE_CLAUDE_PROFILES_JSON", inline)
     assert WrapperConfig().claude_profiles_json == inline
+
+
+def test_macos_default_profile_file_survives_an_older_launchagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_file = tmp_path / ".cc-remote" / "claude-profiles.json"
+    profile_file.parent.mkdir()
+    payload = _profiles(tmp_path / "personal", tmp_path / "company")
+    profile_file.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(config_module.sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "XPC_SERVICE_NAME", "com.mugglepro.cc-remote-wrapper")
+    monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_JSON", raising=False)
+    monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_FILE", raising=False)
+
+    assert WrapperConfig().claude_profiles_json == payload
+
+
+def test_unrelated_process_does_not_implicitly_enable_claude_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_file = tmp_path / ".cc-remote" / "claude-profiles.json"
+    profile_file.parent.mkdir()
+    profile_file.write_text(
+        _profiles(tmp_path / "personal", tmp_path / "company"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module.sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.example.unrelated")
+    monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_JSON", raising=False)
+    monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_FILE", raising=False)
+
+    assert WrapperConfig().claude_profiles_json == ""
 
 
 def test_initial_topology_requires_the_effective_legacy_account_once(

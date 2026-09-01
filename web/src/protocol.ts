@@ -26,6 +26,8 @@ export type CodexServiceTier = "default" | "fast";
 export type CodexWebSearchMode = "cached" | "live";
 export type NoticeSeverity = "info" | "warning";
 export type NoticeCategory = "runtime" | "guardian" | "config" | "deprecation" | "security" | "rate_limit";
+export type BrowserControlMode = "none" | "agent" | "user";
+export type BrowserActionName = "navigate" | "back" | "forward" | "click" | "type" | "press" | "scroll" | "wait" | "resize";
 
 interface Base {
   v: number;
@@ -518,6 +520,65 @@ export interface ClearGoal extends Base { type: "clear_goal" }
 export interface DismissGoal extends Base { type: "dismiss_goal"; goal_id: string }
 export interface AcknowledgeCompletion extends Base { type: "acknowledge_completion"; completion_id: string }
 export interface GetStatus extends Base { type: "get_status" }
+export interface GetBrowserSurface extends Base { type: "get_browser_surface"; sid: string; request_id: string; cmd_id: string; client_id: string; create?: boolean }
+export interface GetBrowserFrame extends Base { type: "get_browser_frame"; sid: string; request_id: string; cmd_id: string; client_id: string; generation?: string | null }
+export interface AcquireBrowserControl extends Base { type: "acquire_browser_control"; sid: string; request_id: string; cmd_id: string; client_id: string }
+export interface ReleaseBrowserControl extends Base { type: "release_browser_control"; sid: string; request_id: string; cmd_id: string; client_id: string }
+export interface BrowserAction extends Base {
+  type: "browser_action";
+  sid: string;
+  request_id: string;
+  cmd_id: string;
+  client_id: string;
+  generation: string;
+  action: BrowserActionName;
+  url?: string | null;
+  x?: number | null;
+  y?: number | null;
+  button?: "left" | "middle" | "right" | null;
+  text?: string | null;
+  key?: string | null;
+  delta_x?: number | null;
+  delta_y?: number | null;
+  ms?: number | null;
+  width?: number | null;
+  height?: number | null;
+}
+export interface BrowserSurface extends Base {
+  type: "browser_surface";
+  to: string;
+  request_id: string;
+  available: boolean;
+  enabled: boolean;
+  surface_id?: string | null;
+  generation?: string | null;
+  frame_revision: number;
+  width: number;
+  height: number;
+  url: string;
+  title: string;
+  control_mode: BrowserControlMode;
+  controlled_by_me: boolean;
+  agent_available: boolean;
+  error?: string | null;
+}
+export interface BrowserFrame extends Base {
+  type: "browser_frame";
+  to: string;
+  request_id: string;
+  surface_id?: string | null;
+  generation?: string | null;
+  frame_revision: number;
+  width: number;
+  height: number;
+  url: string;
+  title: string;
+  control_mode: BrowserControlMode;
+  controlled_by_me: boolean;
+  media_type?: "image/jpeg" | null;
+  data?: string | null;
+  error?: string | null;
+}
 export interface ThreadGoal {
   threadId: string;
   objective: string;
@@ -641,14 +702,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | BrowserSurface | BrowserFrame | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 44;
+export const PROTOCOL_VERSION = 46;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

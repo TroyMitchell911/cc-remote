@@ -124,6 +124,76 @@ def test_codex_rpc_initializes_sends_exact_shape_and_reaps(monkeypatch, tmp_path
     asyncio.run(run())
 
 
+def test_ephemeral_codex_thread_is_not_a_resumable_catalog_row():
+    assert codex_sessions_module.codex_thread_catalog_row({
+        "id": "private-btw",
+        "ephemeral": True,
+        "cwd": "/repo",
+        "updatedAt": 20,
+        "status": {"type": "idle"},
+    }) is None
+
+
+def test_ephemeral_codex_pages_do_not_consume_the_public_catalog_limit(
+    monkeypatch,
+):
+    async def run():
+        calls = []
+        pages = {
+            (False, None): {
+                "data": [
+                    {
+                        "id": "private-btw-1", "ephemeral": True,
+                        "updatedAt": 40,
+                    },
+                    {
+                        "id": "private-btw-2", "ephemeral": True,
+                        "updatedAt": 30,
+                    },
+                ],
+                "nextCursor": "public-page",
+            },
+            (False, "public-page"): {
+                "data": [
+                    {
+                        "id": "ordinary-1", "ephemeral": False,
+                        "updatedAt": 20,
+                    },
+                    {
+                        "id": "ordinary-2", "ephemeral": False,
+                        "updatedAt": 10,
+                    },
+                ],
+                "nextCursor": None,
+            },
+            (True, None): {"data": [], "nextCursor": None},
+        }
+
+        async def rpc(method, params, **_kwargs):
+            calls.append((method, params.copy()))
+            return pages[(params["archived"], params.get("cursor"))]
+
+        monkeypatch.setattr(codex_sessions_module, "codex_rpc", rpc)
+        monkeypatch.setattr(
+            codex_sessions_module, "codex_current_provider", lambda: "")
+
+        rows = await codex_sessions_module.list_codex_sessions(limit=2)
+
+        assert [row["session_id"] for row in rows] == [
+            "ordinary-1", "ordinary-2",
+        ]
+        assert [
+            (params["archived"], params.get("cursor"), params["limit"])
+            for _method, params in calls
+        ] == [
+            (False, None, 2),
+            (False, "public-page", 2),
+            (True, None, 2),
+        ]
+
+    asyncio.run(run())
+
+
 def test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit(
     monkeypatch,
     tmp_path,

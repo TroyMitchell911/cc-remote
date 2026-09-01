@@ -119,7 +119,8 @@ from cc_remote.protocol import (
     AutoCompact, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
-    RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
+    RateLimitUpdate, BrowserSurface, BrowserFrame, DiffReport, FilePreview,
+    FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, CodexTerminalFence, History, TurnDetail, AgentDetail,
     HistoryImage,
@@ -144,6 +145,14 @@ from cc_remote.protocol import (
     ERR_QUEUE_FULL,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.browser import (
+    BROWSER_NAMESPACE,
+    BrowserActionError,
+    BrowserController,
+    BrowserSurfaceData,
+    BrowserUnavailable,
+    browser_dynamic_tools,
+)
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
 from cc_remote.wrapper.session_plans import (
     SessionPlanStore,
@@ -1836,6 +1845,10 @@ class WrapperMachine:
     CODEX_LIVE_USER_ITEM_IDS = 512
     CODEX_PUBLISHED_STEER_IDS = 512
     CODEX_THREAD_STARTED_HINTS = 1024
+    # Codex BTW forks are app-server-ephemeral but can briefly leak through
+    # thread/started and thread/list. Keep a bounded process-local tombstone so
+    # cached or delayed native rows never become ordinary sidebar sessions.
+    CODEX_PRIVATE_BTW_THREADS = 1024
     CODEX_THREAD_STARTED_HINT_TTL_SECONDS = 30.0
     CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS = 10.0
     CODEX_EXACT_CATALOG_RPC_BATCH_IDS = 128
@@ -1890,6 +1903,7 @@ class WrapperMachine:
         "get_history_image",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
+        "get_browser_surface", "get_browser_frame",
         "get_preview_asset", "get_goal", "dismiss_goal",
         "acknowledge_completion",
         "get_queued_query", "list_dir",
@@ -1906,6 +1920,8 @@ class WrapperMachine:
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
+        "get_browser_surface", "get_browser_frame", "acquire_browser_control",
+        "release_browser_control", "browser_action",
         "get_preview_asset", "authorize_preview",
         "answer_question", "get_goal", "set_goal", "clear_goal",
         "dismiss_goal", "acknowledge_completion",
@@ -2004,6 +2020,15 @@ class WrapperMachine:
                 "Codex profile topology could not be loaded",
                 error_type=type(exc).__name__,
             )
+        default_browser = BrowserController(
+            cfg, profile_id=str(self._codex_profiles.default.home))
+        default_browser.require_available()
+        self._browsers: dict[str, BrowserController] = {
+            self._codex_profiles.default.id: default_browser,
+        }
+        self._browser_frame_requests = 0
+        # Compatibility alias for single-profile embedders and existing tests.
+        self._browser = default_browser
         self._codex_daemons = {
             profile.id: CodexDaemonManager(
                 getattr(cfg, "codex_daemon_mode", "auto"),
@@ -2226,6 +2251,9 @@ class WrapperMachine:
         # becomes a browser refresh, and keep both the key set and tasks bounded.
         self._codex_thread_started_hints: OrderedDict[
             tuple[str, str], float
+        ] = OrderedDict()
+        self._private_codex_btw_threads: OrderedDict[
+            tuple[str, str], None
         ] = OrderedDict()
         self._codex_catalog_hint_tasks: set[asyncio.Task] = set()
         self._codex_catalog_hint_dirty = False
@@ -8171,6 +8199,15 @@ class WrapperMachine:
                 if cmd.type == "get_status":
                     self._start_status_command(cmd)
                     continue
+                if cmd.type in {"get_browser_surface", "get_browser_frame"}:
+                    self._start_status_command(cmd)
+                    continue
+                if cmd.type in {
+                    "acquire_browser_control", "release_browser_control",
+                    "browser_action",
+                }:
+                    self._start_interactive_control_command(cmd)
+                    continue
                 if cmd.type in {
                     "get_engine_capabilities", "manage_engine_plugin",
                     "manage_engine_skill", "manage_engine_hook",
@@ -8345,6 +8382,16 @@ class WrapperMachine:
                         forget=disconnected,
                         claude_profile_id=c.claude_profile_id,
                     )
+            browsers = list({
+                id(browser): browser
+                for browser in self._browsers.values()
+            }.values())
+            if not isinstance(self._browser, BrowserController):
+                browsers.append(self._browser)
+            await asyncio.gather(
+                *(browser.close() for browser in browsers),
+                return_exceptions=True,
+            )
             terminal_tasks = list(self._codex_terminal_persist_tasks)
             # Stop every producer first, then give the remaining small fsyncs a
             # chance to finish. Draining earlier could miss a terminal emitted
@@ -8569,11 +8616,12 @@ class WrapperMachine:
                 retryable=retryable,
             )
             if ctx is not None and not ctx.session_id:
+                self.sessions.pop(ctx.key, None)
+                await self._close_codex_browser_ctx_surface(ctx)
                 try:
                     await ctx.sdk.disconnect()
                 except Exception:
                     pass
-                self.sessions.pop(ctx.key, None)
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
             if record is not None and record.session_id is None:
@@ -8718,6 +8766,7 @@ class WrapperMachine:
             # leave the resident slot available until the user focuses it.
             self.sessions.pop(ctx.key, None)
             self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+            await self._close_codex_browser_ctx_surface(ctx)
             try:
                 await ctx.sdk.disconnect()
             except Exception as exc:
@@ -17124,11 +17173,12 @@ class WrapperMachine:
             (Path(config_dir) if config_dir is not None else claude_config_dir())
             / "settings.json"
         )
-        ordinary_paths = [
-            user_settings,
-            os.path.join(root, ".claude", "settings.json"),
-            os.path.join(root, ".claude", "settings.local.json"),
-        ]
+        ordinary_paths = [user_settings]
+        if not isolate_account_env:
+            ordinary_paths.extend([
+                os.path.join(root, ".claude", "settings.json"),
+                os.path.join(root, ".claude", "settings.local.json"),
+            ])
 
         def explicit_model(value) -> tuple[bool, Optional[str]]:
             if not isinstance(value, str):
@@ -17176,8 +17226,11 @@ class WrapperMachine:
                 managed_env_model_set = True
                 managed_env_model = candidate
 
-        # Managed policy cannot be overridden. Claude then applies an `env`
-        # value from settings over the process environment inherited at launch;
+        # Managed policy cannot be overridden. Explicit multi-account sessions
+        # load only the selected user source, so their displayed/spawned default
+        # must not resurrect a project/local or ambient model that the Claude
+        # child itself will reject. In legacy single-account mode Claude applies
+        # an `env` value from settings over the inherited process environment;
         # the scalar model field remains the lowest-precedence explicit source.
         external_model_set, external_model = explicit_model(
             None if isolate_account_env else os.environ.get("ANTHROPIC_MODEL"))
@@ -17563,6 +17616,9 @@ class WrapperMachine:
                 claude_root = self._claude_config_root(claude_profile)
                 if claude_root is not None:
                     hook_kwargs["claude_config_root"] = claude_root
+                    hook_kwargs["isolate_claude_account_env"] = (
+                        self._claude_profiles.is_multi_profile
+                    )
             await manage_engine_hook(
                 cmd.engine,
                 cmd.action,
@@ -18403,6 +18459,7 @@ class WrapperMachine:
             return
         await self._discard_query_queue(ctx)
         self.sessions.pop(ctx.key, None)
+        await self._close_codex_browser_ctx_surface(ctx)
         self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         if ctx.key:
             await self._drop_preview_session(ctx.engine, ctx.key)
@@ -19566,6 +19623,310 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
+
+    def _browser_for_profile(self, profile_id: str):
+        # A few narrow embedders replace the historical alias with a fake. Keep
+        # that seam while production controllers remain profile-isolated.
+        if not isinstance(self._browser, BrowserController):
+            return self._browser
+        browser = self._browsers.get(profile_id)
+        if browser is None:
+            try:
+                profile_identity = str(self._codex_profiles.get(profile_id).home)
+            except (KeyError, ValueError):
+                # Compatibility for narrow tests; routed production contexts
+                # have already been validated against the profile registry.
+                profile_identity = profile_id
+            browser = BrowserController(
+                self.cfg, profile_id=profile_identity)
+            self._browsers[profile_id] = browser
+        return browser
+
+    async def _browser_target(self, cmd, action: str):
+        """Resolve one browser command without exposing profile/thread ids."""
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            error = await self._missing_session_error(cmd, action)
+            return None, None, None, error
+        if ctx.engine != "codex" or ctx.space != "code":
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="托管浏览器只对 Codex Code 会话开放",
+                request_id=getattr(cmd, "request_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return ctx, None, None, error
+        thread_id = getattr(ctx.sdk, "thread_id", None)
+        if not isinstance(thread_id, str) or not thread_id:
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="Codex 会话尚未建立，无法使用浏览器",
+                request_id=getattr(cmd, "request_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return ctx, None, None, error
+        profile_id = ctx.codex_profile_id or self._codex_profiles.default.id
+        return (
+            ctx,
+            self._browser_for_profile(profile_id),
+            f"{profile_id}:{thread_id}",
+            None,
+        )
+
+    def _browser_surface_event(
+        self, cmd, ctx: SessionContext, browser, state,
+        *, error: Optional[str] = None,
+    ) -> BrowserSurface:
+        client_id = getattr(cmd, "client_id", None)
+        return BrowserSurface(
+            request_id=cmd.request_id,
+            available=state.available,
+            enabled=state.enabled,
+            surface_id=state.surface_id,
+            generation=state.generation,
+            frame_revision=state.frame_revision,
+            width=state.width,
+            height=state.height,
+            url=state.url,
+            title=state.title,
+            control_mode=state.control_mode,
+            controlled_by_me=(
+                client_id is not None and state.control_owner == client_id),
+            agent_available=bool(
+                browser.available
+                and getattr(ctx.sdk, "dynamic_tools_declared", False)
+            ),
+            error=(error[:512] if error else state.error),
+            to=client_id,
+        )
+
+    async def _browser_error_state(
+        self, browser, key: str, message: str,
+    ) -> BrowserSurfaceData:
+        try:
+            return await browser.surface_state(key)
+        except Exception:
+            return BrowserSurfaceData(
+                available=browser.available,
+                enabled=browser.enabled,
+                surface_id=None,
+                generation=None,
+                frame_revision=0,
+                width=1280,
+                height=800,
+                url="",
+                title="",
+                control_mode="none",
+                control_owner=None,
+                error=message[:512],
+            )
+
+    async def _close_codex_browser_surface(self, wire_sid: str) -> None:
+        try:
+            profile, native_sid = self._codex_target(wire_sid)
+        except ValueError:
+            return
+        await self._browser_for_profile(profile.id).close_surface(
+            f"{profile.id}:{native_sid}")
+
+    async def _close_codex_browser_ctx_surface(
+        self, ctx: SessionContext,
+    ) -> None:
+        if ctx.engine != "codex" or ctx.space != "code":
+            return
+        thread_id = getattr(ctx.sdk, "thread_id", None)
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        profile_id = ctx.codex_profile_id or self._codex_profiles.default.id
+        await self._browser_for_profile(profile_id).close_surface(
+            f"{profile_id}:{thread_id}")
+
+    async def _reject_stale_browser_target(
+        self,
+        cmd,
+        ctx: SessionContext,
+        browser,
+        key: str,
+        action: str,
+    ) -> Optional[Error]:
+        """Retire a surface recreated by a request crossing session teardown."""
+        if self._is_resident_context(ctx):
+            return None
+        try:
+            await browser.close_surface(key)
+        except Exception as exc:
+            log.warning(
+                "stale browser surface cleanup failed",
+                error_type=type(exc).__name__,
+            )
+        return await self._missing_session_error(cmd, action)
+
+    async def _handle_get_browser_surface(self, cmd):
+        ctx, browser, key, error = await self._browser_target(cmd, "读取浏览器")
+        if error is not None:
+            return error
+        try:
+            state = await browser.surface_state(key, create=cmd.create)
+            event = self._browser_surface_event(cmd, ctx, browser, state)
+        except Exception as exc:
+            log.warning(
+                "browser surface read failed",
+                error_type=type(exc).__name__,
+            )
+            state = await self._browser_error_state(
+                browser, key, "浏览器状态暂不可用")
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error="浏览器状态暂不可用")
+        stale = await self._reject_stale_browser_target(
+            cmd, ctx, browser, key, "读取浏览器")
+        if stale is not None:
+            return stale
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_get_browser_frame(self, cmd):
+        ctx, browser, key, error = await self._browser_target(
+            cmd, "读取浏览器画面")
+        if error is not None:
+            return error
+        client_id = getattr(cmd, "client_id", None)
+        try:
+            if self._browser_frame_requests >= 64:
+                raise BrowserActionError("浏览器画面请求过于频繁")
+            self._browser_frame_requests += 1
+            try:
+                frame = await browser.frame(key, create=True)
+            finally:
+                self._browser_frame_requests -= 1
+            if cmd.generation is not None and cmd.generation != frame.generation:
+                raise BrowserActionError("浏览器页面已经重建，请刷新后重试")
+            event = BrowserFrame(
+                request_id=cmd.request_id,
+                surface_id=frame.surface_id,
+                generation=frame.generation,
+                frame_revision=frame.frame_revision,
+                width=frame.width,
+                height=frame.height,
+                url=frame.url,
+                title=frame.title,
+                control_mode=frame.control_mode,
+                controlled_by_me=(
+                    client_id is not None
+                    and frame.control_owner == client_id),
+                media_type=frame.media_type,
+                data=base64.b64encode(frame.data).decode("ascii"),
+                to=client_id,
+            )
+        except (BrowserUnavailable, BrowserActionError) as exc:
+            event = BrowserFrame(
+                request_id=cmd.request_id,
+                error=str(exc)[:512],
+                to=client_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "browser frame capture failed",
+                error_type=type(exc).__name__,
+            )
+            event = BrowserFrame(
+                request_id=cmd.request_id,
+                error="浏览器画面暂不可用",
+                to=client_id,
+            )
+        stale = await self._reject_stale_browser_target(
+            cmd, ctx, browser, key, "读取浏览器画面")
+        if stale is not None:
+            return stale
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_acquire_browser_control(self, cmd):
+        ctx, browser, key, error = await self._browser_target(cmd, "接管浏览器")
+        if error is not None:
+            return error
+        try:
+            state = await browser.acquire_control(key, cmd.client_id)
+            event = self._browser_surface_event(cmd, ctx, browser, state)
+        except (BrowserUnavailable, BrowserActionError) as exc:
+            state = await self._browser_error_state(browser, key, str(exc))
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error=str(exc),
+            )
+        except Exception as exc:
+            log.warning(
+                "browser control acquisition failed",
+                error_type=type(exc).__name__,
+            )
+            state = await self._browser_error_state(
+                browser, key, "浏览器接管暂不可用")
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error="浏览器接管暂不可用")
+        stale = await self._reject_stale_browser_target(
+            cmd, ctx, browser, key, "接管浏览器")
+        if stale is not None:
+            return stale
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_release_browser_control(self, cmd):
+        ctx, browser, key, error = await self._browser_target(cmd, "释放浏览器")
+        if error is not None:
+            return error
+        try:
+            state = await browser.release_control(key, cmd.client_id)
+            event = self._browser_surface_event(cmd, ctx, browser, state)
+        except (BrowserUnavailable, BrowserActionError) as exc:
+            state = await self._browser_error_state(browser, key, str(exc))
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error=str(exc),
+            )
+        except Exception as exc:
+            log.warning(
+                "browser control release failed",
+                error_type=type(exc).__name__,
+            )
+            state = await self._browser_error_state(
+                browser, key, "浏览器交还暂不可用")
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error="浏览器交还暂不可用")
+        stale = await self._reject_stale_browser_target(
+            cmd, ctx, browser, key, "释放浏览器")
+        if stale is not None:
+            return stale
+        await self._emit(ctx, event)
+        return event
+
+    async def _handle_browser_action(self, cmd):
+        ctx, browser, key, error = await self._browser_target(cmd, "操作浏览器")
+        if error is not None:
+            return error
+        try:
+            state = await browser.user_action(
+                key, cmd.client_id, cmd.generation,
+                cmd.action, cmd.arguments())
+            event = self._browser_surface_event(cmd, ctx, browser, state)
+        except (BrowserUnavailable, BrowserActionError) as exc:
+            state = await self._browser_error_state(browser, key, str(exc))
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error=str(exc),
+            )
+        except Exception as exc:
+            log.warning(
+                "browser user action failed",
+                error_type=type(exc).__name__,
+            )
+            state = await self._browser_error_state(
+                browser, key, "浏览器操作暂不可用")
+            event = self._browser_surface_event(
+                cmd, ctx, browser, state, error="浏览器操作暂不可用")
+        stale = await self._reject_stale_browser_target(
+            cmd, ctx, browser, key, "操作浏览器")
+        if stale is not None:
+            return stale
+        await self._emit(ctx, event)
+        return event
 
     async def _goal_ctx(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -22601,6 +22962,61 @@ class WrapperMachine:
             answers[question_id] = {"answers": answer_values}
         return {"answers": answers}
 
+    async def _on_codex_dynamic_tool(
+        self, ctx: SessionContext, params: dict,
+    ) -> Optional[dict]:
+        """Execute one app-server dynamic browser tool on its exact thread."""
+        if ctx.engine != "codex" or ctx.space != "code":
+            return {
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "托管浏览器只对 Codex Code 会话开放",
+                }],
+                "success": False,
+            }
+        thread_id = params.get("threadId")
+        if (
+            not isinstance(thread_id, str)
+            or thread_id != getattr(ctx.sdk, "thread_id", None)
+        ):
+            return {
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "浏览器工具的会话归属无效",
+                }],
+                "success": False,
+            }
+        if params.get("namespace") != BROWSER_NAMESPACE:
+            # Shared-daemon server requests are multicast. Returning None tells
+            # CodexHandle to stay silent so the client which declared another
+            # namespace can answer it.
+            return None
+        profile_id = ctx.codex_profile_id or self._codex_profiles.default.id
+        key = f"{profile_id}:{thread_id}"
+        browser = self._browser_for_profile(profile_id)
+        result = await browser.execute_dynamic_tool(
+            key,
+            params.get("namespace"),
+            params.get("tool"),
+            params.get("arguments"),
+        )
+        if self._is_resident_context(ctx):
+            return result
+        try:
+            await browser.close_surface(key)
+        except Exception as exc:
+            log.warning(
+                "stale browser tool surface cleanup failed",
+                error_type=type(exc).__name__,
+            )
+        return {
+            "contentItems": [{
+                "type": "inputText",
+                "text": "会话已经关闭，浏览器操作未保留",
+            }],
+            "success": False,
+        }
+
     async def _on_codex_mcp_elicitation(self, ctx: SessionContext,
                                         params: dict) -> dict:
         mode = params.get("mode")
@@ -23437,7 +23853,8 @@ class WrapperMachine:
         suffix = os.path.splitext(path)[1].lower()
         media_type = cls.PREVIEW_ASSET_MEDIA_TYPES.get(suffix)
         if media_type is None:
-            raise ValueError("Markdown 预览只加载 PNG、JPEG、GIF、WebP 或 AVIF 图片")
+            raise ValueError(
+                "Markdown 预览只加载 PNG、JPEG、GIF、WebP、AVIF 或 SVG 图片")
         relative, data, _, _ = cls._read_session_file(
             cwd,
             path,
@@ -23446,8 +23863,7 @@ class WrapperMachine:
             allow_truncate=False,
             allowed_external_paths=allowed_external_paths,
         )
-        if media_type == "image/svg+xml":
-            cls._validate_svg_preview(data)
+        cls._validate_rendered_preview(media_type, data)
         return relative, media_type, data
 
     async def _git_diff(
@@ -23704,16 +24120,58 @@ class WrapperMachine:
         self._codex_session_list_cache = None
         self._codex_session_list_epoch += 1
 
+    def _register_private_codex_btw_thread(
+        self, ctx: SessionContext, native_thread_id: str,
+    ) -> bool:
+        """Hide one exact profile-scoped ephemeral fork from public catalogs."""
+        if ctx.engine != "codex" or not ctx.btw:
+            raise RuntimeError("private Codex thread requires a BTW context")
+        profile = self._codex_profile_for_ctx(ctx)
+        # Validate the native id before it becomes a filtering identity.
+        self._codex_wire_sid(profile, native_thread_id)
+        key = (profile.id, native_thread_id)
+        ctx.btw_real_id = native_thread_id
+        existed = key in self._private_codex_btw_threads
+        self._private_codex_btw_threads[key] = None
+        self._private_codex_btw_threads.move_to_end(key)
+        while (
+            len(self._private_codex_btw_threads)
+            > self.CODEX_PRIVATE_BTW_THREADS
+        ):
+            self._private_codex_btw_threads.popitem(last=False)
+        hinted = self._codex_thread_started_hints.pop(key, None) is not None
+        if not existed or hinted:
+            self._invalidate_codex_session_catalog()
+            return True
+        return False
+
+    def _filter_private_codex_btw_rows(
+        self, rows: list[dict],
+    ) -> list[dict]:
+        """Remove exact private fork identities from any catalog generation."""
+        if not self._private_codex_btw_threads:
+            return rows
+        return [
+            row for row in rows
+            if (
+                row.get("codex_profile_id"),
+                row.get("native_session_id"),
+            ) not in self._private_codex_btw_threads
+        ]
+
     def _on_codex_thread_started_hint(
         self, ctx: SessionContext, native_thread_id: str,
     ) -> None:
         """Turn a foreign CLI thread notification into one async list hint."""
-        if ctx.engine != "codex" or ctx.space != "code":
+        if ctx.engine != "codex" or ctx.space != "code" or ctx.btw:
             return
         try:
             profile = self._codex_profile_for_ctx(ctx)
             wire_sid = self._codex_wire_sid(profile, native_thread_id)
         except (RuntimeError, ValueError):
+            return
+        key = (profile.id, native_thread_id)
+        if key in self._private_codex_btw_threads:
             return
         if any(
             candidate.engine == "codex"
@@ -23728,7 +24186,6 @@ class WrapperMachine:
             return
 
         now = time.monotonic()
-        key = (profile.id, native_thread_id)
         if key in self._codex_thread_started_hints:
             self._codex_thread_started_hints.move_to_end(key)
             return
@@ -23830,6 +24287,10 @@ class WrapperMachine:
         # whose state DB has not materialized a just-forked child yet.
         raw = await asyncio.to_thread(
             self._overlay_completed_codex_forks, raw)
+        # A BTW identity may be registered while this refresh is awaiting the
+        # native catalog or fork overlay. Filter again at the generation edge
+        # before any row enters the reusable cache.
+        raw = self._filter_private_codex_btw_rows(raw)
         self._codex_session_profile_errors = profile_errors
         self._codex_session_list_cache = (
             time.monotonic(), raw, profile_errors,
@@ -24063,6 +24524,10 @@ class WrapperMachine:
                     parent_profile_id=parent_profile.id,
                 )
                 continue
+            if (
+                child_profile.id, child_native
+            ) in self._private_codex_btw_threads:
+                continue
             info = candidate(child_profile.id, child_native)
             if info.get("forked_from_id") is None:
                 info["forked_from_id"] = parent_wire
@@ -24086,6 +24551,12 @@ class WrapperMachine:
             self._codex_thread_started_hints.items()
         ):
             if profile_id not in candidates:
+                continue
+            if (
+                profile_id, native_sid
+            ) in self._private_codex_btw_threads:
+                self._codex_thread_started_hints.pop(
+                    (profile_id, native_sid), None)
                 continue
             try:
                 self._codex_wire_sid(profile_id, native_sid)
@@ -24534,9 +25005,11 @@ class WrapperMachine:
                     profile_id=profile.id,
                     error_type=type(error).__name__,
                 )
-        return self._bounded_codex_profile_catalog([
+        public_candidates = self._filter_private_codex_btw_rows([
             item for profile_rows in rows_by_profile for item in profile_rows
-        ]), tuple(errors)
+        ])
+        return self._bounded_codex_profile_catalog(
+            public_candidates), tuple(errors)
 
     async def _read_all_codex_profile_sessions(self) -> list[dict]:
         """Compatibility seam for direct account-catalog reads and tests."""
@@ -24601,7 +25074,15 @@ class WrapperMachine:
     ) -> None:
         """Filter and route one already-read native Codex catalog."""
         try:
+            # Cached rows can predate the fork's private registration. Apply the
+            # live ownership boundary before metadata claims, watches, or wire
+            # serialization so a stale cache cannot repaint a ghost session.
+            raw = self._filter_private_codex_btw_rows(raw)
             await self._claim_legacy_presentation_from_codex_catalog(raw)
+            # The claim path may yield while an ephemeral fork finishes
+            # connecting. Do not let that newly private row start a sidebar
+            # watch before the final pre-serialization guard below.
+            raw = self._filter_private_codex_btw_rows(raw)
             self._prime_codex_sidebar_watches(raw)
             resident_state = {
                 c.key: c.state for c in self.sessions.values()
@@ -24705,6 +25186,10 @@ class WrapperMachine:
                 log.info(
                     "reconciled Codex Work session",
                     session_id=sid, work_id=record.work_id)
+            # The catalog path above performs bounded async reconciliation. A
+            # BTW fork can finish connecting during one of those awaits, so
+            # close that race immediately before the synchronous wire build.
+            raw = self._filter_private_codex_btw_rows(raw)
             sessions = []
             for row in raw:
                 wire_sid = row["session_id"]
@@ -25044,6 +25529,7 @@ class WrapperMachine:
                 }
                 await self._discard_query_queue(ctx)
                 self.sessions.pop(ctx.key, None)
+                await self._close_codex_browser_ctx_surface(ctx)
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
                 await self._drop_preview_session(ctx.engine, ctx.key)
@@ -27697,6 +28183,7 @@ class WrapperMachine:
                 uncertain_ids.add(id(candidate))
                 uncertain_contexts.append(candidate)
         for candidate in uncertain_contexts:
+            await self._close_codex_browser_ctx_surface(candidate)
             try:
                 await candidate.sdk.disconnect()
             except Exception as exc:
@@ -28443,6 +28930,7 @@ class WrapperMachine:
             for archived_sid in archived_sids:
                 self._watch.pop(archived_sid, None)
                 self._codex_sidebar_watches.pop(archived_sid, None)
+                await self._close_codex_browser_surface(archived_sid)
             if self.focused_sid in set(archived_sids) | {ctx.key}:
                 self.focused_sid = None
         return tuple(archived_sids)
@@ -28772,6 +29260,8 @@ class WrapperMachine:
             await self._delete_codex_client_message_ids(codex_alias_path)
         for deleted_sid in deleted_sids:
             await self._drop_preview_session(engine, deleted_sid)
+            if engine == "codex":
+                await self._close_codex_browser_surface(deleted_sid)
         for deleted_sid in deleted_sids:
             if engine == "codex" and self._codex_controls is not None:
                 try:
@@ -32658,6 +33148,7 @@ class WrapperMachine:
                 return None
             vc = self.sessions.pop(victim)
             self._purge_preview_image_snapshots(vc.preview_snapshot_token)
+            await self._close_codex_browser_ctx_surface(vc)
             try:
                 await vc.sdk.disconnect()
             except Exception:
@@ -32941,6 +33432,10 @@ class WrapperMachine:
                 # test doubles and monkeypatches source-compatible.
                 codex_handle_kwargs["codex_home"] = codex_home
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
+            if space == "code":
+                sdk.dynamic_tool_ownership = browser_dynamic_tools()
+                sdk.dynamic_tools = self._browser_for_profile(
+                    codex_profile.id).dynamic_tools()
         else:
             if broker_handle is not None:
                 sdk = broker_handle
@@ -33217,6 +33712,8 @@ class WrapperMachine:
             ctx.sdk.interaction_callback = (
                 lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
+            ctx.sdk.dynamic_tool_callback = (
+                lambda params: self._on_codex_dynamic_tool(ctx, params))
             ctx.sdk.goal_callback = (
                 lambda goal: self._on_codex_goal(ctx, goal))
             ctx.sdk.turn_lifecycle_callback = (
@@ -33677,6 +34174,7 @@ class WrapperMachine:
                 raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
             vc = self.sessions.pop(victim)
             self._purge_preview_image_snapshots(vc.preview_snapshot_token)
+            await self._close_codex_browser_ctx_surface(vc)
             try:
                 await vc.sdk.disconnect()
             except Exception:
@@ -33698,6 +34196,10 @@ class WrapperMachine:
             if codex_home is not None:
                 codex_handle_kwargs["codex_home"] = codex_home
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
+            if parent_space == "code":
+                sdk.dynamic_tool_ownership = browser_dynamic_tools()
+                sdk.dynamic_tools = self._browser_for_profile(
+                    codex_profile.id).dynamic_tools()
         else:
             assert claude_profile is not None
             claude_handle_kwargs = {}
@@ -33778,6 +34280,8 @@ class WrapperMachine:
             ctx.sdk.interaction_callback = (
                 lambda method, params: self._on_codex_interaction(
                     ctx, method, params))
+            ctx.sdk.dynamic_tool_callback = (
+                lambda params: self._on_codex_dynamic_tool(ctx, params))
             ctx.sdk.goal_callback = (
                 lambda goal: self._on_codex_goal(ctx, goal))
             ctx.sdk.turn_lifecycle_callback = (
@@ -33792,6 +34296,28 @@ class WrapperMachine:
             await ctx.sdk.connect(
                 resume_id=parent_id, cwd=parent.cwd, fork=True)
             if engine == "codex":
+                native_thread_id = getattr(ctx.sdk, "thread_id", None)
+                if not isinstance(native_thread_id, str) or not native_thread_id:
+                    raise RuntimeError(
+                        "Codex BTW fork did not return a native thread id")
+                catalog_changed = self._register_private_codex_btw_thread(
+                    ctx, native_thread_id)
+                if catalog_changed:
+                    for catalog_space in ("code", "work"):
+                        try:
+                            await self._invalidate_session_list(
+                                "codex", catalog_space)
+                        except Exception as exc:
+                            # The private identity and cache epoch are already
+                            # committed locally. A later list request remains
+                            # safe even if this repaint hint could not be sent.
+                            log.warning(
+                                "Codex BTW catalog invalidation could not be sent",
+                                profile_id=ctx.codex_profile_id,
+                                thread_id=native_thread_id,
+                                space=catalog_space,
+                                error_type=type(exc).__name__,
+                            )
                 if parent_space == "work":
                     # A fork response may echo settings persisted by a former
                     # Code incarnation. Work's private process remains

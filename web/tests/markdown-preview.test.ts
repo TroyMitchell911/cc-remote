@@ -8,6 +8,10 @@ import { createServer } from "vite";
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
 import {
+  parseCodexFileCitationDirective,
+  remarkCodexFileCitations,
+} from "../src/codex-file-citation.ts";
+import {
   InlineImageAssetCache,
   classifyMessageImageTarget,
 } from "../src/inline-image-assets.ts";
@@ -61,6 +65,91 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+const reorderedCitation = ':codex-file-citation{purpose="output" '
+  + 'label="报告 } 终版" path="/tmp/demo} final.gif" '
+  + 'artifact_kind="animation"}';
+assert.deepEqual(parseCodexFileCitationDirective(reorderedCitation), {
+  citation: {
+    path: "/tmp/demo} final.gif",
+    purpose: "output",
+    artifactKind: "animation",
+    label: "报告 } 终版",
+  },
+  end: reorderedCitation.length,
+}, "citation attributes are order-independent and quoted braces stay in values");
+for (const malformed of [
+  ':codex-file-citation{path="/tmp/report.pdf" garbage that should remain}',
+  ':codex-file-citation{path="/tmp/report.pdf" purpose="unsafe"}',
+  ':codex-file-citation{path="/tmp/a.pdf" path="/tmp/b.pdf"}',
+  ':codex-file-citation{path="relative.pdf" purpose="output"}',
+  ':codex-file-citation{path="https://example.com/report.pdf"}',
+  ':codex-file-citation{path="//server/share/report.pdf"}',
+  String.raw`:codex-file-citation{path="/tmp/line\nfeed.pdf"}`,
+  `:codex-file-citation{path=${JSON.stringify(`/tmp/${"界".repeat(1400)}.pdf`)}}`,
+  `:codex-file-citation{path=${JSON.stringify(`/tmp/\uD800.pdf`)}}`,
+]) {
+  assert.equal(parseCodexFileCitationDirective(malformed), null,
+    "malformed or unsafe citation syntax must remain literal");
+}
+
+interface CitationAstNode {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: string | null;
+  children?: CitationAstNode[];
+}
+
+const citationTree: CitationAstNode = {
+  type: "root",
+  children: [{
+    type: "paragraph",
+    children: [{
+      type: "text",
+      value: `前 ${reorderedCitation} 后 `
+        + ':codex-file-citation{path="/tmp/report.pdf" invalid tail}',
+    }, {
+      type: "code",
+      value: ':codex-file-citation{path="/tmp/example.pdf"}',
+    }, {
+      type: "link",
+      children: [{
+        type: "text",
+        value: ':codex-file-citation{path="/tmp/already-linked.pdf"}',
+      }],
+    }],
+  }],
+};
+remarkCodexFileCitations()(citationTree);
+const citationChildren = citationTree.children![0].children!;
+assert.deepEqual(citationChildren.slice(0, 2).map((node) => node.type), [
+  "text", "link",
+]);
+assert.equal(citationChildren[1].url,
+  encodeURIComponent("/tmp/demo} final.gif"));
+assert.equal(citationChildren[1].title,
+  "cc-remote-file-citation:output:animation");
+assert.match(citationChildren[2].value ?? "", /invalid tail/,
+  "an invalid directive and its surrounding prose must not be swallowed");
+assert.match(citationChildren[3].value ?? "", /codex-file-citation/,
+  "code nodes stay literal");
+assert.match(citationChildren[4].children?.[0].value ?? "", /codex-file-citation/,
+  "existing links are not rewritten");
+
+const repeatedIncompleteCitation = (
+  ':codex-file-citation{path="/tmp/incomplete.pdf" '
+).repeat(20_000);
+const adversarialCitationTree: CitationAstNode = {
+  type: "root",
+  children: [{ type: "text", value: repeatedIncompleteCitation }],
+};
+const citationScanStarted = performance.now();
+remarkCodexFileCitations()(adversarialCitationTree);
+const citationScanMs = performance.now() - citationScanStarted;
+assert.ok(citationScanMs < 1_500,
+  `incomplete citation scanning must stay linear (took ${citationScanMs.toFixed(1)}ms)`);
+assert.equal(adversarialCitationTree.children![0].value,
+  repeatedIncompleteCitation, "incomplete streaming syntax remains visible");
 assert.equal(isMermaidFenceClass("language-mermaid"), true);
 assert.equal(isMermaidFenceClass("foo language-mermaid bar"), true);
 assert.equal(isMermaidFenceClass("language-mermaid-extra"), false);

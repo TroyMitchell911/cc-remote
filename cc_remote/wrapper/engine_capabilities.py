@@ -442,13 +442,15 @@ def _claude_skills(
 def _claude_settings_files(
     cwd: str,
     claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> tuple[tuple[Path, str], ...]:
     project = Path(cwd) / ".claude"
-    return (
+    files = (
         (_claude_config_home(claude_config_root) / "settings.json", "user"),
         (project / "settings.json", "project"),
         (project / "settings.local.json", "project-local"),
     )
+    return files[:1] if isolate_account_env else files
 
 
 def _settings_path_safe(
@@ -488,9 +490,14 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 def _claude_hook_rows(
     cwd: str,
     claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> list[tuple[dict[str, Any], Path, str, str, int, int, str | None]]:
     rows: list[tuple[dict[str, Any], Path, str, str, int, int, str | None]] = []
-    for path, scope in _claude_settings_files(cwd, claude_config_root):
+    for path, scope in _claude_settings_files(
+        cwd,
+        claude_config_root,
+        isolate_account_env,
+    ):
         if not _settings_path_safe(
             path, cwd, scope, claude_config_root):
             continue
@@ -523,10 +530,11 @@ def _claude_hook_rows(
 def _claude_hooks(
     cwd: str,
     claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> list[dict]:
     items: list[dict] = []
     for handler, path, scope, event, group_index, hook_index, matcher in (
-        _claude_hook_rows(cwd, claude_config_root)
+        _claude_hook_rows(cwd, claude_config_root, isolate_account_env)
     ):
         handler_type = _text(handler.get("type"), 128) or "command"
         command = _text(handler.get("command"), 16 * 1024) or ""
@@ -551,8 +559,11 @@ async def _claude_plugins(
     claude_config_root: str | os.PathLike[str] | None = None,
     isolate_account_env: bool = False,
 ) -> list[dict]:
+    source_args = (
+        ("--setting-sources=user",) if isolate_account_env else ()
+    )
     proc = await asyncio.create_subprocess_exec(
-        binary, "plugin", "list", "--json",
+        binary, *source_args, "plugin", "list", "--json",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         env=(
             sanitized_child_env()
@@ -678,8 +689,11 @@ async def _manage_claude_plugin(
     isolate_account_env: bool = False,
 ) -> None:
     verb = "install" if action == "install" else "uninstall"
+    source_args = (
+        ("--setting-sources=user",) if isolate_account_env else ()
+    )
     proc = await asyncio.create_subprocess_exec(
-        binary, "plugin", verb, plugin_id,
+        binary, *source_args, "plugin", verb, plugin_id,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         env=(
             sanitized_child_env()
@@ -1039,9 +1053,14 @@ def _remove_claude_hook(
     cwd: str,
     hook_id: str,
     claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> None:
     match = None
-    for row in _claude_hook_rows(cwd, claude_config_root):
+    for row in _claude_hook_rows(
+        cwd,
+        claude_config_root,
+        isolate_account_env,
+    ):
         handler, path, _scope, event, group_index, hook_index, _matcher = row
         command = _text(handler.get("command"), 16 * 1024) or ""
         candidate = _opaque_id(
@@ -1096,6 +1115,7 @@ async def manage_engine_hook(
     timeout: int = 60,
     scope: str = "user",
     claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_claude_account_env: bool = False,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改 Code 扩展")
@@ -1107,6 +1127,8 @@ async def manage_engine_hook(
     if action == "create":
         if not event:
             raise ValueError("缺少 Hook 事件")
+        if isolate_claude_account_env and scope != "user":
+            raise ValueError("显式 Claude 账号只加载账号级 Hook")
         await asyncio.to_thread(
             _create_claude_hook,
             target,
@@ -1121,7 +1143,12 @@ async def manage_engine_hook(
     if action != "remove" or not hook_id:
         raise ValueError("缺少 Hook 标识")
     await asyncio.to_thread(
-        _remove_claude_hook, target, hook_id, claude_config_root)
+        _remove_claude_hook,
+        target,
+        hook_id,
+        claude_config_root,
+        isolate_claude_account_env,
+    )
 
 
 async def manage_engine_plugin(
@@ -1180,7 +1207,7 @@ async def claude_capabilities(
     hooks_args = (
         (cwd,)
         if claude_config_root is None
-        else (cwd, claude_config_root)
+        else (cwd, claude_config_root, isolate_account_env)
     )
     items.extend(await asyncio.to_thread(_claude_hooks, *hooks_args))
     errors: list[str] = []
@@ -1196,7 +1223,11 @@ async def claude_capabilities(
             ))
     except Exception:
         errors.append("plugins: claude CLI request failed")
-    return items[:2000], errors, []
+    notes = (
+        ["显式 Claude 账号只加载所选账号的 settings；项目说明与技能仍由 Claude 原生发现。"]
+        if isolate_account_env else []
+    )
+    return items[:2000], errors, notes
 
 
 async def engine_capabilities(

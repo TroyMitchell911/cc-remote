@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -117,6 +118,18 @@ def _claude_profiles_json() -> str:
     if inline:
         return inline
     configured = _env("CC_REMOTE_CLAUDE_PROFILES_FILE", "").strip()
+    # Older installed macOS LaunchAgents predate the explicit profile-file key.
+    # launchd injects the exact XPC service name, so keep only those permanent
+    # managed jobs forward compatible without making an ordinary source/test
+    # process implicitly read a real user's registry on macOS.
+    if (not configured
+            and sys.platform == "darwin"
+            and _env("XPC_SERVICE_NAME", "").strip() in {
+                "com.muggle.cc-remote.wrapper",
+                "com.mugglepro.cc-remote-wrapper",
+            }):
+        configured = str(
+            Path.home() / ".cc-remote" / "claude-profiles.json")
     if not configured:
         return ""
     path = Path(configured).expanduser()
@@ -301,6 +314,28 @@ class WrapperConfig:
     # intentionally keeps its private stdio app-server for isolation.
     codex_daemon_mode: str = field(
         default_factory=lambda: _env("CC_REMOTE_CODEX_DAEMON", "auto").strip().lower()
+    )
+    # Optional wrapper-owned browser for Codex Code dynamic tools and the Web
+    # shared-browser surface. ``off`` is the safe beta default; ``auto`` degrades
+    # cleanly when Playwright or Chrome is unavailable, while ``required`` fails
+    # wrapper startup with an explicit missing-runtime error.
+    codex_browser_mode: str = field(
+        default_factory=lambda: _env(
+            "CC_REMOTE_CODEX_BROWSER", "off").strip().lower()
+    )
+    browser_bin: str = field(
+        default_factory=lambda: _env("CC_REMOTE_BROWSER_BIN", "").strip()
+    )
+    browser_profile_dir: Path = field(default_factory=lambda: Path(_env(
+        "CC_REMOTE_BROWSER_PROFILE_DIR",
+        str(Path.home() / ".cc-remote" / "browser" / "profiles"),
+    )).expanduser())
+    # Browser network traffic is outside Codex's shell sandbox. Keep localhost,
+    # RFC1918, link-local, and other non-global destinations denied unless the
+    # wrapper operator makes the machine-wide policy explicit.
+    browser_allow_private_network: bool = field(
+        default_factory=lambda: _bool(
+            "CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK", False)
     )
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
     # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
@@ -645,6 +680,40 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
     if cfg.codex_daemon_mode not in {"auto", "off"}:
         errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
+    if cfg.codex_browser_mode not in {"off", "auto", "required"}:
+        errors.append(
+            "CC_REMOTE_CODEX_BROWSER must be off, auto, or required")
+    if cfg.browser_bin:
+        expanded_browser_bin = os.path.expanduser(cfg.browser_bin)
+        if ("\x00" in cfg.browser_bin
+                or len(cfg.browser_bin.encode(
+                    "utf-8", errors="surrogatepass")) > 4096):
+            errors.append("CC_REMOTE_BROWSER_BIN must be at most 4096 UTF-8 bytes")
+        elif not os.path.isabs(expanded_browser_bin):
+            errors.append("CC_REMOTE_BROWSER_BIN must be an absolute path")
+    browser_profile = str(cfg.browser_profile_dir)
+    if (not browser_profile or "\x00" in browser_profile
+            or len(browser_profile.encode(
+                "utf-8", errors="surrogatepass")) > 4096):
+        errors.append(
+            "CC_REMOTE_BROWSER_PROFILE_DIR must be a non-empty path of at most "
+            "4096 UTF-8 bytes")
+    elif not cfg.browser_profile_dir.is_absolute():
+        errors.append("CC_REMOTE_BROWSER_PROFILE_DIR must be an absolute path")
+    else:
+        try:
+            browser_profile_path = cfg.browser_profile_dir.resolve(strict=False)
+            home_path = Path.home().resolve(strict=False)
+        except (OSError, RuntimeError):
+            errors.append("CC_REMOTE_BROWSER_PROFILE_DIR could not be resolved")
+        else:
+            forbidden_profile_paths = {
+                Path(browser_profile_path.anchor), home_path,
+            }
+            if browser_profile_path in forbidden_profile_paths:
+                errors.append(
+                    "CC_REMOTE_BROWSER_PROFILE_DIR must not be the filesystem "
+                    "root or user home")
 
     if errors:
         raise ValueError("invalid wrapper configuration: " + "; ".join(errors))
