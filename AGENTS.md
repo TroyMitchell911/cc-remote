@@ -23,10 +23,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.142`**: message-type shapes and the
-  interrupt/drain contract can shift between minor versions. Re-run the
+- **SDK pinned to `claude-agent-sdk==0.2.151`**: message-type shapes and the
+  interrupt/drain contract can shift between patch versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
-  the major/minor at startup).
+  the exact verified patch at startup).
 - **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
   defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
   to the SDK. An empty value keeps this default; only another absolute path may
@@ -34,7 +34,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.142). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.151). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.

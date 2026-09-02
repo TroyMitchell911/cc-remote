@@ -738,7 +738,7 @@ def test_release_docs_and_examples_describe_one_atomic_v46_layout():
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
-    assert "claude-agent-sdk==0.2.142" in claude
+    assert "claude-agent-sdk==0.2.151" in claude
     assert "protocol v46" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude

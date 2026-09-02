@@ -49,6 +49,7 @@ def test_new_session_query_and_turn_binding_roundtrip():
         NewSession(engine="claude", service_tier="fast")
     work = NewSession(
         engine="codex", space="work", codex_profile_id="stack",
+        service_tier="fast",
     )
     assert deserialize(serialize(work)) == work
     with pytest.raises(ValidationError):

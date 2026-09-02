@@ -1208,8 +1208,8 @@ const claudeWorkSlashes = commandsFor("claude", "work")
 const codexWorkSlashes = commandsFor("codex", "work")
   .filter((command) => "slash" in command)
   .map((command) => command.slash);
-assert.deepEqual(codexWorkSlashes, claudeWorkSlashes,
-  "Work must expose one engine-neutral command surface");
+assert.equal(codexWorkSlashes.includes("fast"), true,
+  "Codex Work must expose its supported Fast service tier");
 for (const slash of ["model", "goal", "btw", "preview", "context", "clear"]) {
   assert.equal(claudeWorkSlashes.includes(slash), true, `Work must retain /${slash}`);
 }
@@ -1221,7 +1221,7 @@ for (const slash of ["plan", "code-review", "security-review", "verify", "simpli
   assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
 }
-for (const slash of ["review", "init", "plan", "fast", "status", "compact", "rollback"]) {
+for (const slash of ["review", "init", "plan", "status", "compact", "rollback"]) {
   assert.equal(codexWorkSlashes.includes(slash), false, `Work must hide Codex Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "codex"), true);
 }
@@ -10469,10 +10469,10 @@ try {
   // from cwd-aware settings. An empty models array must still update them.
   state = reduce(state, { type: "event", event: event({
     type: "models", engine: "claude", models: [],
-    default_model: "claude-mythos-5[1m]", default_effort: "max",
+    default_model: "claude-mythos-5-1[1m]", default_effort: "max",
     cwd: "~",
   }) });
-  assert.equal(state.catalogDefault.claude, "claude-mythos-5");
+  assert.equal(state.catalogDefault.claude, "claude-mythos-5-1");
   assert.equal(state.catalogDefaultEffort.claude, "max");
   const {
     compatibleNewChatEffort,
@@ -10594,7 +10594,7 @@ try {
     cwd: "~", engine: "claude",
     controlScopeKey: "machine-a:code:claude",
     model: null, effort: null,
-    defaultModel: "claude-mythos-5", defaultEffort: "max",
+    defaultModel: "claude-mythos-5-1", defaultEffort: "max",
     onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
@@ -10675,7 +10675,7 @@ try {
     assert.match(markup, /本机默认/);
     assert.match(markup, /默认/);
   }
-  assert.match(newChatMarkup, /本机默认 · Mythos 5/);
+  assert.match(newChatMarkup, /本机默认 · Mythos 5\.1/);
   assert.match(newChatMarkup, /默认 · max/);
   assert.match(codexNewChatMarkup, /本机默认 · GPT Future/);
   assert.match(codexNewChatMarkup, /dynamic catalog model/,
@@ -17606,8 +17606,8 @@ assert.equal(matchModelId("claude-opus-5", "claude"),
   "claude-opus-5[1m]",
   "the legacy unqualified Opus 5 alias must resolve to the curated 1M model");
 assert.equal(matchModelId("claude-mythos-5[1m]", "claude"),
-  "claude-mythos-5",
-  "context suffix compatibility must remain for existing Claude cards");
+  "claude-mythos-5[1m]",
+  "an old model id must retain its exact identity after a catalog upgrade");
 assert.equal(matchModelId("claude-opus-5-custom", "claude"),
   "claude-opus-5-custom",
   "a provider-specific model id must not be swallowed by the curated Opus alias");

@@ -7693,10 +7693,11 @@ def test_external_codex_turn_refreshes_collaboration_mode_without_changing_appro
     asyncio.run(run())
 
 
-def test_fast_toggle_updates_only_target_codex_thread():
+def test_fast_toggle_updates_only_target_codex_thread_including_work():
     async def run():
         machine, transport = _mk_machine()
         one = _control_ctx("c1", "codex")
+        one.space = "work"
         two = _control_ctx("c2", "codex")
         claude = _control_ctx("cc", "claude")
         machine.sessions = {"c1": one, "c2": two, "cc": claude}

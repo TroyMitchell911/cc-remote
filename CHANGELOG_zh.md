@@ -4,6 +4,12 @@
 
 ## 未发布
 
+- Codex Work 的新建与已有会话现在都可选择 Fast 服务档位，同时保持 Claude Work
+  使用引擎中立的命令面板。
+- 经过验证的 Claude Agent SDK 固定版本升级到 `0.2.151`（内置 Claude Code
+  `2.1.258`）；内置 Fable 5 与 Mythos 5 模型卡替换为官方
+  `claude-fable-5-1` 和 `claude-mythos-5-1`。已有会话继续保留其真实记录的模型
+  身份，不会被伪装成新版本。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v46，托管浏览器的前进/后退
   改用原生历史导航。Web 画面会跨 renderer 重建持续探测，突发输入按顺序发送而不再
   吞键，操作被拒绝时保留可重试文本，并忽略属于旧请求的迟到画面错误。

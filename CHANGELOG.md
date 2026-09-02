@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Expose the Codex Fast service tier in Work for both new and resident
+  sessions while keeping Claude Work on its engine-neutral command surface.
+- Upgrade the verified Claude Agent SDK pin to `0.2.151` (bundled Claude Code
+  `2.1.258`) and replace the curated Fable 5 and Mythos 5 model cards with the
+  official `claude-fable-5-1` and `claude-mythos-5-1` releases. Existing
+  sessions retain their exact recorded model identity.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v46 so managed
   browser history uses native back/forward navigation. The Web surface now
   keeps polling across renderer rebuilds, serializes burst input without

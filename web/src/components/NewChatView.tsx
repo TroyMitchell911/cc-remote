@@ -194,6 +194,7 @@ interface NewChatExecutionControls {
   permissionMode: CodexPermissionMode;
   permissionProfile: string | null;
   webSearch: CodexWebSearchMode | null;
+  serviceTier: CodexServiceTier;
 }
 
 const defaultExecutionControls = (
@@ -203,6 +204,7 @@ const defaultExecutionControls = (
   permissionMode: "never",
   permissionProfile: null,
   webSearch: null,
+  serviceTier: "default",
 });
 
 function NewChatSelectorSheet({
@@ -334,7 +336,9 @@ export function NewChatView({ cwd, controlScopeKey,
     permissionMode,
     permissionProfile,
     webSearch,
+    serviceTier,
   } = scopedExecutionControls;
+  const fastSelected = serviceTier === "fast";
   const updateExecutionControls = (
     patch: Partial<Omit<NewChatExecutionControls, "scopeKey">>,
   ) => {
@@ -483,7 +487,7 @@ export function NewChatView({ cwd, controlScopeKey,
       engine === "codex" && space === "code"
         ? (webSearch ?? undefined)
         : undefined,
-      engine === "codex" ? "default" : undefined);
+      engine === "codex" ? serviceTier : undefined);
     if (!queued) setCreating(false);
   };
 
@@ -666,6 +670,19 @@ export function NewChatView({ cwd, controlScopeKey,
               disabled={creating || importing || !onPickEffort}>
               {effortLabel}
             </button>
+            {engine === "codex" && space === "work" && (
+              <button type="button"
+                className={"hint-ctl fast-chip" + (fastSelected ? " on" : "")}
+                aria-label="新工作 Fast 服务档位"
+                aria-pressed={fastSelected}
+                onClick={() => updateExecutionControls({
+                  serviceTier: fastSelected ? "default" : "fast",
+                })}
+                title="Fast：快速 / 标准（首条消息生效）"
+                disabled={creating || importing}>
+                {fastSelected ? "快速" : "标准"}
+              </button>
+            )}
             {engine === "codex" && space === "code" && (
               <button type="button" className="newchat-access"
                 onClick={() => {

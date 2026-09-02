@@ -5338,10 +5338,28 @@ test("new-chat controls reset and normalize across Code and Work", async ({
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:work:codex");
   await expect(page.locator(".newchat-access")).toHaveCount(0);
+  const fast = page.getByRole("button", {
+    name: "新工作 Fast 服务档位",
+  });
+  await expect(fast).toHaveText("标准");
+  await fast.click();
+  await expect(fast).toHaveText("快速");
   const workSubmission = await submitNewChatFixture(page);
   expect(workSubmission.permissionMode).toBe("never");
   expect(workSubmission).not.toHaveProperty("permissionProfile");
   expect(workSubmission).not.toHaveProperty("webSearch");
+  expect(workSubmission.serviceTier).toBe("fast");
+
+  await page.getByTestId("switch-newchat-engine").click();
+  await expect(page.getByTestId("newchat-scope"))
+    .toHaveText("machine-a:work:claude");
+  await expect(page.getByRole("button", {
+    name: "新工作 Fast 服务档位",
+  })).toHaveCount(0);
+  await page.getByTestId("switch-newchat-engine").click();
+  await expect(page.getByRole("button", {
+    name: "新工作 Fast 服务档位",
+  })).toHaveText("标准");
 
   await page.getByTestId("switch-newchat-space").click();
   await expect(page.locator(".newchat-access")).toContainText("默认环境");

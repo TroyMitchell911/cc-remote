@@ -324,7 +324,7 @@ class SdkHandle:
             self.auto_compact_threshold_tokens,
         )
         if auto_compact is not None:
-            # SDK 0.2.142 has no typed option yet, but intentionally forwards
+            # SDK 0.2.151 has no typed option yet, but intentionally forwards
             # bounded extra_args to the pinned Claude Code runtime.
             extra_args["autocompact"] = auto_compact
         if self.work_mode:
@@ -412,7 +412,7 @@ class SdkHandle:
             ),
             skills=[] if self.work_mode else None,
             # The wrapper-owned Work settings file already contains the complete
-            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.142
+            # fail-closed sandbox including its filesystem allowlist. SDK 0.2.151
             # replaces (rather than deep-merges) that object when `sandbox=` is
             # also supplied, silently dropping filesystem policy and inlining
             # provider credentials in argv. Pass only the policy path instead.

@@ -957,6 +957,16 @@ export function Composer(p: Props) {
                     disabled={locked}>
                     <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
+                  {p.engine === "codex" && (
+                    <button type="button" className="work-fast-setting"
+                      aria-pressed={!!p.fast}
+                      onClick={() => p.onSetServiceTier?.("toggle")}
+                      disabled={locked || !p.onSetServiceTier}
+                      title="Fast：快速 / 标准（下条消息生效）">
+                      <span>服务档位</span><b>{p.fast == null
+                        ? "读取中" : p.fast ? "快速" : "标准"}</b>
+                    </button>
+                  )}
                   <button type="button" aria-expanded={ctxOpen}
                     onClick={() => {
                       if (!ctxOpen) p.onContext();
