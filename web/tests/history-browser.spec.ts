@@ -2677,6 +2677,9 @@ test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
   const diagram = page.locator(".mermaid-block").first();
   await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
   await applyProductionCsp(page);
+  const inlineSurface = await diagram.locator(".mermaid-svg").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
 
   await diagram.locator(".mermaid-zoom").click();
   const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
@@ -2684,6 +2687,10 @@ test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
   const vector = preview.locator(".image-lightbox-vector > svg");
   await expect(vector).toBeVisible();
   await expect(preview.locator("img")).toHaveCount(0);
+  const vectorSurface = preview.locator(".image-lightbox-vector");
+  await expect.poll(() => vectorSurface.evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  )).toBe(inlineSurface);
   const gesture = await pinchThenPanPreview(page);
   expect(gesture.afterPinch.scale).toBeGreaterThan(1);
   expect(gesture.afterPan.scale).toBe(gesture.afterPinch.scale);
@@ -2704,6 +2711,27 @@ test("a completed Mermaid diagram opens the shared pinch-zoom preview", async ({
       ?.click();
   });
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("a dark Mermaid preview keeps the render theme surface", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?mermaid=1");
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+  });
+  const diagram = page.locator(".mermaid-block").first();
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  const inlineSurface = await diagram.locator(".mermaid-svg").evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  );
+  await diagram.locator(".mermaid-zoom").click();
+
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  const vectorSurface = preview.locator(".image-lightbox-vector");
+  await expect.poll(() => vectorSurface.evaluate(
+    (node) => getComputedStyle(node).backgroundColor,
+  )).toBe(inlineSurface);
 });
 
 test("the real wide Robot Core diagram opens once and fits the viewport", async ({
@@ -2933,8 +2961,19 @@ test("a pending composer image previews without triggering removal", async ({
 
   await preview.click();
   await expect(page.locator(".image-lightbox")).toBeVisible();
-  await expect(page.locator(".image-lightbox img.image-lightbox-image"))
-    .toBeVisible();
+  const rasterSurface = page.locator(
+    ".image-lightbox img.image-lightbox-image",
+  );
+  await expect(rasterSurface).toBeVisible();
+  const rasterBackground = await rasterSurface.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return {
+      color: style.backgroundColor,
+      image: style.backgroundImage,
+    };
+  });
+  expect(rasterBackground.color).toBe("rgb(248, 249, 251)");
+  expect(rasterBackground.image).not.toBe("none");
   await expect(page.locator(".image-lightbox-vector")).toHaveCount(0);
   await page.getByRole("button", { name: "关闭图片预览" }).click();
   await expect(page.locator(".image-lightbox")).toHaveCount(0);

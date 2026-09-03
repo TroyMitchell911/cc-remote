@@ -1350,11 +1350,20 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .image-lightbox.entered .image-lightbox-content{ transform:scale(1); }
 .image-lightbox-visual{ transform:translate(0,0) scale(1); transform-origin:center;
   transition:transform .16s var(--ease); }
-.image-lightbox-image{ display:block; max-width:calc(100vw - 36px); max-height:calc(100vh - 36px);
+.image-lightbox-image{
+  background-color:#f8f9fb;
+  background-image:
+    linear-gradient(45deg,#d8dde5 25%,transparent 25%),
+    linear-gradient(-45deg,#d8dde5 25%,transparent 25%),
+    linear-gradient(45deg,transparent 75%,#d8dde5 75%),
+    linear-gradient(-45deg,transparent 75%,#d8dde5 75%);
+  background-position:0 0,0 9px,9px -9px,-9px 0;
+  background-size:18px 18px;
+  display:block; max-width:calc(100vw - 36px); max-height:calc(100vh - 36px);
   width:auto; height:auto; border-radius:8px; object-fit:contain; box-shadow:var(--shadow-lg); }
 .image-lightbox-vector{ display:inline-grid; width:fit-content; height:fit-content;
   max-width:calc(100vw - 36px); max-height:calc(100vh - 36px);
-  border-radius:8px; box-shadow:var(--shadow-lg); }
+  border-radius:8px; background:var(--surface); box-shadow:var(--shadow-lg); }
 .image-lightbox-vector>svg{ display:block; width:auto; height:auto;
   max-width:calc(100vw - 36px); max-height:calc(100vh - 36px); overflow:hidden; }
 .image-lightbox.interacting .image-lightbox-visual{ will-change:transform; transition:none; }
