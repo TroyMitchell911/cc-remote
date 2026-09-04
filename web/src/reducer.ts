@@ -4804,12 +4804,6 @@ function reduceEvent(
       // Agent detail is a requester-correlated side panel projection. App owns
       // it separately so it can never mutate the parent conversation runtime.
       return state;
-    case "browser_surface":
-    case "browser_frame":
-      // Browser frames and leases are requester-local, high-frequency panel
-      // state. App routes them directly to BrowserPanel; conversation state
-      // and the persisted cache must never retain screenshot bytes.
-      return state;
     case "dir_list":
       return {
         ...state,

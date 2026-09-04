@@ -59,7 +59,6 @@ interface Props {
   opening?: boolean;
   active: RightPanelView;
   hasArtifact: boolean;
-  hasBrowser?: boolean;
   artifactKind?: Artifact["kind"];
   catalog: Catalog;
   draftKey: string;
@@ -318,9 +317,9 @@ export function BtwPanel(p: Props) {
     <div className="btw-panel" data-lock-horizontal-swipe="true">
       <PanelResizer ariaLabel="调整 BTW 面板宽度" />
       <div className="btw-head">
-        {(p.hasArtifact || p.hasBrowser)
+        {p.hasArtifact
           ? <PanelTabs active={p.active} artifactKind={p.artifactKind}
-              hasArtifact={p.hasArtifact} hasBtw hasBrowser={p.hasBrowser}
+              hasArtifact={p.hasArtifact} hasBtw
               onTab={p.onTab} />
           : <div className="btw-titles">
               <span className="btw-title">

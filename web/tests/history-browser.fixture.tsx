@@ -20,9 +20,6 @@ import {
   type Turn,
 } from "../src/reducer";
 import type {
-  BrowserFrame,
-  BrowserSurface,
-  ErrorMsg,
   CodexProfileInfo,
   PermissionProfileInfo,
   QueryFile,
@@ -34,7 +31,6 @@ import type {
   ThreadGoal,
 } from "../src/protocol";
 import { PROTOCOL_VERSION } from "../src/protocol";
-import type { RelayWs } from "../src/ws";
 import {
   ChatView,
 } from "../src/components/ChatView";
@@ -68,7 +64,6 @@ import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
 import { SessionsSidebar } from "../src/components/SessionsSidebar";
-import { BrowserPanel } from "../src/components/BrowserPanel";
 import { useMobileViewport } from "../src/use-mobile-viewport";
 import {
   completedGoalHasNewerUserTurn,
@@ -2718,233 +2713,9 @@ function CodexFileCitationFixture() {
   </main>;
 }
 
-function ManagedBrowserPanelFixture() {
-  const [online, setOnline] = useState(true);
-  const listenerRef = useRef<(
-    (event: BrowserSurface | BrowserFrame | ErrorMsg) => boolean
-  ) | null>(null);
-  const requestCounter = useRef(0);
-  const controlled = useRef(false);
-  const failedSurface = useRef(false);
-  const currentUrl = useRef("https://example.com/");
-  const currentGeneration = useRef("generation-a");
-  const surfaceRevision = useRef(0);
-  const surfacePolls = useRef(0);
-  const recoveryPolls = useRef(0);
-  const frameRequests = useRef(0);
-  const [commands, setCommands] = useState<Array<Record<string, unknown>>>([]);
-  const imageData = useMemo(() => {
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 400;
-    const context = canvas.getContext("2d");
-    if (context) {
-      context.fillStyle = "#315a88";
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.fillStyle = "white";
-      context.font = "32px sans-serif";
-      context.fillText("cc-remote browser", 150, 210);
-    }
-    return canvas.toDataURL("image/jpeg", 0.8).split(",")[1] ?? "";
-  }, []);
-  const ws = useMemo(() => {
-    const next = (kind: string) => `${kind}-${++requestCounter.current}`;
-    const record = (command: Record<string, unknown>) => {
-      setCommands((current) => [...current.slice(-31), command]);
-    };
-    const emit = (
-      event: BrowserSurface | BrowserFrame | ErrorMsg, delay = 0,
-    ) => {
-      window.setTimeout(() => listenerRef.current?.(event), delay);
-    };
-    const surface = (sid: string, requestId: string): BrowserSurface => ({
-      v: PROTOCOL_VERSION,
-      ts: Date.now() / 1000,
-      sid,
-      to: "browser-fixture-client",
-      type: "browser_surface",
-      request_id: requestId,
-      available: true,
-      enabled: true,
-      surface_id: "surface-a",
-      generation: currentGeneration.current,
-      frame_revision: surfaceRevision.current,
-      width: 640,
-      height: 400,
-      url: currentUrl.current,
-      title: "Example Domain",
-      control_mode: controlled.current ? "user"
-        : rootParams.has("browser-agent") ? "agent" : "none",
-      controlled_by_me: controlled.current,
-      agent_available: true,
-    });
-    return {
-      sendGetBrowserSurfaceTo(sid: string, create: boolean) {
-        const id = next("surface");
-        record({ type: "surface", sid, create });
-        if (!create && rootParams.has("browser-agent-update")) {
-          surfacePolls.current += 1;
-          if (surfacePolls.current === 2) {
-            surfaceRevision.current += 1;
-            currentUrl.current = "https://openai.com/agent-step";
-          }
-        }
-        if (!create && rootParams.has("browser-surface-recreate")) {
-          recoveryPolls.current += 1;
-          if (recoveryPolls.current === 1) {
-            emit({
-              ...surface(sid, id),
-              surface_id: null,
-              generation: null,
-              frame_revision: 0,
-              url: "",
-              title: "",
-              control_mode: "none",
-              controlled_by_me: false,
-              error: "浏览器页面尚未创建",
-            });
-            return id;
-          }
-          if (recoveryPolls.current === 2) {
-            currentGeneration.current = "generation-b";
-            currentUrl.current = "https://openai.com/recovered";
-            surfaceRevision.current += 1;
-          }
-        }
-        if (
-          rootParams.has("browser-surface-error")
-          && !failedSurface.current
-        ) {
-          failedSurface.current = true;
-          emit({
-            v: PROTOCOL_VERSION,
-            ts: Date.now() / 1000,
-            sid,
-            type: "error",
-            code: "not_running",
-            message: "该会话未启动，无法读取浏览器",
-            request_id: id,
-          });
-          return id;
-        }
-        emit(surface(sid, id));
-        return id;
-      },
-      sendGetBrowserFrameTo(sid: string, generation?: string | null) {
-        const id = next("frame");
-        frameRequests.current += 1;
-        surfaceRevision.current += 1;
-        record({ type: "frame", sid, generation });
-        if (
-          rootParams.has("browser-frame-error-race")
-          && frameRequests.current === 1
-        ) {
-          emit({
-            v: PROTOCOL_VERSION,
-            ts: Date.now() / 1000,
-            sid,
-            to: "browser-fixture-client",
-            type: "browser_frame",
-            request_id: id,
-            error: "过期画面请求失败",
-          }, 4_500);
-          return id;
-        }
-        emit({
-          v: PROTOCOL_VERSION,
-          ts: Date.now() / 1000,
-          sid,
-          to: "browser-fixture-client",
-          type: "browser_frame",
-          request_id: id,
-          surface_id: "surface-a",
-          generation: currentGeneration.current,
-          frame_revision: surfaceRevision.current,
-          width: 640,
-          height: 400,
-          url: currentUrl.current,
-          title: "Example Domain",
-          control_mode: controlled.current ? "user"
-            : rootParams.has("browser-agent")
-              || rootParams.has("browser-stale-agent-frame") ? "agent" : "none",
-          controlled_by_me: controlled.current,
-          media_type: "image/jpeg",
-          data: imageData,
-        }, rootParams.has("browser-generation-swap")
-          && currentGeneration.current === "generation-b" ? 800 : 0);
-        return id;
-      },
-      sendAcquireBrowserControlTo(sid: string) {
-        const id = next("acquire");
-        controlled.current = true;
-        record({ type: "acquire", sid });
-        emit(surface(sid, id));
-        return id;
-      },
-      sendReleaseBrowserControlTo(sid: string) {
-        const id = next("release");
-        controlled.current = false;
-        record({ type: "release", sid });
-        emit(surface(sid, id));
-        return id;
-      },
-      sendBrowserActionTo(
-        sid: string,
-        generation: string,
-        action: string,
-        args: Record<string, string | number>,
-      ) {
-        const id = next("action");
-        const blocked = (
-          action === "navigate" && args.url === "http://127.0.0.1/"
-        ) || (
-          action === "type" && rootParams.has("browser-type-error")
-        );
-        if (!blocked && action === "navigate" && typeof args.url === "string") {
-          currentUrl.current = args.url;
-        }
-        if (rootParams.has("browser-generation-swap") && action === "navigate") {
-          currentGeneration.current = "generation-b";
-        }
-        if (rootParams.has("browser-reconnect-action")) {
-          setOnline(false);
-          window.setTimeout(() => setOnline(true), 200);
-        }
-        record({ type: "action", sid, generation, action, ...args });
-        const delayedResponse = (blocked && (
-          rootParams.has("browser-action-race")
-          || rootParams.has("browser-reconnect-action")
-        )) || rootParams.has("browser-success-action-race");
-        emit(blocked ? {
-          ...surface(sid, id),
-          error: action === "type" ? "浏览器输入失败"
-            : "目标 URL 被浏览器网络策略拒绝",
-        } : surface(sid, id),
-        delayedResponse ? 900 : 0);
-        return id;
-      },
-    } as unknown as RelayWs;
-  }, [imageData]);
-  const setListener = useCallback((listener: (
-    (event: BrowserSurface | BrowserFrame | ErrorMsg) => boolean
-  ) | null) => {
-    listenerRef.current = listener;
-  }, []);
-  const rememberRequest = useCallback((_requestId: string) => {}, []);
-  return <main style={{ height: "100dvh" }}>
-    <output data-testid="browser-commands">{JSON.stringify(commands)}</output>
-    <BrowserPanel sid="browser-fixture-session" ws={ws} online={online}
-      active="browser"
-      hasArtifact={false} hasBtw={false} onTab={() => {}}
-      onListen={setListener} onRequest={rememberRequest} onClose={() => {}} />
-  </main>;
-}
-
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
-  rootParams.has("browser-panel")
-    ? <ManagedBrowserPanelFixture />
-    : rootParams.has("artifact-html")
+  rootParams.has("artifact-html")
     ? <ArtifactPreviewFixture kind="html" />
     : rootParams.has("artifact-pdf")
     ? <ArtifactPreviewFixture kind="pdf" />

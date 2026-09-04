@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v48
+**Current release: v3.0.0** · Wire protocol v49
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -62,7 +62,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. Exact files outside cwd require confirmation in the requesting session and are bound to that file identity; user-approved Markdown stays read-only, while only files successfully written by the session can be saved. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v48. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v49. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -82,7 +82,6 @@ requirements.
 | **Work projects and knowledge** | Keep provider-scoped projects, file/link/note sources, and reusable work templates. Starting a Work session materializes the selected context into its private directory. |
 | **Work schedules and isolation** | Run one-shot, daily, or weekly tasks with persisted run records, leases, retries, and overlap prevention. Each work item can access only its private directory; add required material explicitly through attachments or the project knowledge collection. |
 | **Remote operation** | Watch streaming replies and send attachments from a phone, tablet, or desktop browser. While Codex is busy, new input defaults to native steering of the active task, with queue still available; Claude retains interrupt-and-send. Stop remains a separate action. |
-| **Shared Codex browser** | Optionally share a dedicated wrapper-local Chrome profile between Codex Code and the user. The Agent operates the page through app-server `dynamicTools`; `/browser` shows bounded JPEG frames and lets the user take or release mouse/keyboard control. Cookies and site storage never leave the wrapper. |
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
 | **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
@@ -171,25 +170,6 @@ commands:
   and the original single-account UI. Multiple profiles use
   `<profile>@<native-session-id>` only as cc-remote's routing key, so the same
   native UUID can safely exist in two accounts.
-- **Shared Codex browser (optional):** set `CC_REMOTE_CODEX_BROWSER=auto` to
-  lazily launch an installed system Chrome/Chromium with a dedicated wrapper
-  profile per Codex account and a separate page for each Codex Code thread.
-  Codex operates that same page through the official
-  [app-server protocol](https://learn.chatgpt.com/docs/app-server)'s experimental
-  `dynamicTools`; enter `/browser` in Web to view it and take or
-  release control. While the panel is open, Agent frame revisions update the
-  shared view without continuously shipping idle JPEGs. The omnibox accepts a
-  complete URL, upgrades a bare domain to `https://`, or searches Google for
-  ordinary text. This uses OpenAI's public app-server dynamic-tool protocol,
-  not Codex App's private embedded WebView. cc-remote does not download a
-  Playwright browser. Cookies, sign-in state, and site storage stay on the
-  wrapper host; the relay carries only bounded JPEG frames and typed input.
-  Agent screenshots are tool results sent to the active Codex model, and Web
-  screenshots transit the relay only to the authorized requester. Do not open
-  pages in this dedicated profile that the model or remote clients must not see.
-  Agent tools are declared only for Code threads created after the feature is
-  enabled. Older threads remain manually browsable but need a new thread for
-  Agent control. Codex Work is excluded.
 - **Concurrent Codex accounts:** `CC_REMOTE_CODEX_PROFILES_JSON` or
   `CC_REMOTE_CODEX_PROFILES_FILE` can register up to 32 fully isolated
   `CODEX_HOME` profiles. Each profile owns its login,
@@ -273,7 +253,7 @@ an existing custom or ambiguous layout is never replaced. Exactly one profile
 must set `default: true`. Relay and Web receive only
 the public profile id, label, and availability—not the local path or credentials.
 Restart the wrapper after changing the registry, and deploy wrapper, relay, and
-Web together for protocol v48.
+Web together for protocol v49.
 Profile-id changes and single/multi-profile transitions migrate local controls
 and recovery state by the resolved `CODEX_HOME`. If that migration is
 interrupted, keep the same target registry and restart the wrapper to resume it.
@@ -631,14 +611,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v48:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v49:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v48 relay and v48 wrapper so the old wrapper cannot occupy the
+> then start the v49 relay and v49 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`. When upgrading from a pre-v34 release, retain
 > the Work SQLite migration protection introduced by v34: a manual release must
 > run `deploy/work_registry_snapshot.py snapshot` before the new wrapper starts.
@@ -701,7 +681,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v48 wrapper after success.
+release's `/healthz` is verified. Start the v49 wrapper after success.
 
 Verify:
 
@@ -832,10 +812,6 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CC_REMOTE_CLAUDE_PROFILES_FILE` | empty (macOS LaunchAgent: `~/.cc-remote/claude-profiles.json`) | Optional bounded regular JSON file. A missing file means single-account mode, allowing installation before configuration. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server and loses live bidirectional coordination with native Codex CLI/App. Work is always private and ignores this setting. |
-| `CC_REMOTE_CODEX_BROWSER` | `off` | Managed Codex Code browser: `off` disables it, `auto` enables it when Playwright and system Chrome/Chromium are available, and `required` refuses wrapper startup with an explicit error if they are missing. Agent tools are injected only into newly created Code threads. |
-| `CC_REMOTE_BROWSER_BIN` | empty (auto-discover) | Optional absolute Chrome/Chromium executable. cc-remote never downloads Playwright's bundled browser. |
-| `CC_REMOTE_BROWSER_PROFILE_DIR` | `~/.cc-remote/browser/profiles` | Parent directory for wrapper-local profiles; cc-remote derives a stable hashed child name per Codex account so cookies cannot cross account boundaries. It cannot be the filesystem root or user home. Cookies and sign-in state are never sent to the relay. |
-| `CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK` | `0` | A wrapper-local proxy with fresh per-runtime authentication resolves, vets, and connects to the same pinned destination IP. It denies localhost, private, link-local, and other non-public targets by default. Set `1` only for an explicitly trusted intranet site; browser traffic is outside the Codex shell sandbox. |
 | `CC_REMOTE_CODEX_PROFILES_JSON` | empty | Optional multi-account registry in the form `{profile_id:{"label":"…","home":"/absolute/CODEX_HOME","default":true}}`. At most 32 unique homes are allowed and exactly one entry must be the default. Each entry owns an independent daemon; Code combines and labels their sessions, while new Codex Work sessions and schedules may select any entry. Empty preserves single-account compatibility. Inline JSON takes precedence over the file. |
 | `CC_REMOTE_CODEX_PROFILES_FILE` | empty (macOS LaunchAgent: `~/.cc-remote/codex-profiles.json`) | Optional bounded regular JSON file. A missing file means single-account mode, allowing installation before configuration. |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | Local wrapper state directory. The account-switch hook and wrapper must use the same value; the daemon generation barrier stored here contains no Codex credentials. |

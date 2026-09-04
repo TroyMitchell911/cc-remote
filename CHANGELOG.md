@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v49 and split the
+  experimental Codex managed-browser/Computer Use stack into its own feature
+  branch. The Claude runtime line no longer ships Playwright, browser control
+  frames, dynamic browser tools, or the `/browser` UI; artifact image, PDF,
+  GIF, SVG, Markdown, and HTML previews remain available.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v48. Codex
   ChatGPT accounts now expose earned rate-limit reset credits through the
   existing sanitized status surface and can redeem one with the official
@@ -31,26 +36,6 @@
   recorded model identities remain unchanged. The wrapper now rejects daily
   Claude Code releases older than `2.1.258` instead of silently launching
   without the native runtime controls this integration depends on.
-- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v46 so managed
-  browser history uses native back/forward navigation. The Web surface now
-  keeps polling across renderer rebuilds, serializes burst input without
-  dropping keys, preserves retryable text after rejected actions, and ignores
-  late frame errors that belong to an older request.
-- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v45 and add an
-  opt-in Codex Code managed browser. New Code threads can receive the official
-  app-server experimental `dynamicTools` browser namespace; `/browser` opens a
-  requester-local JPEG surface where the user can take or release a bounded
-  control lease. Browser profiles are isolated by Codex account, screenshots
-  are never replay-buffered, and an authenticated loopback policy proxy pins each approved
-  hostname to its vetted public IP so DNS rebinding cannot bypass the default
-  private-network denial. Frames are coalesced and idle/evicted surfaces are
-  reclaimed. The shared surface now follows the desktop browser interaction:
-  its omnibox accepts full URLs, bare domains, or Google searches; its tab and
-  control chrome distinguish Codex, user, and another device; and Web pulls a
-  new JPEG only when the Agent advances the authoritative frame revision or a
-  user action needs its result. Codex Work is excluded. Threads created before
-  the tool declaration remain manually operable but require a new thread for
-  Agent browser access.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v44 and add
   Claude account profiles. Each user-defined profile owns one explicit
   `CLAUDE_CONFIG_DIR`; Code, Work, schedules, models, Skills, extensions,

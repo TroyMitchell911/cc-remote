@@ -8,7 +8,7 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  AutoCompactMode, BrowserActionName, DiffTheme, GoalStatus, QueryFile,
+  AutoCompactMode, DiffTheme, GoalStatus, QueryFile,
   QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
 import {
@@ -1162,73 +1162,6 @@ export class RelayWs {
       ...(creditId ? { credit_id: creditId } : {}),
       ts: nowTs(),
     });
-  }
-
-  sendGetBrowserSurfaceTo(sid: string, create = false): string | null {
-    const requestId = uuid();
-    return this.sendTracked({
-      v: PROTOCOL_VERSION,
-      type: "get_browser_surface",
-      sid,
-      request_id: requestId,
-      create,
-      ts: nowTs(),
-    }, requestId);
-  }
-
-  sendGetBrowserFrameTo(
-    sid: string, generation?: string | null,
-  ): string | null {
-    const requestId = uuid();
-    return this.sendTracked({
-      v: PROTOCOL_VERSION,
-      type: "get_browser_frame",
-      sid,
-      request_id: requestId,
-      ...(generation ? { generation } : {}),
-      ts: nowTs(),
-    }, requestId);
-  }
-
-  sendAcquireBrowserControlTo(sid: string): string | null {
-    const requestId = uuid();
-    return this.sendTracked({
-      v: PROTOCOL_VERSION,
-      type: "acquire_browser_control",
-      sid,
-      request_id: requestId,
-      ts: nowTs(),
-    }, requestId);
-  }
-
-  sendReleaseBrowserControlTo(sid: string): string | null {
-    const requestId = uuid();
-    return this.sendTracked({
-      v: PROTOCOL_VERSION,
-      type: "release_browser_control",
-      sid,
-      request_id: requestId,
-      ts: nowTs(),
-    }, requestId);
-  }
-
-  sendBrowserActionTo(
-    sid: string,
-    generation: string,
-    action: BrowserActionName,
-    args: Record<string, string | number>,
-  ): string | null {
-    const requestId = uuid();
-    return this.sendTracked({
-      v: PROTOCOL_VERSION,
-      type: "browser_action",
-      sid,
-      request_id: requestId,
-      generation,
-      action,
-      ...args,
-      ts: nowTs(),
-    }, requestId);
   }
 
   sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {

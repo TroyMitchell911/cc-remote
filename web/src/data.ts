@@ -366,7 +366,6 @@ export const CODEX_COMMANDS: Command[] = [
   { g: "会话" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal resume 恢复 · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
-  { slash: "browser", name: "托管浏览器", ds: "打开 Codex 与你共享的浏览器", ic: "globe" },
   { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
@@ -375,7 +374,7 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "autocompact", "status", "permissions", "fast", "goal", "btw", "browser", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "autocompact", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (

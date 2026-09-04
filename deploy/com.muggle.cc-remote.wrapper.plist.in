@@ -23,12 +23,6 @@
     <string>__HOME__/.local/bin/claude</string>
     <key>CC_REMOTE_CODEX_DAEMON</key>
     <string>auto</string>
-    <key>CC_REMOTE_CODEX_BROWSER</key>
-    <string>off</string>
-    <key>CC_REMOTE_BROWSER_PROFILE_DIR</key>
-    <string>__HOME__/.cc-remote/browser/profiles</string>
-    <key>CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK</key>
-    <string>0</string>
     <key>CC_REMOTE_CODEX_PROFILES_FILE</key>
     <string>__HOME__/.cc-remote/codex-profiles.json</string>
     <key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>

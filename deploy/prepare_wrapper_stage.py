@@ -286,8 +286,6 @@ lock = (stage / "requirements-wrapper.lock").read_text(encoding="utf-8")
 modules = ["claude_agent_sdk", "httpx", "pydantic", "websockets"]
 if "\npillow==" in "\n" + lock.lower():
     modules.append("PIL")
-if "\nplaywright==" in "\n" + lock.lower():
-    modules.append("playwright")
 for module in modules:
     importlib.import_module(module)
 

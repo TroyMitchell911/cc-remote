@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 import pytest
 
@@ -52,14 +51,6 @@ def test_wrapper_startup_config_fails_closed():
         validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="always"))
     validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="auto"))
     validate_wrapper_config(_wrapper_cfg(codex_daemon_mode="off"))
-    validate_wrapper_config(_wrapper_cfg(codex_browser_mode="auto"))
-    validate_wrapper_config(_wrapper_cfg(codex_browser_mode="required"))
-    with pytest.raises(ValueError, match="CC_REMOTE_CODEX_BROWSER"):
-        validate_wrapper_config(_wrapper_cfg(codex_browser_mode="always"))
-    with pytest.raises(ValueError, match="CC_REMOTE_BROWSER_BIN"):
-        validate_wrapper_config(_wrapper_cfg(browser_bin="relative/chrome"))
-    with pytest.raises(ValueError, match="filesystem root or user home"):
-        validate_wrapper_config(_wrapper_cfg(browser_profile_dir=Path.home()))
     # The hidden broker experiment must not make a stale legacy variable break
     # the supported native-CLI mirror path. Its socket is validated only after
     # an explicit opt-in.

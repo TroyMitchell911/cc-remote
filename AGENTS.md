@@ -60,7 +60,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v48 is declared by
+- **Protocol version gate**: current wire protocol v49 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -71,16 +71,6 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   is scoped by `machine_id`; a credential for one enrolled device must never be
   accepted for another. Keep `cc_remote/device.py`, `relay/devices.py`, relay
   routing, and the Web device selector aligned when this contract changes.
-- **Managed-browser SSRF/account boundary**: Playwright routing is only a
-  defense-in-depth URL check. Chromium must keep using the authenticated loopback proxy in
-  `wrapper/browser_proxy.py`, which resolves, vets, and connects to the same
-  numeric IP; never replace it with a boolean hostname allow-cache or restore
-  Chrome's implicit loopback bypass. Each Codex profile owns a separately
-  derived persistent Chrome directory. Browser pages, cookies, control leases,
-  screenshots, and dynamic-tool callbacks must never cross profile/thread keys.
-  Shared-daemon `item/tool/call` requests are multicast: answer only an exact
-  namespace/tool declared by this handle, and stay silent for another client's
-  dynamic tools so an unrelated subscriber cannot win the response race.
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
@@ -155,8 +145,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `codex_lifecycle.py` owns the
   source-bound exact-terminal ledger; `history_store.py` owns the rebuildable
-  SQLite projection; `browser.py` and `browser_proxy.py` own the optional
-  account-isolated Codex browser and its pinned-IP network boundary;
+  SQLite projection;
   `machine.py`, `command_router.py`,
   `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
   the shared session pool, command dispatch, live replay, relay transport, and

@@ -763,7 +763,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v48_layout():
+def test_release_docs_and_examples_describe_one_atomic_v49_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -776,11 +776,11 @@ def test_release_docs_and_examples_describe_one_atomic_v48_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v48" in deploy_readme
+    assert "Protocol v49" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v48" in document
+        assert "v49" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -800,10 +800,6 @@ def test_release_docs_and_examples_describe_one_atomic_v48_layout():
     assert "__HOME__/.cc-remote/codex-profiles.json" in wrapper_plist
     assert "<key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>" in wrapper_plist
     assert "__HOME__/.cc-remote/claude-profiles.json" in wrapper_plist
-    assert "CC_REMOTE_CODEX_BROWSER=off" in wrapper_env
-    assert "CC_REMOTE_BROWSER_ALLOW_PRIVATE_NETWORK=0" in wrapper_env
-    assert "<key>CC_REMOTE_CODEX_BROWSER</key>" in wrapper_plist
-    assert "<key>CC_REMOTE_BROWSER_PROFILE_DIR</key>" in wrapper_plist
     assert "<key>CLAUDE_WORK_ROOT</key>" in wrapper_plist
     assert "<string>__CLAUDE_WORK_ROOT__</string>" in wrapper_plist
     assert "<key>CODEX_WORK_ROOT</key>" in wrapper_plist
@@ -828,7 +824,7 @@ def test_release_docs_and_examples_describe_one_atomic_v48_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.151" in claude
-    assert "protocol v48" in claude
+    assert "protocol v49" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

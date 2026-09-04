@@ -114,7 +114,6 @@ interface Props {
   onClear: () => void;
   onContext: () => void;
   onOpenBtw?: () => void;
-  onBrowser?: () => void;
   onDiff?: () => void;
   onPreview?: (path: string) => void;
   onGoal?: (args: string) => void;
@@ -591,7 +590,6 @@ export function Composer(p: Props) {
       case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
       case "btw": p.onOpenBtw?.(); break;
-      case "browser": p.onBrowser?.(); break;
       case "diff":
         if (args.trim()) { flash("/diff 不接受参数"); return; }
         p.onDiff?.();

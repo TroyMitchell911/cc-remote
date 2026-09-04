@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 48
+PROTOCOL_VERSION = 49
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -76,11 +76,6 @@ PermissionMode = Literal[
 ]
 CollaborationModeName = Literal["default", "plan"]
 WebSearchMode = Literal["cached", "live"]
-BrowserControlMode = Literal["none", "agent", "user"]
-BrowserActionName = Literal[
-    "navigate", "back", "forward", "click", "type", "press", "scroll",
-    "wait", "resize",
-]
 ControlMode = Literal[
     "remote", "codex_shared", "claude_broker", "external_cli",
     "agent_view", "desktop",
@@ -124,8 +119,6 @@ PREVIEW_ASSET_MAX_BYTES = 4 * 1024 * 1024
 MAX_ENCODED_PREVIEW_ASSET_CHARS = ((PREVIEW_ASSET_MAX_BYTES + 2) // 3) * 4
 ARTIFACT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
 MAX_ENCODED_ARTIFACT_PREVIEW_CHARS = ((ARTIFACT_PREVIEW_MAX_BYTES + 2) // 3) * 4
-BROWSER_FRAME_MAX_BYTES = 2 * 1024 * 1024
-MAX_ENCODED_BROWSER_FRAME_CHARS = ((BROWSER_FRAME_MAX_BYTES + 2) // 3) * 4
 
 
 def _valid_attachment_filename(value: str) -> str:
@@ -197,9 +190,6 @@ PreviewAssetData = Annotated[
 ]
 ArtifactPreviewData = Annotated[
     str, StringConstraints(min_length=1, max_length=MAX_ENCODED_ARTIFACT_PREVIEW_CHARS),
-]
-BrowserFrameData = Annotated[
-    str, StringConstraints(min_length=1, max_length=MAX_ENCODED_BROWSER_FRAME_CHARS),
 ]
 StatusErrorText = Annotated[
     str, StringConstraints(min_length=1, max_length=384),
@@ -2071,171 +2061,6 @@ class RateLimitUpdate(_Base):
         return self
 
 
-class GetBrowserSurface(_Command):
-    """Read or lazily create the focused Codex session's browser surface."""
-    type: Literal["get_browser_surface"] = "get_browser_surface"
-    sid: WireId
-    request_id: WireId
-    cmd_id: WireId
-    client_id: WireId
-    create: bool = False
-
-
-class GetBrowserFrame(_Command):
-    """Pull one latest viewport frame; frames are never replay-buffered."""
-    type: Literal["get_browser_frame"] = "get_browser_frame"
-    sid: WireId
-    request_id: WireId
-    cmd_id: WireId
-    client_id: WireId
-    generation: Optional[WireId] = None
-
-
-class AcquireBrowserControl(_Command):
-    type: Literal["acquire_browser_control"] = "acquire_browser_control"
-    sid: WireId
-    request_id: WireId
-    cmd_id: WireId
-    client_id: WireId
-
-
-class ReleaseBrowserControl(_Command):
-    type: Literal["release_browser_control"] = "release_browser_control"
-    sid: WireId
-    request_id: WireId
-    cmd_id: WireId
-    client_id: WireId
-
-
-class BrowserAction(_Command):
-    """One atomic user input action against an acquired browser lease."""
-    type: Literal["browser_action"] = "browser_action"
-    sid: WireId
-    request_id: WireId
-    cmd_id: WireId
-    client_id: WireId
-    generation: WireId
-    action: BrowserActionName
-    url: Optional[str] = Field(default=None, min_length=1, max_length=8192)
-    x: Optional[int] = Field(default=None, ge=0, le=1919)
-    y: Optional[int] = Field(default=None, ge=0, le=1199)
-    button: Optional[Literal["left", "middle", "right"]] = None
-    text: Optional[str] = Field(default=None, max_length=64 * 1024)
-    key: Optional[str] = Field(default=None, min_length=1, max_length=64)
-    delta_x: Optional[int] = Field(default=None, ge=-5000, le=5000)
-    delta_y: Optional[int] = Field(default=None, ge=-5000, le=5000)
-    ms: Optional[int] = Field(default=None, ge=0, le=5000)
-    width: Optional[int] = Field(default=None, ge=320, le=1920)
-    height: Optional[int] = Field(default=None, ge=320, le=1200)
-
-    @model_validator(mode="after")
-    def action_shape(self):
-        supplied = {
-            name for name in (
-                "url", "x", "y", "button", "text", "key", "delta_x",
-                "delta_y", "ms", "width", "height",
-            )
-            if getattr(self, name) is not None
-        }
-        required: dict[str, set[str]] = {
-            "navigate": {"url"},
-            "back": set(),
-            "forward": set(),
-            "click": {"x", "y"},
-            "type": {"text"},
-            "press": {"key"},
-            "scroll": {"delta_y"},
-            "wait": {"ms"},
-            "resize": {"width", "height"},
-        }
-        allowed = {
-            "navigate": {"url"},
-            "back": set(),
-            "forward": set(),
-            "click": {"x", "y", "button"},
-            "type": {"text"},
-            "press": {"key"},
-            "scroll": {"delta_x", "delta_y"},
-            "wait": {"ms"},
-            "resize": {"width", "height"},
-        }
-        if not required[self.action].issubset(supplied):
-            raise ValueError(f"browser {self.action} is missing required fields")
-        if not supplied.issubset(allowed[self.action]):
-            raise ValueError(f"browser {self.action} has unrelated fields")
-        return self
-
-    def arguments(self) -> dict[str, object]:
-        allowed = {
-            "navigate": ("url",),
-            "back": (),
-            "forward": (),
-            "click": ("x", "y", "button"),
-            "type": ("text",),
-            "press": ("key",),
-            "scroll": ("delta_x", "delta_y"),
-            "wait": ("ms",),
-            "resize": ("width", "height"),
-        }[self.action]
-        return {
-            name: getattr(self, name)
-            for name in allowed if getattr(self, name) is not None
-        }
-
-
-class BrowserSurface(_Base):
-    """Small requester-local state; contains no browser profile identity."""
-    type: Literal["browser_surface"] = "browser_surface"
-    to: WireId
-    request_id: WireId
-    available: bool
-    enabled: bool
-    surface_id: Optional[WireId] = None
-    generation: Optional[WireId] = None
-    frame_revision: int = Field(default=0, ge=0)
-    width: int = Field(default=1280, ge=320, le=1920)
-    height: int = Field(default=800, ge=320, le=1200)
-    url: str = Field(default="", max_length=8192)
-    title: str = Field(default="", max_length=1024)
-    control_mode: BrowserControlMode = "none"
-    controlled_by_me: bool = False
-    agent_available: bool = False
-    error: Optional[str] = Field(default=None, max_length=512)
-
-
-class BrowserFrame(_Base):
-    """Bounded unicast viewport image returned only to its requester."""
-    type: Literal["browser_frame"] = "browser_frame"
-    to: WireId
-    request_id: WireId
-    surface_id: Optional[WireId] = None
-    generation: Optional[WireId] = None
-    frame_revision: int = Field(default=0, ge=0)
-    width: int = Field(default=1280, ge=320, le=1920)
-    height: int = Field(default=800, ge=320, le=1200)
-    url: str = Field(default="", max_length=8192)
-    title: str = Field(default="", max_length=1024)
-    control_mode: BrowserControlMode = "none"
-    controlled_by_me: bool = False
-    media_type: Optional[Literal["image/jpeg"]] = None
-    data: Optional[BrowserFrameData] = None
-    error: Optional[str] = Field(default=None, max_length=512)
-
-    @model_validator(mode="after")
-    def success_shape(self):
-        if self.error is None:
-            if (
-                self.surface_id is None
-                or self.generation is None
-                or self.media_type is None
-                or self.data is None
-            ):
-                raise ValueError("successful browser frame requires image metadata")
-        elif self.data is not None or self.media_type is not None:
-            raise ValueError("failed browser frame cannot carry image data")
-        return self
-
-
 class GetDiff(_Command):
     """client -> wrapper: request a git diff (context + line numbers) for a file.
     `theme` picks delta's light/dark rendering so the panel matches the app."""
@@ -2783,8 +2608,8 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetBrowserSurface, GetBrowserFrame, AcquireBrowserControl, ReleaseBrowserControl, BrowserAction, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, RateLimitResetResult, Notice, RateLimitUpdate, BrowserSurface, BrowserFrame, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, RateLimitResetResult, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2841,11 +2666,6 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_context": GetContext,
     "get_status": GetStatus,
     "consume_rate_limit_reset_credit": ConsumeRateLimitResetCredit,
-    "get_browser_surface": GetBrowserSurface,
-    "get_browser_frame": GetBrowserFrame,
-    "acquire_browser_control": AcquireBrowserControl,
-    "release_browser_control": ReleaseBrowserControl,
-    "browser_action": BrowserAction,
     "get_diff": GetDiff,
     "get_file_preview": GetFilePreview,
     "save_markdown": SaveMarkdown,
@@ -2909,8 +2729,6 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "rate_limit_reset_result": RateLimitResetResult,
     "notice": Notice,
     "rate_limit_update": RateLimitUpdate,
-    "browser_surface": BrowserSurface,
-    "browser_frame": BrowserFrame,
     "diff_report": DiffReport,
     "file_preview": FilePreview,
     "file_save_result": FileSaveResult,

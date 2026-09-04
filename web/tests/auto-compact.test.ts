@@ -8,7 +8,6 @@ import {
   parseAutoCompactArgument,
   validAutoCompactThreshold,
 } from "../src/auto-compact.ts";
-import { resolveBrowserAddress } from "../src/browser-address.ts";
 import { clientSlashesFor } from "../src/data.ts";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
 import { RelayWs } from "../src/ws.ts";
@@ -17,27 +16,6 @@ import { RelayWs } from "../src/ws.ts";
 assert.equal(clientSlashesFor("claude").has("autocompact"), true);
 assert.equal(clientSlashesFor("codex").has("autocompact"), true,
   "Codex must intercept the shared Work command and reject it locally");
-assert.equal(clientSlashesFor("codex").has("browser"), true,
-  "Codex Code must expose the managed-browser command");
-assert.deepEqual(resolveBrowserAddress("baidu.com"), {
-  ok: true,
-  url: "https://baidu.com/",
-  kind: "url",
-});
-assert.deepEqual(resolveBrowserAddress("OpenAI browser documentation"), {
-  ok: true,
-  url: "https://www.google.com/search?q=OpenAI%20browser%20documentation",
-  kind: "search",
-});
-assert.deepEqual(resolveBrowserAddress("site:openai.com browser"), {
-  ok: true,
-  url: "https://www.google.com/search?q=site%3Aopenai.com%20browser",
-  kind: "search",
-}, "search operators must not be mistaken for unsupported URL schemes");
-assert.equal(resolveBrowserAddress("javascript:alert(1)").ok, false,
-  "the omnibox must not disguise unsupported schemes as a search");
-assert.equal(resolveBrowserAddress("https://user:pass@example.com").ok, false,
-  "the omnibox must retain the credential-free URL boundary");
 assert.deepEqual(parseAutoCompactArgument("inherit"), {
   ok: true,
   selection: { mode: "inherit", thresholdTokens: null },
@@ -179,42 +157,6 @@ assert.equal(automaticContextFrame.refresh, false,
 relay.sendGetContext(true);
 assert.equal(JSON.parse(socket.sent.at(-1) ?? "{}").refresh, true,
   "an explicit context read must request a fresh native value");
-
-const browserSurfaceRequest = relay.sendGetBrowserSurfaceTo(
-  "codex-browser", true);
-const browserSurfaceFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
-assert.equal(browserSurfaceFrame.type, "get_browser_surface");
-assert.equal(browserSurfaceFrame.sid, "codex-browser");
-assert.equal(browserSurfaceFrame.request_id, browserSurfaceRequest);
-assert.equal(browserSurfaceFrame.cmd_id, browserSurfaceRequest);
-assert.equal(typeof browserSurfaceFrame.client_id, "string");
-
-const browserFrameRequest = relay.sendGetBrowserFrameTo(
-  "codex-browser", "generation-a");
-const browserFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
-assert.equal(browserFrame.type, "get_browser_frame");
-assert.equal(browserFrame.request_id, browserFrameRequest);
-assert.equal(browserFrame.generation, "generation-a");
-
-const acquireBrowserRequest = relay.sendAcquireBrowserControlTo(
-  "codex-browser");
-const acquireBrowserFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
-assert.equal(acquireBrowserFrame.type, "acquire_browser_control");
-assert.equal(acquireBrowserFrame.request_id, acquireBrowserRequest);
-assert.equal(acquireBrowserFrame.cmd_id, acquireBrowserRequest);
-
-const browserActionRequest = relay.sendBrowserActionTo(
-  "codex-browser", "generation-a", "click",
-  { x: 12, y: 34, button: "left" });
-const browserActionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
-assert.equal(browserActionFrame.type, "browser_action");
-assert.equal(browserActionFrame.request_id, browserActionRequest);
-assert.equal(browserActionFrame.cmd_id, browserActionRequest);
-assert.equal(browserActionFrame.generation, "generation-a");
-assert.deepEqual(
-  [browserActionFrame.x, browserActionFrame.y, browserActionFrame.button],
-  [12, 34, "left"],
-);
 
 assert.equal(relay.sendSetAutoCompact("custom", 250_000), true);
 const autoCompactFrame = JSON.parse(socket.sent.at(-1) ?? "{}");

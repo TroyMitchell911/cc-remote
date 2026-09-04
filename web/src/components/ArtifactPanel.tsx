@@ -352,13 +352,12 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
   return <span className="preview-image-loading"><span className="thinking"><span/><span/><span/></span> {alt || "正在加载图片"}</span>;
 }
 
-export function ArtifactPanel({ artifact, active, hasBtw, hasBrowser, onTab, onClose,
+export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
   onSaveMarkdown, onDirtyChange, theme }: {
   artifact: Artifact;
   active: RightPanelView;
   hasBtw: boolean;
-  hasBrowser?: boolean;
   onTab: (v: RightPanelView) => void;
   onClose: () => void;
   onRefresh?: (path: string, line?: number) => void;
@@ -572,9 +571,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, hasBrowser, onTab, onC
       onKeyDown={handlePanelKeyDown}>
       <PanelResizer ariaLabel="调整文件面板宽度" />
       <div className="artifact-head">
-        {(hasBtw || hasBrowser) ? <PanelTabs active={active}
+        {hasBtw ? <PanelTabs active={active}
             artifactKind={artifact.kind} hasArtifact hasBtw={hasBtw}
-            hasBrowser={hasBrowser} onTab={switchPanelTab} />
+            onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
         {["md", "html"].includes(artifact.kind) && !loading && !artifact.error && <div

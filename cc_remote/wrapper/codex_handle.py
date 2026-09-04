@@ -124,9 +124,6 @@ _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
 _DAEMON_GENERATION_CONNECT_ATTEMPTS = 2
 _TURN_START_RECONCILE_PAGE_SIZE = 8
 _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
-_DYNAMIC_TOOLS_MIN_VERSION = (0, 151, 0)
-_DYNAMIC_TOOL_TIMEOUT = 60.0
-_DYNAMIC_TOOL_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 # The managed shared daemon intentionally follows Codex's standalone release
 # channel.  The desktop app can temporarily bundle a newer official app-server
 # core.  Only very large rollouts opt into that private core; normal Code
@@ -171,9 +168,6 @@ _EXTERNAL_THREAD_STARTED_SOURCES = frozenset({"cli", "vscode", "exec"})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
-DynamicToolCallback = Callable[
-    [dict[str, Any]], Awaitable[Optional[dict[str, Any]]]
-]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
 ThreadStartedCallback = Callable[[str], None]
@@ -661,7 +655,7 @@ class _GoalReplacementFence:
 
 
 class _CodexCompactionContinuation:
-    """One managed browser turn spanning native compact turn ids.
+    """One managed compaction turn spanning native compact turn ids.
 
     ``logical_turn_id`` is frozen for the response consumer. ``native_turn_id``
     follows app-server so interrupt and rollout ownership always target the real
@@ -1124,7 +1118,6 @@ _INTERACTION_METHODS = frozenset({
     "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
 })
-_DYNAMIC_TOOL_METHOD = "item/tool/call"
 _APPROVAL_DECISIONS = frozenset({"accept", "acceptForSession", "decline", "cancel"})
 _LEGACY_DECISIONS = {
     "accept": "approved",
@@ -1368,75 +1361,6 @@ def _supports_lightweight_resume(value: Optional[str]) -> bool:
     return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
 
 
-def _valid_dynamic_tool_response(value: Any) -> bool:
-    """Validate the bounded client-executed tool result before JSON-RPC send."""
-    if not isinstance(value, dict) or set(value) != {"contentItems", "success"}:
-        return False
-    if not isinstance(value.get("success"), bool):
-        return False
-    items = value.get("contentItems")
-    if not isinstance(items, list) or len(items) > 4:
-        return False
-    for item in items:
-        if not isinstance(item, dict):
-            return False
-        item_type = item.get("type")
-        if item_type == "inputText":
-            if (set(item) != {"type", "text"}
-                    or not isinstance(item.get("text"), str)
-                    or len(item["text"]) > 64 * 1024):
-                return False
-        elif item_type == "inputImage":
-            image_url = item.get("imageUrl")
-            if (set(item) != {"type", "imageUrl"}
-                    or not isinstance(image_url, str)
-                    or not image_url.startswith("data:image/jpeg;base64,")):
-                return False
-        else:
-            return False
-    try:
-        encoded = json.dumps(
-            value, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-    except (TypeError, UnicodeEncodeError):
-        return False
-    return len(encoded) <= _DYNAMIC_TOOL_RESPONSE_MAX_BYTES
-
-
-def _dynamic_tool_request_is_owned(
-    params: dict[str, Any], expected: list[dict[str, Any]],
-) -> bool:
-    """Match a callback request to the exact tool specs this client owns."""
-    namespace = params.get("namespace")
-    tool = params.get("tool")
-    if not isinstance(tool, str) or not (
-        namespace is None or isinstance(namespace, str)
-    ):
-        return False
-    identities: set[tuple[Optional[str], str]] = set()
-    for spec in expected:
-        if not isinstance(spec, dict):
-            continue
-        spec_type = spec.get("type")
-        spec_name = spec.get("name")
-        if spec_type == "function" and isinstance(spec_name, str):
-            identities.add((None, spec_name))
-            continue
-        if spec_type != "namespace" or not isinstance(spec_name, str):
-            continue
-        tools = spec.get("tools")
-        if not isinstance(tools, list):
-            continue
-        identities.update(
-            (spec_name, item["name"])
-            for item in tools
-            if isinstance(item, dict)
-            and item.get("type") == "function"
-            and isinstance(item.get("name"), str)
-        )
-    return (namespace, tool) in identities
-
-
 def _resolve_codex_bin() -> str:
     """Compatibility seam for resident handle call sites."""
     return _runtime_resolve_codex_bin()
@@ -1466,56 +1390,6 @@ def _profile_rollout_path(
         if codex_home is None
         else codex_rollout_path(session_id, codex_home=codex_home)
     )
-
-
-def _rollout_declares_dynamic_tools(
-    session_id: str,
-    codex_home: Optional[str],
-    expected: list[dict[str, Any]],
-) -> bool:
-    """Read the immutable session header to recover sticky tool ownership."""
-    if not expected:
-        return False
-    expected_ids = {
-        (item.get("type"), item.get("name"))
-        for item in expected
-        if isinstance(item, dict)
-        and isinstance(item.get("type"), str)
-        and isinstance(item.get("name"), str)
-    }
-    if not expected_ids:
-        return False
-    path = _profile_rollout_path(session_id, codex_home)
-    if not path:
-        return False
-    try:
-        with open(path, "rb") as stream:
-            first_line = stream.readline(_ROLLOUT_SESSION_META_MAX_BYTES + 1)
-    except OSError:
-        return False
-    if (
-        not first_line
-        or len(first_line) > _ROLLOUT_SESSION_META_MAX_BYTES
-        or not first_line.endswith(b"\n")
-    ):
-        return False
-    try:
-        record = json.loads(first_line)
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-        return False
-    payload = record.get("payload") if isinstance(record, dict) else None
-    persisted = (
-        payload.get("dynamic_tools") if isinstance(payload, dict) else None)
-    if not isinstance(persisted, list):
-        return False
-    persisted_ids = {
-        (item.get("type"), item.get("name"))
-        for item in persisted
-        if isinstance(item, dict)
-        and isinstance(item.get("type"), str)
-        and isinstance(item.get("name"), str)
-    }
-    return expected_ids.issubset(persisted_ids)
 
 
 def _codex_runtime_tmp(codex_home: Optional[str] = None) -> str:
@@ -1622,9 +1496,6 @@ class CodexHandle:
                  work_mode: bool = False,
                  approval_callback: Optional[ApprovalCallback] = None,
                  interaction_callback: Optional[InteractionCallback] = None,
-                 dynamic_tool_callback: Optional[DynamicToolCallback] = None,
-                 dynamic_tools: Optional[list[dict[str, Any]]] = None,
-                 dynamic_tool_ownership: Optional[list[dict[str, Any]]] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
                  thread_started_callback: Optional[ThreadStartedCallback] = None,
@@ -1675,17 +1546,6 @@ class CodexHandle:
         self._owned_turn_ids: OrderedDict[str, None] = OrderedDict()
         self._cwd = cwd
         self.work_mode = work_mode
-        self.dynamic_tool_callback = dynamic_tool_callback
-        self.dynamic_tools = (
-            json.loads(json.dumps(dynamic_tools))
-            if isinstance(dynamic_tools, list) else []
-        )
-        self.dynamic_tool_ownership = (
-            json.loads(json.dumps(dynamic_tool_ownership))
-            if isinstance(dynamic_tool_ownership, list)
-            else json.loads(json.dumps(self.dynamic_tools))
-        )
-        self.dynamic_tools_declared = False
         requested_daemon_mode = (
             daemon_mode if daemon_mode is not None
             else getattr(daemon_manager, "mode", None)
@@ -2457,17 +2317,6 @@ class CodexHandle:
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
                 bound_thread_id = self.thread_id
-                self.dynamic_tools_declared = bool(
-                    not self.work_mode
-                    and _semantic_version(self.app_server_version)
-                        >= _DYNAMIC_TOOLS_MIN_VERSION
-                    and await asyncio.to_thread(
-                        _rollout_declares_dynamic_tools,
-                        resume_id,
-                        self.codex_home,
-                        self.dynamic_tool_ownership,
-                    )
-                )
             elif resume_id:
                 # A replacement daemon reconstructs approval/profile from
                 # config defaults rather than the last live thread settings.
@@ -2538,17 +2387,6 @@ class CodexHandle:
                 self.thread_id = _thread_id_of(res) or resume_id
                 bound_thread_id = self.thread_id
                 self._shared_resume_binding_thread_id = None
-                self.dynamic_tools_declared = bool(
-                    not self.work_mode
-                    and _semantic_version(self.app_server_version)
-                        >= _DYNAMIC_TOOLS_MIN_VERSION
-                    and await asyncio.to_thread(
-                        _rollout_declares_dynamic_tools,
-                        resume_id,
-                        self.codex_home,
-                        self.dynamic_tool_ownership,
-                    )
-                )
             else:
                 params: dict[str, Any] = {
                     "cwd": self._cwd,
@@ -2570,16 +2408,9 @@ class CodexHandle:
                         "personality": "none",
                         "config": self._work_config,
                     })
-                elif (
-                    self.dynamic_tools
-                    and _semantic_version(self.app_server_version)
-                        >= _DYNAMIC_TOOLS_MIN_VERSION
-                ):
-                    params["dynamicTools"] = self.dynamic_tools
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
                 bound_thread_id = self.thread_id
-                self.dynamic_tools_declared = "dynamicTools" in params
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
             if http_only_resume:
@@ -2663,7 +2494,6 @@ class CodexHandle:
                     asyncio.TimeoutError,
                 ),
             )
-            retry_dynamic_tools = self.dynamic_tools_declared
             if (
                 daemon_proxy
                 and retryable_generation_failure
@@ -2685,9 +2515,6 @@ class CodexHandle:
                     preserve_controls=True,
                     preserve_permission_profile=preserve_permission_profile,
                     _bind_generation_attempt=_bind_generation_attempt + 1,
-                )
-                self.dynamic_tools_declared = bool(
-                    self.dynamic_tools_declared or retry_dynamic_tools
                 )
                 return
             await self.disconnect()
@@ -6366,7 +6193,6 @@ class CodexHandle:
             _NEW_APPROVAL_METHODS
             | _LEGACY_APPROVAL_METHODS
             | _INTERACTION_METHODS
-            | {_DYNAMIC_TOOL_METHOD}
         )
         if method not in supported_methods:
             log.warning("unsupported codex server request; rejecting", method=method)
@@ -6400,56 +6226,6 @@ class CodexHandle:
                 if self._using_daemon_proxy:
                     return
                 await self._respond_error(rid, -32000, "remote user input failed")
-                return
-            await self._respond(rid, result)
-            return
-
-        if method == _DYNAMIC_TOOL_METHOD:
-            callback = self.dynamic_tool_callback
-            requested_thread = params.get("threadId")
-            owns_request = bool(
-                isinstance(requested_thread, str)
-                and self.thread_id is not None
-                and requested_thread == self.thread_id
-                and not self._control_only_connection
-                and self.dynamic_tools_declared
-                and _dynamic_tool_request_is_owned(
-                    params, self.dynamic_tool_ownership)
-            )
-            if callback is None or not owns_request:
-                if self._using_daemon_proxy:
-                    # Shared app-server requests are broadcast to subscribed
-                    # clients. Only the matching resident session may answer;
-                    # rejecting from a control/sibling connection wins the race
-                    # and breaks the real owner.
-                    return
-                await self._respond_error(
-                    rid, -32000, "dynamic tool callback unavailable")
-                return
-            try:
-                result = await asyncio.wait_for(
-                    callback(params), timeout=_DYNAMIC_TOOL_TIMEOUT)
-            except asyncio.TimeoutError:
-                await self._respond_error(
-                    rid, -32001, "dynamic tool call timed out")
-                return
-            except Exception as exc:
-                log.warning(
-                    "codex dynamic tool callback failed",
-                    error_type=type(exc).__name__,
-                )
-                await self._respond_error(
-                    rid, -32000, "dynamic tool call failed")
-                return
-            if result is None:
-                if self._using_daemon_proxy:
-                    return
-                await self._respond_error(
-                    rid, -32000, "dynamic tool callback did not own the request")
-                return
-            if not _valid_dynamic_tool_response(result):
-                await self._respond_error(
-                    rid, -32000, "dynamic tool returned an invalid response")
                 return
             await self._respond(rid, result)
             return
@@ -7050,9 +6826,6 @@ class CodexHandle:
             ) or (
                 method in _INTERACTION_METHODS
                 and self.interaction_callback is None
-            ) or (
-                method == _DYNAMIC_TOOL_METHOD
-                and self.dynamic_tool_callback is None
             ))
             if self._using_daemon_proxy and missing_callback:
                 # A shared app-server can deliver the same prompt to another
@@ -7073,7 +6846,6 @@ class CodexHandle:
                     _NEW_APPROVAL_METHODS
                     | _LEGACY_APPROVAL_METHODS
                     | _INTERACTION_METHODS
-                    | {_DYNAMIC_TOOL_METHOD}
                 )
                 if self._using_daemon_proxy and supported:
                     # Do not let this saturated connection reject a prompt which
