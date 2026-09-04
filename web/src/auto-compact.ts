@@ -9,7 +9,10 @@ export interface AutoCompactSelection {
   thresholdTokens: number | null;
 }
 
-export const AUTO_COMPACT_PRESETS = [200_000, 500_000, 1_000_000] as const;
+export const DEFAULT_AUTO_COMPACT_TOKENS = 500_000;
+export const AUTO_COMPACT_PRESETS = [
+  200_000, DEFAULT_AUTO_COMPACT_TOKENS, 1_000_000,
+] as const;
 
 export function validAutoCompactThreshold(value: unknown): value is number {
   return typeof value === "number"

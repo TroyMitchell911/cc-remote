@@ -12,6 +12,9 @@ import type {
 export interface CmdGroup { g: string }
 export interface Cmd { slash: string; name: string; ds: string; ic: string }
 export type Command = CmdGroup | Cmd;
+const COMPACT_COMMAND: Cmd = {
+  slash: "compact", name: "压缩上下文", ds: "调用原生压缩", ic: "simplify",
+};
 
 export const COMMANDS: Command[] = [
   { g: "模式" },
@@ -44,6 +47,7 @@ export const COMMANDS: Command[] = [
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
   { slash: "autocompact", name: "自动压缩", ds: "/autocompact [数字]；不填打开设置", ic: "simplify" },
+  COMPACT_COMMAND,
 ];
 
 // Work is a separate product surface, not a differently styled Code session.
@@ -331,7 +335,7 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // /rewind stays reserved locally while its UI is hidden so manually typing it
 // cannot fall through to Claude's interactive-only slash layer.
 const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "autocompact", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "autocompact", "compact", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
 
 // Codex engine command palette. Native app-server controls are handled locally
 // and never expanded into natural-language lookalikes. /context is the focused
@@ -367,7 +371,7 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
-  { slash: "compact", name: "压缩上下文", ds: "调用 Codex 原生 compact", ic: "simplify" },
+  COMPACT_COMMAND,
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];

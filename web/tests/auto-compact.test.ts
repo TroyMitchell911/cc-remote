@@ -297,6 +297,7 @@ try {
       threshold_tokens: 250_000,
       applied_mode: "inherit",
       pending: true,
+      phase: "waiting_terminal",
       mutable: true,
     }),
   });
@@ -304,6 +305,7 @@ try {
   assert.equal(state.runtimes[sid].autoCompact.threshold_tokens, 250_000);
   assert.equal(state.runtimes[sid].autoCompact.applied_mode, "inherit");
   assert.equal(state.runtimes[sid].autoCompact.pending, true);
+  assert.equal(state.runtimes[sid].autoCompact.phase, "waiting_terminal");
 
   let contextState = reduce({
     ...initialState,

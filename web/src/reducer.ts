@@ -11,7 +11,8 @@
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState, EventOwnership } from "./ws";
 import type {
-  ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
+  ServerEvent, SessionInfo, State, ContextReport, StatusReport,
+  RateLimitResetResult, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
@@ -25,6 +26,7 @@ import {
   MAX_BACKGROUND_PROCESS_ITEMS,
 } from "./protocol";
 import type { Catalog } from "./data";
+import { DEFAULT_AUTO_COMPACT_TOKENS } from "./auto-compact";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
@@ -347,6 +349,7 @@ export interface SessionRuntime {
   rateLimits: StatusRateLimit[];
   statusRequestId: string | null;
   statusError: string | null;
+  resetCreditResult: RateLimitResetResult | null;
   notices: Notice[];
   // Busy-send choice belongs to this session's composer. A choice made while
   // reading one Codex task must not turn another session away from the default
@@ -469,6 +472,7 @@ export function createRuntime(): SessionRuntime {
     contextError: null, goal: null,
     goalId: null, goalDismissed: false, completion: null,
     statusReport: null, rateLimits: [], statusRequestId: null, statusError: null,
+    resetCreditResult: null,
     notices: [], sendMode: "steer",
     queue: [], pendingSend: null, failedDeferred: [],
     acceptancePending: null,
@@ -2503,6 +2507,7 @@ export function reduce(state: AppState, action: Action): AppState {
       return patch(state, action.sid, (rt) => {
         rt.statusRequestId = action.requestId;
         rt.statusError = null;
+        rt.resetCreditResult = null;
       });
     case "set_artifact":
       return { ...state, artifact: action.artifact };
@@ -3157,10 +3162,11 @@ export function reduce(state: AppState, action: Action): AppState {
           cwdSource: action.cwdSource ?? "default",
           model: action.model ?? null,
           effort: action.effort ?? null,
-          autoCompactMode: action.autoCompactMode ?? "inherit",
+          autoCompactMode: action.autoCompactMode ?? "custom",
           autoCompactThresholdTokens:
-            action.autoCompactMode === "custom"
-              ? action.autoCompactThresholdTokens ?? null
+            (action.autoCompactMode ?? "custom") === "custom"
+              ? action.autoCompactThresholdTokens
+                ?? DEFAULT_AUTO_COMPACT_TOKENS
               : null,
           claudeProfileId: action.claudeProfileId ?? null,
           codexProfileId: action.codexProfileId ?? null,
@@ -3761,8 +3767,8 @@ function reduceEvent(
               ? "inherited" : "default") as "inherited" | "default",
           model: null,
           effort: null,
-          autoCompactMode: "inherit",
-          autoCompactThresholdTokens: null,
+          autoCompactMode: "custom",
+          autoCompactThresholdTokens: DEFAULT_AUTO_COMPACT_TOKENS,
           claudeProfileId: selectedClaudeProfileId,
           codexProfileId: selectedCodexProfileId,
         };
@@ -5380,6 +5386,22 @@ function reduceEvent(
         rt.statusRequestId = null;
         rt.statusError = null;
       });
+    case "rate_limit_reset_result":
+      return patch(state, e.sid, (rt) => {
+        // An ACK-lost retry can replay an older private result. It may restore
+        // an otherwise-untracked request, but must not settle a newer click.
+        if (rt.statusRequestId && e.request_id !== rt.statusRequestId) return;
+        rt.statusRequestId = null;
+        rt.resetCreditResult = e;
+        rt.statusError = null;
+        // The coupon inventory predates this mutation. Hide it immediately so
+        // a slow/failed follow-up read cannot offer another click against stale
+        // rows. The targeted StatusReport that follows restores authoritative
+        // inventory; a failed read leaves the manual Refresh path available.
+        if (rt.statusReport?.reset_credits) {
+          rt.statusReport = { ...rt.statusReport, reset_credits: null };
+        }
+      });
     case "notice":
       return patch(state, e.sid, (rt) => {
         rt.notices = mergeNotices(rt.notices, [e]);
@@ -5544,6 +5566,10 @@ function reduceEvent(
           return patch(state, e.sid, (rt) => {
             rt.statusRequestId = null;
             rt.statusError = presentCommandProblem(e);
+            rt.resetCreditResult = null;
+            if (rt.statusReport?.reset_credits) {
+              rt.statusReport = { ...rt.statusReport, reset_credits: null };
+            }
           });
         }
       }

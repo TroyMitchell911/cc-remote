@@ -48,6 +48,8 @@ from cc_remote.wrapper.claude_rewind import (
 )
 from cc_remote.wrapper.claude_runtime import inspect_claude_runtime
 from cc_remote.wrapper.claude_controls import (
+    CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
+    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     claude_auto_compact_cli_value,
     valid_claude_auto_compact,
     valid_claude_model,
@@ -69,9 +71,28 @@ log = logger("cc_remote.wrapper.sdk")
 CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
 CLAUDE_DEFAULT_EFFORT = "max"
 CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024
+_CLAUDE_1M_MODEL_PINS = {
+    "opus": CLAUDE_DEFAULT_MODEL,
+    "opus[1m]": CLAUDE_DEFAULT_MODEL,
+    "claude-opus-5": CLAUDE_DEFAULT_MODEL,
+    "claude-opus-5[1m]": CLAUDE_DEFAULT_MODEL,
+    "claude-fable-5-1": "claude-fable-5-1[1m]",
+    "claude-fable-5-1[1m]": "claude-fable-5-1[1m]",
+    "claude-mythos-5-1": "claude-mythos-5-1[1m]",
+    "claude-mythos-5-1[1m]": "claude-mythos-5-1[1m]",
+}
 _CONVERSATION_REWIND_PROBE_UUID = "00000000-0000-0000-0000-000000000000"
 _CONTEXT_CONTROL_TIMEOUT = 15.0
 _CONTEXT_STARTUP_TIMEOUT = 5.0
+_CURRENT_LAUNCH_VALUE = object()
+
+
+def normalize_claude_model_selection(model: str | None) -> str | None:
+    """Keep curated long-context aliases pinned across every child generation."""
+    if model is None:
+        return None
+    normalized = model.strip()
+    return _CLAUDE_1M_MODEL_PINS.get(normalized.lower(), normalized)
 
 # Work keeps the file primitives needed for documents and other deliverables,
 # plus first-party web research.  Deliberately omit Agent/Task, Skill,
@@ -178,8 +199,9 @@ class SdkHandle:
         # Automatic compaction is also a spawn-time CLI option. Keep desired and
         # applied values separate so a busy turn can drain to ResultMessage before
         # the wrapper reconnects this exact session with the new threshold.
-        self.auto_compact_mode = "inherit"
-        self.auto_compact_threshold_tokens: int | None = None
+        self.auto_compact_mode = CLAUDE_DEFAULT_AUTO_COMPACT_MODE
+        self.auto_compact_threshold_tokens: int | None = (
+            CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS)
         self.applied_auto_compact_mode: str | None = None
         self.applied_auto_compact_threshold_tokens: int | None = None
         self.effective_auto_compact_threshold_tokens: int | None = None
@@ -303,9 +325,18 @@ class SdkHandle:
             cli_path=runtime.cli_path,
         )
 
-    def _options(self, resume_id: str | None, cwd: str | None = None,
-                 fork: bool = False,
-                 model_override: str | None = None) -> ClaudeAgentOptions:
+    def _options(
+        self,
+        resume_id: str | None,
+        cwd: str | None = None,
+        fork: bool = False,
+        model_override: str | None = None,
+        *,
+        auto_compact_override: tuple[str, int | None] | None = None,
+        effort_override: object = _CURRENT_LAUNCH_VALUE,
+    ) -> ClaudeAgentOptions:
+        if not self.work_mode:
+            model_override = normalize_claude_model_selection(model_override)
         code_prompt_append = (
             "You have two MCP tools on the cc-remote-ask server:\n"
             "- `ask_user(question, options)`: ask the user a clarifying question with "
@@ -319,9 +350,22 @@ class SdkHandle:
             "Modes: default, acceptEdits, plan, auto, bypassPermissions."
         )
         extra_args = {"replay-user-messages": None}
+        auto_compact_mode, auto_compact_threshold = (
+            auto_compact_override
+            if auto_compact_override is not None
+            else (
+                self.auto_compact_mode,
+                self.auto_compact_threshold_tokens,
+            )
+        )
         auto_compact = claude_auto_compact_cli_value(
-            self.auto_compact_mode,
-            self.auto_compact_threshold_tokens,
+            auto_compact_mode,
+            auto_compact_threshold,
+        )
+        launch_effort = (
+            self.effort
+            if effort_override is _CURRENT_LAUNCH_VALUE
+            else effort_override
         )
         if auto_compact is not None:
             # SDK 0.2.151 has no typed option yet, but intentionally forwards
@@ -390,7 +434,10 @@ class SdkHandle:
             # ephemeral /btw side-forks.
             fork_session=fork,
             model=model_override,
-            effort=self.effort,                   # reasoning strength; None -> CLI default (high)
+            # ``connect`` passes an immutable launch snapshot here.  The desired
+            # value may change while the child is starting, but that later choice
+            # must not be misreported as already applied to this generation.
+            effort=launch_effort,                 # None -> CLI default (high)
             # The SDK otherwise copies the wrapper's complete environment into
             # Claude/tool subprocesses. Never expose relay login/bearer secrets.
             env=code_child_env,
@@ -447,12 +494,42 @@ class SdkHandle:
         # copying it into the control-plane logger.
         log.warning("cc stderr: ***", chars=len(line))
 
-    async def connect(self, resume_id: str | None = None, cwd: str | None = None,
-                      fork: bool = False,
-                      model_override: str | None = None,
-                      _suppress_context_probe: bool = False) -> None:
+    async def connect(
+        self,
+        resume_id: str | None = None,
+        cwd: str | None = None,
+        fork: bool = False,
+        model_override: str | None = None,
+        _suppress_context_probe: bool = False,
+        *,
+        _launch_auto_compact: tuple[str, int | None] | None = None,
+        _launch_effort: object = _CURRENT_LAUNCH_VALUE,
+    ) -> None:
+        # Capture every spawn-time option before the first await. A settings
+        # command can run while disconnect/connect is in flight; that command is
+        # the desired state for a later generation, not authority to rewrite the
+        # exact argv of the child currently being launched.
+        launch_auto_compact = valid_claude_auto_compact(*(
+            _launch_auto_compact
+            if _launch_auto_compact is not None
+            else (
+                self.auto_compact_mode,
+                self.auto_compact_threshold_tokens,
+            )
+        ))
+        launch_effort = (
+            self.effort
+            if _launch_effort is _CURRENT_LAUNCH_VALUE
+            else _launch_effort
+        )
         opts = self._options(
-            resume_id, cwd, fork=fork, model_override=model_override)
+            resume_id,
+            cwd,
+            fork=fork,
+            model_override=model_override,
+            auto_compact_override=launch_auto_compact,
+            effort_override=launch_effort,
+        )
         if self.isolate_account_env:
             self.client = ClaudeSDKClient(
                 options=opts,
@@ -514,6 +591,8 @@ class SdkHandle:
                         fork=fork,
                         model_override=model_override,
                         _suppress_context_probe=True,
+                        _launch_auto_compact=launch_auto_compact,
+                        _launch_effort=launch_effort,
                     )
                     return
                 # Model readout is useful control state, but a semantic or
@@ -534,15 +613,15 @@ class SdkHandle:
         self._goal_message_tokens.clear()
         if resume_id and not fork:
             await self.refresh_goal(resume_id)
-        self.applied_effort = self.effort  # the live subprocess now reflects this effort
-        self.applied_auto_compact_mode = self.auto_compact_mode
+        self.applied_effort = launch_effort
+        self.applied_auto_compact_mode = launch_auto_compact[0]
         self.applied_auto_compact_threshold_tokens = (
-            self.auto_compact_threshold_tokens)
+            launch_auto_compact[1])
         self._start_message_pump()
         log.info("sdk connected", resume=bool(resume_id), fork=fork, cwd=opts.cwd,
-                 effort=self.effort, permission_mode=self.permission_mode,
-                 auto_compact=self.auto_compact_mode,
-                 auto_compact_threshold=self.auto_compact_threshold_tokens,
+                 effort=launch_effort, permission_mode=self.permission_mode,
+                 auto_compact=launch_auto_compact[0],
+                 auto_compact_threshold=launch_auto_compact[1],
                  context_probe_suppressed=self.context_probe_suppressed,
                  sdk_version=SDK_VERSION)
 
@@ -636,7 +715,21 @@ class SdkHandle:
             model = usage.get("model") if isinstance(usage, dict) else None
             selected_model = valid_claude_model(model)
             if selected_model is not None:
-                self.model = selected_model
+                # Claude's context response commonly reports the base alias even
+                # when this generation was explicitly selected with ``[1m]``.
+                # Preserve that proven selection across reconnects, but do not
+                # promote a merely observed native/Work base model: Code owns
+                # explicit model selection while Work keeps Claude's policy.
+                current_model = valid_claude_model(self.model)
+                if (
+                    current_model is not None
+                    and current_model.lower().endswith("[1m]")
+                    and normalize_claude_model_selection(current_model)
+                        == normalize_claude_model_selection(selected_model)
+                ):
+                    self.model = normalize_claude_model_selection(current_model)
+                else:
+                    self.model = selected_model
         auto_threshold = usage.get("autoCompactThreshold")
         self.effective_auto_compact_threshold_tokens = (
             auto_threshold
@@ -685,6 +778,14 @@ class SdkHandle:
         recovered = claude_recent_context_usage(message.usage)
         if recovered is not None:
             self._last_recent_context_usage = recovered
+
+    def _observe_context_boundary(self, message: Any) -> None:
+        """Invalidate cached usage at every real native compact boundary."""
+        if (
+            isinstance(message, SystemMessage)
+            and message.subtype == "compact_boundary"
+        ):
+            self.invalidate_context_usage_cache()
 
     def remember_recent_context_usage(self, usage: dict[str, Any]) -> None:
         """Seed a source-validated transcript fallback after cold resume."""
@@ -788,6 +889,9 @@ class SdkHandle:
     async def set_model(self, model: str) -> None:
         """Switch the model for the live cc subprocess (takes effect next query,
         no reconnect)."""
+        model = normalize_claude_model_selection(model)
+        if model is None:
+            raise ValueError("Claude model is required")
         async with self._control_request_lock:
             assert self.client is not None
             previous_model = self.model
@@ -988,7 +1092,7 @@ class SdkHandle:
             resume_id=resume_id,
             cwd=cwd,
             reason="prepare conversation rewind",
-            preserve_model=False,
+            preserve_model=True,
         )
         capability = await self.conversation_rewind_capability(refresh=True)
         if not capability.supported:
@@ -1096,6 +1200,7 @@ class SdkHandle:
             if message is None:
                 continue
             self._observe_recent_context_usage(message)
+            self._observe_context_boundary(message)
             if (isinstance(message, ResultMessage)
                     and not bool(getattr(message, "is_error", False))):
                 # A complete successful turn proves that a no-probe replacement
@@ -1150,6 +1255,7 @@ class SdkHandle:
                 if message is None:
                     continue
                 self._observe_recent_context_usage(message)
+                self._observe_context_boundary(message)
                 if (isinstance(message, ResultMessage)
                         and not bool(getattr(message, "is_error", False))):
                     self.context_probe_suppressed = False
@@ -1382,19 +1488,45 @@ class SdkHandle:
                         error_type=type(exc).__name__,
                     )
 
-    async def force_reconnect(self, resume_id: str | None, cwd: str | None = None,
-                              reason: str = "drain timeout",
-                              preserve_model: bool = True,
-                              fork: bool = False) -> None:
+    async def force_reconnect(
+        self,
+        resume_id: str | None,
+        cwd: str | None = None,
+        reason: str = "drain timeout",
+        preserve_model: bool = True,
+        fork: bool = False,
+        apply_pending_auto_compact: bool = False,
+        launch_auto_compact: tuple[str, int | None] | None = None,
+    ) -> None:
         """Tear down and reconnect with resume. Used after a drain timeout, and to
         apply a spawn-time option change (e.g. effort) to a live session."""
         async with self._permission_reconnect_lock:
             log.warning("force-reconnecting SDK client", reason=reason)
+            launch_effort = self.effort
+            desired_auto_compact = (
+                self.auto_compact_mode,
+                self.auto_compact_threshold_tokens,
+            )
+            if launch_auto_compact is not None:
+                exact_auto_compact = valid_claude_auto_compact(
+                    *launch_auto_compact)
+            elif (
+                not apply_pending_auto_compact
+                and self.applied_auto_compact_mode
+                    in {"inherit", "auto", "custom"}
+            ):
+                exact_auto_compact = valid_claude_auto_compact(
+                    self.applied_auto_compact_mode,
+                    self.applied_auto_compact_threshold_tokens,
+                )
+            else:
+                exact_auto_compact = valid_claude_auto_compact(
+                    *desired_auto_compact)
+            model_override = self.model if preserve_model else None
             try:
                 await self.disconnect()
             except Exception as e:
                 log.warning("disconnect during force-reconnect failed", error=str(e))
-            model_override = self.model if preserve_model else None
             if not preserve_model:
                 # An external terminal may have changed this session's model.
                 # Let resume recover it instead of forcing our stale cache back.
@@ -1405,4 +1537,7 @@ class SdkHandle:
                 # A reconnect is never a fresh-session metadata boundary. It
                 # must become query-ready without synchronously rebuilding
                 # /context, including after a poisoned control generation.
-                _suppress_context_probe=True)
+                _suppress_context_probe=True,
+                _launch_auto_compact=exact_auto_compact,
+                _launch_effort=launch_effort,
+            )

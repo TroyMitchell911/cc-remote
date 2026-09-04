@@ -686,6 +686,10 @@ class _ClaudeRunSdk:
         self.queries = 0
         self.reconnects = 0
         self.reconnect_args = []
+        self.auto_compact_mode = "custom"
+        self.auto_compact_threshold_tokens = 500_000
+        self.applied_auto_compact_mode = "custom"
+        self.applied_auto_compact_threshold_tokens = 500_000
 
     async def query(self, _prompt):
         self.queries += 1
@@ -953,9 +957,13 @@ def test_delayed_sdk_rows_remain_owned_after_result(tmp_path):
         # the metadata belongs to the SDK-authored assistant row above.
         with path.open("ab") as stream:
             stream.write(
-                ("{\"type\":\"last-prompt\","
-                 f"\"leafUuid\":\"{assistant_id}\"}}\n"
-                 "{\"type\":\"mode\",\"mode\":\"normal\"}\n").encode()
+                (
+                    "{\"type\":\"last-prompt\","
+                    f"\"leafUuid\":\"{assistant_id}\"}}\n"
+                    "{\"type\":\"ai-title\","
+                    "\"aiTitle\":\"Owned title\"}\n"
+                    "{\"type\":\"mode\",\"mode\":\"normal\"}\n"
+                ).encode()
             )
         await machine._poll_claude_watch(
             "sid", watch, set(), 1001.0,
@@ -1244,6 +1252,24 @@ def test_claude_growth_classifier_treats_atis_latch_as_neutral_metadata():
     assert owned == (assistant_id,)
 
 
+def test_claude_growth_classifier_treats_ai_title_as_neutral_metadata():
+    assistant_id = "11111111-1111-4111-8111-111111111111"
+    origin, owned = classify_claude_growth(
+        (
+            '{"type":"assistant","entrypoint":"sdk-py",'
+            f'"uuid":"{assistant_id}"}}\n'
+            '{"type":"ai-title","aiTitle":"Generated title",'
+            '"sessionId":"sid"}\n'
+        ).encode()
+    )
+
+    assert origin == "sdk"
+    assert owned == (assistant_id,)
+    assert classify_claude_growth(
+        b'{"type":"ai-title","aiTitle":"Unattributed"}\n'
+    ) == ("unknown", ())
+
+
 def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
     tmp_path,
 ):
@@ -1467,6 +1493,8 @@ def test_claude_takeover_adopts_only_completed_native_controls(
             model="claude-opus-4-6[1m]",
             effort="high",
             permission_mode="bypassPermissions",
+            applied_auto_compact_mode="custom",
+            applied_auto_compact_threshold_tokens=500_000,
         )
         assert any(getattr(event, "type", None) == "model"
                    and event.model == "claude-opus-4-6[1m]"
@@ -1672,14 +1700,104 @@ def test_short_external_append_is_reloaded_before_claude_query(
 
         monkeypatch.setattr(
             machine, "_probe_claude_holders", probe, raising=False)
-        path.write_bytes(b'{"type":"external-user"}\n')
+
+        async def completed_controls(_ctx):
+            return ClaudeControls(
+                model="claude-fable-5-1", effort="high")
+
+        monkeypatch.setattr(
+            machine, "_read_claude_handoff_controls", completed_controls)
+        path.write_bytes(
+            b'{"type":"assistant","entrypoint":"cli"}\n')
 
         await machine._run_turn(ctx, "hello")
 
         assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "external transcript change at final preflight",
+            "preserve_model": True,
+        }]
+        assert sdk.model == "claude-fable-5-1[1m]"
+        assert sdk.effort == "high"
         assert sdk.queries == 1
         assert ctx.state == "idle"
         assert ctx.needs_reload is False
+
+    asyncio.run(go())
+
+
+def test_unknown_growth_does_not_restore_stale_native_controls(
+    tmp_path, monkeypatch,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-metadata"
+        sdk = _ClaudeRunSdk()
+        sdk.model = "claude-mythos-5-1[1m]"
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+
+        async def probe(_paths, _cwds):
+            return HolderScan({"sid": set()}, True)
+
+        stale_control_reads = 0
+
+        async def stale_completed_controls(_ctx):
+            nonlocal stale_control_reads
+            stale_control_reads += 1
+            return ClaudeControls(model="claude-fable-5-1")
+
+        monkeypatch.setattr(
+            machine, "_probe_claude_holders", probe, raising=False)
+        monkeypatch.setattr(
+            machine,
+            "_read_claude_handoff_controls",
+            stale_completed_controls,
+        )
+        path.write_bytes(b'{"type":"future-metadata"}\n')
+
+        await machine._run_turn(ctx, "hello")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args[0]["preserve_model"] is True
+        assert sdk.model == "claude-mythos-5-1[1m]"
+        assert stale_control_reads == 0
+        assert ctx.claude_native_controls_dirty is False
+        assert sdk.queries == 1
+
+    asyncio.run(go())
+
+
+def test_work_handoff_does_not_promote_native_base_model(monkeypatch):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.space = "work"
+        sdk = _ClaudeRunSdk()
+        sdk.model = "claude-fable-5-1"
+        ctx.sdk = sdk
+        ctx.claude_native_controls_dirty = True
+
+        async def completed_controls(_ctx):
+            return ClaudeControls(model="claude-fable-5-1")
+
+        monkeypatch.setattr(
+            machine, "_read_claude_handoff_controls", completed_controls)
+
+        model, _effort = await machine._stage_claude_handoff_controls(ctx)
+
+        assert model == "claude-fable-5-1"
+        assert sdk.model == "claude-fable-5-1"
+        assert ctx.claude_native_controls_dirty is False
 
     asyncio.run(go())
 

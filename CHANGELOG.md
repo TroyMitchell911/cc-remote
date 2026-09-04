@@ -4,12 +4,33 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v48. Codex
+  ChatGPT accounts now expose earned rate-limit reset credits through the
+  existing sanitized status surface and can redeem one with the official
+  app-server API. Redemption is idle-only, explicitly confirmed, requester-
+  scoped, and uses the reliable command id as the native idempotency key;
+  paid credit balances and spend controls remain private.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v47. Managed
+  Claude sessions now launch with a real 500K autocompact threshold by default;
+  reductions compact and verify a native boundary before reconnecting, while
+  crash-safe desired/applied state prevents restarts and forks from applying a
+  smaller window early. Delayed SDK title metadata no longer triggers a false
+  external reload, and genuine transcript reloads preserve the selected
+  long-context model so a 500K threshold cannot become paired with an implicit
+  200K model. cc-remote no longer intercepts or rewrites Claude's native
+  image/PDF `Read` tools; model context limits, media handling, and automatic
+  compaction stay owned by Claude Code.
 - Expose the Codex Fast service tier in Work for both new and resident
   sessions while keeping Claude Work on its engine-neutral command surface.
 - Upgrade the verified Claude Agent SDK pin to `0.2.151` (bundled Claude Code
   `2.1.258`) and replace the curated Fable 5 and Mythos 5 model cards with the
-  official `claude-fable-5-1` and `claude-mythos-5-1` releases. Existing
-  sessions retain their exact recorded model identity.
+  official `claude-fable-5-1` and `claude-mythos-5-1` releases. Managed Code
+  sessions select these through Claude Code's native `[1m]` context marker
+  (which is stripped before provider routing); legacy unsuffixed curated aliases
+  retain their family/version and are normalized to that marker, while other
+  recorded model identities remain unchanged. The wrapper now rejects daily
+  Claude Code releases older than `2.1.258` instead of silently launching
+  without the native runtime controls this integration depends on.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v46 so managed
   browser history uses native back/forward navigation. The Web surface now
   keeps polling across renderer rebuilds, serializes burst input without

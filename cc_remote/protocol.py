@@ -28,12 +28,13 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 46
+PROTOCOL_VERSION = 48
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
 # one-shot status frame into an unbounded relay/browser allocation.
 MAX_STATUS_USAGE_BUCKETS = 53 * 7
+MAX_STATUS_RESET_CREDITS = 32
 MAX_SAFE_WIRE_INTEGER = 9_007_199_254_740_991
 MAX_SAFE_WIRE_TIMESTAMP_SECONDS = MAX_SAFE_WIRE_INTEGER // 1000
 MAX_BACKGROUND_PROCESS_ITEMS = 64
@@ -66,6 +67,9 @@ EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ]
 AutoCompactMode = Literal["inherit", "auto", "custom"]
+AutoCompactPhase = Literal[
+    "stable", "waiting_terminal", "compacting", "reconnecting", "blocked",
+]
 PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
     "never", "on-request", "untrusted",
@@ -95,6 +99,12 @@ WireId = Annotated[
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
     ),
+]
+ResetCreditId = Annotated[
+    str, StringConstraints(min_length=1, max_length=512),
+]
+RateLimitResetOutcome = Literal[
+    "reset", "nothingToReset", "noCredit", "alreadyRedeemed", "unknown",
 ]
 
 MAX_ENCODED_ATTACHMENT_CHARS = ((MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3) * 4
@@ -703,6 +713,7 @@ class AutoCompact(_Base):
         le=MAX_AUTO_COMPACT_TOKENS,
     )
     pending: bool = False
+    phase: AutoCompactPhase = "stable"
     mutable: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
 
@@ -1149,7 +1160,8 @@ class NewSession(_Command):
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
-    auto_compact_mode: Optional[AutoCompactMode] = None  # Claude only; None -> inherit
+    # Claude only. None resolves to cc-remote's real 500k launch default.
+    auto_compact_mode: Optional[AutoCompactMode] = None
     auto_compact_threshold_tokens: Optional[int] = Field(
         default=None,
         ge=MIN_AUTO_COMPACT_TOKENS,
@@ -1269,7 +1281,7 @@ class RollbackResult(_Base):
 class CompactSession(_Command):
     type: Literal["compact_session"] = "compact_session"
     session_id: WireId
-    engine: Literal["codex"] = "codex"
+    engine: Literal["claude", "codex"] = "codex"
     space: Literal["code"] = "code"
 
 
@@ -1861,6 +1873,23 @@ class GetStatus(_Command):
     type: Literal["get_status"] = "get_status"
 
 
+class ConsumeRateLimitResetCredit(_Command):
+    """client -> wrapper: redeem one Codex account reset credit.
+
+    ``cmd_id`` is also the native app-server idempotency key, so a transport
+    retry or wrapper restart cannot redeem the same logical action twice.
+    Omitting ``credit_id`` lets the account backend select the next available
+    reset credit.
+    """
+    type: Literal[
+        "consume_rate_limit_reset_credit"
+    ] = "consume_rate_limit_reset_credit"
+    sid: WireId
+    cmd_id: WireId
+    client_id: WireId
+    credit_id: Optional[ResetCreditId] = None
+
+
 class _StatusPart(BaseModel):
     """Strict nested payload shared by StatusReport's allow-listed sections."""
     model_config = ConfigDict(extra="forbid")
@@ -1922,6 +1951,27 @@ class StatusRateLimit(_StatusPart):
     secondary: Optional[StatusRateLimitWindow] = None
 
 
+class StatusRateLimitResetCredit(_StatusPart):
+    id: ResetCreditId
+    granted_at: int = Field(ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS)
+    expires_at: Optional[int] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+    )
+    reset_type: Literal["codexRateLimits", "unknown"]
+    status: Literal["available", "redeeming", "redeemed", "unknown"]
+    title: Optional[str] = Field(default=None, max_length=256)
+    description: Optional[str] = Field(default=None, max_length=2048)
+
+
+class StatusRateLimitResetCredits(_StatusPart):
+    available_count: int = Field(ge=0, le=MAX_SAFE_WIRE_INTEGER)
+    # ``None`` means the backend exposed only the count. An empty list means it
+    # did return detail rows and none were available. The list may be capped.
+    credits: Optional[list[StatusRateLimitResetCredit]] = Field(
+        default=None, max_length=MAX_STATUS_RESET_CREDITS,
+    )
+
+
 class StatusDailyUsageBucket(_StatusPart):
     start_date: Annotated[
         str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -1945,8 +1995,10 @@ class StatusReport(_Base):
 
     Every nested model forbids extras. The wrapper copies only explicitly
     approved display fields; account email, credentials, config instructions,
-    rollout paths/previews and credit balances never cross the wire. Daily
-    activity is limited to validated date/token pairs for the latest 53 weeks.
+    rollout paths/previews and paid credit balances never cross the wire.
+    Earned rate-limit reset credits are a separate, explicitly allow-listed
+    control surface. Daily activity is limited to validated date/token pairs
+    for the latest 53 weeks.
     ``component_errors`` makes partial RPC failure visible without hiding the
     successful sections.
     """
@@ -1959,10 +2011,21 @@ class StatusReport(_Base):
     context: StatusContext
     account: Optional[StatusAccount] = None
     rate_limits: list[StatusRateLimit] = Field(default_factory=list, max_length=16)
+    reset_credits: Optional[StatusRateLimitResetCredits] = None
     usage: Optional[StatusUsage] = None
     # Entries are ``<component>: <generic reason>``. Raw RPC error text is never
     # allowed, because it may contain provider or account details.
     component_errors: list[StatusErrorText] = Field(default_factory=list, max_length=5)
+
+
+class RateLimitResetResult(_Base):
+    """Private result of one idempotent reset-credit redemption attempt."""
+    type: Literal["rate_limit_reset_result"] = "rate_limit_reset_result"
+    sid: WireId
+    to: WireId
+    request_id: WireId
+    outcome: RateLimitResetOutcome
+    credit_id: Optional[ResetCreditId] = None
 
 
 class Notice(_Base):
@@ -2720,8 +2783,8 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetBrowserSurface, GetBrowserFrame, AcquireBrowserControl, ReleaseBrowserControl, BrowserAction, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, BrowserSurface, BrowserFrame, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetBrowserSurface, GetBrowserFrame, AcquireBrowserControl, ReleaseBrowserControl, BrowserAction, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, RateLimitResetResult, Notice, RateLimitUpdate, BrowserSurface, BrowserFrame, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2777,6 +2840,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "web_search": WebSearch,
     "get_context": GetContext,
     "get_status": GetStatus,
+    "consume_rate_limit_reset_credit": ConsumeRateLimitResetCredit,
     "get_browser_surface": GetBrowserSurface,
     "get_browser_frame": GetBrowserFrame,
     "acquire_browser_control": AcquireBrowserControl,
@@ -2842,6 +2906,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "perm": Perm,
     "context_report": ContextReport,
     "status_report": StatusReport,
+    "rate_limit_reset_result": RateLimitResetResult,
     "notice": Notice,
     "rate_limit_update": RateLimitUpdate,
     "browser_surface": BrowserSurface,

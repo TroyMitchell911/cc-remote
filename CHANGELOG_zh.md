@@ -4,12 +4,26 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v48。Codex ChatGPT
+  账号现在可在现有脱敏状态界面查看获赠的额度重置券，并通过官方 app-server
+  接口使用。兑换只允许在空闲会话进行，必须二次确认，结果仅回给请求端；可靠命令
+  ID 同时作为原生幂等键。付费 credits 余额和消费控制仍不会离开本机。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v47。Remote 托管的 Claude
+  会话现在默认以真实的 500K 自动压缩阈值启动；降低窗口时会先执行原生压缩并确认
+  compact boundary，再用新阈值重连。desired/applied 状态会跨重启和 fork 持久化，
+  不会提前套用更小窗口。延迟到达的 SDK 标题元数据不再触发伪外部重载；真正需要
+  重载 transcript 时也会保留已选长上下文模型，避免 500K 压缩阈值与隐式 200K 模型
+  错配。cc-remote 不再拦截或改写 Claude 原生的图片/PDF `Read` 工具；模型上下文
+  限制、媒体处理和自动压缩全部交还 Claude Code。
 - Codex Work 的新建与已有会话现在都可选择 Fast 服务档位，同时保持 Claude Work
   使用引擎中立的命令面板。
 - 经过验证的 Claude Agent SDK 固定版本升级到 `0.2.151`（内置 Claude Code
   `2.1.258`）；内置 Fable 5 与 Mythos 5 模型卡替换为官方
-  `claude-fable-5-1` 和 `claude-mythos-5-1`。已有会话继续保留其真实记录的模型
-  身份，不会被伪装成新版本。
+  `claude-fable-5-1` 和 `claude-mythos-5-1`。托管 Code 会话通过 Claude Code 原生的
+  `[1m]` 上下文标记选择它们（路由到 Provider 前会移除标记）；旧会话中未带后缀的
+  内置模型别名会保留原系列/版本并规范为该标记，其他真实记录的模型身份保持不变。
+  Wrapper 现在会拒绝低于 `2.1.258` 的日常 Claude Code，不再在缺失本集成依赖的
+  原生运行控制时静默启动。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v46，托管浏览器的前进/后退
   改用原生历史导航。Web 画面会跨 renderer 重建持续探测，突发输入按顺序发送而不再
   吞键，操作被拒绝时保留可重试文本，并忽略属于旧请求的迟到画面错误。

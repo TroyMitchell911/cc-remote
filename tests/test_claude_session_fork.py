@@ -196,18 +196,19 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
         command = _command()
         await machine._handle_fork_session(command)
         inherited = machine._claude_controls.get(CHILD)
-        assert inherited.model == "claude-opus-5"
+        assert inherited.model == "claude-opus-5[1m]"
         assert inherited.effort == "max"
         assert inherited.permission_mode == "acceptEdits"
         assert inherited.auto_compact_mode == "custom"
         assert inherited.auto_compact_threshold_tokens == 250_000
         assert machine._claude_forks.entries[
             "request-1"]["controls"] == {
-                "model": "claude-opus-5",
+                "model": "claude-opus-5[1m]",
                 "effort": "max",
                 "permission_mode": "acceptEdits",
                 "auto_compact_mode": "custom",
                 "auto_compact_threshold_tokens": 250_000,
+                "applied_auto_compact_mode": "inherit",
             }
 
         machine._claude_controls.update(

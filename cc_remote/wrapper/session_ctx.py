@@ -140,6 +140,11 @@ class SessionContext:
     # rows with no baseline must keep showing the authoritative raw total rather
     # than silently reclassifying their existing conversation as engine cost.
     work_context_baseline_pending: bool = False
+    # Only an explicitly native Claude transcript mutation may replace the
+    # current Remote model/effort on reload. Origin-less metadata still makes
+    # the in-memory conversation stale, but must not roll back a newer Remote
+    # control selection to an older completed transcript row.
+    claude_native_controls_dirty: bool = False
     turn_task: Optional[asyncio.Task] = None
     # Browser queue mode transfers complete Query commands here immediately.
     # The wrapper-owned drain keeps running while browsers are disconnected or
@@ -233,7 +238,14 @@ class SessionContext:
     # hello/focus refreshes do not make a still-pending choice look applied.
     announced_auto_compact: Optional[tuple[object, ...]] = None
     auto_compact_error: Optional[str] = None
+    auto_compact_phase: str = "stable"
+    auto_compact_compaction_done: bool = False
     auto_compact_apply_task: Optional[asyncio.Task] = None
+    auto_compact_apply_started_revision: Optional[int] = None
+    # Monotonic proof that this resident context completed a real native
+    # compact transaction. A manual command snapshots it before waiting for the
+    # query lock so it cannot repeat maintenance that won the same race.
+    claude_compaction_revision: int = 0
     # Model/effort/permission mutations and the spawn-time autocompact control
     # use separate command paths.  Persist one coherent SDK snapshot per
     # resident Claude session so an older async write cannot land after a newer
@@ -321,6 +333,17 @@ class SessionContext:
     codex_checkpoint_ready: bool = False
     codex_checkpoint_accepted: bool = False
     codex_checkpoint_unavailable_reason: Optional[str] = None
+    # A shared ``turn/start`` response can be lost during an official daemon
+    # replacement. The original runner remains the sole write owner while it
+    # reconciles exact native identity; a reconnect-time turn/started callback
+    # must not mistake that recovery for a competing automatic turn.
+    codex_turn_start_reconciling: bool = False
+    codex_deferred_turn_start_id: Optional[str] = None
+    # Every native lifecycle callback advances this fence while reconciliation
+    # owns the session. The recovery loop snapshots it after an ordered status
+    # probe and refuses to unlock if a turn started or completed during any
+    # subsequent await.
+    codex_turn_start_reconcile_revision: int = 0
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is

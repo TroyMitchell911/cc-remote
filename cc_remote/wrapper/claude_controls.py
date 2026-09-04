@@ -30,6 +30,9 @@ CLAUDE_PERMISSION_MODES = frozenset({
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
 })
 CLAUDE_AUTO_COMPACT_MODES = frozenset({"inherit", "auto", "custom"})
+CLAUDE_DEFAULT_AUTO_COMPACT_MODE = "custom"
+CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS = 500_000
+_DEFAULT_AUTO_COMPACT_THRESHOLD = object()
 
 _MODEL_ID = re.compile(r"^claude-[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,254}$")
 _MAX_ENTRIES = 4096
@@ -50,8 +53,17 @@ class ClaudeControls:
     model: str | None = None
     effort: str | None = None
     permission_mode: str | None = None
-    auto_compact_mode: str = "inherit"
-    auto_compact_threshold_tokens: int | None = None
+    auto_compact_mode: str = CLAUDE_DEFAULT_AUTO_COMPACT_MODE
+    auto_compact_threshold_tokens: int | None = (
+        CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS)
+    # Version 3 stores the launch value separately from the user's desired
+    # value. A lowering transaction may survive a wrapper restart without
+    # silently launching under the lower threshold before /compact succeeds.
+    # Whether this process has already compacted is deliberately not durable:
+    # the transcript may grow while the wrapper is down, so a fresh boundary
+    # must be proven before a pending lower threshold is applied.
+    applied_auto_compact_mode: str | None = "inherit"
+    applied_auto_compact_threshold_tokens: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -61,12 +73,111 @@ class ClaudeControls:
                 ("permission_mode", self.permission_mode),
             ) if value is not None
         }
-        if self.auto_compact_mode != "inherit":
-            payload["auto_compact_mode"] = self.auto_compact_mode
-            if self.auto_compact_mode == "custom":
-                payload["auto_compact_threshold_tokens"] = (
-                    self.auto_compact_threshold_tokens)
+        # Always serialize the mode.  Earlier versions omitted ``inherit``, so
+        # it was indistinguishable from an old record that had never selected a
+        # real limit.  Version 3 needs that distinction for the 500k migration.
+        payload["auto_compact_mode"] = self.auto_compact_mode
+        if self.auto_compact_mode == "custom":
+            payload["auto_compact_threshold_tokens"] = (
+                self.auto_compact_threshold_tokens)
+        if self.applied_auto_compact_mode is not None:
+            payload["applied_auto_compact_mode"] = (
+                self.applied_auto_compact_mode)
+            if self.applied_auto_compact_mode == "custom":
+                payload["applied_auto_compact_threshold_tokens"] = (
+                    self.applied_auto_compact_threshold_tokens)
         return payload
+
+
+def default_claude_auto_compact() -> tuple[str, int]:
+    """Return the real cc-remote launch default, not Claude's implicit flag."""
+    return (
+        CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
+        CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
+    )
+
+
+def _defaulted_auto_compact_threshold(
+    mode: object,
+    threshold_tokens: object,
+) -> object:
+    if threshold_tokens is not _DEFAULT_AUTO_COMPACT_THRESHOLD:
+        return threshold_tokens
+    return (
+        CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS
+        if mode == "custom" else None
+    )
+
+
+def _stored_auto_compact(
+    raw: dict[str, Any],
+    *,
+    legacy_desired_was_applied: bool = False,
+) -> tuple[str, int | None, str, int | None]:
+    """Decode one durable desired/applied pair.
+
+    v1/v2 had no separate applied field, so a valid desired value was also the
+    value that old cc-remote launched. A missing/malformed v3 applied field has
+    no such proof and therefore fails closed to ``inherit``. Missing desired
+    state adopts 500k as policy while preserving that same honest applied
+    fallback.
+    """
+    raw_mode = raw.get("auto_compact_mode")
+    raw_threshold = raw.get("auto_compact_threshold_tokens")
+    desired_valid = bool(
+        raw_mode in CLAUDE_AUTO_COMPACT_MODES
+        and (
+            (
+                raw_mode == "custom"
+                and isinstance(raw_threshold, int)
+                and not isinstance(raw_threshold, bool)
+                and MIN_AUTO_COMPACT_TOKENS <= raw_threshold
+                <= MAX_AUTO_COMPACT_TOKENS
+            )
+            or (raw_mode != "custom" and raw_threshold is None)
+        )
+    )
+    if desired_valid:
+        desired_mode, desired_threshold = valid_claude_auto_compact(
+            raw_mode, raw_threshold)
+    else:
+        desired_mode, desired_threshold = default_claude_auto_compact()
+
+    raw_applied_mode = raw.get("applied_auto_compact_mode")
+    raw_applied_threshold = raw.get(
+        "applied_auto_compact_threshold_tokens")
+    applied_valid = bool(
+        raw_applied_mode in CLAUDE_AUTO_COMPACT_MODES
+        and (
+            (
+                raw_applied_mode == "custom"
+                and isinstance(raw_applied_threshold, int)
+                and not isinstance(raw_applied_threshold, bool)
+                and MIN_AUTO_COMPACT_TOKENS <= raw_applied_threshold
+                <= MAX_AUTO_COMPACT_TOKENS
+            )
+            or (
+                raw_applied_mode != "custom"
+                and raw_applied_threshold is None
+            )
+        )
+    )
+    if applied_valid:
+        applied_mode, applied_threshold = valid_claude_auto_compact(
+            raw_applied_mode, raw_applied_threshold)
+    elif desired_valid and legacy_desired_was_applied:
+        applied_mode, applied_threshold = desired_mode, desired_threshold
+    else:
+        # Neither absent desired state nor a malformed v3 applied field proves
+        # a launch flag. Resume under the historical implicit setting so a
+        # lower desired threshold cannot skip compact-before-reconnect.
+        applied_mode, applied_threshold = "inherit", None
+    return (
+        desired_mode,
+        desired_threshold,
+        applied_mode,
+        applied_threshold,
+    )
 
 
 def _canonical_session_id(value: object) -> str:
@@ -200,10 +311,21 @@ class ClaudeControlStore:
     def get(self, session_id: str) -> ClaudeControls:
         session_id = _canonical_session_id(session_id)
         with self._lock:
-            raw = dict(self._sessions.get(session_id, {}))
-        auto_mode, auto_threshold = valid_claude_auto_compact(
-            raw.get("auto_compact_mode"),
-            raw.get("auto_compact_threshold_tokens"),
+            stored = self._sessions.get(session_id)
+            raw = dict(stored) if stored is not None else None
+        if raw is None:
+            mode, threshold = default_claude_auto_compact()
+            return ClaudeControls(
+                auto_compact_mode=mode,
+                auto_compact_threshold_tokens=threshold,
+                # No record proves what flag an existing native transcript was
+                # launched with. Treat it as the historical implicit setting;
+                # resume under that value and require compact-before-lower.
+                applied_auto_compact_mode="inherit",
+                applied_auto_compact_threshold_tokens=None,
+            )
+        auto_mode, auto_threshold, applied_mode, applied_threshold = (
+            _stored_auto_compact(raw)
         )
         return ClaudeControls(
             model=valid_claude_model(raw.get("model")),
@@ -211,6 +333,8 @@ class ClaudeControlStore:
             permission_mode=valid_claude_permission(raw.get("permission_mode")),
             auto_compact_mode=auto_mode,
             auto_compact_threshold_tokens=auto_threshold,
+            applied_auto_compact_mode=applied_mode,
+            applied_auto_compact_threshold_tokens=applied_threshold,
         )
 
     def update(
@@ -220,18 +344,33 @@ class ClaudeControlStore:
         model: str | None,
         effort: str | None,
         permission_mode: str | None,
-        auto_compact_mode: str = "inherit",
-        auto_compact_threshold_tokens: int | None = None,
+        auto_compact_mode: str = CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
+        auto_compact_threshold_tokens: object = (
+            _DEFAULT_AUTO_COMPACT_THRESHOLD),
+        applied_auto_compact_mode: str | None = None,
+        applied_auto_compact_threshold_tokens: int | None = None,
     ) -> ClaudeControls:
         session_id = _canonical_session_id(session_id)
+        auto_compact_threshold_tokens = _defaulted_auto_compact_threshold(
+            auto_compact_mode, auto_compact_threshold_tokens)
         checked_auto_mode, checked_auto_threshold = valid_claude_auto_compact(
             auto_compact_mode, auto_compact_threshold_tokens)
+        if applied_auto_compact_mode is None:
+            applied_mode, applied_threshold = (
+                checked_auto_mode, checked_auto_threshold)
+        else:
+            applied_mode, applied_threshold = valid_claude_auto_compact(
+                applied_auto_compact_mode,
+                applied_auto_compact_threshold_tokens,
+            )
         controls = ClaudeControls(
             model=valid_claude_model(model),
             effort=valid_claude_effort(effort),
             permission_mode=valid_claude_permission(permission_mode),
             auto_compact_mode=checked_auto_mode,
             auto_compact_threshold_tokens=checked_auto_threshold,
+            applied_auto_compact_mode=applied_mode,
+            applied_auto_compact_threshold_tokens=applied_threshold,
         )
         payload = controls.as_dict()
         with self._lock:
@@ -255,6 +394,8 @@ class ClaudeControlStore:
         *,
         mode: str,
         threshold_tokens: int | None,
+        applied_mode: str | None = None,
+        applied_threshold_tokens: int | None = None,
         preserve_other_controls: bool = True,
     ) -> ClaudeControls:
         """Atomically replace autocompact, optionally clearing Code controls.
@@ -267,6 +408,14 @@ class ClaudeControlStore:
         session_id = _canonical_session_id(session_id)
         checked_mode, checked_threshold = valid_claude_auto_compact(
             mode, threshold_tokens)
+        if applied_mode is None:
+            checked_applied_mode, checked_applied_threshold = (
+                checked_mode, checked_threshold)
+        else:
+            checked_applied_mode, checked_applied_threshold = (
+                valid_claude_auto_compact(
+                    applied_mode, applied_threshold_tokens)
+            )
         with self._lock:
             raw = (
                 dict(self._sessions.get(session_id, {}))
@@ -279,6 +428,9 @@ class ClaudeControlStore:
                     raw.get("permission_mode")),
                 auto_compact_mode=checked_mode,
                 auto_compact_threshold_tokens=checked_threshold,
+                applied_auto_compact_mode=checked_applied_mode,
+                applied_auto_compact_threshold_tokens=(
+                    checked_applied_threshold),
             )
             payload = controls.as_dict()
             updated = dict(self._sessions)
@@ -298,29 +450,42 @@ class ClaudeControlStore:
         model: str | None,
         effort: str | None,
         permission_mode: str | None,
-        auto_compact_mode: str = "inherit",
-        auto_compact_threshold_tokens: int | None = None,
+        auto_compact_mode: str = CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
+        auto_compact_threshold_tokens: object = (
+            _DEFAULT_AUTO_COMPACT_THRESHOLD),
+        applied_auto_compact_mode: str | None = None,
+        applied_auto_compact_threshold_tokens: int | None = None,
     ) -> ClaudeControls:
         """Seed a new fork once without overwriting later child choices."""
         session_id = _canonical_session_id(session_id)
+        auto_compact_threshold_tokens = _defaulted_auto_compact_threshold(
+            auto_compact_mode, auto_compact_threshold_tokens)
         checked_auto_mode, checked_auto_threshold = valid_claude_auto_compact(
             auto_compact_mode, auto_compact_threshold_tokens)
+        if applied_auto_compact_mode is None:
+            applied_mode, applied_threshold = (
+                checked_auto_mode, checked_auto_threshold)
+        else:
+            applied_mode, applied_threshold = valid_claude_auto_compact(
+                applied_auto_compact_mode,
+                applied_auto_compact_threshold_tokens,
+            )
         controls = ClaudeControls(
             model=valid_claude_model(model),
             effort=valid_claude_effort(effort),
             permission_mode=valid_claude_permission(permission_mode),
             auto_compact_mode=checked_auto_mode,
             auto_compact_threshold_tokens=checked_auto_threshold,
+            applied_auto_compact_mode=applied_mode,
+            applied_auto_compact_threshold_tokens=applied_threshold,
         )
         payload = controls.as_dict()
         with self._lock:
             existing = self._sessions.get(session_id)
             if existing is not None:
-                existing_auto_mode, existing_auto_threshold = (
-                    valid_claude_auto_compact(
-                        existing.get("auto_compact_mode"),
-                        existing.get("auto_compact_threshold_tokens"),
-                    )
+                (existing_auto_mode, existing_auto_threshold,
+                 existing_applied_mode, existing_applied_threshold) = (
+                    _stored_auto_compact(existing)
                 )
                 return ClaudeControls(
                     model=valid_claude_model(existing.get("model")),
@@ -329,6 +494,9 @@ class ClaudeControlStore:
                         existing.get("permission_mode")),
                     auto_compact_mode=existing_auto_mode,
                     auto_compact_threshold_tokens=existing_auto_threshold,
+                    applied_auto_compact_mode=existing_applied_mode,
+                    applied_auto_compact_threshold_tokens=(
+                        existing_applied_threshold),
                 )
             if not payload:
                 return controls
@@ -359,7 +527,11 @@ class ClaudeControlStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise ClaudeControlStoreError("Claude control store is unreadable") from exc
         sessions = raw.get("sessions") if isinstance(raw, dict) else None
-        if (not isinstance(raw, dict) or raw.get("version") not in {1, 2}
+        version = raw.get("version") if isinstance(raw, dict) else None
+        if (not isinstance(raw, dict)
+                or not isinstance(version, int)
+                or isinstance(version, bool)
+                or version not in {1, 2, 3}
                 or not isinstance(sessions, dict)
                 or len(sessions) > _MAX_ENTRIES):
             raise ClaudeControlStoreError("Claude control store has invalid shape")
@@ -380,9 +552,10 @@ class ClaudeControlStore:
                 session_id = _canonical_session_id(raw_id)
             except ClaudeControlStoreError:
                 continue
-            auto_mode, auto_threshold = valid_claude_auto_compact(
-                values.get("auto_compact_mode"),
-                values.get("auto_compact_threshold_tokens"),
+            (auto_mode, auto_threshold,
+             applied_mode, applied_threshold) = _stored_auto_compact(
+                values,
+                legacy_desired_was_applied=version in {1, 2},
             )
             controls = ClaudeControls(
                 model=valid_claude_model(values.get("model")),
@@ -391,6 +564,8 @@ class ClaudeControlStore:
                     values.get("permission_mode")),
                 auto_compact_mode=auto_mode,
                 auto_compact_threshold_tokens=auto_threshold,
+                applied_auto_compact_mode=applied_mode,
+                applied_auto_compact_threshold_tokens=applied_threshold,
             ).as_dict()
             if controls:
                 loaded[session_id] = controls
@@ -407,7 +582,7 @@ class ClaudeControlStore:
         os.chmod(parent, 0o700)
         payload = json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "profile_revision": (
                     self._profile_revision
                     if profile_revision is None else profile_revision

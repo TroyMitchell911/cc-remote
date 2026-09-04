@@ -31,6 +31,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexManagedOverflow,
     _provider_error_diagnostic,
 )
+from cc_remote.wrapper.claude_runtime import UnsupportedClaudeCliVersion
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.session_ctx import CodexGoalMutation
 from cc_remote.wrapper.work_prompt import (
@@ -8057,10 +8058,19 @@ class _FiniteTransport:
             yield command
 
 
+@pytest.mark.parametrize(
+    ("unsupported_cli", "expected_message"),
+    [
+        (False, "Claude 暂时不可用"),
+        (True, "Claude CLI 2.1.257 版本过旧"),
+    ],
+)
 def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, unsupported_cli, expected_message):
     async def run():
         def fail(_cli_path):
+            if unsupported_cli:
+                raise UnsupportedClaudeCliVersion("2.1.257", "2.1.258")
             raise RuntimeError("claude unavailable")
 
         monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
@@ -8076,8 +8086,10 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
         assert transport.started is True and transport.stopped is True
         assert machine.sessions == {} and machine.focused_sid is None
         assert any(message.type == "hello" for message in transport.sent)
-        assert any(message.type == "error" and "Claude 暂时不可用" in message.message
-                   for message in transport.sent)
+        assert any(
+            message.type == "error" and expected_message in message.message
+            for message in transport.sent
+        )
 
     asyncio.run(run())
 
@@ -8843,6 +8855,82 @@ def test_wrapper_rejects_new_steer_after_interrupt_has_started():
         assert result.code == ERR_NOT_STEERABLE
         assert sdk.calls == 0
         assert ctx.state == "interrupting"
+
+    asyncio.run(run())
+
+
+def test_wrapper_rejects_steer_while_turn_start_owner_is_unproven():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        ctx.codex_turn_start_reconciling = True
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="must not reach an unproven turn",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert result.to == "client-1"
+        assert sdk.calls == 0
+        assert not any(
+            isinstance(event, TurnSteered) for event in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_wrapper_rechecks_turn_start_reconciliation_inside_steer_lock():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        await ctx.steer_lock.acquire()
+        try:
+            task = asyncio.create_task(machine._handle_steer(Steer(
+                sid=ctx.key,
+                prompt="races the generation disconnect",
+                msg_id="steer-message",
+                cmd_id="steer-command",
+                client_id="client-1",
+            )))
+            # Let the command pass its initial check and block on steer_lock.
+            await asyncio.sleep(0)
+            ctx.codex_turn_start_reconciling = True
+        finally:
+            ctx.steer_lock.release()
+
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert sdk.calls == 0
 
     asyncio.run(run())
 

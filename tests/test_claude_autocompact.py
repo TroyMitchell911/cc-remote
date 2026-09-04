@@ -12,6 +12,7 @@ from claude_agent_sdk.types import (
     AssistantMessage,
     ResultMessage,
     StreamEvent,
+    SystemMessage,
     TaskNotificationMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
@@ -22,11 +23,13 @@ from claude_agent_sdk.types import (
 )
 
 from cc_remote.protocol import (
+    CompactSession,
     ContextReport,
     Delta,
     Error,
     GetContext,
     Query,
+    ProcessEvent,
     SetAutoCompact,
     ToolResult,
     ToolUse,
@@ -34,11 +37,37 @@ from cc_remote.protocol import (
     UserMsg,
 )
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.claude_errors import (
+    classify_provider_request_too_large,
+    is_provider_request_too_large,
+)
 from cc_remote.wrapper.stream import StreamTranslator
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def test_nested_provider_413_is_classified_without_retrying_other_errors():
+    outer = RuntimeError("Claude request failed")
+    outer.__cause__ = RuntimeError(
+        "输入Tokens数量(1249708)超过系统限制(1000000)")
+    assert classify_provider_request_too_large(outer) == "context"
+    assert is_provider_request_too_large(outer) is True
+    assert classify_provider_request_too_large(
+        RuntimeError("payload too large"),
+    ) == "request"
+    assert classify_provider_request_too_large(
+        RuntimeError("request failed"), status_code=413,
+    ) == "request"
+    assert is_provider_request_too_large(RuntimeError("temporary 503")) is False
+
+
+def test_nested_context_overflow_takes_precedence_over_outer_generic_413():
+    outer = RuntimeError("status_code=413, payload too large")
+    outer.__cause__ = RuntimeError(
+        "input token count exceeds the maximum allowed tokens")
+    assert classify_provider_request_too_large(outer) == "context"
 
 
 class _AutoCompactSdk:
@@ -48,14 +77,25 @@ class _AutoCompactSdk:
     permission_mode = "bypassPermissions"
     is_claude_broker = False
 
-    def __init__(self, *, fail_first_reconnect: bool = False):
+    def __init__(
+        self,
+        *,
+        fail_first_reconnect: bool = False,
+        context_total: int | None = 0,
+    ):
         self.auto_compact_mode = "inherit"
         self.auto_compact_threshold_tokens = None
         self.applied_auto_compact_mode = "inherit"
         self.applied_auto_compact_threshold_tokens = None
         self.fail_first_reconnect = fail_first_reconnect
+        self.context_total = context_total
         self.reconnects: list[tuple[str, int | None, dict]] = []
         self.disconnected = 0
+
+    def cached_recent_context_usage(self):
+        if self.context_total is None:
+            return None
+        return {"totalTokens": self.context_total}
 
     def set_auto_compact(
         self, mode: str, threshold_tokens: int | None = None,
@@ -64,16 +104,21 @@ class _AutoCompactSdk:
         self.auto_compact_threshold_tokens = threshold_tokens
 
     async def force_reconnect(self, **kwargs) -> None:
+        launch = kwargs.get("launch_auto_compact")
+        if launch is None:
+            launch = (
+                self.auto_compact_mode,
+                self.auto_compact_threshold_tokens,
+            )
         self.reconnects.append((
-            self.auto_compact_mode,
-            self.auto_compact_threshold_tokens,
+            launch[0],
+            launch[1],
             kwargs,
         ))
         if self.fail_first_reconnect and len(self.reconnects) == 1:
             raise RuntimeError("new launch failed")
-        self.applied_auto_compact_mode = self.auto_compact_mode
-        self.applied_auto_compact_threshold_tokens = (
-            self.auto_compact_threshold_tokens)
+        self.applied_auto_compact_mode = launch[0]
+        self.applied_auto_compact_threshold_tokens = launch[1]
 
     async def disconnect(self) -> None:
         self.disconnected += 1
@@ -140,6 +185,7 @@ def test_idle_autocompact_change_reconnects_and_persists_exact_session():
             "cwd": ctx.cwd,
             "reason": "autocompact setting change",
             "fork": False,
+            "apply_pending_auto_compact": True,
         }
         saved = machine._claude_controls.get(SESSION_ID)
         assert saved.auto_compact_mode == "custom"
@@ -358,11 +404,265 @@ def test_failed_change_rolls_back_live_child_but_keeps_desired_value_pending():
         assert sdk.auto_compact_threshold_tokens == 200_000
         assert sdk.applied_auto_compact_mode == "inherit"
         assert event.pending is True
-        assert event.error and "下次安全边界重试" in event.error
+        assert event.phase == "blocked"
+        assert event.error and "恢复上一次可用设置" in event.error
         saved = machine._claude_controls.get(SESSION_ID)
         assert saved.auto_compact_mode == "custom"
         assert saved.auto_compact_threshold_tokens == 200_000
         assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+class _CompactingAutoCompactSdk(_AutoCompactSdk):
+    def __init__(self, *, context_total: int | None = 600_000, boundary=True):
+        super().__init__(context_total=context_total)
+        self.auto_compact_mode = "custom"
+        self.auto_compact_threshold_tokens = 800_000
+        self.applied_auto_compact_mode = "custom"
+        self.applied_auto_compact_threshold_tokens = 800_000
+        self.boundary = boundary
+        self.queries: list[str] = []
+        self.next_turn_id = None
+        self.context_invalidations = 0
+
+    async def query(self, prompt):
+        self.queries.append(prompt)
+
+    async def receive_response(self):
+        if self.boundary:
+            yield SystemMessage(
+                subtype="compact_boundary",
+                data={
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "uuid": "compact-boundary",
+                    "timestamp": "2026-09-03T01:02:03.000Z",
+                    "compactMetadata": {
+                        "trigger": "manual",
+                        "preTokens": 600_000,
+                        "postTokens": 8_000,
+                        "durationMs": 25,
+                    },
+                },
+            )
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=25,
+            duration_api_ms=20,
+            is_error=False,
+            num_turns=1,
+            session_id=SESSION_ID,
+        )
+
+    def release_background_messages(self):
+        return None
+
+    def invalidate_context_usage_cache(self):
+        self.context_invalidations += 1
+        self.context_total = 8_000
+
+
+def test_lowering_window_compacts_before_reconnecting_with_new_threshold():
+    async def run():
+        sdk = _CompactingAutoCompactSdk()
+        machine, transport, _ctx = _machine_with_sdk(sdk)
+
+        event = await machine._handle_set_auto_compact(SetAutoCompact(
+            sid=SESSION_ID,
+            mode="custom",
+            threshold_tokens=500_000,
+        ))
+
+        assert sdk.queries == ["/compact"]
+        assert sdk.context_invalidations == 1
+        assert [(mode, threshold) for mode, threshold, _ in sdk.reconnects] == [
+            ("custom", 500_000),
+        ]
+        assert event.pending is False
+        assert event.phase == "stable"
+        compactions = [
+            item for item in transport.sent
+            if isinstance(item, ProcessEvent) and item.kind == "compaction"
+        ]
+        assert len(compactions) == 1
+        assert compactions[0].item_id == "compact-boundary"
+
+    asyncio.run(run())
+
+
+def test_manual_compact_does_not_repeat_background_compact_while_waiting():
+    async def run():
+        sdk = _CompactingAutoCompactSdk(context_total=8_000)
+        sdk.auto_compact_threshold_tokens = 800_000
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        context_resolved = asyncio.Event()
+
+        async def resolve_context(_cmd, _action):
+            context_resolved.set()
+            return ctx
+
+        machine._claude_code_context = resolve_context
+        await ctx.query_lock.acquire()
+        keep_background_active = asyncio.Event()
+        ctx.auto_compact_apply_started_revision = 0
+        background = asyncio.create_task(keep_background_active.wait())
+        ctx.auto_compact_apply_task = background
+        # The scheduler has already finished the native compact but is still
+        # reconnecting before it can release query_lock.
+        ctx.claude_compaction_revision = 1
+        command = asyncio.create_task(machine._handle_compact_session(
+            CompactSession(session_id=SESSION_ID, engine="claude"),
+        ))
+        await asyncio.wait_for(context_resolved.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        ctx.query_lock.release()
+        result = await command
+
+        assert sdk.queries == []
+        assert result.title == "上下文压缩完成"
+        assert "后台维护" in result.message
+        background.cancel()
+        await asyncio.gather(background, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_lowering_uses_recent_turn_usage_over_stale_context_cache():
+    class StaleControlCacheSdk(_CompactingAutoCompactSdk):
+        def cached_context_usage(self):
+            return {"totalTokens": 250_000}
+
+        def cached_recent_context_usage(self):
+            return {"totalTokens": 350_000}
+
+    async def run():
+        sdk = StaleControlCacheSdk(context_total=350_000)
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
+
+        event = await machine._handle_set_auto_compact(SetAutoCompact(
+            sid=SESSION_ID,
+            mode="custom",
+            threshold_tokens=300_000,
+        ))
+
+        assert sdk.queries == ["/compact"]
+        assert sdk.reconnects[0][0:2] == ("custom", 300_000)
+        assert event.pending is False
+
+    asyncio.run(run())
+
+
+def test_lowering_never_reconnects_without_a_real_compact_boundary():
+    async def run():
+        sdk = _CompactingAutoCompactSdk(boundary=False)
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
+
+        event = await machine._handle_set_auto_compact(SetAutoCompact(
+            sid=SESSION_ID,
+            mode="custom",
+            threshold_tokens=500_000,
+        ))
+
+        assert sdk.queries == ["/compact"]
+        assert sdk.context_invalidations == 0
+        assert sdk.reconnects == []
+        assert event.pending is True
+        assert event.phase == "blocked"
+        assert event.applied_threshold_tokens == 800_000
+
+    asyncio.run(run())
+
+
+def test_unknown_auto_target_compacts_nontrivial_context_before_reconnect():
+    async def run():
+        sdk = _CompactingAutoCompactSdk(context_total=200_000)
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
+
+        event = await machine._handle_set_auto_compact(SetAutoCompact(
+            sid=SESSION_ID,
+            mode="auto",
+        ))
+
+        assert sdk.queries == ["/compact"]
+        assert sdk.reconnects[0][0:2] == ("auto", None)
+        assert event.pending is False
+        assert event.applied_mode == "auto"
+
+    asyncio.run(run())
+
+
+def test_unknown_legacy_window_compacts_once_before_adopting_default():
+    async def run():
+        sdk = _CompactingAutoCompactSdk(context_total=None)
+        sdk.auto_compact_mode = "custom"
+        sdk.auto_compact_threshold_tokens = 500_000
+        sdk.applied_auto_compact_mode = "inherit"
+        sdk.applied_auto_compact_threshold_tokens = None
+        machine, _transport, _ctx = _machine_with_sdk(sdk)
+
+        event, applied = await machine._apply_pending_claude_auto_compact(
+            _ctx, reason="legacy default migration",
+        )
+
+        assert sdk.queries == ["/compact"]
+        assert sdk.reconnects[0][0:2] == ("custom", 500_000)
+        assert applied is True
+        assert event.pending is False
+
+    asyncio.run(run())
+
+
+def test_external_growth_reloads_under_applied_window_before_lowering():
+    class ReloadingSdk(_CompactingAutoCompactSdk):
+        def invalidate_context_usage_cache(self):
+            self.context_total = None
+
+    async def run():
+        sdk = ReloadingSdk(context_total=100_000)
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        ctx.needs_reload = True
+
+        event = await machine._handle_set_auto_compact(SetAutoCompact(
+            sid=SESSION_ID,
+            mode="custom",
+            threshold_tokens=500_000,
+        ))
+
+        assert [(mode, threshold) for mode, threshold, _ in sdk.reconnects] == [
+            ("custom", 800_000),
+            ("custom", 500_000),
+        ]
+        assert sdk.reconnects[0][2]["preserve_model"] is True
+        assert sdk.reconnects[1][2]["apply_pending_auto_compact"] is True
+        assert sdk.queries == ["/compact"]
+        assert event.pending is False
+        assert ctx.needs_reload is False
+
+    asyncio.run(run())
+
+
+def test_persistent_fork_inherits_desired_and_applied_windows_separately():
+    async def run():
+        sdk = _AutoCompactSdk()
+        sdk.auto_compact_mode = "custom"
+        sdk.auto_compact_threshold_tokens = 300_000
+        sdk.applied_auto_compact_mode = "custom"
+        sdk.applied_auto_compact_threshold_tokens = 800_000
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+
+        controls = await machine._claude_fork_control_snapshot(
+            SESSION_ID, ctx.cwd, ctx)
+        assert controls["auto_compact_threshold_tokens"] == 300_000
+        assert controls["applied_auto_compact_threshold_tokens"] == 800_000
+
+        child_id = "22222222-2222-4222-8222-222222222222"
+        await machine._inherit_claude_fork_controls(child_id, controls)
+        child = machine._claude_controls.get(child_id)
+        assert child.auto_compact_threshold_tokens == 300_000
+        assert child.applied_auto_compact_threshold_tokens == 800_000
+        assert "auto_compact_compaction_done" not in child.as_dict()
 
     asyncio.run(run())
 
@@ -896,7 +1196,7 @@ def test_context_refresh_reloads_terminal_growth_before_native_read():
             "resume_id": SESSION_ID,
             "cwd": ctx.cwd,
             "reason": "external transcript change before context",
-            "preserve_model": False,
+            "preserve_model": True,
             "fork": False,
         }
         assert ctx.needs_reload is False
@@ -1216,8 +1516,9 @@ def test_real_run_turn_final_guard_never_writes_or_reports_crash():
         sdk.client = Client()
         sdk.effort = "max"
         sdk.applied_effort = "max"
-        sdk.applied_auto_compact_mode = "inherit"
-        sdk.applied_auto_compact_threshold_tokens = None
+        sdk.set_auto_compact("custom", 500_000)
+        sdk.applied_auto_compact_mode = "custom"
+        sdk.applied_auto_compact_threshold_tokens = 500_000
         ctx.sdk = sdk
         machine.sessions[ctx.key] = ctx
         machine._configure_claude_sdk_callbacks(ctx, sdk)
@@ -1277,6 +1578,87 @@ def test_real_run_turn_final_guard_never_writes_or_reports_crash():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_message", "unexpected_message"),
+    [
+        (
+            "status_code=413, input tokens exceed system limit",
+            "原生自动压缩",
+            "较大附件",
+        ),
+        (
+            "status_code=413, payload too large",
+            "较大附件",
+            "原生自动压缩",
+        ),
+    ],
+)
+def test_query_exception_413_is_not_retried_and_explains_known_cause(
+    failure, expected_message, unexpected_message,
+):
+    async def run():
+        class Client:
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.queries = []
+
+            async def receive_messages(self):
+                while True:
+                    yield await self.queue.get()
+
+            async def query(self, prompt):
+                self.queries.append(prompt)
+                raise RuntimeError(failure)
+
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.engine = "claude"
+        sdk = SdkHandle(machine.cfg)
+        sdk.client = Client()
+        sdk.effort = "max"
+        sdk.applied_effort = "max"
+        sdk.set_auto_compact("custom", 500_000)
+        sdk.applied_auto_compact_mode = "custom"
+        sdk.applied_auto_compact_threshold_tokens = 500_000
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        machine._configure_claude_sdk_callbacks(ctx, sdk)
+        sdk._start_message_pump()
+
+        async def no_external_owner(_sid):
+            return False
+
+        machine._prime_claude_ownership = no_external_owner
+        machine._schedule_pending_claude_auto_compact = lambda _ctx: None
+        try:
+            result = await machine._handle_query(Query(
+                sid=SESSION_ID,
+                prompt="one attempt only",
+                msg_id="provider-413-query",
+            ))
+            assert result is None
+            turn = ctx.turn_task
+            assert turn is not None
+            await asyncio.wait_for(turn, timeout=1)
+
+            assert sdk.client.queries == ["one attempt only"]
+            errors = [
+                item for item in transport.sent
+                if isinstance(item, Error)
+                and item.msg_id == "provider-413-query"
+            ]
+            assert [item.code for item in errors] == ["bad_prompt"]
+            assert "/compact" in errors[0].message
+            assert expected_message in errors[0].message
+            assert unexpected_message not in errors[0].message
+            assert ctx.state == "idle"
+        finally:
+            sdk.release_background_messages()
+            await sdk._stop_message_pump()
+
+    asyncio.run(run())
+
+
 def test_deferred_query_survives_final_guard_and_retries_after_result():
     async def run():
         class Client:
@@ -1298,6 +1680,7 @@ def test_deferred_query_survives_final_guard_and_retries_after_result():
         sdk.client = Client()
         sdk.effort = "max"
         sdk.applied_effort = "max"
+        sdk.set_auto_compact("inherit")
         sdk.applied_auto_compact_mode = "inherit"
         sdk.applied_auto_compact_threshold_tokens = None
         ctx.sdk = sdk

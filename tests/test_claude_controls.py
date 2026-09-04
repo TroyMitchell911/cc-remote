@@ -10,6 +10,7 @@ import pytest
 
 from cc_remote.wrapper import claude_controls as controls_module
 from cc_remote.wrapper.claude_controls import (
+    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     ClaudeControls,
     ClaudeControlStore,
     ClaudeControlStoreError,
@@ -43,6 +44,17 @@ def test_remote_control_store_is_private_bounded_and_roundtrips(tmp_path):
     assert ClaudeControlStore(tmp_path).get(SESSION_ID) == saved
 
 
+def test_missing_session_record_never_claims_default_was_already_applied(
+    tmp_path,
+):
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert saved.auto_compact_threshold_tokens == 500_000
+    assert saved.applied_auto_compact_mode == "inherit"
+    assert saved.applied_auto_compact_threshold_tokens is None
+
+
 def test_remote_control_store_drops_untrusted_values(tmp_path):
     store = ClaudeControlStore(tmp_path)
     saved = store.update(
@@ -52,8 +64,14 @@ def test_remote_control_store_drops_untrusted_values(tmp_path):
         permission_mode="owner",
     )
 
-    assert saved.as_dict() == {}
-    assert store.get(SESSION_ID).as_dict() == {}
+    assert saved.as_dict() == {
+        "auto_compact_mode": "custom",
+        "auto_compact_threshold_tokens": CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
+        "applied_auto_compact_mode": "custom",
+        "applied_auto_compact_threshold_tokens": (
+            CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS),
+    }
+    assert store.get(SESSION_ID) == saved
 
 
 def test_remote_control_store_roundtrips_autocompact_without_losing_controls(
@@ -67,6 +85,8 @@ def test_remote_control_store_roundtrips_autocompact_without_losing_controls(
         permission_mode="plan",
         auto_compact_mode="custom",
         auto_compact_threshold_tokens=250_000,
+        applied_auto_compact_mode="custom",
+        applied_auto_compact_threshold_tokens=250_000,
     )
 
     saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
@@ -76,6 +96,8 @@ def test_remote_control_store_roundtrips_autocompact_without_losing_controls(
         permission_mode="plan",
         auto_compact_mode="custom",
         auto_compact_threshold_tokens=250_000,
+        applied_auto_compact_mode="custom",
+        applied_auto_compact_threshold_tokens=250_000,
     )
 
     cleared = store.update_auto_compact(
@@ -84,7 +106,7 @@ def test_remote_control_store_roundtrips_autocompact_without_losing_controls(
     assert cleared.effort == saved.effort
     assert cleared.permission_mode == saved.permission_mode
     assert cleared.auto_compact_mode == "inherit"
-    assert "auto_compact_mode" not in store.get(SESSION_ID).as_dict()
+    assert store.get(SESSION_ID).as_dict()["auto_compact_mode"] == "inherit"
 
 
 def test_work_autocompact_store_clears_stale_code_controls(tmp_path):
@@ -106,8 +128,129 @@ def test_work_autocompact_store_clears_stale_code_controls(tmp_path):
     assert saved == ClaudeControls(
         auto_compact_mode="custom",
         auto_compact_threshold_tokens=300_000,
+        applied_auto_compact_mode="custom",
+        applied_auto_compact_threshold_tokens=300_000,
     )
     assert ClaudeControlStore(tmp_path).get(SESSION_ID) == saved
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_missing_autocompact_migrates_to_pending_real_default(
+    tmp_path, version,
+):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": version,
+        "sessions": {SESSION_ID: {"effort": "max"}},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert (
+        saved.auto_compact_threshold_tokens
+        == CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS
+    )
+    assert saved.applied_auto_compact_mode == "inherit"
+    assert saved.applied_auto_compact_threshold_tokens is None
+
+
+def test_v3_explicit_inherit_remains_explicit(tmp_path):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": 3,
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "inherit",
+            "applied_auto_compact_mode": "inherit",
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "inherit"
+    assert saved.applied_auto_compact_mode == "inherit"
+    assert saved.as_dict()["auto_compact_mode"] == "inherit"
+
+
+def test_v3_missing_applied_value_cannot_bypass_lowering_transaction(tmp_path):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": 3,
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 300_000,
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert saved.auto_compact_threshold_tokens == 300_000
+    assert saved.applied_auto_compact_mode == "inherit"
+    assert saved.applied_auto_compact_threshold_tokens is None
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_valid_autocompact_was_already_applied(tmp_path, version):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": version,
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 300_000,
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert saved.applied_auto_compact_mode == "custom"
+    assert saved.applied_auto_compact_threshold_tokens == 300_000
+
+
+def test_pending_autocompact_transaction_roundtrips_without_compact_proof(
+    tmp_path,
+):
+    store = ClaudeControlStore(tmp_path)
+    store.update_auto_compact(
+        SESSION_ID,
+        mode="custom",
+        threshold_tokens=300_000,
+        applied_mode="custom",
+        applied_threshold_tokens=500_000,
+    )
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert saved.auto_compact_threshold_tokens == 300_000
+    assert saved.applied_auto_compact_mode == "custom"
+    assert saved.applied_auto_compact_threshold_tokens == 500_000
+
+
+def test_stale_compact_proof_is_discarded_on_restart(tmp_path):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": 3,
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 300_000,
+            "applied_auto_compact_mode": "custom",
+            "applied_auto_compact_threshold_tokens": 500_000,
+            "auto_compact_compaction_done": True,
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_threshold_tokens == 300_000
+    assert saved.applied_auto_compact_threshold_tokens == 500_000
+    assert "auto_compact_compaction_done" not in saved.as_dict()
 
 
 def test_autocompact_helpers_accept_only_canonical_cli_values():
@@ -138,6 +281,15 @@ def test_remote_control_store_rejects_public_or_symlink_state(tmp_path):
     target.write_text(json.dumps({"version": 1, "sessions": {}}))
     path.symlink_to(target)
     with pytest.raises(ClaudeControlStoreError, match="private bounded"):
+        ClaudeControlStore(tmp_path)
+
+
+def test_remote_control_store_rejects_boolean_schema_version(tmp_path):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({"version": True, "sessions": {}}))
+    os.chmod(path, 0o600)
+
+    with pytest.raises(ClaudeControlStoreError, match="invalid shape"):
         ClaudeControlStore(tmp_path)
 
 

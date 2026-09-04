@@ -3627,6 +3627,7 @@ try {
           applied_mode: "custom",
           applied_threshold_tokens: 500_000,
           pending: false,
+          phase: "stable",
           mutable: true,
         }),
       },
@@ -3642,6 +3643,7 @@ try {
       applied_mode: "custom",
       applied_threshold_tokens: 500_000,
       pending: true,
+      phase: "waiting_terminal",
       mutable: true,
     }),
   });
@@ -3660,6 +3662,7 @@ try {
       applied_mode: "custom",
       applied_threshold_tokens: 400_000,
       pending: false,
+      phase: "stable",
       mutable: true,
     }),
   });
@@ -18431,6 +18434,9 @@ assert.equal(normalizeDiffTheme(null), "light");
 relay.setFocusedSid("codex-control-session", "codex");
 const reliableControlFrames: Array<[string, () => void]> = [
   ["get_status", () => relay.sendGetStatus()],
+  ["consume_rate_limit_reset_credit", () =>
+    relay.sendConsumeRateLimitResetCredit(
+      "codex-control-session", "opaque/credit")],
   ["get_goal", () => relay.sendGetGoal()],
   ["set_goal", () => relay.sendSetGoal("ship it", "active", 1024)],
   ["clear_goal", () => relay.sendClearGoal()],
@@ -18443,6 +18449,9 @@ for (const [type, sendCommand] of reliableControlFrames) {
   assert.equal(frame.sid, "codex-control-session");
   assert.equal(typeof frame.cmd_id, "string");
   assert.equal(typeof frame.client_id, "string");
+  if (type === "consume_rate_limit_reset_credit") {
+    assert.equal(frame.credit_id, "opaque/credit");
+  }
 }
 const targetedGoalRequest = relay.sendGetGoalTo("background-goal-session");
 assert.equal(typeof targetedGoalRequest, "string");

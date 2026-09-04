@@ -38,6 +38,8 @@ from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
+    MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+    MAX_STATUS_RESET_CREDITS,
     MAX_STATUS_USAGE_BUCKETS,
     Notice,
     RateLimitUpdate,
@@ -69,6 +71,7 @@ from cc_remote.wrapper.codex_runtime import (
     resolve_codex_bin as _runtime_resolve_codex_bin,
 )
 from cc_remote.wrapper.codex_permissions import normalize_permission_profiles
+from cc_remote.wrapper.process_scan import ProcessIdentity
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -118,6 +121,8 @@ _GOAL_PROMPT_CANDIDATE_TTL_SECONDS = 30.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
+_DAEMON_GENERATION_CONNECT_ATTEMPTS = 2
+_TURN_START_RECONCILE_PAGE_SIZE = 8
 _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
 _DYNAMIC_TOOLS_MIN_VERSION = (0, 151, 0)
 _DYNAMIC_TOOL_TIMEOUT = 60.0
@@ -207,6 +212,112 @@ class CodexDaemonProxyClosed(RuntimeError):
         self.generation = generation
         self.close_kind = close_kind
         super().__init__("Codex shared app-server proxy closed")
+
+
+class CodexAppServerDisconnected(RuntimeError):
+    """A resident JSON-RPC request lost its app-server transport."""
+
+    __slots__ = ("app_server_version", "generation")
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+    ) -> None:
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        super().__init__("codex app-server disconnected")
+
+
+class CodexTurnStartDisconnected(RuntimeError):
+    """``turn/start`` lost its response after the submission boundary.
+
+    ``accepted`` is true only when the old generation emitted an exact
+    ``clientUserMessageId`` user item before disconnecting.  False means the
+    outcome is unknown, not that replay is safe.
+    """
+
+    __slots__ = (
+        "accepted",
+        "app_server_version",
+        "client_message_id",
+        "generation",
+        "native_turn_id",
+        "native_message_id",
+    )
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+        *,
+        accepted: bool,
+        client_message_id: Optional[str] = None,
+        native_turn_id: Optional[str] = None,
+        native_message_id: Optional[str] = None,
+    ) -> None:
+        self.accepted = bool(accepted)
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        self.client_message_id = client_message_id
+        self.native_turn_id = native_turn_id
+        self.native_message_id = native_message_id
+        super().__init__("Codex turn/start outcome interrupted by disconnect")
+
+
+class CodexTurnStartReconciliation:
+    """Bounded authoritative state for one interrupted ``turn/start``.
+
+    ``matched_turn_id`` is populated only when the replacement app-server
+    exposes the exact registered client id/native user item (or the already
+    proven native task id).  ``thread_active`` without a match is deliberately
+    not ownership proof; Machine keeps the session blocked and polls instead of
+    adopting or replaying somebody else's concurrent turn.
+    """
+
+    __slots__ = (
+        "active_turn_id",
+        "latest_turn_id",
+        "matched_turn_active",
+        "matched_turn_id",
+        "matched_turn_is_latest",
+        "newer_turns_present",
+        "page_truncated",
+        "thread_active",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_active: bool,
+        active_turn_id: Optional[str],
+        matched_turn_id: Optional[str],
+        matched_turn_active: bool,
+        latest_turn_id: Optional[str] = None,
+        matched_turn_is_latest: bool = False,
+        newer_turns_present: bool = False,
+        page_truncated: bool = False,
+    ) -> None:
+        self.thread_active = bool(thread_active)
+        self.active_turn_id = active_turn_id
+        self.matched_turn_id = matched_turn_id
+        self.matched_turn_active = bool(matched_turn_active)
+        self.latest_turn_id = latest_turn_id
+        self.matched_turn_is_latest = bool(matched_turn_is_latest)
+        self.newer_turns_present = bool(newer_turns_present)
+        self.page_truncated = bool(page_truncated)
+
+
+class _CodexDaemonGenerationChanged(RuntimeError):
+    """The managed daemon child changed while a proxy was initializing."""
 
 
 class CodexAppServerError(RuntimeError):
@@ -1594,6 +1705,7 @@ class CodexHandle:
         # session.  Keep this affinity across proxy reconnects so Machine can
         # preserve bidirectional ownership while the short-lived proxy is down.
         self._daemon_proxy_established = False
+        self._daemon_process_identity: Optional[ProcessIdentity] = None
         self._proxy_read_buffer = bytearray()
         self._proxy_close_sent = False
         self._send_lock = asyncio.Lock()
@@ -1805,6 +1917,33 @@ class CodexHandle:
             and not self._dead
             and getattr(self.proc, "returncode", None) is None
         )
+
+    @property
+    def daemon_process_generation_current(self) -> bool:
+        """Whether this proxy still targets the official daemon child it joined.
+
+        Managers without the official identity surface retain normal WebSocket
+        liveness. Once that surface exists, an unavailable or different child
+        is a stale generation even when the proxy subprocess has not observed
+        EOF yet.
+        """
+        if not self.using_daemon_proxy:
+            return False
+        expected = self._daemon_process_identity
+        observe = getattr(
+            self.daemon_manager, "current_process_identity", None,
+        )
+        if not callable(observe):
+            # Third-party/test managers without the official PID observation
+            # surface use WebSocket liveness only.
+            return True
+        current = observe()
+        if expected is None:
+            # A manager which implements identity observation but cannot return
+            # the generation is temporarily unavailable, not "unsupported".
+            # Fail closed so a later preflight reconnects and binds it.
+            return False
+        return current == expected
 
     @property
     def shared_daemon_affinity(self) -> bool:
@@ -2031,6 +2170,7 @@ class CodexHandle:
         preserve_controls: bool = False,
         preserve_permission_profile: bool = True,
         control_only: bool = False,
+        _bind_generation_attempt: int = 0,
     ) -> None:
         if control_only and (resume_id is not None or fork or self.work_mode):
             raise ValueError(
@@ -2161,46 +2301,99 @@ class CodexHandle:
                 )
             attempts = [(proxy_argv, True, codex_bin)]
         initialized: Any = None
-        for argv, daemon_proxy, attempt_codex_bin in attempts:
-            self._shared_resume_binding_thread_id = (
-                resume_id
-                if daemon_proxy and resume_id and not fork
-                else None
-            )
-            try:
-                await self._open_process(
-                    argv, attempt_codex_bin, daemon_proxy=daemon_proxy)
-                initialized = await self._request(
-                    "initialize", _initialize_params())
-                self.app_server_version = _app_server_version(initialized)
-                await self._notify("initialized")
-                if daemon_proxy:
-                    self._daemon_proxy_established = True
-                break
-            except asyncio.CancelledError:
-                await self.disconnect()
-                raise
-            except Exception as exc:
-                await self.disconnect()
-                if not daemon_proxy:
+        connected = False
+        for candidate_argv, daemon_proxy, attempt_codex_bin in attempts:
+            argv = candidate_argv
+            generation_attempt = 0
+            while True:
+                self._shared_resume_binding_thread_id = (
+                    resume_id
+                    if daemon_proxy and resume_id and not fork
+                    else None
+                )
+                observe = getattr(
+                    self.daemon_manager,
+                    "current_process_identity",
+                    None,
+                )
+                try:
+                    generation_before = (
+                        observe()
+                        if daemon_proxy and callable(observe) else None
+                    )
+                    await self._open_process(
+                        argv, attempt_codex_bin, daemon_proxy=daemon_proxy)
+                    initialized = await self._request(
+                        "initialize", _initialize_params())
+                    self.app_server_version = _app_server_version(initialized)
+                    await self._notify("initialized")
+                    if daemon_proxy:
+                        generation_after = (
+                            observe() if callable(observe) else None
+                        )
+                        if callable(observe) and (
+                            generation_before is None
+                            or generation_after is None
+                            or generation_before != generation_after
+                        ):
+                            raise _CodexDaemonGenerationChanged(
+                                "Codex app-server changed during proxy initialize"
+                            )
+                        self._daemon_proxy_established = True
+                        self._daemon_process_identity = generation_after
+                    connected = True
+                    break
+                except asyncio.CancelledError:
+                    await self.disconnect()
                     raise
-                self.daemon_manager.invalidate()
-                if (
-                    strict_shared
-                    or self._daemon_proxy_established
-                    or control_only
-                ):
+                except Exception as exc:
+                    await self.disconnect()
+                    if not daemon_proxy:
+                        raise
+                    self.daemon_manager.invalidate()
+                    if isinstance(exc, _CodexDaemonGenerationChanged):
+                        generation_attempt += 1
+                        if (
+                            generation_attempt
+                            >= _DAEMON_GENERATION_CONNECT_ATTEMPTS
+                        ):
+                            log.warning(
+                                "Codex daemon kept changing during proxy initialize",
+                                attempts=generation_attempt,
+                            )
+                            raise
+                        refreshed = await self.daemon_manager.proxy_args(
+                            codex_bin, child_env)
+                        if refreshed is None:
+                            raise RuntimeError(
+                                "shared Codex app-server proxy is unavailable"
+                            ) from exc
+                        argv = refreshed
+                        log.info(
+                            "retrying Codex proxy after daemon generation change",
+                            attempt=generation_attempt + 1,
+                        )
+                        continue
+                    if (
+                        strict_shared
+                        or self._daemon_proxy_established
+                        or control_only
+                    ):
+                        log.warning(
+                            "Codex shared daemon proxy unavailable; reconnect required",
+                            error_type=type(exc).__name__,
+                        )
+                        raise
                     log.warning(
-                        "Codex shared daemon proxy unavailable; reconnect required",
+                        "Codex daemon proxy unavailable; using stdio",
                         error_type=type(exc).__name__,
                     )
-                    raise
-                log.warning(
-                    "Codex daemon proxy unavailable; using stdio",
-                    error_type=type(exc).__name__,
-                )
-        else:  # pragma: no cover - the attempt list is never empty
+                    break
+            if connected:
+                break
+        if not connected:  # pragma: no cover - the attempt list is never empty
             raise RuntimeError("unable to start Codex app-server transport")
+        bound_thread_id: Optional[str] = None
         try:
             if control_only:
                 log.info("codex control connection established", cwd=self._cwd)
@@ -2263,6 +2456,7 @@ class CodexHandle:
                     fork_params["excludeTurns"] = True
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
+                bound_thread_id = self.thread_id
                 self.dynamic_tools_declared = bool(
                     not self.work_mode
                     and _semantic_version(self.app_server_version)
@@ -2342,6 +2536,7 @@ class CodexHandle:
                         )
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
+                bound_thread_id = self.thread_id
                 self._shared_resume_binding_thread_id = None
                 self.dynamic_tools_declared = bool(
                     not self.work_mode
@@ -2383,6 +2578,7 @@ class CodexHandle:
                     params["dynamicTools"] = self.dynamic_tools
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
+                bound_thread_id = self.thread_id
                 self.dynamic_tools_declared = "dynamicTools" in params
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
@@ -2430,7 +2626,70 @@ class CodexHandle:
                     sticky["permissions"] = self.permission_profile
                 await self._update_thread_settings(
                     wait_for_notification=True, **sticky)
-        except BaseException:
+            if daemon_proxy and callable(observe):
+                generation_after_bind = observe()
+                if (
+                    self._daemon_process_identity is None
+                    or generation_after_bind is None
+                    or generation_after_bind != self._daemon_process_identity
+                ):
+                    raise _CodexDaemonGenerationChanged(
+                        "Codex app-server changed while binding its thread"
+                    )
+        except BaseException as exc:
+            # initialize is not the complete connection boundary: resume/start
+            # and sticky settings still target the same daemon child. If that
+            # child is replaced after initialize, rebind the already-known
+            # native thread on the replacement generation. No turn input has
+            # been submitted yet, so resuming that identity is idempotent. A
+            # lost brand-new thread/start response has no recoverable id and is
+            # deliberately not retried, avoiding duplicate blank sessions.
+            retry_thread_id = (
+                bound_thread_id
+                or (
+                    resume_id
+                    if isinstance(resume_id, str) and not fork
+                    else None
+                )
+            )
+            retryable_generation_failure = isinstance(
+                exc,
+                (
+                    _CodexDaemonGenerationChanged,
+                    CodexAppServerDisconnected,
+                    CodexDaemonProxyClosed,
+                    ConnectionError,
+                    EOFError,
+                    asyncio.TimeoutError,
+                ),
+            )
+            retry_dynamic_tools = self.dynamic_tools_declared
+            if (
+                daemon_proxy
+                and retryable_generation_failure
+                and isinstance(retry_thread_id, str)
+                and retry_thread_id
+                and _bind_generation_attempt
+                    < _DAEMON_GENERATION_CONNECT_ATTEMPTS - 1
+            ):
+                self.daemon_manager.invalidate()
+                await self.disconnect()
+                log.info(
+                    "retrying Codex thread bind after daemon generation change",
+                    thread_id=retry_thread_id,
+                    attempt=_bind_generation_attempt + 2,
+                )
+                await self.connect(
+                    resume_id=retry_thread_id,
+                    cwd=self._cwd,
+                    preserve_controls=True,
+                    preserve_permission_profile=preserve_permission_profile,
+                    _bind_generation_attempt=_bind_generation_attempt + 1,
+                )
+                self.dynamic_tools_declared = bool(
+                    self.dynamic_tools_declared or retry_dynamic_tools
+                )
+                return
             await self.disconnect()
             raise
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
@@ -2497,6 +2756,12 @@ class CodexHandle:
             )
             if registered_identity else None
         )
+        pending_identity = (
+            self._pending_steer_user_identities.get(client_user_message_id)
+            if registered_identity
+            and isinstance(client_user_message_id, str)
+            else None
+        )
         # Mark the turn active before awaiting the RPC.  app-server may dispatch
         # turn/completed immediately after the response, before this coroutine is
         # scheduled again; setting this afterwards would resurrect a completed
@@ -2517,13 +2782,47 @@ class CodexHandle:
                     params,
                     response_boundary=response_boundary,
                 )
-        except BaseException:
+        except BaseException as exc:
+            proof = (
+                pending_identity.proof
+                if pending_identity is not None
+                and pending_identity.state != "ambiguous"
+                else None
+            )
             self._discard_steer_user_identity(client_user_message_id)
             self.turn_active = False
             self.turn_id = None
             if self._turn_q is queue:
                 self._turn_q = None
             self._managed_overflow = False
+            if (
+                self.shared_daemon_affinity
+                and isinstance(exc, (
+                    CodexAppServerDisconnected,
+                    ConnectionError,
+                    EOFError,
+                    asyncio.TimeoutError,
+                ))
+            ):
+                raise CodexTurnStartDisconnected(
+                    getattr(
+                        exc,
+                        "app_server_version",
+                        self.app_server_version,
+                    ),
+                    getattr(exc, "generation", self._generation),
+                    accepted=proof is not None,
+                    client_message_id=(
+                        client_user_message_id
+                        if registered_identity else None
+                    ),
+                    native_turn_id=(
+                        proof.native_turn_id if proof is not None else None
+                    ),
+                    native_message_id=(
+                        proof.native_message_id if proof is not None else None
+                    ),
+                ) from exc
             raise
         finally:
             self.turn_start_pending = False
@@ -2840,6 +3139,7 @@ class CodexHandle:
                 return True
             # One client id proving two native items is ambiguous. Fail closed
             # instead of letting arrival order choose a durable alias.
+            pending.state = "ambiguous"
             self._pending_steer_user_identities.pop(
                 pending.client_message_id, None)
             log.warning(
@@ -4233,6 +4533,8 @@ class CodexHandle:
         proc = self.proc
         process_group = self._process_group
         daemon_proxy = self._using_daemon_proxy
+        disconnect_version = self.app_server_version
+        disconnect_generation = self._generation
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
@@ -4290,6 +4592,7 @@ class CodexHandle:
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
         self._using_daemon_proxy = False
+        self._daemon_process_identity = None
         self._control_only_connection = False
         self._shared_resume_binding_thread_id = None
         self._proxy_read_buffer.clear()
@@ -4300,7 +4603,10 @@ class CodexHandle:
         self._managed_overflow = False
         for fut in list(self._pending.values()):
             if not fut.done():
-                fut.set_exception(RuntimeError("codex app-server disconnected"))
+                fut.set_exception(CodexAppServerDisconnected(
+                    disconnect_version,
+                    disconnect_generation,
+                ))
         self._pending.clear()
         self.turn_id = None
         self.turn_start_pending = False
@@ -5287,6 +5593,166 @@ class CodexHandle:
         )
         return {"used_tokens": used, "context_window": win, "raw": u}
 
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id: Optional[str] = None,
+        native_message_id: Optional[str] = None,
+    ) -> CodexTurnStartReconciliation:
+        """Resolve a lost ``turn/start`` response without replaying its input.
+
+        The replacement shared connection supplies two independent facts: the
+        thread's current liveness and a bounded newest-turn page.  Only exact
+        native user identity can attribute a turn to the interrupted request;
+        a merely active thread remains unowned and must stay write-blocked.
+        """
+        if (
+            not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(client_message_id)
+            or not isinstance(self.thread_id, str)
+        ):
+            raise ValueError("invalid Codex turn/start reconciliation identity")
+        for value in (native_turn_id, native_message_id):
+            if value is not None and (
+                not isinstance(value, str)
+                or not _STATUS_WIRE_ID.fullmatch(value)
+            ):
+                raise ValueError(
+                    "invalid Codex turn/start reconciliation identity"
+                )
+
+        response = await self._request("thread/read", {
+            "threadId": self.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        raw_status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") not in {None, self.thread_id}
+            or not isinstance(raw_status, dict)
+            or raw_status.get("type") not in _THREAD_STATUSES
+        ):
+            raise RuntimeError(
+                "codex thread/read returned an invalid reconciliation state"
+            )
+        read_reports_active = raw_status.get("type") == "active"
+
+        page = await self._request("thread/turns/list", {
+            "threadId": self.thread_id,
+            "cursor": None,
+            "limit": _TURN_START_RECONCILE_PAGE_SIZE,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(turns, list):
+            raise RuntimeError(
+                "codex latest-turn read returned an invalid reconciliation page"
+            )
+
+        active_turn_id: Optional[str] = None
+        latest_turn_id: Optional[str] = None
+        if turns:
+            latest = turns[0]
+            latest_id = latest.get("id") if isinstance(latest, dict) else None
+            if (
+                isinstance(latest_id, str)
+                and _STATUS_WIRE_ID.fullmatch(latest_id)
+            ):
+                latest_turn_id = latest_id
+                # thread/turns/list is issued after thread/read. A turn may
+                # start between those requests, so its newer inProgress row is
+                # authoritative active evidence even when the older read said
+                # idle. The opposite disagreement stays conservatively active
+                # until a later ordered probe agrees it is idle.
+                if latest.get("status") == "inProgress":
+                    active_turn_id = latest_id
+        thread_active = bool(read_reports_active or active_turn_id is not None)
+
+        matches: set[str] = set()
+        match_indexes: dict[str, int] = {}
+        for index, turn in enumerate(
+            turns[:_TURN_START_RECONCILE_PAGE_SIZE]
+        ):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = turn.get("id")
+            if (
+                not isinstance(turn_id, str)
+                or not _STATUS_WIRE_ID.fullmatch(turn_id)
+            ):
+                continue
+            # An exact notification proof can expose the same task id as the
+            # control turn even when this app-server's summary omits items.
+            if (
+                native_message_id is not None
+                and native_turn_id is not None
+                and turn_id == native_turn_id
+            ):
+                matches.add(turn_id)
+                match_indexes.setdefault(turn_id, index)
+            items = turn.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                item_id = item.get("id")
+                item_client_id = item.get("clientId")
+                client_match = item_client_id == client_message_id
+                native_match = (
+                    native_message_id is not None
+                    and item_id == native_message_id
+                )
+                if not (client_match or native_match):
+                    continue
+                if (
+                    client_match
+                    and native_message_id is not None
+                    and item_id != native_message_id
+                ) or (
+                    native_match
+                    and isinstance(item_client_id, str)
+                    and item_client_id != client_message_id
+                ):
+                    raise RuntimeError(
+                        "conflicting Codex turn/start reconciliation identity"
+                    )
+                matches.add(turn_id)
+                match_indexes.setdefault(turn_id, index)
+
+        if len(matches) > 1:
+            raise RuntimeError(
+                "ambiguous Codex turn/start reconciliation identity"
+            )
+        matched_turn_id = next(iter(matches), None)
+        matched_index = (
+            match_indexes.get(matched_turn_id)
+            if matched_turn_id is not None else None
+        )
+        next_cursor = page.get("nextCursor") if isinstance(page, dict) else None
+        if next_cursor not in (None, "") and not isinstance(next_cursor, str):
+            raise RuntimeError(
+                "codex latest-turn read returned an invalid cursor"
+            )
+        return CodexTurnStartReconciliation(
+            thread_active=thread_active,
+            active_turn_id=active_turn_id,
+            matched_turn_id=matched_turn_id,
+            matched_turn_active=bool(
+                matched_turn_id is not None
+                and matched_turn_id == active_turn_id
+            ),
+            latest_turn_id=latest_turn_id,
+            matched_turn_is_latest=matched_index == 0,
+            newer_turns_present=bool(
+                matched_index is not None and matched_index > 0
+            ),
+            page_truncated=bool(next_cursor),
+        )
+
     async def probe_owned_turn(
         self, turn_id: str,
     ) -> Optional[CodexOwnedTurnProbe]:
@@ -5615,6 +6081,21 @@ class CodexHandle:
                 "rateLimits": self.last_rate_limits,
                 "rateLimitsByLimitId": self.last_rate_limits_by_id,
             })
+        reset_credits = None
+        if (
+            not skip_chatgpt_stats
+            and rate_response is not None
+            and "rateLimitResetCredits" in rate_response
+        ):
+            raw_reset_credits = rate_response.get("rateLimitResetCredits")
+            reset_credits = _sanitize_rate_limit_reset_credits(
+                raw_reset_credits)
+            if raw_reset_credits is not None and reset_credits is None:
+                _append_status_error(
+                    errors,
+                    "reset_credits",
+                    "app-server returned an invalid response",
+                )
 
         usage = None
         usage_response = responses.get("usage")
@@ -5640,9 +6121,32 @@ class CodexHandle:
             "context": context,
             "account": account,
             "rate_limits": rate_limits,
+            "reset_credits": reset_credits,
             "usage": usage,
             "component_errors": errors[:5],
         }
+
+    async def consume_rate_limit_reset_credit(
+        self,
+        *,
+        credit_id: Optional[str],
+        idempotency_key: str,
+    ) -> str:
+        """Redeem one native Codex reset credit with caller-owned idempotency."""
+        params = {"idempotencyKey": idempotency_key}
+        if credit_id is not None:
+            params["creditId"] = credit_id
+        response = await self._request(
+            "account/rateLimitResetCredit/consume", params)
+        outcome = response.get("outcome") if isinstance(response, dict) else None
+        if not isinstance(outcome, str) or not outcome:
+            raise RuntimeError(
+                "codex reset-credit consume returned an invalid response")
+        if outcome not in {
+            "reset", "nothingToReset", "noCredit", "alreadyRedeemed",
+        }:
+            return "unknown"
+        return outcome
 
     def _remember_rate_limits(self, response: dict) -> None:
         single = response.get("rateLimits")
@@ -6032,8 +6536,16 @@ class CodexHandle:
         frame = _websocket_client_frame(payload, opcode=opcode)
         async with self._send_lock:
             proc = self.proc
-            if proc is None or proc.stdin is None:
-                raise RuntimeError("codex daemon proxy disconnected")
+            if (
+                proc is None
+                or proc.stdin is None
+                or self._dead
+                or proc.returncode is not None
+            ):
+                raise CodexAppServerDisconnected(
+                    self.app_server_version,
+                    self._generation,
+                )
             proc.stdin.write(frame)
             await proc.stdin.drain()
 
@@ -6207,7 +6719,14 @@ class CodexHandle:
                 self._managed_overflow = False
                 for fut in self._pending.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("codex app-server closed"))
+                        fut.set_exception(
+                            CodexAppServerDisconnected(
+                                self.app_server_version,
+                                generation,
+                            )
+                            if daemon_proxy else
+                            RuntimeError("codex app-server closed")
+                        )
                 self._clear_steer_user_identities()
                 if spontaneous_turn_id is not None:
                     await self._publish_turn_lifecycle(
@@ -7564,3 +8083,62 @@ def _sanitize_rate_limits(response: dict) -> list[dict]:
             "secondary": _sanitize_rate_window(snapshot.get("secondary")),
         })
     return out
+
+
+def _sanitize_rate_limit_reset_credits(value: Any) -> Optional[dict]:
+    """Copy only the bounded earned-reset-credit account surface.
+
+    Paid credit balances and spend controls live beside this payload upstream
+    and are deliberately not inspected here. Opaque ids are never truncated:
+    an oversized id drops its detail row so it cannot redeem a different item.
+    """
+    if not isinstance(value, dict):
+        return None
+    available_count = _nonnegative_int(value.get("availableCount"))
+    if available_count is None:
+        return None
+    raw_credits = value.get("credits")
+    if raw_credits is not None and not isinstance(raw_credits, list):
+        return None
+    credits = None
+    if isinstance(raw_credits, list):
+        credits = []
+        for raw in raw_credits[:MAX_STATUS_RESET_CREDITS]:
+            if not isinstance(raw, dict):
+                continue
+            credit_id = raw.get("id")
+            granted_at = _nonnegative_int(raw.get("grantedAt"))
+            if (
+                not isinstance(credit_id, str)
+                or not 1 <= len(credit_id) <= 512
+                or granted_at is None
+                or granted_at > MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+            ):
+                continue
+            expires_at = raw.get("expiresAt")
+            if expires_at is not None:
+                expires_at = _nonnegative_int(expires_at)
+                if (
+                    expires_at is None
+                    or expires_at > MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+                ):
+                    continue
+            reset_type = raw.get("resetType")
+            if reset_type not in {"codexRateLimits", "unknown"}:
+                reset_type = "unknown"
+            status = raw.get("status")
+            if status not in {
+                "available", "redeeming", "redeemed", "unknown",
+            }:
+                status = "unknown"
+            credits.append({
+                "id": credit_id,
+                "granted_at": granted_at,
+                "expires_at": expires_at,
+                "reset_type": reset_type,
+                "status": status,
+                "title": _bounded_string(raw.get("title"), 256),
+                "description": _bounded_string(
+                    raw.get("description"), 2048),
+            })
+    return {"available_count": available_count, "credits": credits}

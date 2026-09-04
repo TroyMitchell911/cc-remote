@@ -379,6 +379,22 @@
 .status-rate-window > div { display:flex; justify-content:space-between; color:var(--dim); font-size:11px; }
 .status-rate-window > div b { color:var(--text); font-size:10.5px; }
 .status-rate-window small { display:block; margin-top:4px; color:var(--faint); font-size:9.5px; }
+.status-reset-summary { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:10px 12px; border:1px solid var(--border); border-radius:11px; background:var(--bg); }
+.status-reset-summary span { color:var(--dim); font-size:11.5px; }
+.status-reset-summary b { color:var(--text); font-family:var(--mono); font-size:16px; }
+.status-reset-summary small { color:var(--faint); font-size:9.5px; text-align:right; }
+.status-reset-list { display:grid; gap:7px; margin-top:8px; }
+.status-reset-credit { display:flex; align-items:center; gap:10px; padding:9px 10px; border:1px solid var(--border); border-radius:10px; background:var(--bg); }
+.status-reset-credit > span { min-width:0; flex:1; display:flex; flex-direction:column; gap:2px; }
+.status-reset-credit b { font-size:11.5px; }
+.status-reset-credit small { color:var(--dim); font-size:9.5px; line-height:1.4; overflow-wrap:anywhere; }
+.status-reset-credit button,.status-reset-next { flex:none; padding:6px 10px; border-radius:8px; color:var(--accent-ink); background:var(--accent-weak); font-size:10.5px; font-weight:650; }
+.status-reset-credit button:hover,.status-reset-next:hover { filter:brightness(1.08); }
+.status-reset-credit button:disabled,.status-reset-next:disabled { opacity:.45; cursor:default; filter:none; }
+.status-reset-credit em { flex:none; color:var(--faint); font-size:10px; font-style:normal; }
+.status-reset-next { margin-top:8px; }
+.status-reset-result { margin-top:8px; padding:8px 10px; border-radius:9px; color:var(--ok); background:var(--ok-weak); font-size:10.5px; }
+.status-reset-result.error { color:var(--danger); background:var(--danger-weak); }
 .status-usage { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; }
 .status-usage > div { display:flex; flex-direction:column; padding:9px; border:1px solid var(--border); border-radius:10px; background:var(--bg); }
 .status-usage small { color:var(--faint); font-size:9.5px; }

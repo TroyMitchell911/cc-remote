@@ -209,6 +209,43 @@ def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
     asyncio.run(run())
 
 
+def test_claude_code_image_reaches_native_sdk_without_media_interception():
+    image_data = _png()
+
+    class FailingSdk:
+        effort = "high"
+        applied_effort = "high"
+
+        async def query(self, messages):
+            [payload] = [item async for item in messages]
+            content = payload["message"]["content"]
+            assert content == [
+                {"type": "text", "text": "inspect image"},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_data,
+                }},
+            ]
+            raise RuntimeError("synthetic failure after native query boundary")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("tmp-code-image", None)
+        ctx.engine = "claude"
+        ctx.state = "running"
+        ctx.active_msg_id = "image-message"
+        ctx.sdk = FailingSdk()
+
+        await machine._run_turn(
+            ctx,
+            "inspect image",
+            images=[{"media_type": "image/png", "data": image_data}],
+        )
+
+    asyncio.run(run())
+
+
 def test_history_strips_legacy_and_workspace_work_attachment_paths():
     machine, _ = _mk_machine()
     roots = (

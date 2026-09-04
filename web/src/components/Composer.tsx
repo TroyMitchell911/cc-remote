@@ -49,6 +49,7 @@ import { UsageMeter } from "./UsageMeter";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
 import {
+  DEFAULT_AUTO_COMPACT_TOKENS,
   normalizeAutoCompactSelection,
   parseAutoCompactArgument,
   type AutoCompactSelection,
@@ -585,7 +586,7 @@ export function Composer(p: Props) {
       case "compact":
         if (args.trim()) { flash("/compact 不接受参数"); return; }
         p.onCompact?.();
-        flash("正在启动 Codex 原生上下文压缩…");
+        flash("正在启动原生上下文压缩…");
         break;
       case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
@@ -727,8 +728,8 @@ export function Composer(p: Props) {
     ? workContextMetrics(exactContextReport)
     : null;
   const autoCompactSelection = normalizeAutoCompactSelection(
-    p.autoCompact?.mode ?? "inherit",
-    p.autoCompact?.threshold_tokens,
+    p.autoCompact?.mode ?? "custom",
+    p.autoCompact?.threshold_tokens ?? DEFAULT_AUTO_COMPACT_TOKENS,
   );
   const autoCompactControl = (
     <Suspense fallback={

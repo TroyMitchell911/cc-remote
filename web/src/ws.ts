@@ -1150,6 +1150,20 @@ export class RelayWs {
     });
   }
 
+  sendConsumeRateLimitResetCredit(
+    sid: string,
+    creditId?: string | null,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "consume_rate_limit_reset_credit",
+      sid,
+      client_id: this.clientId,
+      ...(creditId ? { credit_id: creditId } : {}),
+      ts: nowTs(),
+    });
+  }
+
   sendGetBrowserSurfaceTo(sid: string, create = false): string | null {
     const requestId = uuid();
     return this.sendTracked({
@@ -1493,10 +1507,10 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendCompactSession(sessionId: string): boolean {
+  sendCompactSession(sessionId: string, engine: "claude" | "codex"): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,
-      engine: "codex", space: "code", ts: nowTs(),
+      engine, space: "code", ts: nowTs(),
     });
   }
 

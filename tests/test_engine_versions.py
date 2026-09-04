@@ -56,6 +56,49 @@ def test_claude_runtime_configured_path_and_version_probe(monkeypatch, tmp_path)
     assert claude_runtime.probe_claude_cli_version(str(cli)) == "2.1.220"
 
 
+def test_claude_runtime_rejects_failed_version_probe(monkeypatch, tmp_path):
+    cli = tmp_path / "claude"
+    cli.write_text("")
+    cli.chmod(0o755)
+    monkeypatch.setattr(
+        claude_runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout="2.1.258 (Claude Code)\n", stderr="", returncode=1,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exited with status 1"):
+        claude_runtime.probe_claude_cli_version(str(cli))
+
+
+@pytest.mark.parametrize("version", ["2.1.258", "2.1.258+build.1", "2.2.0", "3.0.0"])
+def test_claude_runtime_accepts_supported_cli_versions(version):
+    assert claude_runtime.validate_cli_version(version) == version
+
+
+@pytest.mark.parametrize("version", ["2.1.257", "2.1.258-beta.1"])
+def test_claude_runtime_rejects_unsupported_cli_versions(version):
+    with pytest.raises(RuntimeError, match="run `claude update`"):
+        claude_runtime.validate_cli_version(version)
+
+
+def test_claude_runtime_inspection_enforces_cli_minimum(monkeypatch, tmp_path):
+    cli = tmp_path / "claude"
+    cli.write_text("")
+    cli.chmod(0o755)
+    monkeypatch.setattr(
+        claude_runtime, "resolve_claude_cli",
+        lambda _configured="": (str(cli), "configured"),
+    )
+    monkeypatch.setattr(
+        claude_runtime, "probe_claude_cli_version", lambda _path: "2.1.257",
+    )
+
+    with pytest.raises(RuntimeError, match="older than required 2.1.258"):
+        claude_runtime.inspect_claude_runtime(str(cli))
+
+
 def test_claude_runtime_rejects_relative_configured_path():
     with pytest.raises(RuntimeError, match="must be an absolute path"):
         claude_runtime.resolve_claude_cli("bin/claude")

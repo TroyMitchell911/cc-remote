@@ -201,6 +201,8 @@ class ClaudeForkJournal:
         if not isinstance(controls, dict) or set(controls) - {
             "model", "effort", "permission_mode",
             "auto_compact_mode", "auto_compact_threshold_tokens",
+            "applied_auto_compact_mode",
+            "applied_auto_compact_threshold_tokens",
         }:
             raise ValueError("invalid Claude fork controls")
         model = controls.get("model")
@@ -230,6 +232,25 @@ class ClaudeForkJournal:
                 raise ValueError("invalid Claude fork autocompact threshold")
         elif auto_threshold is not None:
             raise ValueError("unexpected Claude fork autocompact threshold")
+        applied_mode = controls.get("applied_auto_compact_mode")
+        applied_threshold = controls.get(
+            "applied_auto_compact_threshold_tokens")
+        if applied_mode is None:
+            if applied_threshold is not None:
+                raise ValueError(
+                    "unexpected Claude fork applied autocompact threshold")
+        elif applied_mode not in {"inherit", "auto", "custom"}:
+            raise ValueError("invalid Claude fork applied autocompact mode")
+        elif applied_mode == "custom":
+            if (not isinstance(applied_threshold, int)
+                    or isinstance(applied_threshold, bool)
+                    or not MIN_AUTO_COMPACT_TOKENS <= applied_threshold
+                    <= MAX_AUTO_COMPACT_TOKENS):
+                raise ValueError(
+                    "invalid Claude fork applied autocompact threshold")
+        elif applied_threshold is not None:
+            raise ValueError(
+                "unexpected Claude fork applied autocompact threshold")
 
     @classmethod
     def _validate_entry(cls, request_id: Any, entry: Any) -> None:

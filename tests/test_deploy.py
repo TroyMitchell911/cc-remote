@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import re
 import sqlite3
+import stat
 import subprocess
 
 import pytest
@@ -30,6 +31,7 @@ from deploy.work_registry_snapshot import (
     WorkRegistrySnapshotError,
     create_snapshot,
     resolve_work_roots,
+    resolve_wrapper_state_dir,
     restore_snapshot,
     verify_profile_migration,
 )
@@ -297,6 +299,88 @@ def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
     assert not Path(f"{codex_database}-shm").exists()
 
 
+def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    original = b'{"version":2,"sessions":{}}\n'
+    controls.write_bytes(original)
+    controls.chmod(0o600)
+
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    controls.write_bytes(b'{"version":3,"sessions":{"new":{}}}\n')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert controls.read_bytes() == original
+    assert stat.S_IMODE(controls.stat().st_mode) == 0o600
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    assert manifest["version"] == 2
+    assert manifest["wrapper_state"]["exists"] is True
+
+
+def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert not controls.exists()
+
+
+def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o644)
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="private bounded file",
+    ):
+        create_snapshot(
+            tmp_path / "snapshot", roots, state_dir=state_dir)
+
+
+def test_release_snapshot_rejects_boolean_manifest_version(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = True
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="unsupported wrapper data snapshot",
+    ):
+        restore_snapshot(snapshot)
+
+
 @pytest.mark.parametrize("engine", ["claude", "codex"])
 def test_work_registry_migration_verifier_rejects_unowned_profile_rows(
     tmp_path, engine,
@@ -360,11 +444,13 @@ def test_work_registry_roots_are_read_without_executing_service_config(tmp_path)
     env_file.write_text(
         f'CLAUDE_WORK_ROOT="{tmp_path / "Claude Work"}"\n'
         f"CODEX_WORK_ROOT={tmp_path / 'codex-env'}\n"
+        f"CC_REMOTE_STATE_DIR={tmp_path / 'state-env'}\n"
     )
     plist = tmp_path / "wrapper.plist"
     plist.write_bytes(plistlib.dumps({
         "EnvironmentVariables": {
             "CODEX_WORK_ROOT": str(tmp_path / "Codex Work"),
+            "CC_REMOTE_STATE_DIR": str(tmp_path / "State Dir"),
         },
     }))
 
@@ -374,6 +460,9 @@ def test_work_registry_roots_are_read_without_executing_service_config(tmp_path)
         "claude": (tmp_path / "Claude Work").resolve(),
         "codex": (tmp_path / "Codex Work").resolve(),
     }
+    assert resolve_wrapper_state_dir(
+        home, env_file=env_file, plist=plist,
+    ) == (tmp_path / "State Dir").resolve()
 
 
 @pytest.mark.parametrize("destination_exists", [False, True])
@@ -674,7 +763,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v46_layout():
+def test_release_docs_and_examples_describe_one_atomic_v48_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -687,11 +776,11 @@ def test_release_docs_and_examples_describe_one_atomic_v46_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v46" in deploy_readme
+    assert "Protocol v48" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v46" in document
+        assert "v48" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -739,7 +828,7 @@ def test_release_docs_and_examples_describe_one_atomic_v46_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.151" in claude
-    assert "protocol v46" in claude
+    assert "protocol v48" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

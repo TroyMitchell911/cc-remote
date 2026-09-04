@@ -120,6 +120,40 @@ def test_begin_rejects_invalid_controls_without_mutating_the_journal(tmp_path):
     assert not journal.path.exists()
 
 
+def test_fork_journal_preserves_pending_autocompact_transaction(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+    controls = {
+        "auto_compact_mode": "custom",
+        "auto_compact_threshold_tokens": 300_000,
+        "applied_auto_compact_mode": "custom",
+        "applied_auto_compact_threshold_tokens": 800_000,
+    }
+
+    entry = journal.begin(
+        "request-pending", "parent", "message-1", "/repo", controls)
+
+    assert entry["controls"] == controls
+    assert ClaudeForkJournal(tmp_path).get(
+        "request-pending")["controls"] == controls
+
+    with pytest.raises(
+        ClaudeForkJournalError,
+        match="invalid Claude fork applied autocompact threshold",
+    ):
+        journal.begin(
+            "request-invalid-applied",
+            "parent",
+            "message-2",
+            "/repo",
+            {
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 300_000,
+                "applied_auto_compact_mode": "custom",
+                "applied_auto_compact_threshold_tokens": 99_999,
+            },
+        )
+
+
 def test_get_canonical_follows_alias_and_returns_an_independent_copy(tmp_path):
     journal = ClaudeForkJournal(tmp_path)
     assert journal.get_canonical("missing-request") is None

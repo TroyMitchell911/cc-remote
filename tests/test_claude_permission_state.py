@@ -147,6 +147,69 @@ def test_claude_control_state_survives_sdk_reconnect_and_failed_set(
     asyncio.run(go())
 
 
+def test_claude_curated_model_stays_pinned_across_context_echo_and_reconnect(
+    monkeypatch,
+):
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+
+        await handle.set_model("claude-fable-5-1")
+        first = _FakeClaudeClient.created[-1]
+        assert first.model_calls == ["claude-fable-5-1[1m]"]
+        assert handle.model == "claude-fable-5-1[1m]"
+
+        # Native /context may echo only the base alias. It must not erase the
+        # long-context selection used by the next child generation.
+        handle._record_context_usage(
+            {"model": "claude-fable-5-1", "totalTokens": 10},
+            update_model=True,
+        )
+        assert handle.model == "claude-fable-5-1[1m]"
+
+        await handle.force_reconnect(None, "/tmp", reason="test reconnect")
+        replacement = _FakeClaudeClient.created[-1]
+        assert replacement.options.model == "claude-fable-5-1[1m]"
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_context_observation_does_not_promote_native_base_model():
+    handle = SdkHandle(WrapperConfig())
+
+    handle._record_context_usage(
+        {"model": "claude-fable-5-1", "totalTokens": 10},
+        update_model=True,
+    )
+
+    assert handle.model == "claude-fable-5-1"
+
+
+def test_claude_work_launch_does_not_promote_native_base_model(monkeypatch):
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        handle = SdkHandle(WrapperConfig())
+        handle.work_mode = True
+        handle.model = "claude-fable-5-1"
+
+        await handle.connect(
+            cwd="/tmp", model_override=handle.model,
+            _suppress_context_probe=True,
+        )
+
+        assert _FakeClaudeClient.created[-1].options.model == (
+            "claude-fable-5-1")
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
 def test_claude_model_switch_invalidates_serialized_context_generation(
     monkeypatch,
 ):
@@ -258,7 +321,7 @@ def test_claude_model_event_cannot_overtake_old_context_report():
         await asyncio.wait_for(context_emit_started.wait(), timeout=1)
 
         model_task = asyncio.create_task(machine._handle_set_model(SetModel(
-            sid=ctx.key, model="claude-opus-5[1m]")))
+            sid=ctx.key, model="claude-fable-5-1")))
         await asyncio.sleep(0)
         assert model_task.done() is False
         assert ctx.sdk.model == "claude-mythos-5"
@@ -271,7 +334,7 @@ def test_claude_model_event_cannot_overtake_old_context_report():
         ]
         assert [type(event) for event in projected] == [ContextReport, Model]
         assert projected[0].model == "claude-mythos-5"
-        assert projected[1].model == "claude-opus-5[1m]"
+        assert projected[1].model == "claude-fable-5-1[1m]"
 
     asyncio.run(go())
 
@@ -303,17 +366,90 @@ def test_claude_sdk_passes_bounded_autocompact_as_a_spawn_option(monkeypatch):
         handle.set_auto_compact("auto")
         assert handle.applied_auto_compact_mode == "custom"
         await handle.force_reconnect(
-            None, "/tmp", reason="apply autocompact")
+            None, "/tmp", reason="apply autocompact",
+            apply_pending_auto_compact=True)
         assert ContextClient.created[-1].options.extra_args[
             "autocompact"] == "auto"
         assert handle.applied_auto_compact_mode == "auto"
 
         handle.set_auto_compact("inherit")
         await handle.force_reconnect(
-            None, "/tmp", reason="inherit autocompact")
+            None, "/tmp", reason="inherit autocompact",
+            apply_pending_auto_compact=True)
         assert "autocompact" not in (
             ContextClient.created[-1].options.extra_args or {})
         assert handle.applied_auto_compact_mode == "inherit"
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_unrelated_reconnect_does_not_apply_a_pending_smaller_window(
+    monkeypatch,
+):
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+        handle.set_auto_compact("custom", 200_000)
+
+        await handle.force_reconnect(
+            None, "/tmp", reason="effort change")
+
+        replacement = _FakeClaudeClient.created[-1]
+        assert replacement.options.extra_args["autocompact"] == "500000"
+        assert handle.auto_compact_threshold_tokens == 200_000
+        assert handle.applied_auto_compact_threshold_tokens == 500_000
+        await handle.disconnect()
+
+    asyncio.run(go())
+
+
+def test_reconnect_uses_immutable_spawn_snapshot_without_losing_newer_choice(
+    monkeypatch,
+):
+    class BlockingDisconnect(_FakeClaudeClient):
+        disconnect_started = asyncio.Event()
+        release_disconnect = asyncio.Event()
+
+        async def disconnect(self):
+            if self is self.created[0]:
+                self.disconnect_started.set()
+                await self.release_disconnect.wait()
+            await super().disconnect()
+
+    async def go():
+        BlockingDisconnect.created = []
+        BlockingDisconnect.disconnect_started = asyncio.Event()
+        BlockingDisconnect.release_disconnect = asyncio.Event()
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", BlockingDisconnect)
+        handle = SdkHandle(WrapperConfig())
+        await handle.connect(cwd="/tmp")
+        handle.set_auto_compact("custom", 200_000)
+
+        reconnect = asyncio.create_task(handle.force_reconnect(
+            None, "/tmp", reason="unrelated reconnect",
+        ))
+        await asyncio.wait_for(
+            BlockingDisconnect.disconnect_started.wait(), timeout=1)
+
+        # This command belongs to the next generation. It must neither alter the
+        # argv already selected above nor be overwritten when reconnect returns.
+        handle.set_auto_compact("custom", 300_000)
+        handle.effort = "high"
+        BlockingDisconnect.release_disconnect.set()
+        await reconnect
+
+        replacement = BlockingDisconnect.created[-1]
+        assert replacement.options.extra_args["autocompact"] == "500000"
+        assert replacement.options.effort == "max"
+        assert handle.applied_auto_compact_threshold_tokens == 500_000
+        assert handle.applied_effort == "max"
+        assert handle.auto_compact_threshold_tokens == 300_000
+        assert handle.effort == "high"
         await handle.disconnect()
 
     asyncio.run(go())
@@ -514,7 +650,8 @@ def test_autocompact_reconnect_drops_previous_context_generation(
 
         handle.set_auto_compact("custom", 400_000)
         await handle.force_reconnect(
-            None, "/tmp", reason="autocompact setting change")
+            None, "/tmp", reason="autocompact setting change",
+            apply_pending_auto_compact=True)
 
         replacement = ContextTimeout.created[-1]
         assert replacement is not first
@@ -688,6 +825,8 @@ def test_claude_new_session_defaults_use_settings_without_sdk_probe(
             ("opus[1m]", CLAUDE_DEFAULT_MODEL),
             ("claude-opus-5", CLAUDE_DEFAULT_MODEL),
             (CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_MODEL),
+            ("claude-fable-5-1", "claude-fable-5-1[1m]"),
+            ("claude-mythos-5-1", "claude-mythos-5-1[1m]"),
             ("claude-sonnet-5", "claude-sonnet-5"),
             ("provider-custom-model", "provider-custom-model"),
         ):
@@ -826,11 +965,13 @@ def test_explicit_fresh_claude_model_wins_without_reading_default(
         ("opus[1m]", CLAUDE_DEFAULT_MODEL),
         ("claude-opus-5", CLAUDE_DEFAULT_MODEL),
         (CLAUDE_DEFAULT_MODEL, CLAUDE_DEFAULT_MODEL),
+        ("claude-fable-5-1", "claude-fable-5-1[1m]"),
+        ("claude-mythos-5-1", "claude-mythos-5-1[1m]"),
         ("claude-sonnet-5", "claude-sonnet-5"),
         ("provider-custom-model", "provider-custom-model"),
     ],
 )
-def test_explicit_new_session_normalizes_only_opus_5_aliases(
+def test_explicit_new_session_normalizes_curated_1m_models(
     monkeypatch,
     tmp_path,
     requested,
@@ -1011,6 +1152,12 @@ def test_claude_code_resume_without_override_never_reads_fresh_default(
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
+        monkeypatch.setattr(
+            machine_module,
+            "last_completed_assistant_controls",
+            lambda *_args, **_kwargs: ClaudeControls(),
+        )
+
         async def forbidden_default(_cwd):
             raise AssertionError("resume must not resolve a fresh default")
 
@@ -1021,6 +1168,100 @@ def test_claude_code_resume_without_override_never_reads_fresh_default(
         assert ctx is not None
         assert _FakeClaudeClient.created[-1].model_calls == []
         assert _FakeClaudeClient.created[-1].options.model is None
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_code_resume_recovers_native_curated_model_before_history(
+    monkeypatch,
+    tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-333333333333"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+        recovered = []
+
+        def native_controls(native_id, **kwargs):
+            recovered.append((native_id, kwargs))
+            return ClaudeControls(model="claude-fable-5-1")
+
+        monkeypatch.setattr(
+            machine_module,
+            "last_completed_assistant_controls",
+            native_controls,
+        )
+        machine, _ = _mk_machine()
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id=session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        assert recovered[0][0] == session_id
+        assert recovered[0][1]["directory"] == str(tmp_path)
+        assert _FakeClaudeClient.created[-1].model_calls == [
+            "claude-fable-5-1[1m]",
+        ]
+        assert ctx.sdk.model == "claude-fable-5-1[1m]"
+        assert machine._claude_controls.get(session_id).model == (
+            "claude-fable-5-1[1m]"
+        )
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_claude_code_resume_migrates_saved_curated_model_to_native_1m_marker(
+    monkeypatch,
+    tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-222222222222"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+        machine, _ = _mk_machine()
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        async def saved_controls(_sid):
+            return ClaudeControls(model="claude-fable-5-1")
+
+        machine._load_claude_session_controls = saved_controls
+        ctx = await machine._spawn(
+            resume_id=session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        assert _FakeClaudeClient.created[-1].model_calls == [
+            "claude-fable-5-1[1m]",
+        ]
+        assert ctx.sdk.model == "claude-fable-5-1[1m]"
         await ctx.sdk.disconnect()
 
     asyncio.run(go())
@@ -1055,6 +1296,16 @@ def test_claude_work_resume_never_applies_code_fresh_default(
         machine._watch_session = lambda _sid: None
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        def forbidden_native_controls(*_args, **_kwargs):
+            raise AssertionError(
+                "Work resume must not import Code transcript controls")
+
+        monkeypatch.setattr(
+            machine_module,
+            "last_completed_assistant_controls",
+            forbidden_native_controls,
+        )
 
         async def forbidden_default(_cwd):
             raise AssertionError("Work resume must preserve its native model")
@@ -1157,7 +1408,104 @@ def test_cold_claude_resume_restores_private_remote_controls(
             model="claude-opus-4-6[1m]",
             effort="high",
             permission_mode="plan",
+            applied_auto_compact_mode="custom",
+            applied_auto_compact_threshold_tokens=500_000,
         )
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_cold_resume_keeps_pending_lower_window_out_of_launch(
+    monkeypatch, tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+
+        machine, _ = _mk_machine()
+        machine._claude_controls.update(
+            session_id,
+            model=None,
+            effort=None,
+            permission_mode=None,
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=300_000,
+            applied_auto_compact_mode="custom",
+            applied_auto_compact_threshold_tokens=800_000,
+        )
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        client = _FakeClaudeClient.created[-1]
+        assert client.options.extra_args["autocompact"] == "800000"
+        assert ctx.sdk.auto_compact_threshold_tokens == 300_000
+        assert ctx.sdk.applied_auto_compact_threshold_tokens == 800_000
+        assert machine._claude_auto_compact_event(ctx).pending is True
+        await ctx.sdk.disconnect()
+
+    asyncio.run(go())
+
+
+def test_cold_resume_without_control_record_does_not_fake_500k_launch(
+    monkeypatch, tmp_path,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+
+    async def go():
+        _FakeClaudeClient.created = []
+        monkeypatch.setattr(
+            sdk_module, "ClaudeSDKClient", _FakeClaudeClient)
+        monkeypatch.setattr(
+            SdkHandle, "preflight", staticmethod(lambda _path: None))
+        monkeypatch.setattr(
+            SdkHandle, "refresh_goal", lambda *_args: asyncio.sleep(0))
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd=str(tmp_path)))
+        monkeypatch.setattr(
+            machine_module, "save_session_id", lambda *_args: None)
+
+        machine, _ = _mk_machine()
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            session_id, engine="claude", space="code")
+
+        assert ctx is not None
+        client = _FakeClaudeClient.created[-1]
+        assert "autocompact" not in (client.options.extra_args or {})
+        assert ctx.sdk.auto_compact_mode == "custom"
+        assert ctx.sdk.auto_compact_threshold_tokens == 500_000
+        assert ctx.sdk.applied_auto_compact_mode == "inherit"
+        assert ctx.sdk.applied_auto_compact_threshold_tokens is None
+        event = machine._claude_auto_compact_event(ctx)
+        assert event.pending is True
+        assert event.phase == "waiting_terminal"
+        saved = machine._claude_controls.get(session_id)
+        assert saved.auto_compact_mode == "custom"
+        assert saved.auto_compact_threshold_tokens == 500_000
+        assert saved.applied_auto_compact_mode == "inherit"
+        assert saved.applied_auto_compact_threshold_tokens is None
         await ctx.sdk.disconnect()
 
     asyncio.run(go())
@@ -1276,6 +1624,53 @@ def test_claude_btw_inherits_parent_permission_before_connect(monkeypatch):
 
         assert fork.sdk.permission_mode == "plan"
         assert fork.sdk.connected_permission == "plan"
+
+    asyncio.run(go())
+
+
+def test_claude_btw_launches_with_parent_applied_autocompact(monkeypatch):
+    class FakeHandle:
+        @staticmethod
+        def preflight(_path):
+            return None
+
+        def __init__(self, _cfg):
+            self.permission_mode = "bypassPermissions"
+            self.effort = "max"
+            self.auto_compact_mode = "custom"
+            self.auto_compact_threshold_tokens = 500_000
+            self.connected_auto_compact = None
+
+        def set_auto_compact(self, mode, threshold):
+            self.auto_compact_mode = mode
+            self.auto_compact_threshold_tokens = threshold
+
+        async def connect(self, **_kwargs):
+            self.connected_auto_compact = (
+                self.auto_compact_mode,
+                self.auto_compact_threshold_tokens,
+            )
+
+        async def disconnect(self):
+            return None
+
+    async def go():
+        monkeypatch.setattr(machine_module, "SdkHandle", FakeHandle)
+        machine, _ = _mk_machine()
+        parent = _mk_ctx("parent-1", "parent-1")
+        parent.sdk = SimpleNamespace(
+            permission_mode="plan",
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=300_000,
+            applied_auto_compact_mode="custom",
+            applied_auto_compact_threshold_tokens=800_000,
+        )
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        assert fork.sdk.connected_auto_compact == ("custom", 800_000)
 
     asyncio.run(go())
 

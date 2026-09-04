@@ -66,7 +66,7 @@ from claude_agent_sdk import (
     rename_session, tag_session,
 )
 from claude_agent_sdk.types import (
-    ResultMessage, TaskNotificationMessage,
+    ResultMessage, SystemMessage, TaskNotificationMessage,
     TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage,
     RateLimitEvent, TERMINAL_TASK_STATUSES, UserMessage,
 )
@@ -111,6 +111,7 @@ from cc_remote.protocol import (
     MAX_BACKGROUND_PROCESS_CWD_CHARS,
     MAX_BACKGROUND_PROCESS_ITEMS,
     MAX_BACKGROUND_PROCESS_SUMMARY_CHARS,
+    MIN_AUTO_COMPACT_TOKENS,
     MAX_SAFE_WIRE_INTEGER,
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, QueryQueueState, QueuedQueryDetail, QueuedQueryInfo,
@@ -118,7 +119,7 @@ from cc_remote.protocol import (
     Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort,
     AutoCompact, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
-    BtwOpened, ContextReport, StatusReport, Notice,
+    BtwOpened, ContextReport, StatusReport, RateLimitResetResult, Notice,
     RateLimitUpdate, BrowserSurface, BrowserFrame, DiffReport, FilePreview,
     FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
@@ -164,6 +165,8 @@ from cc_remote.wrapper.session_presentation import (
     SessionPresentationStoreError,
 )
 from cc_remote.wrapper.claude_controls import (
+    CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
+    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     ClaudeControlStore,
     ClaudeControlStoreError,
     ClaudeControls,
@@ -177,6 +180,12 @@ from cc_remote.wrapper.claude_client_messages import (
     ClaudeClientMessageStore,
     ClaudeClientMessageStoreError,
 )
+from cc_remote.wrapper.claude_errors import (
+    classify_provider_request_too_large,
+    is_provider_request_too_large,
+    provider_request_too_large_message,
+)
+from cc_remote.wrapper.claude_runtime import UnsupportedClaudeCliVersion
 from cc_remote.wrapper.claude_rate_limits import (
     ClaudeRateLimitStore,
     ClaudeRateLimitStoreError,
@@ -213,6 +222,7 @@ from cc_remote.wrapper.sdk import (
     CLAUDE_DEFAULT_MODEL,
     ClaudeAutonomousFollowupPending,
     SdkHandle,
+    normalize_claude_model_selection,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
 from cc_remote.wrapper.rollback_commands import (
@@ -260,7 +270,7 @@ from cc_remote.wrapper.stream import (
 )
 from cc_remote.wrapper.codex_handle import (
     CodexAppServerError, CodexArchiveOutcomeUnknown,
-    CodexDaemonProxyClosed, CodexHandle,
+    CodexDaemonProxyClosed, CodexHandle, CodexTurnStartDisconnected,
     CodexManagedOverflow,
     CodexNoActiveTurnError, CodexNoActiveTurnFence,
     CodexSteerOutcomeUnknown,
@@ -392,14 +402,9 @@ CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
 CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS = 1.0
 CODEX_EFFORT_RESOLVE_RETRY_SECONDS = 30.0
 CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS = 45.0
-_CLAUDE_OPUS_5_1M_ALIASES = frozenset({
-    "opus",
-    "opus[1m]",
-    "claude-opus-5",
-    "claude-opus-5[1m]",
-})
-
-
+CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS = 0.25
+CODEX_TURN_START_RECONCILE_DEADLINE_SECONDS = 120.0
+CODEX_TURN_START_RECONNECT_BACKOFF_MAX_SECONDS = 5.0
 def _quarantine_rebuildable_projection(
     path: Path,
     *,
@@ -442,13 +447,13 @@ def _quarantine_rebuildable_projection(
     return True
 
 
-def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
-    """Pin only fresh-session Opus 5 aliases to the explicit 1M model."""
-    if model is None:
-        return None
-    if model.strip().lower() in _CLAUDE_OPUS_5_1M_ALIASES:
-        return CLAUDE_DEFAULT_MODEL
-    return model
+def _claude_preflight_user_message(exc: BaseException) -> str:
+    if isinstance(exc, UnsupportedClaudeCliVersion):
+        return (
+            f"Claude CLI {exc.version} 版本过旧；请在主机运行 `claude update` "
+            f"并重启 Wrapper（最低版本 {exc.minimum}）。"
+        )
+    return "Claude 暂时不可用，请稍后重试。"
 
 
 def _has_claude_context_total(usage: object) -> bool:
@@ -1919,7 +1924,8 @@ class WrapperMachine:
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
-        "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
+        "get_context", "get_status", "consume_rate_limit_reset_credit",
+        "get_diff", "get_file_preview", "save_markdown",
         "get_browser_surface", "get_browser_frame", "acquire_browser_control",
         "release_browser_control", "browser_action",
         "get_preview_asset", "authorize_preview",
@@ -5593,11 +5599,123 @@ class WrapperMachine:
             pass
         return False
 
+    async def _adopt_reconciled_codex_turn_start(
+        self,
+        ctx: SessionContext,
+        *,
+        turn_id: str,
+        msg_id: str,
+        native_turn_id: Optional[str],
+        native_message_id: Optional[str],
+    ) -> bool:
+        """Attach an exactly identified turn whose start response was lost."""
+        if (
+            ctx.codex_spontaneous_turn_id is not None
+            and ctx.codex_spontaneous_turn_id != turn_id
+        ):
+            return False
+
+        # A reconnect can announce the already-running turn before the ordered
+        # status probe completes. Replace that provisional automatic lease with
+        # the now-proven browser identity; no model input is submitted here.
+        if (
+            ctx.codex_spontaneous_turn_id == turn_id
+            and ctx.codex_owned_initial_msg_id in {None, turn_id}
+        ):
+            self._release_codex_turn(ctx, turn_id)
+        ctx.active_msg_id = msg_id
+        self._claim_codex_turn(ctx, turn_id, msg_id, automatic=False)
+        await self._remember_codex_initial_turn_alias(ctx, turn_id)
+
+        stream_turn_id = (
+            native_turn_id
+            if isinstance(native_turn_id, str) and native_turn_id != turn_id
+            else None
+        )
+        if isinstance(native_message_id, str):
+            history_turn_id = stream_turn_id or turn_id
+            try:
+                source_path = await asyncio.to_thread(
+                    self._codex_rollout_for_wire,
+                    self._ctx_wire_sid(ctx) or "",
+                )
+            except (OSError, ValueError):
+                source_path = None
+            if stream_turn_id is not None:
+                await self._persist_codex_stream_binding(
+                    ctx,
+                    turn_id,
+                    stream_turn_id,
+                    native_message_id,
+                    source_path=source_path,
+                )
+            await self._remember_codex_client_message_id(
+                ctx,
+                history_turn_id,
+                msg_id,
+                native_message_id=native_message_id,
+                source_path=source_path,
+            )
+
+        existing_task = ctx.codex_spontaneous_task
+        if (
+            ctx.codex_spontaneous_turn_id == turn_id
+            and existing_task is not None
+            and not existing_task.done()
+        ):
+            if ctx.codex_spontaneous_anchor_id in {None, turn_id}:
+                ctx.codex_spontaneous_anchor_id = msg_id
+            return True
+
+        recover = getattr(ctx.sdk, "recover_owned_turn", None)
+        if not callable(recover):
+            return False
+        ctx.codex_recovered_turn_id = turn_id
+        ctx.codex_recovered_msg_id = msg_id
+        ctx.codex_recovered_automatic = False
+        try:
+            recovered = bool(
+                await recover(
+                    turn_id,
+                    stream_turn_ids=(stream_turn_id,),
+                )
+                if stream_turn_id is not None
+                else await recover(turn_id)
+            )
+            if recovered and ctx.codex_spontaneous_task is None:
+                # A reconnect-time turn/started is intentionally deferred until
+                # this exact identity check. CodexHandle already retained its
+                # bounded queue, so publish the lifecycle now with the recovered
+                # browser id still armed.
+                await self._on_codex_turn_lifecycle(
+                    ctx, "started", turn_id)
+        except Exception as exc:
+            log.warning(
+                "Codex interrupted turn/start reattach failed",
+                session_id=ctx.session_id,
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
+            recovered = False
+        finally:
+            ctx.codex_recovered_turn_id = None
+            ctx.codex_recovered_msg_id = None
+            ctx.codex_recovered_automatic = None
+        if (
+            recovered
+            and ctx.codex_spontaneous_turn_id == turn_id
+            and ctx.codex_spontaneous_task is not None
+        ):
+            return True
+        self._release_codex_turn(ctx, turn_id)
+        return False
+
     async def _ensure_codex_daemon_generation(
         self,
         ctx: SessionContext,
         *,
         reason: str,
+        force: bool = False,
     ) -> bool:
         """Cross an intentional restart only between native Codex turns."""
         if not self._codex_shared_affinity(ctx):
@@ -5620,10 +5738,38 @@ class WrapperMachine:
             # waits on the per-context lock.  Do not resurrect a detached SDK.
             if not self._is_resident_context(ctx):
                 return False
+            shared_live = self._codex_shared_live(ctx)
+            native_generation_current = getattr(
+                ctx.sdk, "daemon_process_generation_current", True,
+            )
+            if not isinstance(native_generation_current, bool):
+                native_generation_current = True
+            native_generation_changed = bool(
+                shared_live and not native_generation_current
+            )
+            if native_generation_changed:
+                # The official updater can replace only its app-server child
+                # while leaving both the updater and this per-client proxy
+                # superficially alive. Its same-user PID + kernel start token
+                # is an independent generation fence for that unmarked swap.
+                self._codex_daemon_for_profile(
+                    self._codex_profile_for_ctx(ctx)).invalidate()
+                log.info(
+                    "Codex daemon process generation changed",
+                    session_id=ctx.session_id,
+                )
             if state is None:
-                if self._codex_shared_live(ctx):
+                if (
+                    shared_live
+                    and not native_generation_changed
+                    and not force
+                ):
                     return True
-                connected = await self._reconnect_codex_shared(ctx, reason=reason)
+                connected = await self._reconnect_codex_shared(
+                    ctx,
+                    reason=reason,
+                    force=(native_generation_changed or force),
+                )
             else:
                 if state.phase != "ready":
                     log.warning(
@@ -5634,19 +5780,28 @@ class WrapperMachine:
                     )
                     return False
                 generation_changed = ctx.codex_daemon_epoch != state.epoch
-                if generation_changed:
+                if generation_changed or native_generation_changed:
                     # The manager caches readiness by binary/socket path, which
                     # remains stable across an official restart. Invalidate only
                     # its liveness cache; sticky per-thread shared affinity remains
                     # on the handle.
                     self._codex_daemon_for_profile(
                         self._codex_profile_for_ctx(ctx)).invalidate()
-                if not generation_changed and self._codex_shared_live(ctx):
+                if (
+                    not generation_changed
+                    and not native_generation_changed
+                    and not force
+                    and shared_live
+                ):
                     return True
                 connected = await self._reconnect_codex_shared(
                     ctx,
                     reason=reason,
-                    force=generation_changed,
+                    force=(
+                        generation_changed
+                        or native_generation_changed
+                        or force
+                    ),
                 )
 
             # ``force_reconnect`` awaits process setup.  The normal eviction
@@ -6635,12 +6790,18 @@ class WrapperMachine:
             and (applied_mode, applied_threshold)
                 != (desired_mode, desired_threshold)
         )
+        phase = ctx.auto_compact_phase
+        if not pending:
+            phase = "stable"
+        elif phase == "stable":
+            phase = "waiting_terminal"
         return AutoCompact(
             mode=desired_mode,
             threshold_tokens=desired_threshold,
             applied_mode=applied_mode,
             applied_threshold_tokens=applied_threshold,
             pending=pending,
+            phase=phase,
             mutable=mutable,
             error=ctx.auto_compact_error,
         )
@@ -6658,6 +6819,7 @@ class WrapperMachine:
             event.applied_mode,
             event.applied_threshold_tokens,
             event.pending,
+            event.phase,
             event.mutable,
             event.error,
         )
@@ -6681,6 +6843,155 @@ class WrapperMachine:
         )
         return parent_id, True
 
+    @staticmethod
+    def _claude_cached_context_total(ctx: SessionContext) -> int | None:
+        """Return a conservative trustworthy local total without an SDK RPC.
+
+        A control-plane ``/context`` cache can predate the just-finished turn,
+        while recent assistant usage already includes it. Context grows
+        monotonically between real compact boundaries (which invalidate both
+        caches), so the maximum valid reading is the only safe lowering check.
+        """
+        totals: list[int] = []
+        for reader_name in (
+            "cached_context_usage",
+            "cached_recent_context_usage",
+        ):
+            reader = getattr(ctx.sdk, reader_name, None)
+            if not callable(reader):
+                continue
+            usage = reader()
+            total = usage.get("totalTokens") if isinstance(usage, dict) else None
+            if (
+                isinstance(total, int)
+                and not isinstance(total, bool)
+                and 0 <= total <= MAX_SAFE_WIRE_INTEGER
+            ):
+                totals.append(total)
+        return max(totals) if totals else None
+
+    @classmethod
+    def _claude_setting_needs_compaction(
+        cls,
+        ctx: SessionContext,
+        event: AutoCompact,
+    ) -> bool:
+        """Whether applying a smaller custom window first needs /compact."""
+        total = cls._claude_cached_context_total(ctx)
+        target = event.threshold_tokens if event.mode == "custom" else None
+        if target is None:
+            # ``auto`` and ``inherit`` reveal their effective threshold only in
+            # the replacement child. A prior custom window may already hold
+            # more context than that unknown target. Avoid reconnecting into an
+            # oversized first request; only a known context below the smallest
+            # selectable threshold can safely skip the boundary.
+            return total is None or total >= MIN_AUTO_COMPACT_TOKENS
+        if total is not None:
+            return total >= target
+        current_threshold = (
+            event.applied_threshold_tokens
+            if event.applied_mode == "custom" else
+            getattr(ctx.sdk, "effective_auto_compact_threshold_tokens", None)
+        )
+        # Unknown usage while reducing a proven larger window is not permission
+        # to gamble the next provider request. Compact conservatively once.
+        if (
+            isinstance(current_threshold, int)
+            and not isinstance(current_threshold, bool)
+        ):
+            return current_threshold >= target
+        # ``inherit``/``auto`` without a successful control reading is an
+        # unknown upper bound, not proof that the current context fits. This is
+        # also how v1/v2 sessions safely adopt the new real 500k default.
+        return event.applied_mode in {"inherit", "auto", None}
+
+    async def _compact_managed_claude_context(
+        self,
+        ctx: SessionContext,
+        *,
+        reason: str,
+    ) -> ProcessEvent:
+        """Run native /compact through the sole SDK response consumer.
+
+        This is an internal control transaction: it emits only Claude's real
+        compact-boundary ProcessEvent, never a fabricated user turn. The caller
+        owns ``query_lock`` and proves the session is idle and remotely writable.
+        """
+        if (
+            ctx.engine != "claude"
+            or getattr(ctx.sdk, "is_claude_broker", False)
+            or ctx.state != "idle"
+            or self._claude_has_background_work(ctx)
+        ):
+            raise RuntimeError("Claude session is not safe to compact")
+        if not ctx.session_id:
+            raise RuntimeError("Claude session has no native id to compact")
+
+        translator = StreamTranslator(
+            self.cfg.tool_result_max,
+            turn_id=None,
+            item_turns=ctx.claude_item_turns,
+            item_titles=ctx.claude_item_titles,
+            item_meta=ctx.claude_item_meta,
+            item_commands=ctx.claude_item_commands,
+        )
+        compact_event: ProcessEvent | None = None
+        terminal: ResultMessage | None = None
+        ctx.sdk.next_turn_id = f"compact-{uuid4().hex}"
+        ctx.claude_write_active = True
+        try:
+            await ctx.sdk.query("/compact")
+            async for message in ctx.sdk.receive_response():
+                native_sid = extract_session_id(message)
+                if native_sid and not ctx.session_id:
+                    await self._capture_session_id(ctx, native_sid)
+                if (
+                    isinstance(message, SystemMessage)
+                    and message.subtype == "compact_boundary"
+                ):
+                    for event in translator.feed(message):
+                        if (
+                            isinstance(event, ProcessEvent)
+                            and event.kind == "compaction"
+                        ):
+                            compact_event = event
+                            await self._emit(ctx, event)
+                if isinstance(message, ResultMessage):
+                    terminal = message
+                    break
+        finally:
+            release_background = getattr(
+                ctx.sdk, "release_background_messages", None)
+            if callable(release_background):
+                release_background()
+            ctx.claude_write_active = False
+            if ctx.session_id:
+                self._resync_watch(ctx.session_id)
+
+        if terminal is None:
+            raise RuntimeError("Claude compact ended without ResultMessage")
+        if terminal.is_error:
+            detail = terminal.result or "; ".join(terminal.errors or [])
+            if is_provider_request_too_large(
+                detail or "", status_code=terminal.api_error_status,
+            ):
+                raise RuntimeError(
+                    "Claude compact request exceeded the provider limit")
+            raise RuntimeError("Claude native compact failed")
+        if compact_event is None:
+            raise RuntimeError(
+                "Claude reported compact success without compact_boundary")
+
+        self._invalidate_claude_context_usage(ctx)
+        ctx.claude_compaction_revision += 1
+        log.info(
+            "Claude native context compacted",
+            session_id=ctx.session_id,
+            reason=reason,
+            boundary_id=compact_event.item_id,
+        )
+        return compact_event
+
     async def _apply_pending_claude_auto_compact(
         self,
         ctx: SessionContext,
@@ -6701,18 +7012,109 @@ class WrapperMachine:
         if not current.pending:
             return await self._publish_claude_auto_compact(ctx)
         if self._claude_has_background_work(ctx):
+            ctx.auto_compact_phase = "waiting_terminal"
+            return await self._publish_claude_auto_compact(ctx, force=True)
+        if ctx.auto_compact_phase == "blocked":
             return await self._publish_claude_auto_compact(ctx, force=True)
 
         sdk = ctx.sdk
-        desired = (current.mode, current.threshold_tokens)
         old_applied = (current.applied_mode, current.applied_threshold_tokens)
         resume_id, fork = self._claude_reconnect_identity(ctx)
+        if ctx.needs_reload and ctx.session_id:
+            if ctx.state != "idle":
+                ctx.auto_compact_phase = "waiting_terminal"
+                return await self._publish_claude_auto_compact(
+                    ctx, force=True)
+            # The local usage cache and in-memory SDK context predate an
+            # external transcript append. Reload that transcript under the
+            # last proven launch threshold first; otherwise a stale low token
+            # reading could apply the requested reduction before compacting the
+            # actual latest context.
+            reload_value = (
+                old_applied
+                if old_applied[0] in {"inherit", "auto", "custom"}
+                else ("inherit", None)
+            )
+            ctx.auto_compact_phase = "reconnecting"
+            ctx.auto_compact_error = None
+            await self._publish_claude_auto_compact(ctx, force=True)
+            self._invalidate_claude_context_usage(ctx)
+            ctx.needs_reload = False
+            try:
+                await self._stage_claude_handoff_controls(ctx)
+                await sdk.force_reconnect(
+                    resume_id=resume_id,
+                    cwd=ctx.cwd,
+                    reason="external transcript change before autocompact",
+                    preserve_model=True,
+                    fork=fork,
+                    launch_auto_compact=reload_value,
+                )
+            except Exception as reload_exc:
+                ctx.needs_reload = True
+                ctx.auto_compact_phase = "blocked"
+                ctx.auto_compact_error = (
+                    "外部更新后的 Claude 上下文无法在原阈值下安全恢复；"
+                    "新阈值尚未生效，请重新进入会话后重试。"
+                )
+                log.warning(
+                    "Claude autocompact pre-reload failed",
+                    session_id=ctx.session_id,
+                    error_type=type(reload_exc).__name__,
+                )
+            if ctx.auto_compact_phase == "blocked" or ctx.needs_reload:
+                if ctx.auto_compact_phase != "blocked":
+                    ctx.auto_compact_phase = "blocked"
+                    ctx.auto_compact_error = (
+                        "Claude 上下文在阈值切换期间再次被外部更新；"
+                        "新阈值尚未生效，请重试。"
+                    )
+                await self._persist_claude_session_controls(ctx)
+                event, _ = await self._publish_claude_auto_compact(
+                    ctx, force=True)
+                return event, False
+        needs_compaction = bool(
+            not ctx.auto_compact_compaction_done
+            and self._claude_setting_needs_compaction(ctx, current)
+        )
+        if needs_compaction:
+            if ctx.state != "idle":
+                ctx.auto_compact_phase = "waiting_terminal"
+                return await self._publish_claude_auto_compact(
+                    ctx, force=True)
+            ctx.auto_compact_phase = "compacting"
+            ctx.auto_compact_error = None
+            await self._persist_claude_session_controls(ctx)
+            await self._publish_claude_auto_compact(ctx, force=True)
+            try:
+                await self._compact_managed_claude_context(
+                    ctx, reason=f"before autocompact change: {reason}")
+            except Exception as compact_exc:
+                ctx.auto_compact_phase = "blocked"
+                ctx.auto_compact_error = (
+                    "当前上下文高于目标窗口，但原生压缩未产生有效边界；"
+                    "仍保留原阈值，未发送新的模型请求。可以 Fork/新建会话后继续。"
+                )
+                await self._persist_claude_session_controls(ctx)
+                event, _ = await self._publish_claude_auto_compact(
+                    ctx, force=True)
+                log.warning(
+                    "Claude autocompact lowering blocked before reconnect",
+                    session_id=ctx.session_id,
+                    error_type=type(compact_exc).__name__,
+                )
+                return event, False
+            ctx.auto_compact_compaction_done = True
+
+        ctx.auto_compact_phase = "reconnecting"
+        await self._publish_claude_auto_compact(ctx, force=True)
         try:
             await sdk.force_reconnect(
                 resume_id=resume_id,
                 cwd=ctx.cwd,
                 reason=reason,
                 fork=fork,
+                apply_pending_auto_compact=True,
             )
         except Exception as apply_exc:
             log.warning(
@@ -6723,12 +7125,12 @@ class WrapperMachine:
             recovered = False
             if old_applied[0] is not None:
                 try:
-                    sdk.set_auto_compact(*old_applied)
                     await sdk.force_reconnect(
                         resume_id=resume_id,
                         cwd=ctx.cwd,
                         reason="restore previous autocompact after failed change",
                         fork=fork,
+                        launch_auto_compact=old_applied,
                     )
                     recovered = True
                 except Exception as restore_exc:
@@ -6737,22 +7139,21 @@ class WrapperMachine:
                         session_id=ctx.session_id,
                         error_type=type(restore_exc).__name__,
                     )
-            sdk.set_auto_compact(*desired)
+            ctx.auto_compact_phase = "blocked"
             ctx.auto_compact_error = (
-                "自动压缩阈值暂未生效，已保留当前会话设置并将在下次安全边界重试。"
+                "自动压缩阈值暂未生效，已恢复上一次可用设置；"
+                "请重新选择阈值后重试。"
                 if recovered else
                 "自动压缩阈值切换后会话恢复失败；设置已保留，请重新进入会话后重试。"
             )
             await self._persist_claude_session_controls(ctx)
             event, _ = await self._publish_claude_auto_compact(
                 ctx, force=True)
-            if not recovered:
-                raise RuntimeError(
-                    "Claude autocompact reconnect and rollback both failed"
-                ) from apply_exc
             return event, False
 
         ctx.auto_compact_error = None
+        ctx.auto_compact_phase = "stable"
+        ctx.auto_compact_compaction_done = False
         await self._persist_claude_session_controls(ctx)
         event, _ = await self._publish_claude_auto_compact(ctx, force=True)
         # force_reconnect() deliberately skips optional Context inspection.
@@ -6762,6 +7163,38 @@ class WrapperMachine:
         await self._handle_get_context_locked(
             ctx, None, prefer_cached_claude=True)
         return event, True
+
+    async def _prepare_claude_context_before_query(
+        self,
+        ctx: SessionContext,
+        *,
+        msg_id: str | None,
+    ) -> Error | None:
+        """Finish a pending native spawn-option change before a prompt."""
+        auto = self._claude_auto_compact_event(ctx)
+        if auto.pending:
+            if auto.phase == "blocked":
+                return Error(
+                    code=ERR_BUSY,
+                    message=(
+                        auto.error
+                        or "自动压缩阈值切换被阻止；请重新选择阈值后重试。"
+                    ),
+                    msg_id=msg_id,
+                )
+            auto, _ = await self._apply_pending_claude_auto_compact(
+                ctx, reason="autocompact before query acceptance")
+            if auto.pending:
+                return Error(
+                    code=ERR_BUSY,
+                    message=(
+                        auto.error
+                        or "自动压缩设置尚未到达安全生效边界，本次消息未发送。"
+                    ),
+                    msg_id=msg_id,
+                )
+
+        return None
 
     def _schedule_pending_claude_auto_compact(
         self, ctx: SessionContext,
@@ -6773,6 +7206,7 @@ class WrapperMachine:
         if (ctx.engine != "claude" or ctx.state != "idle"
                 or getattr(ctx.sdk, "is_claude_broker", False)
                 or self._claude_has_background_work(ctx)
+                or ctx.auto_compact_phase == "blocked"
                 or not self._claude_auto_compact_event(ctx).pending):
             return
 
@@ -6787,20 +7221,25 @@ class WrapperMachine:
                     return
                 try:
                     await self._apply_pending_claude_auto_compact(
-                        ctx, reason="autocompact after background task completion")
+                        ctx,
+                        reason="autocompact after background task completion",
+                    )
                 except Exception as exc:
                     log.warning(
-                        "deferred Claude autocompact apply failed",
+                        "deferred Claude autocompact change failed",
                         session_id=ctx.session_id,
                         error_type=type(exc).__name__,
                     )
 
+        ctx.auto_compact_apply_started_revision = (
+            ctx.claude_compaction_revision)
         task = asyncio.create_task(apply())
         ctx.auto_compact_apply_task = task
 
         def clear(completed: asyncio.Task) -> None:
             if ctx.auto_compact_apply_task is completed:
                 ctx.auto_compact_apply_task = None
+                ctx.auto_compact_apply_started_revision = None
 
         task.add_done_callback(clear)
 
@@ -6811,6 +7250,7 @@ class WrapperMachine:
         """Stop an idle reconnect task before disposing its session context."""
         task = ctx.auto_compact_apply_task
         ctx.auto_compact_apply_task = None
+        ctx.auto_compact_apply_started_revision = None
         if task is None or task.done():
             return
         task.cancel()
@@ -6868,6 +7308,19 @@ class WrapperMachine:
                 getattr(ctx.sdk, "auto_compact_mode", None),
                 getattr(ctx.sdk, "auto_compact_threshold_tokens", None),
             )
+            raw_applied_mode = getattr(
+                ctx.sdk, "applied_auto_compact_mode", None)
+            if raw_applied_mode in {"inherit", "auto", "custom"}:
+                applied_mode, applied_threshold = valid_claude_auto_compact(
+                    raw_applied_mode,
+                    getattr(
+                        ctx.sdk,
+                        "applied_auto_compact_threshold_tokens",
+                        None,
+                    ),
+                )
+            else:
+                applied_mode, applied_threshold = auto_mode, auto_threshold
             if self._claude_controls is not None:
                 try:
                     if ctx.space == "work":
@@ -6876,6 +7329,8 @@ class WrapperMachine:
                             session_id,
                             mode=auto_mode,
                             threshold_tokens=auto_threshold,
+                            applied_mode=applied_mode,
+                            applied_threshold_tokens=applied_threshold,
                             preserve_other_controls=False,
                         )
                     else:
@@ -6887,6 +7342,9 @@ class WrapperMachine:
                             permission_mode=permission_mode,
                             auto_compact_mode=auto_mode,
                             auto_compact_threshold_tokens=auto_threshold,
+                            applied_auto_compact_mode=applied_mode,
+                            applied_auto_compact_threshold_tokens=(
+                                applied_threshold),
                         )
                 except Exception as exc:
                     # A live runtime control change already succeeded. Do not
@@ -6900,6 +7358,10 @@ class WrapperMachine:
             if not self._claude_broker_enabled or ctx.space != "code":
                 return
             try:
+                # A terminal TUI launched during a pending reduction must use
+                # the last proven process value. The private control store above
+                # keeps the user's desired value until compact + reconnect make
+                # it safe to publish here as applied.
                 await self._claude_broker.set_preferences(
                     session_id,
                     model=model,
@@ -6907,7 +7369,7 @@ class WrapperMachine:
                     permission_mode=permission_mode,
                     auto_compact=(
                         claude_auto_compact_cli_value(
-                            auto_mode, auto_threshold)
+                            applied_mode, applied_threshold)
                         or "inherit"
                     ),
                 )
@@ -7041,19 +7503,52 @@ class WrapperMachine:
             )
             return ClaudeControls()
 
-    async def _reload_claude_after_takeover(
-        self, ctx: SessionContext,
-    ) -> Error | None:
-        """Atomically resume SDK ownership after the native writer has exited."""
-        controls = await self._read_claude_handoff_controls(ctx)
-        previous_model = getattr(ctx.sdk, "model", None)
+    async def _stage_claude_handoff_controls(
+        self,
+        ctx: SessionContext,
+        *,
+        adopt_native: bool | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Reconcile durable Code controls before a transcript reload.
+
+        Claude transcript assistant rows expose the provider's base model id,
+        but do not preserve the selected ``[1m]`` context suffix. Normalize a
+        completed native model through the same curated Code policy used by a
+        cold resume; if the append has no completed assistant row, retain the
+        last explicit Remote selection. This still adopts a genuine external
+        switch to another model family while preventing a metadata-only reload
+        from silently pairing a 200k model with a larger autocompact threshold.
+        """
+        if adopt_native is None:
+            adopt_native = ctx.claude_native_controls_dirty
+        if adopt_native:
+            # Consume before the await so a newer watcher observation can
+            # reassert the bit while the transcript tail is being read.
+            ctx.claude_native_controls_dirty = False
+            controls = await self._read_claude_handoff_controls(ctx)
+        else:
+            controls = ClaudeControls()
+        previous_model = valid_claude_model(getattr(ctx.sdk, "model", None))
         previous_effort = getattr(ctx.sdk, "effort", None)
-        model = controls.model or previous_model
+        observed_model = controls.model or previous_model
+        model = (
+            normalize_claude_model_selection(observed_model)
+            if ctx.space == "code"
+            else observed_model
+        )
         effort = controls.effort or previous_effort
         if model:
             ctx.sdk.model = model
         if effort:
             ctx.sdk.effort = effort
+        return model, effort
+
+    async def _reload_claude_after_takeover(
+        self, ctx: SessionContext,
+    ) -> Error | None:
+        """Atomically resume SDK ownership after the native writer has exited."""
+        model, effort = await self._stage_claude_handoff_controls(
+            ctx, adopt_native=True)
         self._invalidate_claude_context_usage(ctx)
         ctx.needs_reload = True
         try:
@@ -8196,7 +8691,9 @@ class WrapperMachine:
                 if cmd.type == "get_permission_profiles":
                     self._start_models_command(cmd)
                     continue
-                if cmd.type == "get_status":
+                if cmd.type in {
+                    "get_status", "consume_rate_limit_reset_credit",
+                }:
                     self._start_status_command(cmd)
                     continue
                 if cmd.type in {"get_browser_surface", "get_browser_frame"}:
@@ -8353,6 +8850,7 @@ class WrapperMachine:
                     *auto_compact_tasks, return_exceptions=True)
             for c in self.sessions.values():
                 c.auto_compact_apply_task = None
+                c.auto_compact_apply_started_revision = None
             followup_recovery_tasks = [
                 c.claude_followup_recovery_task for c in self.sessions.values()
                 if c.claude_followup_recovery_task is not None
@@ -12528,6 +13026,7 @@ class WrapperMachine:
         was_file_available = w.get("file_available", True)
         ctx = self._ctx_by_sid(sid)
         external_growth = False
+        growth_origin = "unknown"
         try:
             file_stat = await asyncio.to_thread(os.stat, w["path"])
         except OSError:
@@ -12630,6 +13129,10 @@ class WrapperMachine:
                 w["file_id"] = file_id
                 w["size"] = size
                 external_growth = True
+                # Replacing or truncating the authoritative transcript is an
+                # explicit native source transition, even though there is no
+                # append chunk from which to read an entrypoint.
+                growth_origin = "external"
             elif size > w["size"]:
                 old_size = int(w["size"])
                 grew = size - old_size
@@ -12643,6 +13146,7 @@ class WrapperMachine:
                 owned_ids = w.setdefault("owned_message_ids", OrderedDict())
                 origin, new_owned_ids = classify_claude_growth(
                     data, owned_ids.keys())
+                growth_origin = origin
                 if origin == "sdk" and not holders:
                     for message_id in new_owned_ids:
                         owned_ids[message_id] = None
@@ -12681,6 +13185,8 @@ class WrapperMachine:
             # at observation time rather than waiting for the next Query.
             self._invalidate_claude_context_usage(ctx)
             ctx.needs_reload = True
+            if growth_origin == "external":
+                ctx.claude_native_controls_dirty = True
 
         is_external = self._is_external(sid)
         if ctx is not None:
@@ -16553,6 +17059,12 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
+        if ctx.engine == "claude" and not is_claude_broker:
+            context_error = await self._prepare_claude_context_before_query(
+                ctx, msg_id=getattr(cmd, "msg_id", None))
+            if context_error is not None:
+                await self._emit(ctx, context_error)
+                return context_error
         # All synchronous rejection paths have passed. A new conversation may
         # now finish before the next sidebar catalog read, so remember its first
         # accepted prompt under the temporary key; capture migrates it to the
@@ -16636,6 +17148,11 @@ class WrapperMachine:
             return await reject(
                 ERR_NOT_STEERABLE,
                 "该会话当前为只读状态，无法从 Remote 引导")
+        if ctx.codex_turn_start_reconciling:
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "Codex 正在核对当前回合归属，本次引导未发送；请稍后重试。",
+            )
         if ctx.codex_uncertain_steer is not None:
             return await reject(
                 ERR_STEER_UNKNOWN,
@@ -16704,6 +17221,16 @@ class WrapperMachine:
                     return await reject(
                         ERR_NOT_STEERABLE,
                         "Codex 任务已结束，本次引导未发送。",
+                    )
+                if ctx.codex_turn_start_reconciling:
+                    # Re-check after attachment staging and lock acquisition.
+                    # A daemon disconnect can begin reconciliation while this
+                    # command was waiting behind another steer; mutating the
+                    # handle's merely-active turn before exact ownership is
+                    # proven could steer an automatic or foreign native turn.
+                    return await reject(
+                        ERR_NOT_STEERABLE,
+                        "Codex 正在核对当前回合归属，本次引导未发送；请稍后重试。",
                     )
                 sdk_turn_id = getattr(ctx.sdk, "turn_id", None)
                 sdk_turn_active = bool(
@@ -17074,6 +17601,18 @@ class WrapperMachine:
             try:
                 await ctx.sdk.interrupt()
             except CodexNoActiveTurnError as error:
+                if ctx.codex_turn_start_reconciling:
+                    # A bounded turn/start recovery can deliberately outlive
+                    # its worker after the daemon stayed unavailable. "No
+                    # active turn" on one replacement connection does not
+                    # resolve whether the original exactly-once submission ran;
+                    # keep the explicit input_busy lock until wrapper restart.
+                    log.warning(
+                        "Codex interrupt could not resolve frozen turn/start",
+                        session_id=ctx.session_id,
+                        turn_id=error.turn_id,
+                    )
+                    return
                 if await self._reconcile_codex_no_active_turn(ctx, error):
                     return
                 log.warning(
@@ -17093,6 +17632,7 @@ class WrapperMachine:
                     ctx.turn_task is None
                     and ctx.codex_spontaneous_task is None
                     and not self._claude_autonomous_followup_pending(ctx)
+                    and not ctx.codex_turn_start_reconciling
                 ):
                     await self._set_state(ctx, "idle")
 
@@ -17261,12 +17801,12 @@ class WrapperMachine:
             config_dir=self._claude_config_root(profile),
             isolate_account_env=self._claude_profiles.is_multi_profile,
         )
-        # Claude's generic Opus aliases intentionally track the current Opus.
-        # Pin cc-remote's new-session choice to the context-qualified id so a
-        # provider cannot silently drop the requested 1M window. Exact custom
-        # and non-Opus ids remain provider-owned and pass through unchanged.
+        # Claude Code uses ``[1m]`` as its native context-qualification marker
+        # and strips it before calling a third-party provider. Pin only models
+        # that cc-remote's curated catalog explicitly presents as 1M; every
+        # unknown/custom id remains provider-owned and passes through unchanged.
         return (
-            _normalize_claude_new_session_model(model)
+            normalize_claude_model_selection(model)
             or CLAUDE_DEFAULT_MODEL,
             CLAUDE_DEFAULT_EFFORT,
         )
@@ -17810,6 +18350,10 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "切换模型")
+        requested_model = (
+            normalize_claude_model_selection(cmd.model)
+            if ctx.engine == "claude" else cmd.model
+        )
         control_error = await self._runtime_control_preflight(
             ctx, action="切换模型")
         if control_error is not None:
@@ -17817,7 +18361,7 @@ class WrapperMachine:
         try:
             if getattr(ctx.sdk, "is_claude_broker", False):
                 confirmed = await self._confirm_claude_broker_model_switch(
-                    ctx, cmd.model, getattr(cmd, "client_id", None))
+                    ctx, requested_model, getattr(cmd, "client_id", None))
                 if not confirmed:
                     current = getattr(ctx.sdk, "model", None)
                     if isinstance(current, str) and current:
@@ -17842,9 +18386,9 @@ class WrapperMachine:
                     if not self._is_resident_context(ctx):
                         return await self._missing_session_error(
                             cmd, "切换模型")
-                    await ctx.sdk.set_model(cmd.model)
+                    await ctx.sdk.set_model(requested_model)
             else:
-                await ctx.sdk.set_model(cmd.model)
+                await ctx.sdk.set_model(requested_model)
             await self._refresh_pending_claude_work_baseline(ctx)
             await self._persist_claude_session_controls(ctx)
             if ctx.engine == "codex":
@@ -17857,7 +18401,7 @@ class WrapperMachine:
                 await self._publish_codex_model_effort(
                     ctx, force=True, published=responses)
                 return tuple(responses)
-            applied_model = getattr(ctx.sdk, "model", None) or cmd.model
+            applied_model = getattr(ctx.sdk, "model", None) or requested_model
             ctx.announced_model = applied_model
             model_event = Model(model=applied_model)
             await self._emit(ctx, model_event)
@@ -18176,6 +18720,8 @@ class WrapperMachine:
                 ctx.sdk.auto_compact_mode = cmd.mode
                 ctx.sdk.auto_compact_threshold_tokens = cmd.threshold_tokens
             ctx.auto_compact_error = None
+            ctx.auto_compact_phase = "waiting_terminal"
+            ctx.auto_compact_compaction_done = False
             await self._persist_claude_session_controls(ctx)
 
             if ctx.state != "idle" or self._claude_has_background_work(ctx):
@@ -19152,11 +19698,12 @@ class WrapperMachine:
             # stale bit without being overwritten after the await.
             ctx.needs_reload = False
             try:
+                await self._stage_claude_handoff_controls(ctx)
                 await expected_sdk.force_reconnect(
                     resume_id=resume_id,
                     cwd=ctx.cwd,
                     reason="external transcript change before context",
-                    preserve_model=False,
+                    preserve_model=True,
                     fork=fork,
                 )
             except Exception as reconnect_exc:
@@ -19623,6 +20170,112 @@ class WrapperMachine:
                 )
                 await self._emit(ctx, error)
                 return error
+
+    async def _handle_consume_rate_limit_reset_credit(self, cmd):
+        """Redeem one native account reset credit and refresh its snapshot."""
+        ctx = self._ctx_for(getattr(cmd, "sid", None))
+        if ctx is None:
+            return await self._missing_session_error(cmd, "使用重置券")
+        if ctx.engine != "codex":
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="重置券仅适用于 Codex ChatGPT 账户",
+                request_id=cmd.cmd_id,
+                to=cmd.client_id,
+            )
+            await self._emit(ctx, error)
+            return error
+
+        async def reject_busy():
+            error = Error(
+                code=ERR_BUSY,
+                message="会话状态已变化，重置券未使用；请重试",
+                request_id=cmd.cmd_id,
+                to=cmd.client_id,
+            )
+            await self._emit(ctx, error)
+            return error
+
+        # A click is an immediate account mutation, not deferred work. Record
+        # the session sequence before either lock so a turn that starts and ends
+        # while this command waits cannot make the old confirmation valid again.
+        observed_seq = ctx.seq
+        if ctx.state != "idle":
+            return await reject_busy()
+
+        # Status reads and mutation share one per-session account lane. This
+        # prevents a read started just before redemption from arriving after the
+        # result and temporarily republishing stale coupon inventory.
+        async with ctx.codex_status_lock:
+            # Query launch uses this same lock. Holding it only through the
+            # irreversible native RPC closes the idle-check race without
+            # blocking a later prompt on the best-effort refresh below.
+            async with ctx.query_lock:
+                if not self._is_resident_context(ctx):
+                    return await self._missing_session_error(cmd, "使用重置券")
+                if ctx.state != "idle" or ctx.seq != observed_seq:
+                    return await reject_busy()
+                preflight_seq = ctx.seq
+                if (
+                    self._codex_shared_affinity(ctx)
+                    and not await self._ensure_codex_daemon_generation(
+                        ctx, reason="reset-credit preflight")
+                ):
+                    error = Error(
+                        code=ERR_NOT_RUNNING,
+                        message="Codex 共享通道重连失败，重置券未使用；请重试",
+                        request_id=cmd.cmd_id,
+                        to=cmd.client_id,
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                # The generation barrier can await while another lifecycle path
+                # changes state. Fail closed before spending a credit.
+                if (
+                    not self._is_resident_context(ctx)
+                    or ctx.state != "idle"
+                    or ctx.seq != preflight_seq
+                ):
+                    return await reject_busy()
+                try:
+                    outcome = await ctx.sdk.consume_rate_limit_reset_credit(
+                        credit_id=cmd.credit_id,
+                        idempotency_key=cmd.cmd_id,
+                    )
+                except Exception:
+                    log.exception("Codex reset-credit consume failed")
+                    error = Error(
+                        code=ERR_INTERNAL,
+                        message="重置券使用失败，请刷新状态后重试",
+                        request_id=cmd.cmd_id,
+                        to=cmd.client_id,
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                result = RateLimitResetResult(
+                    sid=self._ctx_wire_sid(ctx) or ctx.key,
+                    to=cmd.client_id,
+                    request_id=cmd.cmd_id,
+                    outcome=outcome,
+                    credit_id=cmd.credit_id,
+                )
+                # Emit the authoritative outcome before the optional composed
+                # read. A refresh failure must never make an already-spent
+                # credit look unacknowledged and tempt a second logical use.
+                await self._emit(ctx, result)
+
+            report = None
+            try:
+                report = StatusReport(
+                    **await ctx.sdk.get_status(),
+                    request_id=cmd.cmd_id,
+                    to=cmd.client_id,
+                )
+                await self._emit(ctx, report)
+            except Exception:
+                log.exception(
+                    "status refresh after reset-credit consume failed")
+        return (result, report) if report is not None else result
 
     def _browser_for_profile(self, profile_id: str):
         # A few narrow embedders replace the historical alias with a fake. Keep
@@ -20209,7 +20862,30 @@ class WrapperMachine:
         intentionally performs no relay I/O: state is claimed synchronously and a
         separate task drains the handle's bounded raw-notification bridge.
         """
+        if ctx.codex_turn_start_reconciling and phase in {"started", "completed"}:
+            # This callback can run while reconciliation is awaiting a relay
+            # write, history refresh, or checkpoint I/O. Preserve both a
+            # monotonic fence so even a start+complete pair during a later await
+            # cannot be mistaken for an unchanged idle thread.
+            ctx.codex_turn_start_reconcile_revision += 1
         if phase == "started":
+            if (
+                ctx.codex_turn_start_reconciling
+                and ctx.codex_recovered_turn_id != turn_id
+            ):
+                deferred = ctx.codex_deferred_turn_start_id
+                if deferred not in {None, turn_id}:
+                    log.warning(
+                        "overlapping Codex turn deferred during start recovery",
+                        active_turn_id=deferred,
+                        incoming_turn_id=turn_id,
+                    )
+                    return
+                # CodexHandle already owns the bounded spontaneous queue. Do not
+                # project, lease, or interrupt this turn until the ordered
+                # thread/turns read proves it owns the lost client id.
+                ctx.codex_deferred_turn_start_id = turn_id
+                return
             if (ctx.codex_spontaneous_turn_id == turn_id
                     and ctx.codex_spontaneous_task is not None):
                 return
@@ -20254,11 +20930,18 @@ class WrapperMachine:
                 and ctx.state == "running"
             ):
                 mutation.turn_id = turn_id
-            if ctx.turn_task is not None and not ctx.codex_account_handoff:
+            if (
+                ctx.turn_task is not None
+                and not ctx.codex_account_handoff
+                and recovered_msg_id is None
+                and not ctx.codex_turn_start_reconciling
+            ):
                 # A user send claimed the session but has not reached turn/start
                 # yet (otherwise CodexHandle.turn_active would already be true).
                 # Abort that launch rather than write concurrently with the
-                # automatic turn that won the race.
+                # automatic turn that won the race. An exact turn/start recovery
+                # deliberately keeps the original runner alive while this bridge
+                # drains, so its recovered browser id exempts only that case.
                 ctx.interrupt_event.set()
             announce_running = ctx.state == "idle"
             if announce_running:
@@ -20278,6 +20961,13 @@ class WrapperMachine:
             ctx.codex_recovered_turn_id = None
             ctx.codex_recovered_msg_id = None
             ctx.codex_recovered_automatic = None
+            ctx.codex_deferred_turn_start_id = None
+            return
+        if (
+            phase == "completed"
+            and ctx.codex_deferred_turn_start_id == turn_id
+        ):
+            ctx.codex_deferred_turn_start_id = None
             return
         if phase != "completed" or ctx.codex_spontaneous_turn_id != turn_id:
             return
@@ -20294,11 +20984,23 @@ class WrapperMachine:
     ) -> None:
         if ctx.codex_spontaneous_turn_id != turn_id:
             return
-        await self._record_codex_unavailable_turn(
-            ctx,
-            turn_id,
-            reason="automatic turn began before Remote could capture a pre-image",
-        )
+        if (
+            ctx.codex_checkpoint_turn_id is not None
+            and ctx.codex_checkpoint_accepted
+        ):
+            # A lost turn/start response can re-enter through the spontaneous
+            # bridge while retaining its original pre-image. Commit that one
+            # managed slot; recording an additional automatic tombstone here
+            # would shift every later count-based rollback by one turn.
+            await self._finish_codex_checkpoint(ctx)
+        else:
+            await self._record_codex_unavailable_turn(
+                ctx,
+                turn_id,
+                reason=(
+                    "automatic turn began before Remote could capture a pre-image"
+                ),
+            )
         mutation = ctx.codex_goal_mutation
         if mutation is not None and mutation.turn_id == turn_id:
             ctx.codex_goal_mutation = None
@@ -20333,7 +21035,7 @@ class WrapperMachine:
         recovered_msg_id: Optional[str] = None,
         pending_switch: Optional[CodexDaemonRestartState] = None,
         goal_prompt: Optional[str] = None,
-    ) -> None:
+    ) -> bool | None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
         current_turn_id = turn_id
@@ -20771,7 +21473,12 @@ class WrapperMachine:
             # unwinding. Preserve wire order: its TurnEnd must land before this
             # new empty-prompt turn begins.
             managed_task = ctx.turn_task
-            if managed_task is not None and managed_task is not asyncio.current_task():
+            if (
+                recovered_msg_id is None
+                and not ctx.codex_turn_start_reconciling
+                and managed_task is not None
+                and managed_task is not asyncio.current_task()
+            ):
                 await asyncio.shield(managed_task)
             if ctx.codex_spontaneous_turn_id != turn_id:
                 return
@@ -20798,7 +21505,13 @@ class WrapperMachine:
             # executing the automatic continuation. A filesystem pre-image taken
             # here could be a half-turn snapshot, so preserve count alignment with
             # an explicit unavailable slot instead of claiming code rollback.
-            if recovered_msg_id is None:
+            if (
+                recovered_msg_id is None
+                and not (
+                    ctx.codex_turn_start_reconciling
+                    and ctx.codex_checkpoint_accepted
+                )
+            ):
                 await self._record_codex_unavailable_turn(
                     ctx,
                     turn_id,
@@ -21004,6 +21717,7 @@ class WrapperMachine:
                         cwd=None,
                         detail="summary",
                     )
+        return terminal_seen
 
     async def _run_codex_review_turn(
         self, ctx: SessionContext, turn_id: str,
@@ -25765,7 +26479,7 @@ class WrapperMachine:
                 return error
         requested_model = getattr(cmd, "model", None)
         if engine == "claude":
-            requested_model = _normalize_claude_new_session_model(
+            requested_model = normalize_claude_model_selection(
                 requested_model)
         work_record = None
         target_cwd = getattr(cmd, "cwd", None)
@@ -29497,11 +30211,12 @@ class WrapperMachine:
             self._invalidate_claude_context_usage(ctx)
             ctx.needs_reload = False
             try:
+                await self._stage_claude_handoff_controls(ctx)
                 await ctx.sdk.force_reconnect(
                     resume_id=native_sid,
                     cwd=ctx.cwd,
                     reason=f"external transcript change before {action}",
-                    preserve_model=False,
+                    preserve_model=True,
                 )
             except Exception as exc:
                 ctx.needs_reload = True
@@ -30277,6 +30992,76 @@ class WrapperMachine:
         )
 
     async def _handle_compact_session(self, cmd):
+        if cmd.engine == "claude":
+            ctx = await self._claude_code_context(cmd, "压缩上下文")
+            if isinstance(ctx, Error):
+                return ctx
+            compact_revision = ctx.claude_compaction_revision
+            background_task = ctx.auto_compact_apply_task
+            background_start_revision = (
+                ctx.auto_compact_apply_started_revision)
+            if (
+                background_task is not None
+                and not background_task.done()
+                and isinstance(background_start_revision, int)
+            ):
+                # The scheduler may already have completed /compact and still be
+                # reconnecting under query_lock. Compare against the revision at
+                # which that whole maintenance transaction began, not a value
+                # sampled halfway through its tail.
+                compact_revision = min(
+                    compact_revision, background_start_revision)
+            async with ctx.query_lock:
+                if not self._is_resident_context(ctx):
+                    return await self._missing_session_error(
+                        cmd, "压缩上下文")
+                compacted_while_waiting = (
+                    ctx.claude_compaction_revision != compact_revision
+                )
+                if not compacted_while_waiting:
+                    try:
+                        await self._compact_managed_claude_context(
+                            ctx, reason="manual compact command")
+                    except Exception as exc:
+                        log.warning(
+                            "Claude compact failed",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                        error = Error(
+                            code=ERR_INTERNAL,
+                            message=(
+                                "Claude 原生上下文压缩失败；"
+                                "当前上下文未被标记为已压缩"
+                            ),
+                            sid=self._ctx_wire_sid(ctx),
+                            to=getattr(cmd, "client_id", None),
+                        )
+                        await self.transport.send(error)
+                        return error
+                if self._claude_auto_compact_event(ctx).pending:
+                    ctx.auto_compact_compaction_done = True
+                    ctx.auto_compact_phase = "waiting_terminal"
+                    ctx.auto_compact_error = None
+                    await self._apply_pending_claude_auto_compact(
+                        ctx, reason="autocompact after manual compact")
+                notice = Notice(
+                    notice_id=f"compact-{uuid4().hex}",
+                    severity="info",
+                    category="runtime",
+                    title="上下文压缩完成",
+                    message=(
+                        "Claude 后台维护已写入原生 compact boundary。"
+                        if compacted_while_waiting else
+                        "Claude 已写入原生 compact boundary。"
+                    ),
+                    thread_id=self._ctx_wire_sid(ctx),
+                    sid=self._ctx_wire_sid(ctx),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(notice)
+                return notice
+
         ctx = await self._codex_code_context(cmd, "压缩上下文")
         if isinstance(ctx, Error):
             return ctx
@@ -30761,6 +31546,32 @@ class WrapperMachine:
              if ctx is not None
              else saved.auto_compact_threshold_tokens),
         )
+        raw_applied_mode = (
+            getattr(ctx.sdk, "applied_auto_compact_mode", None)
+            if ctx is not None else saved.applied_auto_compact_mode
+        )
+        if raw_applied_mode in {"inherit", "auto", "custom"}:
+            applied_mode, applied_threshold = valid_claude_auto_compact(
+                raw_applied_mode,
+                (
+                    getattr(
+                        ctx.sdk,
+                        "applied_auto_compact_threshold_tokens",
+                        None,
+                    )
+                    if ctx is not None else
+                    saved.applied_auto_compact_threshold_tokens
+                ),
+            )
+        elif saved.applied_auto_compact_mode in {
+            "inherit", "auto", "custom",
+        }:
+            applied_mode, applied_threshold = valid_claude_auto_compact(
+                saved.applied_auto_compact_mode,
+                saved.applied_auto_compact_threshold_tokens,
+            )
+        else:
+            applied_mode, applied_threshold = auto_mode, auto_threshold
         if (model is None or effort is None) and ctx is None:
             try:
                 profile, native_sid = self._claude_target(sid)
@@ -30780,6 +31591,7 @@ class WrapperMachine:
                     session_id=sid,
                     error_type=type(exc).__name__,
                 )
+        model = normalize_claude_model_selection(model)
         controls: dict[str, object] = {
             key: value
             for key, value in (
@@ -30789,10 +31601,17 @@ class WrapperMachine:
             )
             if isinstance(value, str) and value
         }
-        if auto_mode != "inherit":
-            controls["auto_compact_mode"] = auto_mode
-            if auto_mode == "custom":
-                controls["auto_compact_threshold_tokens"] = auto_threshold
+        # A fork copies the source transcript, including whatever context was
+        # built under the current live threshold. Preserve desired and applied
+        # separately so a pending reduction cannot become effective merely by
+        # resuming the child. The child must prove its own compact boundary.
+        controls["auto_compact_mode"] = auto_mode
+        if auto_mode == "custom":
+            controls["auto_compact_threshold_tokens"] = auto_threshold
+        controls["applied_auto_compact_mode"] = applied_mode
+        if applied_mode == "custom":
+            controls["applied_auto_compact_threshold_tokens"] = (
+                applied_threshold)
         return controls
 
     async def _codex_fork_control_snapshot(
@@ -30893,6 +31712,10 @@ class WrapperMachine:
                 "auto_compact_mode", "inherit"),
             auto_compact_threshold_tokens=values.get(
                 "auto_compact_threshold_tokens"),
+            applied_auto_compact_mode=values.get(
+                "applied_auto_compact_mode"),
+            applied_auto_compact_threshold_tokens=values.get(
+                "applied_auto_compact_threshold_tokens"),
         )
 
     async def _inherit_codex_fork_controls(
@@ -32988,6 +33811,8 @@ class WrapperMachine:
         resolves from current settings, then falls back to the curated default;
         omitted Codex controls retain native defaults."""
         explicit_claude_model = engine == "claude" and model is not None
+        explicit_claude_auto_compact = bool(
+            engine == "claude" and auto_compact_mode is not None)
         explicit_codex_model = engine == "codex" and model is not None
         explicit_codex_effort = engine == "codex" and effort is not None
         claude_profile = (
@@ -33006,6 +33831,7 @@ class WrapperMachine:
         else:
             wire_resume_id = resume_id
         saved_codex_controls = CodexControls()
+        saved_claude_controls: ClaudeControls | None = None
         if resume_id and engine == "codex" and space == "code":
             saved_codex_controls = await self._load_codex_session_controls(
                 wire_resume_id)
@@ -33123,7 +33949,7 @@ class WrapperMachine:
                 log.warning("Claude preflight failed; engine unavailable",
                             error=str(exc))
                 await reject(
-                    ERR_CC_CRASH, "Claude 暂时不可用，请稍后重试。",
+                    ERR_CC_CRASH, _claude_preflight_user_message(exc),
                     route="sid", sid=resume_id)
                 return None
 
@@ -33368,8 +34194,37 @@ class WrapperMachine:
             # remain owned by the isolated Work runtime.
             saved_controls = await self._load_claude_session_controls(
                 wire_resume_id)
+            saved_claude_controls = saved_controls
             if space == "code":
                 model = model or saved_controls.model
+                if model is None:
+                    # Legacy/native sessions may predate Remote's private
+                    # control record. Resolve their last completed native model
+                    # before the child starts; history loading happens later and
+                    # updating only the model chip at that point leaves Claude
+                    # running on its implicit 200K alias.
+                    try:
+                        transcript_controls = await asyncio.to_thread(
+                            last_completed_assistant_controls,
+                            resume_id,
+                            directory=target_cwd,
+                            max_bytes=self.cfg.history_source_max_bytes,
+                            index_store=self._history_index,
+                            config_dir=self._claude_config_root(
+                                claude_profile),
+                        )
+                    except Exception as exc:
+                        # The native model is advisory when no private choice is
+                        # available. Preserve Claude's own resume behavior rather
+                        # than forcing the current global default onto this
+                        # conversation.
+                        log.warning(
+                            "Claude resume controls unavailable",
+                            session_id=resume_id,
+                            error_type=type(exc).__name__,
+                        )
+                    else:
+                        model = transcript_controls.model
                 effort = effort or saved_controls.effort
                 permission_mode = (
                     permission_mode or saved_controls.permission_mode)
@@ -33386,6 +34241,18 @@ class WrapperMachine:
                 target_cwd,
                 claude_profile=claude_profile,
             )
+
+        if engine == "claude":
+            # Controls written before the 1M marker migration may still carry
+            # an unsuffixed curated id. Normalize at the final spawn boundary,
+            # not only in NewSession/SetModel handlers, so a cold resume cannot
+            # silently re-enter Claude Code with the legacy 200K declaration.
+            model = normalize_claude_model_selection(model)
+
+        if engine == "claude" and auto_compact_mode is None:
+            auto_compact_mode = CLAUDE_DEFAULT_AUTO_COMPACT_MODE
+            auto_compact_threshold_tokens = (
+                CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS)
 
         codex_resume_model_reconcile: Optional[str] = None
         if engine == "codex":
@@ -33448,6 +34315,8 @@ class WrapperMachine:
                 if self._claude_profiles.is_multi_profile:
                     claude_handle_kwargs["isolate_account_env"] = True
                 sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
+        desired_auto_compact: tuple[str, int | None] | None = None
+        launch_auto_compact: tuple[str, int | None] | None = None
         if engine == "claude" and broker_handle is None:
             checked_auto_mode, checked_auto_threshold = (
                 valid_claude_auto_compact(
@@ -33455,19 +34324,32 @@ class WrapperMachine:
                     auto_compact_threshold_tokens,
                 )
             )
+            desired_auto_compact = (
+                checked_auto_mode, checked_auto_threshold)
+            launch_auto_compact = desired_auto_compact
+            if (
+                resume_id
+                and saved_claude_controls is not None
+                and not explicit_claude_auto_compact
+                and saved_claude_controls.applied_auto_compact_mode
+                    in {"inherit", "auto", "custom"}
+            ):
+                launch_auto_compact = valid_claude_auto_compact(
+                    saved_claude_controls.applied_auto_compact_mode,
+                    saved_claude_controls.applied_auto_compact_threshold_tokens,
+                )
             set_auto_compact = getattr(sdk, "set_auto_compact", None)
             if callable(set_auto_compact):
-                set_auto_compact(
-                    checked_auto_mode, checked_auto_threshold)
+                set_auto_compact(*launch_auto_compact)
             else:
                 # Keep narrow embedded/test adapters source-compatible. The
                 # production SdkHandle owns the explicit desired/applied split;
                 # an adapter without that control is truthfully treated as
                 # having inherited its launch option already.
-                setattr(sdk, "auto_compact_mode", checked_auto_mode)
+                setattr(sdk, "auto_compact_mode", launch_auto_compact[0])
                 setattr(
                     sdk, "auto_compact_threshold_tokens",
-                    checked_auto_threshold)
+                    launch_auto_compact[1])
         if space == "work":
             if engine == "codex":
                 # The named Work permission profile grants autonomous access only
@@ -33797,6 +34679,18 @@ class WrapperMachine:
             else:
                 await ctx.sdk.connect(
                     resume_id=resume_id, cwd=target_cwd)
+                if (
+                    desired_auto_compact is not None
+                    and launch_auto_compact is not None
+                    and desired_auto_compact != launch_auto_compact
+                ):
+                    # A v3 durable transaction always resumes under the last
+                    # proven launch value. Restore the desired value only after
+                    # connect records that applied generation, so lowering can
+                    # continue through /compact instead of becoming effective
+                    # merely because the wrapper restarted.
+                    ctx.sdk.set_auto_compact(*desired_auto_compact)
+                    ctx.auto_compact_phase = "waiting_terminal"
         except CodexProfileDaemonUnavailable as e:
             try:
                 await ctx.sdk.disconnect()
@@ -33830,6 +34724,26 @@ class WrapperMachine:
                 except Exception:
                     log.warning("bootstrap resume cleanup failed")
                 try:
+                    if (
+                        engine == "claude"
+                        and broker_handle is None
+                        and desired_auto_compact is not None
+                    ):
+                        # The failed resume never became a live generation. A
+                        # genuinely fresh conversation has no oversized old
+                        # context to compact, so launch it directly under the
+                        # user's desired value rather than leaking the old
+                        # transaction's applied value into a new session.
+                        setter = getattr(ctx.sdk, "set_auto_compact", None)
+                        if callable(setter):
+                            setter(*desired_auto_compact)
+                        else:
+                            ctx.sdk.auto_compact_mode = (
+                                desired_auto_compact[0])
+                            ctx.sdk.auto_compact_threshold_tokens = (
+                                desired_auto_compact[1])
+                        ctx.auto_compact_phase = "stable"
+                        ctx.auto_compact_compaction_done = False
                     await ctx.sdk.connect(resume_id=None, cwd=target_cwd)
                 except Exception as e2:
                     log.exception("fresh connect also failed", error=str(e2))
@@ -34157,7 +35071,9 @@ class WrapperMachine:
             except Exception as exc:
                 log.warning("Claude preflight failed for btw", error=str(exc))
                 raise _BtwSpawnFailure(
-                    ERR_CC_CRASH, "Claude 暂时不可用，请稍后重试。") from exc
+                    ERR_CC_CRASH,
+                    _claude_preflight_user_message(exc),
+                ) from exc
         # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
         if len(self.sessions) >= self.cfg.max_concurrent_sessions:
             victim = next((k for k, c in self.sessions.items()
@@ -34232,10 +35148,31 @@ class WrapperMachine:
             sdk.permission_mode = getattr(
                 parent.sdk, "permission_mode", "bypassPermissions")
         if engine != "codex":
-            auto_mode, auto_threshold = valid_claude_auto_compact(
-                getattr(parent.sdk, "auto_compact_mode", None),
-                getattr(parent.sdk, "auto_compact_threshold_tokens", None),
+            raw_applied_mode = getattr(
+                parent.sdk, "applied_auto_compact_mode", None)
+            parent_mode = (
+                raw_applied_mode
+                if raw_applied_mode in {"inherit", "auto", "custom"}
+                else getattr(parent.sdk, "auto_compact_mode", None)
             )
+            parent_threshold = (
+                getattr(
+                    parent.sdk,
+                    "applied_auto_compact_threshold_tokens",
+                    None,
+                )
+                if raw_applied_mode in {"inherit", "auto", "custom"}
+                else getattr(
+                    parent.sdk, "auto_compact_threshold_tokens", None)
+            )
+            auto_mode, auto_threshold = valid_claude_auto_compact(
+                parent_mode,
+                parent_threshold,
+            )
+            # A private side-fork inherits the live parent context, so launch it
+            # under the parent's proven applied threshold. A pending reduction
+            # belongs to the durable parent transaction and must not become
+            # effective merely because /btw opened a new child process.
             setter = getattr(sdk, "set_auto_compact", None)
             if callable(setter):
                 setter(auto_mode, auto_threshold)
@@ -35534,14 +36471,15 @@ class WrapperMachine:
 
         async def reconnect_claude(reason: str) -> None:
             """Reconnect without hiding transcript changes during the await."""
-            if reason.startswith("external transcript change"):
+            external_change = reason.startswith("external transcript change")
+            if external_change:
                 self._invalidate_claude_context_usage(ctx)
+                await self._stage_claude_handoff_controls(ctx)
             resume_id, fork = self._claude_reconnect_identity(ctx)
             fork_option = {"fork": True} if fork else {}
             await ctx.sdk.force_reconnect(
                 resume_id=resume_id, cwd=ctx.cwd, reason=reason,
-                preserve_model=not reason.startswith(
-                    "external transcript change"),
+                preserve_model=True,
                 **fork_option,
             )
             model = _session_model(ctx)
@@ -35619,8 +36557,19 @@ class WrapperMachine:
             if (not is_codex
                     and self._claude_auto_compact_event(ctx).pending):
                 async with ctx.query_lock:
-                    await self._apply_pending_claude_auto_compact(
+                    auto_event, _ = await self._apply_pending_claude_auto_compact(
                         ctx, reason="autocompact before next turn")
+                if auto_event.pending:
+                    await self._emit(ctx, Error(
+                        code=ERR_BUSY,
+                        message=(
+                            auto_event.error
+                            or "自动压缩设置尚未安全生效，本次消息未发送。"
+                        ),
+                        msg_id=ctx.active_msg_id,
+                    ))
+                    await close_unsubmitted_turn()
+                    return
             # apply a pending effort change: --effort is spawn-time, so respawn the
             # cc subprocess (resume preserves context) before issuing this turn. Only
             # fires when the level actually changed since the live client was spawned;
@@ -36035,16 +36984,18 @@ class WrapperMachine:
                 # Claude-branded models so a cc-switch proxy's raw upstream name
                 # (e.g. glm-5.2) never replaces the user's Claude alias in the chip.
                 mdl = extract_model(msg)
-                if (mdl and not getattr(ctx.sdk, "model", None)
-                        and mdl.startswith("claude-")):
+                selected_mdl = (
+                    mdl if mdl and mdl.startswith("claude-") else None)
+                if selected_mdl and not getattr(ctx.sdk, "model", None):
                     # get_context_usage owns the selected alias. Init/transcript
                     # metadata can expose a gateway's Claude upstream model; use
                     # it only as a fallback when the control-plane read failed.
-                    ctx.sdk.model = mdl
-                if (mdl and mdl == getattr(ctx.sdk, "model", None)
-                        and mdl != ctx.announced_model):
-                    ctx.announced_model = mdl
-                    await self._emit(ctx, Model(model=mdl))
+                    ctx.sdk.model = selected_mdl
+                if (selected_mdl
+                        and selected_mdl == getattr(ctx.sdk, "model", None)
+                        and selected_mdl != ctx.announced_model):
+                    ctx.announced_model = selected_mdl
+                    await self._emit(ctx, Model(model=selected_mdl))
 
                 goal_changed, goal = ctx.sdk.observe_goal_message(
                     msg, ctx.session_id or ctx.key)
@@ -36065,6 +37016,19 @@ class WrapperMachine:
                 if native_user_id is not None:
                     await self._remember_claude_client_message_id(
                         ctx, native_user_id)
+                if isinstance(msg, ResultMessage) and msg.is_error:
+                    result_detail = msg.result or "; ".join(msg.errors or [])
+                    too_large_kind = classify_provider_request_too_large(
+                        result_detail or "",
+                        status_code=msg.api_error_status,
+                    )
+                    if too_large_kind is not None:
+                        await self._emit(ctx, Error(
+                            code=ERR_BAD_PROMPT,
+                            message=provider_request_too_large_message(
+                                too_large_kind),
+                            msg_id=ctx.active_msg_id,
+                        ))
                 for ev in ctx.translator.feed(msg):
                     await self._emit(ctx, ev)
 
@@ -36125,6 +37089,374 @@ class WrapperMachine:
                     msg_id=ctx.active_msg_id,
                 ))
             await self._set_idle_after_managed_turn(ctx)
+        except CodexTurnStartDisconnected as exc:
+            # ``turn/start`` is an exactly-once boundary. A lost response says
+            # nothing about whether the non-idempotent prompt ran, so keep this
+            # original runner as the write lock and reconcile the replacement
+            # app-server's authoritative thread state. Never replay the prompt.
+            submission_msg_id = (
+                exc.client_message_id
+                if isinstance(exc.client_message_id, str)
+                else ctx.active_msg_id
+            )
+            if not isinstance(submission_msg_id, str):
+                submission_msg_id = uuid4().hex
+            accepted = exc.accepted
+            published = False
+            waiting_announced = False
+            first_reconnect = True
+            reconnect_failures = 0
+            completed_recovered_turn_ids: set[str] = set()
+            recovery_loop = asyncio.get_running_loop()
+            recovery_deadline = (
+                recovery_loop.time()
+                + CODEX_TURN_START_RECONCILE_DEADLINE_SECONDS
+            )
+
+            # Arm the lifecycle fence before the first relay or filesystem
+            # await. The old response channel is gone, but a replacement/native
+            # start notification can still race publication of the accepted
+            # browser row.
+            ctx.codex_turn_start_reconciling = True
+            ctx.codex_deferred_turn_start_id = None
+            ctx.codex_turn_start_reconcile_revision += 1
+
+            async def publish_accepted_submission() -> None:
+                nonlocal published
+                if not published:
+                    ctx.active_msg_id = submission_msg_id
+                    await self._emit(ctx, UserMsg(
+                        msg_id=submission_msg_id,
+                        prompt=display_prompt,
+                        images=images,
+                        files=file_meta,
+                    ))
+                    published = True
+                    settle_launch(True)
+
+            def refresh_history() -> None:
+                route_sid = self._ctx_wire_sid(ctx)
+                if route_sid:
+                    self._schedule_history_refresh(
+                        route_sid,
+                        before=None,
+                        limit=self.MIRROR_LIMIT,
+                        cwd=None,
+                        detail="summary",
+                    )
+
+            async def settle_idle_if_fence_unchanged(
+                observed_revision: int,
+            ) -> bool:
+                """Release recovery ownership only across a quiescent fence.
+
+                There is intentionally no await between the final native-state
+                checks and clearing ``codex_turn_start_reconciling``. A later
+                turn/started callback therefore either advances the old fence,
+                or sees recovery released and claims a normal spontaneous turn.
+                ``_set_idle_after_managed_turn`` re-checks that claim after its
+                own awaited cleanup before it can publish idle.
+                """
+                sdk_turn_active = bool(
+                    getattr(ctx.sdk, "turn_active", False)
+                )
+                if (
+                    ctx.codex_turn_start_reconcile_revision
+                    != observed_revision
+                    or ctx.codex_deferred_turn_start_id is not None
+                    or sdk_turn_active
+                ):
+                    return False
+                ctx.codex_turn_start_reconciling = False
+                ctx.codex_deferred_turn_start_id = None
+                await self._set_idle_after_managed_turn(ctx)
+                return True
+
+            async def freeze_indeterminate_recovery() -> None:
+                """Stop retry churn without manufacturing a writable idle."""
+                route_sid = self._ctx_wire_sid(ctx) or ""
+                watch = self._watch.get(route_sid)
+                await self._set_session_control(
+                    ctx,
+                    control_mode="codex_shared",
+                    write_state="input_busy",
+                    terminal_attached=bool((watch or {}).get("holders")),
+                    reason=(
+                        "Codex 原生回合状态暂时无法确认；为避免重复执行，"
+                        "会话保持锁定，请重启本机 Wrapper 后继续"
+                    ),
+                    can_takeover=False,
+                )
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message=(
+                        "Codex 提交后的原生状态持续无法确认；本次没有重发。"
+                        "为避免并发或重复执行，会话已安全锁定，请重启本机 "
+                        "Wrapper 后检查历史再继续。"
+                    ),
+                    msg_id=submission_msg_id,
+                ))
+
+            # A disconnect destroys the only ordered boundary between this
+            # turn's terminal and a possible native successor. Even exact
+            # acceptance cannot make a later filesystem post-image atomic with
+            # respect to an automatic turn. Quarantine the old count journal;
+            # an actively reattached turn will record one unavailable slot in a
+            # fresh tail instead of ever claiming two native mutations as one.
+            await self._retire_codex_checkpoint(
+                ctx,
+                reason="turn/start ordering interrupted by disconnect",
+                allow_restart=True,
+            )
+            if accepted:
+                await publish_accepted_submission()
+
+            while self._is_resident_context(ctx):
+                remaining = recovery_deadline - recovery_loop.time()
+                if remaining <= 0:
+                    log.error(
+                        "Codex turn/start recovery deadline exhausted",
+                        session_id=ctx.session_id,
+                        accepted=accepted,
+                    )
+                    await freeze_indeterminate_recovery()
+                    return
+                reconnected = False
+                try:
+                    reconnected = await asyncio.wait_for(
+                        self._ensure_codex_daemon_generation(
+                            ctx,
+                            reason="recover after turn/start disconnect",
+                            force=first_reconnect,
+                        ),
+                        timeout=min(
+                            CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS,
+                            remaining,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Codex turn/start recovery timed out",
+                        session_id=ctx.session_id,
+                    )
+                except Exception as recovery_exc:
+                    log.warning(
+                        "Codex turn/start reconnect failed",
+                        session_id=ctx.session_id,
+                        error_type=type(recovery_exc).__name__,
+                    )
+                first_reconnect = False
+
+                if not reconnected:
+                    reconnect_failures += 1
+                    delay = min(
+                        CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS
+                        * (2 ** min(reconnect_failures - 1, 8)),
+                        CODEX_TURN_START_RECONNECT_BACKOFF_MAX_SECONDS,
+                        max(0.0, recovery_deadline - recovery_loop.time()),
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+
+                probe = None
+                reconcile = getattr(ctx.sdk, "reconcile_turn_start", None)
+                if reconnected and callable(reconcile):
+                    try:
+                        probe = await reconcile(
+                            submission_msg_id,
+                            native_turn_id=exc.native_turn_id,
+                            native_message_id=exc.native_message_id,
+                        )
+                    except Exception as recovery_exc:
+                        log.warning(
+                            "Codex turn/start authoritative probe failed",
+                            session_id=ctx.session_id,
+                            error_type=type(recovery_exc).__name__,
+                        )
+
+                if probe is None:
+                    reconnect_failures += 1
+                    delay = min(
+                        CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS
+                        * (2 ** min(reconnect_failures - 1, 8)),
+                        CODEX_TURN_START_RECONNECT_BACKOFF_MAX_SECONDS,
+                        max(0.0, recovery_deadline - recovery_loop.time()),
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                reconnect_failures = 0
+                probe_revision = ctx.codex_turn_start_reconcile_revision
+
+                matched_turn_id = (
+                    getattr(probe, "matched_turn_id", None)
+                    if probe is not None else None
+                )
+                deferred_turn_id = ctx.codex_deferred_turn_start_id
+                sdk_turn_active = bool(
+                    getattr(ctx.sdk, "turn_active", False)
+                )
+                sdk_turn_id = getattr(ctx.sdk, "turn_id", None)
+                active_turn_id = getattr(probe, "active_turn_id", None)
+                if not isinstance(active_turn_id, str):
+                    active_turn_id = None
+                if deferred_turn_id is not None:
+                    active_turn_id = deferred_turn_id
+                elif sdk_turn_active and isinstance(sdk_turn_id, str):
+                    active_turn_id = sdk_turn_id
+                matched_active = bool(
+                    isinstance(matched_turn_id, str)
+                    and (
+                        getattr(probe, "matched_turn_active", False)
+                        or matched_turn_id == active_turn_id
+                    )
+                )
+                thread_active = bool(
+                    getattr(probe, "thread_active", False)
+                    or deferred_turn_id is not None
+                    or sdk_turn_active
+                )
+                if (
+                    isinstance(matched_turn_id, str)
+                    and matched_turn_id in completed_recovered_turn_ids
+                    and active_turn_id == matched_turn_id
+                    and deferred_turn_id is None
+                    and not sdk_turn_active
+                ):
+                    # The bridge consumed this exact turn's authoritative
+                    # terminal after the status snapshot which first found it.
+                    # A replacement app-server may briefly return the older
+                    # inProgress projection again; do not reattach a completed
+                    # queue forever. A different lifecycle id still advances
+                    # the fence/deferred owner and prevents this idle handoff.
+                    active_turn_id = None
+                    matched_active = False
+                    thread_active = False
+
+                if isinstance(matched_turn_id, str):
+                    accepted = True
+                    await publish_accepted_submission()
+                    refresh_history()
+                    if matched_active:
+                        recovered = await (
+                            self._adopt_reconciled_codex_turn_start(
+                                ctx,
+                                turn_id=matched_turn_id,
+                                msg_id=submission_msg_id,
+                                native_turn_id=exc.native_turn_id,
+                                native_message_id=exc.native_message_id,
+                            )
+                        )
+                        if recovered:
+                            log.info(
+                                "reattached Codex turn after lost start response",
+                                session_id=ctx.session_id,
+                                turn_id=matched_turn_id,
+                            )
+                            if (
+                                ctx.interrupt_event.is_set()
+                                or ctx.state == "interrupting"
+                            ):
+                                # Interrupt may have raced the disconnected
+                                # launch boundary and found no live transport.
+                                # Once exact identity is reattached, deliver it
+                                # again so the recovered consumer can drain the
+                                # authoritative terminal instead of running on
+                                # after the user's Stop request.
+                                try:
+                                    await ctx.sdk.interrupt()
+                                except CodexNoActiveTurnError:
+                                    # The terminal can win the RPC race; the
+                                    # spontaneous consumer remains the source
+                                    # of truth and will close the turn.
+                                    pass
+                                except Exception as interrupt_exc:
+                                    log.warning(
+                                        "recovered Codex turn interrupt failed",
+                                        session_id=ctx.session_id,
+                                        turn_id=matched_turn_id,
+                                        error_type=type(
+                                            interrupt_exc).__name__,
+                                    )
+                            spontaneous = ctx.codex_spontaneous_task
+                            if spontaneous is not None:
+                                terminal_results = await asyncio.gather(
+                                    spontaneous, return_exceptions=True)
+                                if terminal_results == [True]:
+                                    completed_recovered_turn_ids.add(
+                                        matched_turn_id
+                                    )
+                            # The lifecycle bridge emits the sole TurnBinding
+                            # and advances the fence on both start and terminal.
+                            # Re-probe instead of publishing idle from a stale
+                            # pre-reattach snapshot; a successor may already own
+                            # the same native thread.
+                            continue
+                        # The exact turn can complete between the ordered probe
+                        # and reattach read. Probe again before unlocking.
+                        await asyncio.sleep(
+                            CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS)
+                        continue
+                    if not thread_active:
+                        if await settle_idle_if_fence_unchanged(probe_revision):
+                            return
+                        continue
+
+                if not thread_active:
+                    refresh_history()
+                    if await settle_idle_if_fence_unchanged(probe_revision):
+                        if not accepted:
+                            # Absence after a lost response cannot prove
+                            # rejection: an ultra-fast accepted turn may already
+                            # have left the bounded page. The journal was already
+                            # quarantined and the prompt is never replayed.
+                            await self._emit(ctx, Error(
+                                code=ERR_CC_CRASH,
+                                message=(
+                                    "Codex 提交确认时连接中断，无法证明该消息是否"
+                                    "执行。为避免重复操作，本次没有自动重发，请先"
+                                    "检查历史后再决定是否重试。"
+                                ),
+                                msg_id=submission_msg_id,
+                            ))
+                        return
+                    continue
+
+                if not waiting_announced:
+                    waiting_announced = True
+                    await self._emit(ctx, StateEvent(
+                        # Never regress an interrupt accepted while the old
+                        # turn/start transport was disconnected.
+                        state=ctx.state,
+                        phase="waiting",
+                        detail=(
+                            "Codex 提交确认连接中断，正在核对原生回合；"
+                            "不会重复发送。"
+                        ),
+                        msg_id=submission_msg_id,
+                    ))
+                    log.warning(
+                        "Codex turn/start connection interrupted; reconciling",
+                        session_id=ctx.session_id,
+                        accepted=accepted,
+                        previous_app_server_version=exc.app_server_version,
+                        active_turn_id=active_turn_id,
+                        matched_turn_id=matched_turn_id,
+                        newer_turns_present=bool(
+                            getattr(probe, "newer_turns_present", False)
+                        ),
+                        page_truncated=bool(
+                            getattr(probe, "page_truncated", False)
+                        ),
+                    )
+                await asyncio.sleep(
+                    CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS)
+
+            # The detached context cannot receive another browser command. Drop
+            # only its in-memory fence; its checkpoint was already quarantined.
+            ctx.codex_turn_start_reconciling = False
+            ctx.codex_deferred_turn_start_id = None
         except CodexDaemonProxyClosed as exc:
             # A shared daemon may be atomically replaced by Codex's official
             # updater while a native turn is running. Never replay that prompt:
@@ -36222,9 +37554,21 @@ class WrapperMachine:
             await self._set_idle_after_managed_turn(ctx)
         except Exception as e:
             log.exception("turn failed", error=str(e))
+            provider_too_large_kind = (
+                classify_provider_request_too_large(e)
+                if not is_codex else None
+            )
             await self._emit(ctx, Error(
-                code=ERR_CC_CRASH,
-                message="本次回复未完成，请重试。",
+                code=(
+                    ERR_BAD_PROMPT
+                    if provider_too_large_kind is not None else ERR_CC_CRASH
+                ),
+                message=(
+                    provider_request_too_large_message(
+                        provider_too_large_kind)
+                    if provider_too_large_kind is not None else
+                    "本次回复未完成，请重试。"
+                ),
                 msg_id=ctx.active_msg_id))
             await self._set_idle_after_managed_turn(
                 ctx, claude_terminal=claude_turn_completed)
@@ -36243,6 +37587,8 @@ class WrapperMachine:
                 ctx.claude_activity_event.clear()
                 ctx.claude_progress_notice_active = False
             ctx.codex_account_handoff = False
+            if not ctx.codex_turn_start_reconciling:
+                ctx.codex_deferred_turn_start_id = None
             ctx.translator = None
             ctx.turn_task = None
             if not is_codex:
@@ -36250,7 +37596,10 @@ class WrapperMachine:
                 # this task was still alive. Reconcile again only after dropping
                 # the managed owner so that event order cannot strand ``running``.
                 await self._settle_claude_lifecycle_if_quiescent(ctx)
-            if ctx.codex_spontaneous_turn_id is None:
+            if (
+                ctx.codex_spontaneous_turn_id is None
+                and not ctx.codex_turn_start_reconciling
+            ):
                 ctx.active_msg_id = None
                 preserve_autonomous_interrupt = bool(
                     not is_codex

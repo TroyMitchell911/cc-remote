@@ -45,6 +45,7 @@ import {
 } from "../process-blocks";
 import { PanelResizer } from "./PanelResizer";
 import {
+  DEFAULT_AUTO_COMPACT_TOKENS,
   autoCompactSelectionLabel,
   parseAutoCompactArgument,
   type AutoCompactSelection,
@@ -489,9 +490,10 @@ export function BtwPanel(p: Props) {
           <div className="sheet-title">BTW 自动压缩</div>
           <div className="sheet-scroll">
             <AutoCompactControl value={{
-              mode: p.rt?.autoCompact?.mode ?? "inherit",
+              mode: p.rt?.autoCompact?.mode ?? "custom",
               thresholdTokens:
-                p.rt?.autoCompact?.threshold_tokens ?? null,
+                p.rt?.autoCompact?.threshold_tokens
+                  ?? DEFAULT_AUTO_COMPACT_TOKENS,
             }} state={p.rt?.autoCompact}
               disabled={!p.sid}
               onChange={(selection) => {

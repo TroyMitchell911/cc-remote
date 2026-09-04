@@ -17,6 +17,7 @@ from cc_remote.wrapper.codex_daemon import (
     CodexDaemonUpgradeRequired,
 )
 from cc_remote.wrapper.codex_handle import (
+    CodexAppServerDisconnected,
     CodexDaemonProxyClosed,
     CodexHandle,
     CodexProxyProtocolError,
@@ -216,6 +217,29 @@ def test_linux_managed_daemon_nofile_is_applied_to_exact_pid(
     ) is True
     assert calls[1][2] == (daemon_module._DAEMON_NOFILE_SOFT_LIMIT, 524288)
     assert calls[-1][2] is None
+
+
+def test_managed_daemon_identity_uses_same_user_pid_and_start_token(
+        monkeypatch, tmp_path):
+    daemon_root = tmp_path / "app-server-daemon"
+    daemon_root.mkdir()
+    (daemon_root / "app-server.pid").write_text(
+        '{"pid":4321}', encoding="utf-8")
+    identity = ProcessIdentity(4321, 987654)
+    monkeypatch.setattr(
+        daemon_module, "process_owner_uid", lambda _pid: os.getuid())
+    monkeypatch.setattr(
+        daemon_module, "process_identity", lambda _pid: identity)
+
+    assert daemon_module._managed_daemon_process_identity(
+        tmp_path) == identity
+
+    monkeypatch.setattr(
+        daemon_module,
+        "process_owner_uid",
+        lambda _pid: os.getuid() + 1,
+    )
+    assert daemon_module._managed_daemon_process_identity(tmp_path) is None
 
 
 def test_linux_managed_daemon_nofile_fails_closed_on_low_hard_limit(
@@ -1169,6 +1193,272 @@ class _Manager:
         self.invalidations += 1
 
 
+def test_handle_detects_managed_daemon_process_generation_change(
+        monkeypatch):
+    original = ProcessIdentity(4321, 100)
+    replacement = ProcessIdentity(4321, 200)
+    observed = original
+    manager = CodexDaemonManager("auto")
+    manager._ready_codex_home = "/tmp/codex-generation-test"
+    monkeypatch.setattr(
+        daemon_module,
+        "_managed_daemon_process_identity",
+        lambda _home: observed,
+    )
+    handle = CodexHandle(
+        _Cfg(), daemon_mode="auto", daemon_manager=manager)
+    handle.proc = _Process()
+    handle._using_daemon_proxy = True
+    handle._daemon_process_identity = original
+
+    assert handle.daemon_process_generation_current is True
+    observed = replacement
+    assert handle.daemon_process_generation_current is False
+
+    # Invalidating one proxy's cached readiness must not erase the profile home
+    # used to observe healthy sibling connections.
+    manager.invalidate()
+    assert manager.current_process_identity() == replacement
+
+    # An identity which was transiently unavailable at connect time must not
+    # disable generation checks for the rest of this handle's lifetime.
+    handle._daemon_process_identity = None
+    assert handle.daemon_process_generation_current is False
+
+
+def test_proxy_connect_retries_if_daemon_changes_during_initialize(monkeypatch):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        old = ProcessIdentity(4321, 100)
+        replacement = ProcessIdentity(4322, 200)
+
+        class _SwappingManager(_Manager):
+            def __init__(self):
+                super().__init__(
+                    ["/usr/bin/codex", "app-server", "proxy"],
+                    strict_shared=True,
+                )
+                self.identities = [old, replacement, replacement, replacement]
+
+            def current_process_identity(self):
+                if len(self.identities) > 1:
+                    return self.identities.pop(0)
+                return self.identities[0]
+
+        manager = _SwappingManager()
+        processes = [
+            _Process(_Reader(_handshake_response(nonce)), 50010),
+            _Process(_Reader(_handshake_response(nonce)), 50011),
+        ]
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return processes.pop(0)
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager)
+        handle.model = "gpt-test"
+        handle.effort = None
+        initialize_calls = 0
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, _params=None):
+            nonlocal initialize_calls
+            if method == "initialize":
+                initialize_calls += 1
+                return {"serverInfo": {"version": "0.150.0"}}
+            if method == "thread/start":
+                return {"thread": {"id": "stable-thread"}}
+            if method == "thread/settings/update":
+                handle._thread_settings_updated.set()
+                return {}
+            raise AssertionError(method)
+
+        handle._read_loop = idle  # type: ignore[method-assign]
+        handle._request = request  # type: ignore[method-assign]
+        handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+
+        await handle.connect(cwd="/tmp")
+
+        assert spawned == [
+            ["/usr/bin/codex", "app-server", "proxy"],
+            ["/usr/bin/codex", "app-server", "proxy"],
+        ]
+        assert manager.proxy_calls == 2
+        assert manager.invalidations == 1
+        assert initialize_calls == 2
+        assert handle.using_daemon_proxy is True
+        assert handle._daemon_process_identity == replacement
+        assert handle.daemon_process_generation_current is True
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_proxy_connect_rebinds_resume_if_daemon_changes_after_thread_read(
+    monkeypatch,
+):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        old = ProcessIdentity(4321, 100)
+        replacement = ProcessIdentity(4322, 200)
+
+        class _SwappingManager(_Manager):
+            def __init__(self):
+                super().__init__(
+                    ["/usr/bin/codex", "app-server", "proxy"],
+                    strict_shared=True,
+                )
+                self.identities = [
+                    old, old, replacement,
+                    replacement, replacement, replacement,
+                ]
+
+            def current_process_identity(self):
+                if len(self.identities) > 1:
+                    return self.identities.pop(0)
+                return self.identities[0]
+
+        manager = _SwappingManager()
+        processes = [
+            _Process(_Reader(_handshake_response(nonce)), 50020),
+            _Process(_Reader(_handshake_response(nonce)), 50021),
+        ]
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return processes.pop(0)
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager)
+        resume_calls = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.150.0"}}
+            if method == "thread/resume":
+                resume_calls.append(params)
+                return {"thread": {"id": "stable-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle  # type: ignore[method-assign]
+        handle._request = request  # type: ignore[method-assign]
+        handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+
+        await handle.connect(resume_id="stable-thread", cwd="/tmp")
+
+        assert len(spawned) == 2
+        assert len(resume_calls) == 2
+        assert all(call["threadId"] == "stable-thread"
+                   for call in resume_calls)
+        assert manager.invalidations == 1
+        assert handle.thread_id == "stable-thread"
+        assert handle._daemon_process_identity == replacement
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_proxy_connect_resumes_created_thread_if_sticky_settings_disconnect(
+    monkeypatch,
+):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        old = ProcessIdentity(4321, 100)
+        replacement = ProcessIdentity(4322, 200)
+
+        class _SwappingManager(_Manager):
+            def __init__(self):
+                super().__init__(
+                    ["/usr/bin/codex", "app-server", "proxy"],
+                    strict_shared=True,
+                )
+                self.identities = [
+                    old, old,
+                    replacement, replacement, replacement,
+                ]
+
+            def current_process_identity(self):
+                if len(self.identities) > 1:
+                    return self.identities.pop(0)
+                return self.identities[0]
+
+        manager = _SwappingManager()
+        processes = [
+            _Process(_Reader(_handshake_response(nonce)), 50030),
+            _Process(_Reader(_handshake_response(nonce)), 50031),
+        ]
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return processes.pop(0)
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager)
+        handle.model = "gpt-test"
+        start_calls = 0
+        resume_calls = 0
+        settings_calls = 0
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, _params=None):
+            nonlocal start_calls, resume_calls, settings_calls
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.150.0"}}
+            if method == "thread/start":
+                start_calls += 1
+                return {"thread": {"id": "created-thread"}}
+            if method == "thread/settings/update":
+                settings_calls += 1
+                raise CodexAppServerDisconnected("0.150.0", 7)
+            if method == "thread/resume":
+                resume_calls += 1
+                return {"thread": {"id": "created-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle  # type: ignore[method-assign]
+        handle._request = request  # type: ignore[method-assign]
+        handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+
+        await handle.connect(cwd="/tmp")
+
+        assert len(spawned) == 2
+        assert start_calls == 1
+        assert settings_calls == 1
+        assert resume_calls == 1
+        assert manager.invalidations == 1
+        assert handle.thread_id == "created-thread"
+        assert handle._daemon_process_identity == replacement
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
 def test_proxy_protocol_error_invalidates_daemon_and_clears_live_state():
     async def run():
         manager = _Manager()
@@ -1219,6 +1509,30 @@ def test_proxy_close_surfaces_typed_incomplete_managed_boundary():
 
     async def _collect_async(stream):
         return [item async for item in stream]
+
+    asyncio.run(run())
+
+
+def test_proxy_close_unblocks_pending_rpc_with_generation_identity():
+    async def run():
+        manager = _Manager()
+        process = _Process(_Reader(_server_frame(
+            (1001).to_bytes(2, "big"), opcode=0x8)))
+        handle = CodexHandle(
+            _Cfg(), daemon_mode="auto", daemon_manager=manager)
+        handle.proc = process
+        handle._using_daemon_proxy = True
+        handle._dead = False
+        handle.app_server_version = "0.150.0"
+        pending = asyncio.get_running_loop().create_future()
+        handle._pending[1] = pending
+
+        await handle._read_loop(process, handle._generation)
+
+        with pytest.raises(CodexAppServerDisconnected) as raised:
+            await pending
+        assert raised.value.app_server_version == "0.150.0"
+        assert raised.value.generation == 0
 
     asyncio.run(run())
 

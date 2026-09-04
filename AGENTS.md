@@ -27,7 +27,8 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   interrupt/drain contract can shift between patch versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
   the exact verified patch at startup).
-- **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
+- **Claude Code is the user's daily CLI, not the SDK bundle**: Claude Code
+  `>=2.1.258` is required and checked before a Claude session starts. The wrapper
   defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
   to the SDK. An empty value keeps this default; only another absolute path may
   override it. Keep that CLI updated and signed in before starting the wrapper.
@@ -59,7 +60,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v46 is declared by
+- **Protocol version gate**: current wire protocol v48 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all

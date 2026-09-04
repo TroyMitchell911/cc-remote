@@ -39,6 +39,7 @@ _BACKGROUND_ROLES = frozenset({
 _SDK_ENTRYPOINTS = frozenset({"sdk-py"})
 _SDK_PROMPT_SOURCES = frozenset({"sdk"})
 _NEUTRAL_METADATA_TYPES = frozenset({
+    "ai-title",
     "atis-latch",
     "mode",
     "permission-mode",

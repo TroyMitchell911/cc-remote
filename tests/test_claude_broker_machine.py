@@ -1065,6 +1065,8 @@ def test_exited_broker_restores_sdk_in_place_without_switch_session(
             "permission_mode": "acceptEdits",
             "auto_compact_mode": "custom",
             "auto_compact_threshold_tokens": 250_000,
+            "applied_auto_compact_mode": "custom",
+            "applied_auto_compact_threshold_tokens": 250_000,
         })]
 
     asyncio.run(go())

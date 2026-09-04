@@ -25,6 +25,8 @@ from typing import Any, Mapping, Optional
 from cc_remote.log import logger
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
+    ProcessIdentity,
+    process_identity,
     process_owner_uid,
 )
 
@@ -327,6 +329,24 @@ def _managed_pid(path: Path) -> Optional[int]:
     return pid if isinstance(pid, int) and pid > 1 else None
 
 
+def _managed_daemon_process_identity(
+    codex_home: str | Path,
+) -> Optional[ProcessIdentity]:
+    """Return the exact same-user app-server generation from official state.
+
+    The durable updater keeps running while replacing its app-server child.
+    A per-client proxy can therefore remain superficially alive after the
+    socket generation it joined has gone away.  Pair the official bounded PID
+    record with the kernel process start token so PID reuse cannot make an old
+    proxy look current.
+    """
+    home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
+    pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return None
+    return process_identity(pid)
+
+
 def _linux_process_start_ticks(pid: int) -> Optional[int]:
     """Return one stable Linux process-generation token."""
     try:
@@ -622,6 +642,7 @@ class CodexDaemonManager:
         self._capable = False
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
+        self._ready_codex_home: Optional[str] = None
 
     @property
     def info(self) -> Optional[CodexDaemonInfo]:
@@ -642,6 +663,17 @@ class CodexDaemonManager:
         """Forget liveness after unexpected proxy EOF; keep help capability."""
         self._ready_identity = None
         self._ready = None
+        # Keep the profile-scoped home after the first verified connection so
+        # other resident handles can still compare their process generation.
+        # Clearing it here would make one proxy EOF look like a daemon swap to
+        # every healthy sibling handle and cause a reconnect cascade.
+
+    def current_process_identity(self) -> Optional[ProcessIdentity]:
+        """Observe the current official app-server child, if one was verified."""
+        home = self._ready_codex_home
+        if home is None:
+            return None
+        return _managed_daemon_process_identity(home)
 
     async def _run(
         self, codex_bin: str, env: Mapping[str, str], *args: str,
@@ -782,6 +814,9 @@ class CodexDaemonManager:
         """Start and remotely enable the daemon, or return ``None`` for stdio."""
         if self.mode == "off":
             return None
+        codex_home = os.path.realpath(os.path.expanduser(
+            env.get("CODEX_HOME") or "~/.codex"
+        ))
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._ready_identity and self._ready is not None:
             return self._ready
@@ -851,6 +886,7 @@ class CodexDaemonManager:
                 log.info("using existing official Codex app-server candidate")
                 self._ready_identity = identity
                 self._ready = existing
+                self._ready_codex_home = codex_home
                 return existing
 
             # Only a successful enable proves that this is the official managed
@@ -912,6 +948,7 @@ class CodexDaemonManager:
             )
             self._ready_identity = identity
             self._ready = info
+            self._ready_codex_home = codex_home
             return info
 
     async def proxy_args(

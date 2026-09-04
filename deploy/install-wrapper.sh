@@ -254,9 +254,9 @@ cleanup() {
   if [ "$status" -ne 0 ]; then
     rollback_ready=1
     if [ "$snapshot_created" -eq 1 ]; then
-      # Never start old code against a database migrated by the failed new
-      # release. Stop the new process first, then restore the complete SQLite
-      # images (including committed WAL pages captured by the backup API).
+      # Never start old code against data migrated by the failed new release.
+      # Stop the new process first, then restore the complete SQLite images and
+      # the matching bounded private wrapper-control snapshot.
       if ! stop_wrapper_service; then
         rollback_ready=0
         echo "ERROR: new wrapper could not be stopped; data was not restored" >&2
@@ -264,7 +264,7 @@ cleanup() {
           "$target/deploy/work_registry_snapshot.py" restore \
           --snapshot "$rollback_snapshot"; then
         rollback_ready=0
-        echo "ERROR: Work registry restore failed; wrapper remains stopped" >&2
+        echo "ERROR: wrapper data restore failed; wrapper remains stopped" >&2
       fi
     fi
     if [ "$switched" -eq 1 ]; then
@@ -303,7 +303,7 @@ cleanup() {
       fi
     fi
     if [ "$rollback_ready" -eq 1 ]; then
-      echo "ERROR: wrapper activation failed; code and Work data were restored" >&2
+      echo "ERROR: wrapper activation failed; code and wrapper data were restored" >&2
     else
       echo "ERROR: wrapper activation failed; manual data recovery is required" >&2
     fi
@@ -406,9 +406,9 @@ if [ ! -f "$device_file" ] || [ -L "$device_file" ]; then
 fi
 chmod 0600 "$device_file"
 
-# Work metadata lives outside immutable release directories. Capture it before
-# activation so a code rollback also restores the schema and fixed account
-# ownership understood by the previous wrapper.
+# Mutable Work metadata and private wrapper control state live outside immutable
+# release directories. Capture them before activation so a code rollback also
+# restores the schemas understood by the previous wrapper.
 if [ "$service_had_file" -eq 1 ]; then
   if [ "$system" = darwin ]; then
     domain="gui/$(id -u)"
@@ -576,7 +576,7 @@ echo "Wrapper v$version installed from $git_sha."
 echo "Active release: $target"
 if [ -n "$previous" ] && [ "$previous" != "$target" ]; then
   echo "Previous release retained for rollback: $previous"
-  echo "Matching Work data snapshot: $rollback_snapshot"
+  echo "Matching wrapper data snapshot: $rollback_snapshot"
 fi
 if [ "$system" = darwin ]; then
   echo "Logs: $log_dir"

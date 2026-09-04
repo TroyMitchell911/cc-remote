@@ -74,16 +74,18 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   hosts that already run nginx instead of the managed Caddy. Loopback-only
   requirement is documented in the file header.
 - `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
-  through SQLite's backup API, restores the matching pre-release images before
-  an older wrapper is restarted, and verifies the v34 Codex ownership backfill.
+  through SQLite's backup API plus the bounded private Claude control store,
+  restores the matching pre-release data before an older wrapper is restarted,
+  and verifies the v34 Codex ownership backfill.
 
-Protocol v46 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v48 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v46 relay/web release; then start the v46 wrapper.
+activate the v48 relay/web release; then start the v48 wrapper.
 
-The wrapper installer treats local Work data as part of the release
+The wrapper installer treats local Work data and versioned private control state
+as part of the release
 transaction. It stops the existing service, writes a private snapshot below
 the install root's `rollback-data/`, starts the new release, and refuses the
 activation unless the Claude and Codex Work schemas and all legacy profile
@@ -92,8 +94,8 @@ restores and starts the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v46, and retain that snapshot with the previous release. To roll back,
-stop v46, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v48, and retain that snapshot with the previous release. To roll back,
+stop v48, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state

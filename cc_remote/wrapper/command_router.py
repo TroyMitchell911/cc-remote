@@ -33,6 +33,7 @@ COMMAND_HANDLER_NAMES = MappingProxyType({
     "set_web_search": "_handle_set_web_search",
     "get_context": "_handle_get_context",
     "get_status": "_handle_get_status",
+    "consume_rate_limit_reset_credit": "_handle_consume_rate_limit_reset_credit",
     "get_browser_surface": "_handle_get_browser_surface",
     "get_browser_frame": "_handle_get_browser_frame",
     "acquire_browser_control": "_handle_acquire_browser_control",

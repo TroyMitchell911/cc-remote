@@ -10,12 +10,18 @@ from pydantic import ValidationError
 
 from cc_remote.protocol import (
     CommandAck,
+    ConsumeRateLimitResetCredit,
     DOWNSTREAM_TYPES,
+    Error,
     GetStatus,
     MAX_SAFE_WIRE_INTEGER,
+    MAX_STATUS_RESET_CREDITS,
     MAX_STATUS_USAGE_BUCKETS,
+    RateLimitResetResult,
     StatusContext,
     StatusDailyUsageBucket,
+    StatusRateLimitResetCredit,
+    StatusRateLimitResetCredits,
     StatusReport,
     StatusRuntime,
     StatusThread,
@@ -27,6 +33,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexHandle,
     _app_server_version,
     _sanitize_daily_usage_buckets,
+    _sanitize_rate_limit_reset_credits,
     _status_error_message,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -48,6 +55,7 @@ def _minimal_status(thread_id: str = "thread-1") -> dict:
         "context": {"used_tokens": 10, "max_tokens": 100, "percentage": 10.0},
         "account": None,
         "rate_limits": [],
+        "reset_credits": None,
         "usage": None,
         "component_errors": [],
     }
@@ -58,6 +66,11 @@ def test_status_protocol_is_strict_and_round_trips():
     command = GetStatus(
         sid="thread-1", cmd_id="status-1", client_id="client-1")
     assert deserialize(serialize(command)) == command
+    consume = ConsumeRateLimitResetCredit(
+        sid="thread-1", cmd_id="reset-1", client_id="client-1",
+        credit_id="opaque/reset:credit",
+    )
+    assert deserialize(serialize(consume)) == consume
 
     report = StatusReport(
         sid="thread-1",
@@ -71,6 +84,14 @@ def test_status_protocol_is_strict_and_round_trips():
             sandbox_mode="workspace-write",
         ),
         context=StatusContext(used_tokens=25, max_tokens=100, percentage=25.0),
+        reset_credits=StatusRateLimitResetCredits(
+            available_count=1,
+            credits=[StatusRateLimitResetCredit(
+                id="credit-1", granted_at=1_700_000_000,
+                expires_at=1_800_000_000, reset_type="codexRateLimits",
+                status="available", title="Reset", description="One reset",
+            )],
+        ),
         usage=StatusUsage(
             lifetime_tokens=1000,
             daily_usage_buckets=[StatusDailyUsageBucket(
@@ -80,6 +101,12 @@ def test_status_protocol_is_strict_and_round_trips():
         component_errors=["usage: unsupported by this Codex app-server"],
     )
     assert deserialize(serialize(report)) == report
+    result = RateLimitResetResult(
+        sid="thread-1", to="client-1", request_id="reset-1",
+        outcome="reset", credit_id="credit-1",
+    )
+    assert deserialize(serialize(result)) == result
+    assert "rate_limit_reset_result" not in DOWNSTREAM_TYPES
     with pytest.raises(ValidationError):
         StatusThread(thread_id="thread-1", secret="must-not-pass")
     with pytest.raises(ValidationError):
@@ -97,6 +124,22 @@ def test_status_protocol_is_strict_and_round_trips():
         StatusUsage(daily_usage_buckets=[
             StatusDailyUsageBucket(start_date="2026-07-31", tokens=1)
         ] * (MAX_STATUS_USAGE_BUCKETS + 1))
+    with pytest.raises(ValidationError):
+        ConsumeRateLimitResetCredit(
+            sid="thread-1", cmd_id="reset-1", client_id="client-1",
+            credit_id="x" * 513,
+        )
+    with pytest.raises(ValidationError):
+        StatusRateLimitResetCredits(
+            available_count=MAX_SAFE_WIRE_INTEGER + 1)
+    with pytest.raises(ValidationError):
+        StatusRateLimitResetCredits(
+            available_count=MAX_STATUS_RESET_CREDITS + 1,
+            credits=[StatusRateLimitResetCredit(
+                id=f"credit-{index}", granted_at=1,
+                reset_type="codexRateLimits", status="available",
+            ) for index in range(MAX_STATUS_RESET_CREDITS + 1)],
+        )
 
 
 def test_app_server_version_extracts_only_version():
@@ -158,7 +201,21 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
                             "windowDurationMins": 300},
                 "credits": {"balance": "SECRET_BALANCE", "hasCredits": True,
                             "unlimited": False},
-            }},
+            }, "accountId": "SECRET_ACCOUNT_ID",
+                "rateLimitResetCredits": {
+                    "availableCount": 2,
+                    "credits": [{
+                        "id": "reset-credit-1",
+                        "grantedAt": 1_700_000_000,
+                        "expiresAt": 1_800_000_000,
+                        "resetType": "codexRateLimits",
+                        "status": "available",
+                        "title": "Launch reset",
+                        "description": "Reset one eligible Codex window",
+                        "secret": "SECRET_RESET_ROW",
+                    }],
+                },
+            },
             "account/usage/read": {"summary": {
                 "lifetimeTokens": 123456, "peakDailyTokens": 3000,
                 "currentStreakDays": 2, "longestStreakDays": 8,
@@ -208,6 +265,18 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
             "requires_openai_auth": True,
         }
         assert status["rate_limits"][0]["primary"]["used_percent"] == 42
+        assert status["reset_credits"] == {
+            "available_count": 2,
+            "credits": [{
+                "id": "reset-credit-1",
+                "granted_at": 1_700_000_000,
+                "expires_at": 1_800_000_000,
+                "reset_type": "codexRateLimits",
+                "status": "available",
+                "title": "Launch reset",
+                "description": "Reset one eligible Codex window",
+            }],
+        }
         assert status["usage"]["lifetime_tokens"] == 123456
         assert status["usage"]["daily_usage_buckets"] == [
             {"start_date": day_4, "tokens": 400},
@@ -219,7 +288,7 @@ def test_status_rpcs_are_staged_by_auth_and_sensitive_fields_are_dropped():
         for secret in (
             "secret@example.com", "SECRET_PREVIEW", "SECRET_INSTRUCTIONS",
             "SECRET_DEVELOPER", "SECRET_BALANCE", "SECRET_DAY",
-            "/secret/rollout.jsonl",
+            "SECRET_ACCOUNT_ID", "SECRET_RESET_ROW", "/secret/rollout.jsonl",
         ):
             assert secret not in wire
         # The sanitized dictionary must satisfy the strict wire model.
@@ -263,6 +332,92 @@ def test_daily_usage_sanitizer_is_canonical_and_bounded_to_53_weeks():
     StatusUsage(daily_usage_buckets=sanitized)
 
 
+def test_reset_credit_sanitizer_preserves_count_semantics_and_bounds_rows():
+    assert _sanitize_rate_limit_reset_credits(None) is None
+    assert _sanitize_rate_limit_reset_credits({"availableCount": 2}) == {
+        "available_count": 2, "credits": None,
+    }
+    assert _sanitize_rate_limit_reset_credits({
+        "availableCount": 1, "credits": "not-a-list",
+    }) is None
+
+    rows = [{
+        "id": f"credit/{index}",
+        "grantedAt": 1_700_000_000 + index,
+        "expiresAt": None,
+        "resetType": "futureResetType" if index == 0 else "codexRateLimits",
+        "status": "futureStatus" if index == 0 else "available",
+        "title": "T" * 300,
+        "description": "D" * 3000,
+        "paidCredits": "SECRET_BALANCE",
+    } for index in range(MAX_STATUS_RESET_CREDITS + 5)]
+    rows[1]["id"] = "x" * 513
+    rows[2]["grantedAt"] = True
+    rows[3]["expiresAt"] = MAX_SAFE_WIRE_INTEGER
+    sanitized = _sanitize_rate_limit_reset_credits({
+        "availableCount": 100,
+        "credits": rows,
+        "accountId": "SECRET_ACCOUNT",
+    })
+    assert sanitized is not None
+    assert sanitized["available_count"] == 100
+    assert len(sanitized["credits"]) == MAX_STATUS_RESET_CREDITS - 3
+    assert sanitized["credits"][0]["reset_type"] == "unknown"
+    assert sanitized["credits"][0]["status"] == "unknown"
+    assert len(sanitized["credits"][0]["title"]) == 256
+    assert len(sanitized["credits"][0]["description"]) == 2048
+    assert "SECRET" not in json.dumps(sanitized)
+    StatusRateLimitResetCredits(**sanitized)
+
+
+def test_handle_consumes_reset_credit_with_exact_native_idempotency_contract():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        calls = []
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            return {"outcome": "reset"}
+
+        handle._request = request
+        outcome = await handle.consume_rate_limit_reset_credit(
+            credit_id="opaque/credit", idempotency_key="browser-command-1")
+        assert outcome == "reset"
+        assert calls == [(
+            "account/rateLimitResetCredit/consume",
+            {
+                "creditId": "opaque/credit",
+                "idempotencyKey": "browser-command-1",
+            },
+        )]
+
+        calls.clear()
+        await handle.consume_rate_limit_reset_credit(
+            credit_id=None, idempotency_key="browser-command-2")
+        assert calls == [(
+            "account/rateLimitResetCredit/consume",
+            {"idempotencyKey": "browser-command-2"},
+        )]
+
+        async def malformed(_method, _params=None):
+            return {"outcome": "futureOutcome"}
+
+        handle._request = malformed
+        assert await handle.consume_rate_limit_reset_credit(
+            credit_id=None, idempotency_key="browser-command-3",
+        ) == "unknown"
+
+        async def missing(_method, _params=None):
+            return {}
+
+        handle._request = missing
+        with pytest.raises(RuntimeError, match="invalid response"):
+            await handle.consume_rate_limit_reset_credit(
+                credit_id=None, idempotency_key="browser-command-4")
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("auth_type", ["apiKey", "amazonBedrock"])
 def test_status_skips_chatgpt_stats_for_explicit_non_chatgpt_auth(auth_type):
     async def run():
@@ -288,6 +443,7 @@ def test_status_skips_chatgpt_stats_for_explicit_non_chatgpt_auth(auth_type):
         assert set(calls) == {"thread/read", "config/read", "account/read"}
         assert status["account"]["auth_type"] == auth_type
         assert status["rate_limits"] == []
+        assert status["reset_credits"] is None
         assert status["usage"] is None
         assert status["component_errors"] == []
         StatusReport(**status)
@@ -330,6 +486,7 @@ def test_status_attempts_chatgpt_stats_when_account_is_unknown_or_fails(account_
             "account/rateLimits/read", "account/usage/read",
         }
         assert status["rate_limits"][0]["primary"]["used_percent"] == 7
+        assert status["reset_credits"] is None
         assert status["usage"]["lifetime_tokens"] == 123
         expected_errors = (
             ["account: app-server request failed"] if account_mode == "failure" else []
@@ -431,5 +588,111 @@ def test_machine_status_is_routed_and_safe_retry_reexecutes_read():
         acks = [message for message in transport.sent
                 if isinstance(message, CommandAck)]
         assert len(acks) == 2
+
+    asyncio.run(run())
+
+
+def test_machine_reset_credit_is_idle_only_targeted_and_at_most_once():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-1", "thread-1")
+        ctx.engine = "codex"
+
+        class ResetSdk:
+            def __init__(self):
+                self.consume_calls = []
+                self.status_calls = 0
+
+            async def consume_rate_limit_reset_credit(
+                self, *, credit_id, idempotency_key,
+            ):
+                self.consume_calls.append((credit_id, idempotency_key))
+                return "reset"
+
+            async def get_status(self):
+                self.status_calls += 1
+                return {
+                    **_minimal_status(),
+                    "reset_credits": {
+                        "available_count": 0, "credits": [],
+                    },
+                }
+
+        sdk = ResetSdk()
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        command = ConsumeRateLimitResetCredit(
+            sid="thread-1", cmd_id="reset-command-1",
+            client_id="client-1", credit_id="opaque/credit",
+        )
+        await machine._process_command(command)
+        await machine._process_command(command)
+
+        assert sdk.consume_calls == [("opaque/credit", "reset-command-1")]
+        assert sdk.status_calls == 1
+        results = [message for message in transport.sent
+                   if isinstance(message, RateLimitResetResult)]
+        assert len(results) == 2
+        assert all(
+            result.sid == "thread-1"
+            and result.to == "client-1"
+            and result.request_id == "reset-command-1"
+            and result.outcome == "reset"
+            and result.seq is None
+            for result in results
+        )
+        reports = [message for message in transport.sent
+                   if isinstance(message, StatusReport)]
+        assert len(reports) == 2
+        assert all(report.reset_credits is not None
+                   and report.reset_credits.available_count == 0
+                   for report in reports)
+        assert len([message for message in transport.sent
+                    if isinstance(message, CommandAck)]) == 2
+
+        busy_machine, busy_transport = _mk_machine()
+        busy_ctx = _mk_ctx("thread-2", "thread-2")
+        busy_ctx.engine = "codex"
+        busy_sdk = ResetSdk()
+        busy_ctx.sdk = busy_sdk
+        busy_ctx.state = "running"
+        busy_machine.sessions[busy_ctx.key] = busy_ctx
+        await busy_machine._process_command(ConsumeRateLimitResetCredit(
+            sid="thread-2", cmd_id="reset-command-2",
+            client_id="client-2",
+        ))
+        assert busy_sdk.consume_calls == []
+        errors = [message for message in busy_transport.sent
+                  if isinstance(message, Error)]
+        assert len(errors) == 1
+        assert errors[0].code == "busy"
+        assert errors[0].to == "client-2"
+        assert errors[0].request_id == "reset-command-2"
+
+        race_machine, race_transport = _mk_machine()
+        race_ctx = _mk_ctx("thread-3", "thread-3")
+        race_ctx.engine = "codex"
+        race_sdk = ResetSdk()
+        race_ctx.sdk = race_sdk
+        race_machine.sessions[race_ctx.key] = race_ctx
+        await race_ctx.query_lock.acquire()
+        race_task = asyncio.create_task(race_machine._process_command(
+            ConsumeRateLimitResetCredit(
+                sid="thread-3", cmd_id="reset-command-3",
+                client_id="client-3",
+            )))
+        await asyncio.sleep(0)
+        assert not race_task.done()
+        # A complete intervening turn can return state to idle before this
+        # command obtains query_lock. The monotonic event sequence still makes
+        # the user's old confirmation stale and must fail closed.
+        race_ctx.seq += 1
+        race_ctx.query_lock.release()
+        await race_task
+        assert race_sdk.consume_calls == []
+        race_errors = [message for message in race_transport.sent
+                       if isinstance(message, Error)]
+        assert len(race_errors) == 1
+        assert race_errors[0].code == "busy"
 
     asyncio.run(run())

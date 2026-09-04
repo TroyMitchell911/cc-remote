@@ -64,17 +64,26 @@ export function AutoCompactControl({
     : null;
   const customTokens = Number(customThousands) * 1_000;
   const customValid = validAutoCompactThreshold(customTokens);
+  const phaseLabel = state?.phase === "compacting" ? "正在压缩"
+    : state?.phase === "reconnecting" ? "正在重连"
+      : state?.phase === "blocked" ? "需要处理"
+        : "等待安全边界";
 
   const choose = (selection: AutoCompactSelection) => {
     setCustomOpen(false);
-    if (!sameSelection(normalized, selection)) onChange(selection);
+    if (
+      !sameSelection(normalized, selection)
+      || state?.phase === "blocked"
+    ) {
+      onChange(selection);
+    }
   };
 
   return (
     <div className="auto-compact-control">
       <div className="auto-compact-head">
         <span>自动压缩</span>
-        <b>{state?.pending ? "等待安全边界"
+        <b>{state?.pending ? phaseLabel
           : autoCompactSelectionLabel(normalized)}</b>
       </div>
       <div className="auto-compact-options" role="group"
@@ -124,8 +133,14 @@ export function AutoCompactControl({
         </div>
       )}
       <div className="auto-compact-meta">
-        {state?.pending && applied && (
-          <span>当前仍为 {autoCompactSelectionLabel(applied)}；将在下一次可确认的回合终态或下一条消息前切换。</span>
+        {state?.pending && applied && state.phase === "waiting_terminal" && (
+          <span>当前为 {autoCompactSelectionLabel(applied)}；回合结束后安全切换。</span>
+        )}
+        {state?.pending && state.phase === "compacting" && (
+          <span>正在原生压缩上下文，再应用目标设置。</span>
+        )}
+        {state?.pending && state.phase === "reconnecting" && (
+          <span>正在按目标阈值重连。</span>
         )}
         {readOnly && (
           <span>本机 Claude TUI 正在控制此会话；这里只展示启动参数。</span>

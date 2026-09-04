@@ -14,6 +14,7 @@ export type ProcessAppendTarget = "summary" | "detail" | "output" | "diff" | "pr
 export type CodexThreadStatus = "notLoaded" | "idle" | "systemError" | "active";
 export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type AutoCompactMode = "inherit" | "auto" | "custom";
+export type AutoCompactPhase = "stable" | "waiting_terminal" | "compacting" | "reconnecting" | "blocked";
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "never" | "on-request" | "untrusted";
 export type CollaborationModeName = "default" | "plan";
 export type ControlMode = "remote" | "codex_shared" | "claude_broker" | "external_cli" | "agent_view" | "desktop";
@@ -26,6 +27,7 @@ export type CodexServiceTier = "default" | "fast";
 export type CodexWebSearchMode = "cached" | "live";
 export type NoticeSeverity = "info" | "warning";
 export type NoticeCategory = "runtime" | "guardian" | "config" | "deprecation" | "security" | "rate_limit";
+export type RateLimitResetOutcome = "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed" | "unknown";
 export type BrowserControlMode = "none" | "agent" | "user";
 export type BrowserActionName = "navigate" | "back" | "forward" | "click" | "type" | "press" | "scroll" | "wait" | "resize";
 
@@ -134,6 +136,7 @@ export interface AutoCompact extends Base {
   applied_mode?: AutoCompactMode | null;
   applied_threshold_tokens?: number | null;
   pending: boolean;
+  phase: AutoCompactPhase;
   mutable: boolean;
   error?: string | null;
 }
@@ -378,7 +381,7 @@ export interface RollbackResult extends Base {
   prefill_text?: string | null;
   detail?: string | null;
 }
-export interface CompactSession extends Base { type: "compact_session"; session_id: string; engine?: "codex"; space?: "code" }
+export interface CompactSession extends Base { type: "compact_session"; session_id: string; engine?: "claude" | "codex"; space?: "code" }
 export interface StartReview extends Base { type: "start_review"; session_id: string; engine?: "codex"; space?: "code"; target: "uncommittedChanges" | "baseBranch" | "commit" | "custom"; value?: string | null }
 export interface GetWorkDashboard extends Base { type: "get_work_dashboard"; engine?: Engine }
 export interface CreateWorkProject extends Base { type: "create_work_project"; engine?: Engine; name: string; description?: string }
@@ -520,6 +523,7 @@ export interface ClearGoal extends Base { type: "clear_goal" }
 export interface DismissGoal extends Base { type: "dismiss_goal"; goal_id: string }
 export interface AcknowledgeCompletion extends Base { type: "acknowledge_completion"; completion_id: string }
 export interface GetStatus extends Base { type: "get_status" }
+export interface ConsumeRateLimitResetCredit extends Base { type: "consume_rate_limit_reset_credit"; sid: string; cmd_id: string; client_id: string; credit_id?: string | null }
 export interface GetBrowserSurface extends Base { type: "get_browser_surface"; sid: string; request_id: string; cmd_id: string; client_id: string; create?: boolean }
 export interface GetBrowserFrame extends Base { type: "get_browser_frame"; sid: string; request_id: string; cmd_id: string; client_id: string; generation?: string | null }
 export interface AcquireBrowserControl extends Base { type: "acquire_browser_control"; sid: string; request_id: string; cmd_id: string; client_id: string }
@@ -635,6 +639,8 @@ export interface StatusContext { used_tokens?: number | null; max_tokens?: numbe
 export interface StatusAccount { auth_type: string; plan_type?: string | null; requires_openai_auth: boolean }
 export interface StatusRateWindow { used_percent?: number | null; resets_at?: number | null; window_duration_mins?: number | null }
 export interface StatusRateLimit { limit_id?: string | null; limit_name?: string | null; plan_type?: string | null; rate_limit_reached_type?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
+export interface StatusRateLimitResetCredit { id: string; granted_at: number; expires_at?: number | null; reset_type: "codexRateLimits" | "unknown"; status: "available" | "redeeming" | "redeemed" | "unknown"; title?: string | null; description?: string | null }
+export interface StatusRateLimitResetCredits { available_count: number; credits?: StatusRateLimitResetCredit[] | null }
 export interface StatusDailyUsageBucket { start_date: string; tokens: number }
 export interface StatusUsage {
   lifetime_tokens?: number | null;
@@ -653,8 +659,17 @@ export interface StatusReport extends Base {
   context: StatusContext;
   account?: StatusAccount | null;
   rate_limits: StatusRateLimit[];
+  reset_credits?: StatusRateLimitResetCredits | null;
   usage?: StatusUsage | null;
   component_errors: string[];
+}
+export interface RateLimitResetResult extends Base {
+  type: "rate_limit_reset_result";
+  sid: string;
+  to: string;
+  request_id: string;
+  outcome: RateLimitResetOutcome;
+  credit_id?: string | null;
 }
 export interface Notice extends Base {
   type: "notice";
@@ -702,14 +717,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | BrowserSurface | BrowserFrame | RollbackResult
+  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | BrowserSurface | BrowserFrame | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 46;
+export const PROTOCOL_VERSION = 48;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

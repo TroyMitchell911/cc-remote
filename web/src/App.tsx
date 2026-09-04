@@ -41,7 +41,6 @@ import {
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
 import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
@@ -263,6 +262,9 @@ const BrowserPanel = lazy(() => import("./components/BrowserPanel").then(
 ));
 const StatusSheet = lazy(() => import("./components/StatusSheet").then(
   ({ StatusSheet: Sheet }) => ({ default: Sheet }),
+));
+const ForkWorktreeSheet = lazy(() => import("./components/ForkWorktreeSheet").then(
+  ({ ForkWorktreeSheet: Sheet }) => ({ default: Sheet }),
 ));
 const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
   ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
@@ -4135,6 +4137,33 @@ export default function App() {
       dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
     }
   }, [focusedEngine, focusedSid]);
+  const consumeResetCredit = useCallback((creditId?: string | null) => {
+    if (!focusedSid || focusedEngine !== "codex") return false;
+    const current = stateRef.current;
+    const runtime = current.runtimes[focusedSid];
+    const session = current.sessions.find(
+      (candidate) => candidate.session_id === focusedSid);
+    if (
+      current.newChat
+      || session?.tag === "archived"
+      || !runtime
+      || runtime.state !== "idle"
+      || runtime.statusRequestId
+      || runtime.statusError
+      || current.connState !== "connected"
+      || !current.wrapperOnline
+    ) return false;
+    const requestId = wsRef.current?.sendConsumeRateLimitResetCredit(
+      focusedSid, creditId) ?? null;
+    if (requestId) {
+      dispatch({
+        type: "begin_status_request",
+        sid: focusedSid,
+        requestId,
+      });
+    }
+    return requestId !== null;
+  }, [focusedEngine, focusedSid]);
   useEffect(() => {
     if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
         || archivedBrowse
@@ -5663,7 +5692,9 @@ export default function App() {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
           }}
           onCompact={() => {
-            if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
+            if (focusedSid) {
+              wsRef.current?.sendCompactSession(focusedSid, focusedEngine);
+            }
           }}
           onOpenExtensions={(kind) => {
             setCapabilitiesKind(kind);
@@ -5852,8 +5883,18 @@ export default function App() {
           <StatusSheet open report={rt.statusReport}
             notices={rt.notices}
             error={rt.statusError}
+            resetCreditLoading={rt.statusRequestId !== null}
+            resetCreditResult={rt.resetCreditResult}
+            resetCreditDisabled={
+              rt.state !== "idle"
+              || rt.statusRequestId !== null
+              || !!rt.statusError
+              || state.connState !== "connected"
+              || !state.wrapperOnline
+            }
             onClose={() => setStatusOpenSid(null)}
             onRefresh={openStatus}
+            onConsumeResetCredit={consumeResetCredit}
             onDismissNotice={(noticeId) => {
               if (focusedSid) dispatch({
                 type: "dismiss_notice", sid: focusedSid, noticeId,
@@ -5871,9 +5912,11 @@ export default function App() {
           onRefresh={refreshStatus}
         />
       </Suspense>}
-      <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
-        creating={forkWorktreeCreating} error={forkWorktreeError}
-        onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
+      {forkWorktreeSession !== null && <Suspense fallback={null}>
+        <ForkWorktreeSheet open session={forkWorktreeSession}
+          creating={forkWorktreeCreating} error={forkWorktreeError}
+          onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
+      </Suspense>}
       <WorkDashboardSheet
         key={sessionScopeKey(machineId, engine, "work")}
         open={workManagerOpen && space === "work"}

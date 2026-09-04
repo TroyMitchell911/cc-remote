@@ -214,6 +214,68 @@ try {
   assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 0,
     "the matching status response installs and completes the request");
 
+  const resetStatus = {
+    ...currentStatus,
+    request_id: "reset-status",
+    reset_credits: {
+      available_count: 2,
+      credits: [{
+        id: "credit/one",
+        granted_at: 1_700_000_000,
+        expires_at: 1_800_000_000,
+        reset_type: "codexRateLimits" as const,
+        status: "available" as const,
+        title: "Launch reset",
+        description: "Reset an eligible Codex limit window",
+      }],
+    },
+  } satisfies StatusReport;
+  state = reduce(state, { type: "event", event: resetStatus });
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "reset-current",
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_reset_result",
+    to: "browser",
+    request_id: "reset-stale",
+    outcome: "reset",
+    credit_id: "credit/one",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, "reset-current");
+  assert.equal(state.runtimes[sid].resetCreditResult, null,
+    "a stale coupon result must not settle a newer click");
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_reset_result",
+    to: "browser",
+    request_id: "reset-current",
+    outcome: "reset",
+    credit_id: "credit/one",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].resetCreditResult?.outcome, "reset");
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits, null,
+    "coupon inventory must stay hidden until the authoritative refresh arrives");
+  state = reduce(state, { type: "event", event: {
+    ...resetStatus,
+    request_id: "reset-current",
+    reset_credits: { available_count: 1, credits: null },
+  } });
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits?.available_count, 1);
+
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "reset-error",
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "error", code: "internal", message: "provider secret detail",
+    request_id: "reset-error",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].resetCreditResult, null);
+  assert.equal(state.runtimes[sid].statusError,
+    "操作未完成，请稍后重试。");
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits, null,
+    "an ambiguous status operation must hide stale coupon inventory");
+
   const claudeSid = "claude-rate-session";
   let claudeState = {
     ...initialState,
@@ -503,6 +565,25 @@ try {
   assert.doesNotMatch(usageMarkup, /used_percent|rate_limit_reached/i);
   assert.match(usageMarkup, /aria-haspopup="true"/);
   assert.doesNotMatch(usageMarkup, /role="dialog"/);
+  const resetStatusMarkup = renderToStaticMarkup(createElement(StatusSheet, {
+    open: true,
+    report: { ...quotaReport, reset_credits: resetStatus.reset_credits },
+    notices: [],
+    error: null,
+    resetCreditLoading: false,
+    resetCreditDisabled: false,
+    resetCreditResult: null,
+    onClose: () => {},
+    onRefresh: () => {},
+    onConsumeResetCredit: () => true,
+  }));
+  assert.match(resetStatusMarkup, /重置券/);
+  assert.match(resetStatusMarkup, /<b>2<\/b> 张可用/);
+  assert.match(resetStatusMarkup, /Launch reset/);
+  assert.match(resetStatusMarkup, /Reset an eligible Codex limit window/);
+  assert.match(resetStatusMarkup, /使用下一张/,
+    "a capped detail list must retain the backend-selects-next action");
+  assert.doesNotMatch(resetStatusMarkup, /SECRET|paidCredits|balance/);
   const claudeUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
     engine: "claude",
     open: true,
@@ -627,6 +708,12 @@ try {
     /focusedEngine !== "codex"[\s\S]*refreshStatus\(\)/,
     "focused Codex sessions must load quota without opening /status");
   assert.match(appSource, /statusReport=\{rt\.statusReport\}/);
+  const statusSheetSource = readFileSync(resolve(
+    process.cwd(), "src/components/StatusSheet.tsx"), "utf8");
+  assert.match(statusSheetSource, /window\.confirm\(/,
+    "redeeming an earned reset credit must keep an explicit user confirmation");
+  assert.match(statusSheetSource, /resetLaunchRef\.current/,
+    "the lazy reset-credit UI must reject double clicks before React rerenders");
   const composerSource = readFileSync(resolve(
     process.cwd(), "src/components/Composer.tsx"), "utf8");
   assert.match(composerSource, /<UsageMeter/);
