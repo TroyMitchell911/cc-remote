@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 49
+PROTOCOL_VERSION = 52
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -290,6 +290,10 @@ class _Base(BaseModel):
     # echo this value; the relay drops them if `client_id` has since reconnected
     # onto another socket. Clients must not treat it as a durable identity.
     route_id: Optional[WireId] = None
+    # Relay-authenticated browser-account identity. Unlike ``client_id`` this
+    # survives page reloads and is shared by independent tabs signed in as the
+    # same relay user. The relay always replaces client-supplied values.
+    owner_id: Optional[WireId] = None
 
 
 class _Command(_Base):
@@ -594,6 +598,14 @@ class CloseBtw(_Command):
     # `sid` (inherited) = the btw fork to close.
 
 
+class SyncBtw(_Command):
+    """Hydrate one visible resident BTW from its bounded replay ring."""
+
+    type: Literal["sync_btw"] = "sync_btw"
+    cursor: Optional[int] = Field(default=None, ge=0)
+    generation: Optional[WireId] = None
+
+
 class Ping(_Base):
     type: Literal["ping"] = "ping"
     n: int = Field(ge=0, le=2_147_483_647)
@@ -744,7 +756,42 @@ class BtwOpened(_Base):
     request_id: WireId
     btw_sid: WireId
     parent_sid: WireId
-    engine: str
+    engine: Engine
+    created_at: float = Field(ge=0)
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+
+
+class BtwSessionInfo(BaseModel):
+    """One owner-scoped resident side chat in an authoritative BTW catalog."""
+
+    model_config = ConfigDict(extra="forbid")
+    btw_sid: WireId
+    parent_sid: WireId
+    engine: Literal["claude", "codex"]
+    created_at: float = Field(ge=0)
+    state: State = "idle"
+
+
+class BtwSync(_Base):
+    """Wrapper -> client: complete resident BTW catalog for this client.
+
+    This reconnect baseline is intentionally independent of the narrative ring:
+    an idle fork still exists even when no recent event mentions it.
+    """
+
+    type: Literal["btw_sync"] = "btw_sync"
+    generation: WireId
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+    sessions: list[BtwSessionInfo] = Field(max_length=64)
+
+
+class BtwClosed(_Base):
+    """Wrapper -> owner: one resident side chat was explicitly discarded."""
+
+    type: Literal["btw_closed"] = "btw_closed"
+    btw_sid: WireId
+    parent_sid: WireId
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
 
 
 class UserMsg(_Base):
@@ -837,12 +884,34 @@ class ToolResult(_Base):
     duration_ms: Optional[int] = Field(default=None, ge=0)
 
 
+class AsyncQuestionSpec(BaseModel):
+    """Native non-blocking question; a reply is ordinary user input, not approval."""
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=8192)
+    options: Optional[list[Annotated[str, Field(min_length=1, max_length=1024)]]] = Field(
+        default=None, max_length=16)
+
+
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
     message_id: WireId
     turn_id: Optional[WireId] = None
     background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
+    # These are message content, not pending AskUser/Future state. They survive
+    # history/reconnect and may be answered while the native turn keeps running.
+    delivery: Optional[Literal["async"]] = None
+    questions: Optional[list[AsyncQuestionSpec]] = Field(default=None, max_length=16)
+
+    @model_validator(mode="after")
+    def bounded_async_questions(self):
+        if self.questions is not None:
+            if self.delivery != "async":
+                raise ValueError("questions require async delivery")
+            if len(json.dumps([q.model_dump() for q in self.questions],
+                              ensure_ascii=False)) > 16 * 1024:
+                raise ValueError("async question metadata exceeds 16 KiB")
+        return self
 
 
 class ProcessEvent(_Base):
@@ -1150,7 +1219,7 @@ class NewSession(_Command):
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
-    # Claude only. None resolves to cc-remote's real 500k launch default.
+    # Claude only. None delegates to Claude Code's model/provider default.
     auto_compact_mode: Optional[AutoCompactMode] = None
     auto_compact_threshold_tokens: Optional[int] = Field(
         default=None,
@@ -2608,7 +2677,7 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, SyncBtw, BtwOpened, BtwSync, BtwClosed, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, RateLimitResetResult, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
@@ -2655,7 +2724,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_collaboration_mode": SetCollaborationMode,
     "open_btw": OpenBtw,
     "close_btw": CloseBtw,
+    "sync_btw": SyncBtw,
     "btw_opened": BtwOpened,
+    "btw_sync": BtwSync,
+    "btw_closed": BtwClosed,
     "set_perm": SetPerm,
     "get_permission_profiles": GetPermissionProfiles,
     "permission_profiles": PermissionProfiles,
@@ -2812,8 +2884,12 @@ def deserialize(raw: str | bytes) -> AnyMessage:
 
 
 def serialize(msg: BaseModel) -> str:
+    # ``owner_id`` is a relay-only routing envelope. Avoid adding a null field
+    # to every ordinary event.
+    common_exclude = ({"owner_id"}
+                      if getattr(msg, "owner_id", None) is None else set())
     if isinstance(msg, ContextReport):
-        exclude: set[str] = set()
+        exclude: set[str] = set(common_exclude)
         if all(value is None for value in (
                 msg.session_tokens, msg.fixed_tokens,
                 msg.session_percentage)):
@@ -2831,7 +2907,7 @@ def serialize(msg: BaseModel) -> str:
             exclude.add("raw_max_tokens")
         if exclude:
             return msg.model_dump_json(exclude=exclude)
-    return msg.model_dump_json()
+    return msg.model_dump_json(exclude=common_exclude)
 
 
 def is_downstream(msg: BaseModel) -> bool:

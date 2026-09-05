@@ -894,6 +894,27 @@ def test_health_reports_loaded_protocol_without_caching():
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_btw_owner_identity_is_stable_opaque_and_subject_scoped():
+    secret = "relay-secret" * 4
+    alice = server._btw_owner_id(
+        server.SessionClaims(expires_at=10, jti="a" * 16, subject="alice"),
+        secret,
+    )
+    refreshed_alice = server._btw_owner_id(
+        server.SessionClaims(expires_at=20, jti="b" * 16, subject="alice"),
+        secret,
+    )
+    bob = server._btw_owner_id(
+        server.SessionClaims(expires_at=20, jti="c" * 16, subject="bob"),
+        secret,
+    )
+
+    assert alice == refreshed_alice
+    assert alice != bob
+    assert alice.startswith("owner-")
+    assert "alice" not in alice
+
+
 def test_allow_insecure_http_permits_a_plain_http_public_ip_origin():
     # Explicit opt-in escape hatch: a bare public IP without a TLS terminator.
     cfg = _cfg(public_origin="http://198.51.100.10:8765", allow_insecure_http=True)

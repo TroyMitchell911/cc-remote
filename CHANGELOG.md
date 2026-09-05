@@ -4,6 +4,26 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v52. Codex native
+  async questions retain their bounded structured metadata in live events and
+  history, and render as nonblocking inline forms. Replies use the existing
+  session-scoped query/steer outbox; they never masquerade as approval requests
+  or mark a running turn complete. Rebuild older Codex history projections.
+- Scope the BTW panel's open preference by device, surface, engine and parent,
+  preserving background chats without opening empty panels on unrelated
+  sessions. The legacy unscoped visibility flag is ignored; retained chats are
+  untouched. Restore safe Markdown details/summary disclosures, and preserve
+  native Mac drag-selection auto-scrolling through deferred layout updates.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v51. `/btw` now
+  behaves as a resident side-chat workspace: the shortcut collapses instead of
+  destroying it, each parent may own several explicitly closable chats, and an
+  relay-authenticated owner catalog plus bounded ring replay restores them
+  after reload or reconnect in any tab or device signed in as that owner.
+  Page-scoped connection ids keep duplicated tabs independent. Codex side chats
+  also use the Codex presentation path, hiding successful hook plumbing while
+  retaining actionable failures. New side chats start at `xhigh` reasoning
+  (clamped to the selected model's capabilities), and the compact Goal/Plan
+  monitor yields while a mobile input method is open, then returns unchanged.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v49 and split the
   experimental Codex managed-browser/Computer Use stack into its own feature
   branch. The Claude runtime line no longer ships Playwright, browser control
@@ -16,13 +36,15 @@
   scoped, and uses the reliable command id as the native idempotency key;
   paid credit balances and spend controls remain private.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v47. Managed
-  Claude sessions now launch with a real 500K autocompact threshold by default;
-  reductions compact and verify a native boundary before reconnecting, while
-  crash-safe desired/applied state prevents restarts and forks from applying a
-  smaller window early. Delayed SDK title metadata no longer triggers a false
-  external reload, and genuine transcript reloads preserve the selected
-  long-context model so a 500K threshold cannot become paired with an implicit
-  200K model. cc-remote no longer intercepts or rewrites Claude's native
+  Claude sessions delegate the default autocompact window to Claude Code so it
+  follows the selected model, account, gateway, and native settings; v3 control
+  records created with cc-remote's short-lived forced 500K default migrate back
+  to that native behavior. Explicit reductions still compact and verify a
+  native boundary before reconnecting, while crash-safe desired/applied state
+  prevents restarts and forks from applying a smaller window early. Delayed SDK
+  title metadata no longer triggers a false external reload, and genuine
+  transcript reloads preserve the selected long-context model. cc-remote no
+  longer intercepts or rewrites Claude's native
   image/PDF `Read` tools; model context limits, media handling, and automatic
   compaction stay owned by Claude Code.
 - Expose the Codex Fast service tier in Work for both new and resident

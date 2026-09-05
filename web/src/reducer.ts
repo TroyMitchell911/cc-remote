@@ -26,7 +26,6 @@ import {
   MAX_BACKGROUND_PROCESS_ITEMS,
 } from "./protocol";
 import type { Catalog } from "./data";
-import { DEFAULT_AUTO_COMPACT_TOKENS } from "./auto-compact";
 import type { DiffLine, GitDiffSection } from "./diff";
 import { parseGitDiff } from "./diff";
 import { matchModelId } from "./data";
@@ -420,10 +419,12 @@ export interface AppState {
   // A disconnected/rebuilding browse window remains paintable but owns no
   // request authority. Only a matching authoritative head may reactivate it.
   retainedHistoryBrowse: HistoryBrowseProjection | null;
-  // /btw ephemeral side-forks are owned by their parent sessions. Their
-  // runtimes live under each binding's `sid`; navigation only changes which
-  // binding is visible and never reassigns a fork to another parent.
-  btwByParentSid: Record<string, { sid: string; engine: string }>;
+  // /btw ephemeral side-forks are owned by their parent sessions. A parent can
+  // keep several resident chats; exactly one is selected in the side panel.
+  btwByParentSid: Record<string, BtwGroup>;
+  // Orders the authoritative reconnect catalog and subsequent open/close
+  // mutations. It is scoped to one Wrapper generation (which resets state).
+  btwRevision: number;
   // Model catalogs the engine reported (currently Codex only). Claude still sends
   // an empty catalog plus its cwd-aware defaults; data.ts keeps the static list.
   catalog: Catalog;
@@ -435,6 +436,18 @@ export interface AppState {
   // engine -> cwd those defaults were resolved for. Claude defaults are only
   // rendered when this still matches the new-chat form's directory.
   catalogDefaultCwd: Record<string, string>;
+}
+
+export interface BtwChat {
+  sid: string;
+  engine: "claude" | "codex";
+  createdAt: number;
+  state: "idle" | "running" | "interrupting" | "draining";
+}
+
+export interface BtwGroup {
+  chats: BtwChat[];
+  activeSid: string;
 }
 
 export function createRuntime(): SessionRuntime {
@@ -515,7 +528,8 @@ export type Action =
   | { type: "preview_authorization_retry_failed"; sid: string; authorizationId: string; requestId: string }
   | { type: "start_file_save"; requestId: string; content: string }
   | { type: "clear_artifact" }
-  | { type: "clear_btw"; parentSid: string }
+  | { type: "select_btw"; parentSid: string; btwSid: string }
+  | { type: "clear_btw"; parentSid: string; btwSid: string }
   | { type: "clear_all_btw" }
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
@@ -573,6 +587,7 @@ export const initialState: AppState = {
   historyBrowse: null,
   retainedHistoryBrowse: null,
   btwByParentSid: {},
+  btwRevision: 0,
   catalog: {},
   catalogDefault: {},
   catalogDefaultEffort: {},
@@ -1401,7 +1416,8 @@ function jsonChars(value: unknown): number {
 
 function blockPayloadChars(block: Block): number {
   if (block.kind === "text") {
-    return 128 + block.message_id.length + block.text.length;
+    return 128 + block.message_id.length + block.text.length
+      + (block.questions ? jsonChars(block.questions) : 0);
   }
   if (block.kind === "tool") {
     return 256 + block.message_id.length + block.tool_use_id.length
@@ -2255,7 +2271,8 @@ export function reduce(state: AppState, action: Action): AppState {
       return {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
-        newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
+        newChat: null, btwByParentSid: {}, btwRevision: 0,
+        catalog: {}, catalogDefault: {},
         catalogDefaultEffort: {}, catalogDefaultCwd: {}, claudeProfiles: [],
         defaultClaudeProfileId: null, claudeProfileByScope: {}, codexProfiles: [],
         defaultCodexProfileId: null, codexProfileByScope: {},
@@ -2604,21 +2621,54 @@ export function reduce(state: AppState, action: Action): AppState {
       } };
     case "clear_artifact":
       return { ...state, artifact: null };
+    case "select_btw": {
+      const group = state.btwByParentSid[action.parentSid];
+      if (!group || group.activeSid === action.btwSid
+          || !group.chats.some((chat) => chat.sid === action.btwSid)) {
+        return state;
+      }
+      return {
+        ...state,
+        btwByParentSid: {
+          ...state.btwByParentSid,
+          [action.parentSid]: { ...group, activeSid: action.btwSid },
+        },
+      };
+    }
     case "clear_btw": {
-      const binding = state.btwByParentSid[action.parentSid];
-      if (!binding) return state;
+      const group = state.btwByParentSid[action.parentSid];
+      if (!group || !group.chats.some((chat) => chat.sid === action.btwSid)) {
+        return state;
+      }
       const runtimes = { ...state.runtimes };
-      delete runtimes[binding.sid];
+      delete runtimes[action.btwSid];
+      const chats = group.chats.filter((chat) => chat.sid !== action.btwSid);
       const btwByParentSid = { ...state.btwByParentSid };
-      delete btwByParentSid[action.parentSid];
+      if (chats.length === 0) {
+        delete btwByParentSid[action.parentSid];
+      } else {
+        const closedIndex = group.chats.findIndex(
+          (chat) => chat.sid === action.btwSid);
+        const fallback = chats[Math.min(closedIndex, chats.length - 1)];
+        btwByParentSid[action.parentSid] = {
+          chats,
+          activeSid: group.activeSid === action.btwSid
+            ? fallback.sid : group.activeSid,
+        };
+      }
       return { ...state, btwByParentSid, runtimes };
     }
     case "clear_all_btw": {
-      const bindings = Object.values(state.btwByParentSid);
-      if (bindings.length === 0) return state;
+      const groups = Object.values(state.btwByParentSid);
+      if (groups.length === 0) {
+        return state.btwRevision === 0
+          ? state : { ...state, btwRevision: 0 };
+      }
       const runtimes = { ...state.runtimes };
-      for (const binding of bindings) delete runtimes[binding.sid];
-      return { ...state, btwByParentSid: {}, runtimes };
+      for (const group of groups) {
+        for (const chat of group.chats) delete runtimes[chat.sid];
+      }
+      return { ...state, btwByParentSid: {}, btwRevision: 0, runtimes };
     }
     case "clear_session_list":
       return {
@@ -3133,8 +3183,8 @@ export function reduce(state: AppState, action: Action): AppState {
     case "prune_runtimes": {
       const protectedSids = new Set(action.protectedSids);
       if (state.focusedSid) protectedSids.add(state.focusedSid);
-      for (const binding of Object.values(state.btwByParentSid)) {
-        protectedSids.add(binding.sid);
+      for (const group of Object.values(state.btwByParentSid)) {
+        for (const chat of group.chats) protectedSids.add(chat.sid);
       }
       if (state.artifact?.sid) protectedSids.add(state.artifact.sid);
       const runtimes = pruneRuntimeMap(state.runtimes, protectedSids);
@@ -3162,11 +3212,10 @@ export function reduce(state: AppState, action: Action): AppState {
           cwdSource: action.cwdSource ?? "default",
           model: action.model ?? null,
           effort: action.effort ?? null,
-          autoCompactMode: action.autoCompactMode ?? "custom",
+          autoCompactMode: action.autoCompactMode ?? "inherit",
           autoCompactThresholdTokens:
-            (action.autoCompactMode ?? "custom") === "custom"
-              ? action.autoCompactThresholdTokens
-                ?? DEFAULT_AUTO_COMPACT_TOKENS
+            action.autoCompactMode === "custom"
+              ? action.autoCompactThresholdTokens ?? null
               : null,
           claudeProfileId: action.claudeProfileId ?? null,
           codexProfileId: action.codexProfileId ?? null,
@@ -3253,6 +3302,15 @@ function reduceEvent(
   state: AppState, e: ServerEvent, boundCompletedTurns = true,
   ownership?: EventOwnership,
 ): AppState {
+  // A close can race a reconnect replay. Once the authoritative catalog no
+  // longer owns a btw-* sid, late Snapshot/narrative frames must not recreate
+  // an empty ghost runtime after BtwClosed removed it.
+  if (e.sid?.startsWith("btw-")
+      && e.type !== "btw_opened" && e.type !== "btw_closed"
+      && !Object.values(state.btwByParentSid).some((group) =>
+        group.chats.some((chat) => chat.sid === e.sid))) {
+    return state;
+  }
   // History is built asynchronously. Any newer replayable frame — including a
   // state/ownership update with no message block — makes an older History
   // envelope stale for control state. Narrative event reducers also advance
@@ -3277,6 +3335,56 @@ function reduceEvent(
     };
   }
   switch (e.type) {
+    case "btw_sync": {
+      if (e.revision < state.btwRevision) return state;
+      const oldChats = new Set(Object.values(state.btwByParentSid).flatMap(
+        (group) => group.chats.map((chat) => chat.sid)));
+      const grouped: Record<string, BtwChat[]> = {};
+      for (const item of e.sessions) {
+        const chats = grouped[item.parent_sid] ?? [];
+        if (!chats.some((chat) => chat.sid === item.btw_sid)) {
+          chats.push({
+            sid: item.btw_sid,
+            engine: item.engine,
+            createdAt: item.created_at,
+            state: item.state ?? "idle",
+          });
+        }
+        grouped[item.parent_sid] = chats;
+      }
+      const btwByParentSid: Record<string, BtwGroup> = {};
+      const runtimes = { ...state.runtimes };
+      const retained = new Set<string>();
+      for (const [parentSid, unsorted] of Object.entries(grouped)) {
+        const chats = [...unsorted].sort((a, b) =>
+          a.createdAt - b.createdAt || a.sid.localeCompare(b.sid));
+        for (const chat of chats) {
+          retained.add(chat.sid);
+          const runtime = runtimes[chat.sid];
+          // A sequenced live State is newer than a catalog snapshot that can
+          // race it on an already-synced socket. After disconnect every runtime
+          // is marked unsynced, so the same catalog becomes the authoritative
+          // reconnect seed until SyncBtw supplies its selected-chat Snapshot.
+          runtimes[chat.sid] = runtime
+            ? runtime.syncReady ? runtime : { ...runtime, state: chat.state }
+            : { ...createRuntime(), state: chat.state };
+        }
+        const previous = state.btwByParentSid[parentSid];
+        const activeSid = previous
+          && chats.some((chat) => chat.sid === previous.activeSid)
+          ? previous.activeSid : chats[chats.length - 1].sid;
+        btwByParentSid[parentSid] = { chats, activeSid };
+      }
+      for (const oldSid of oldChats) {
+        if (!retained.has(oldSid)) delete runtimes[oldSid];
+      }
+      return {
+        ...state,
+        btwByParentSid,
+        btwRevision: e.revision,
+        runtimes,
+      };
+    }
     case "snapshot": {
       // Per-session: the frame's sid is the runtime key; cc_session_id is the
       // real cc id (may still be null while a brand-new session's id is captured).
@@ -3607,8 +3715,22 @@ function reduceEvent(
       if (parentBtw) {
         const targetBtw = btwByParentSid[session_id];
         btwByParentSid = { ...btwByParentSid };
-        if (!targetBtw) btwByParentSid[session_id] = parentBtw;
-        else if (targetBtw.sid !== parentBtw.sid) delete runtimes[parentBtw.sid];
+        if (!targetBtw) {
+          btwByParentSid[session_id] = parentBtw;
+        } else {
+          const chats = [...targetBtw.chats];
+          for (const chat of parentBtw.chats) {
+            if (!chats.some((candidate) => candidate.sid === chat.sid)) {
+              chats.push(chat);
+            }
+          }
+          chats.sort((a, b) => a.createdAt - b.createdAt
+            || a.sid.localeCompare(b.sid));
+          btwByParentSid[session_id] = {
+            chats,
+            activeSid: targetBtw.activeSid || parentBtw.activeSid,
+          };
+        }
         delete btwByParentSid[old_key];
       }
       const historyRecovery = state.historyRecovery?.sid === old_key
@@ -3767,8 +3889,8 @@ function reduceEvent(
               ? "inherited" : "default") as "inherited" | "default",
           model: null,
           effort: null,
-          autoCompactMode: "custom",
-          autoCompactThresholdTokens: DEFAULT_AUTO_COMPACT_TOKENS,
+          autoCompactMode: "inherit",
+          autoCompactThresholdTokens: null,
           claudeProfileId: selectedClaudeProfileId,
           codexProfileId: selectedCodexProfileId,
         };
@@ -5261,15 +5383,66 @@ function reduceEvent(
       // Bind the fork to its authoritative parent without changing focus. A
       // response may arrive after the user navigates; it must remain hidden
       // until that exact parent is viewed again.
-      const runtimes = { ...state.runtimes, [e.btw_sid]: state.runtimes[e.btw_sid] ?? createRuntime() };
+      if (e.revision < state.btwRevision) return state;
+      const runtimes = {
+        ...state.runtimes,
+        [e.btw_sid]: state.runtimes[e.btw_sid] ?? createRuntime(),
+      };
       const previous = state.btwByParentSid[e.parent_sid];
-      if (previous && previous.sid !== e.btw_sid) delete runtimes[previous.sid];
+      const chat: BtwChat = {
+        sid: e.btw_sid,
+        engine: e.engine,
+        createdAt: e.created_at,
+        state: "idle",
+      };
+      const alreadyKnown = previous?.chats.some(
+        (candidate) => candidate.sid === e.btw_sid) ?? false;
+      const chats = alreadyKnown
+        ? previous!.chats.map((candidate) =>
+            candidate.sid === e.btw_sid ? chat : candidate)
+        : [...(previous?.chats ?? []), chat];
+      chats.sort((a, b) => a.createdAt - b.createdAt
+        || a.sid.localeCompare(b.sid));
       return {
         ...state,
         btwByParentSid: {
           ...state.btwByParentSid,
-          [e.parent_sid]: { sid: e.btw_sid, engine: e.engine },
+          [e.parent_sid]: {
+            chats,
+            activeSid: alreadyKnown && previous
+              ? previous.activeSid : e.btw_sid,
+          },
         },
+        btwRevision: e.revision,
+        runtimes,
+      };
+    }
+    case "btw_closed": {
+      if (e.revision < state.btwRevision) return state;
+      const group = state.btwByParentSid[e.parent_sid];
+      const runtimes = { ...state.runtimes };
+      delete runtimes[e.btw_sid];
+      if (!group || !group.chats.some((chat) => chat.sid === e.btw_sid)) {
+        return { ...state, btwRevision: e.revision, runtimes };
+      }
+      const chats = group.chats.filter((chat) => chat.sid !== e.btw_sid);
+      const btwByParentSid = { ...state.btwByParentSid };
+      if (chats.length === 0) {
+        delete btwByParentSid[e.parent_sid];
+      } else {
+        const closedIndex = group.chats.findIndex(
+          (chat) => chat.sid === e.btw_sid);
+        const fallback = chats[Math.min(closedIndex, chats.length - 1)];
+        btwByParentSid[e.parent_sid] = {
+          chats,
+          activeSid: group.activeSid === e.btw_sid
+            ? fallback.sid : group.activeSid,
+        };
+      }
+      return {
+        ...state,
+        btwByParentSid,
+        btwRevision: e.revision,
         runtimes,
       };
     }
@@ -5406,8 +5579,12 @@ function reduceEvent(
         rt.statusReport = mergeRateLimitUpdate(rt.statusReport, rt.rateLimits);
       });
     case "replay_start": {
-      const needsAuthoritativeHistory = e.truncated || !!e.rebuild;
       const replaySid = e.sid ?? state.focusedSid;
+      // Ephemeral side chats have no canonical History endpoint. Their ring is
+      // the authoritative bounded projection, so keep and apply a retained
+      // suffix even when its older prefix has fallen out of the ring.
+      const needsAuthoritativeHistory = (e.truncated || !!e.rebuild)
+        && !replaySid?.startsWith("btw-");
       const submittedTurn = needsAuthoritativeHistory && !e.rebuild
         ? recoverableSubmittedTurn(
             state.runtimes[replaySid ?? ""] ?? createRuntime(),
@@ -6074,6 +6251,10 @@ function reduceEvent(
             }
             b.channel = resolvedChannel(b.channel, e.channel ?? "unknown");
             b.done = true;
+            if (e.delivery === "async") {
+              b.delivery = "async";
+              if (e.questions?.length) b.questions = e.questions;
+            }
             if (e.background === true || b.background === true) {
               b.doneTs = eventTimestampMs(e.ts);
               b.background = true;
@@ -6081,6 +6262,7 @@ function reduceEvent(
             if (b.channel === "commentary" && b.text.length > 0) {
               settleVisibleProcessIfComplete(t, eventTimestampMs(e.ts));
             }
+            if (e.delivery === "async" && boundCompletedTurns) limitTurnBlocks(t);
             break;
           }
         }

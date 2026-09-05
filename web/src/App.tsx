@@ -42,7 +42,6 @@ import {
 } from "./components/NewChatView";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
-import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
@@ -54,6 +53,10 @@ import {
   codexProfilePresentation,
 } from "./codex-profile-presentation";
 import { parseGoalCommand } from "./goal-command";
+import {
+  BTW_PANEL_SCOPES_KEY, btwPanelScopeKey, readBtwPanelScopes,
+  rekeyBtwPanelScope, setBtwPanelScope,
+} from "./btw-panel-state";
 import {
   dismissGoalUi,
   goalStableIdentity,
@@ -102,7 +105,7 @@ import {
   type PendingWorktreeFork,
   withoutForkFocusPlaceholder,
 } from "./session-worktree";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
+import { matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexWebSearchMode, type PermissionProfileInfo,
@@ -264,6 +267,9 @@ const ForkWorktreeSheet = lazy(() => import("./components/ForkWorktreeSheet").th
 const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
   ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
 ));
+const WorkArtifactsSheet = lazy(() => import("./components/WorkArtifactsSheet").then(
+  ({ WorkArtifactsSheet: Sheet }) => ({ default: Sheet }),
+));
 const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").then(
   ({ CapabilitiesSheet: Sheet }) => ({ default: Sheet }),
 ));
@@ -326,7 +332,10 @@ export default function App() {
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
   // The right slot is shared by artifacts and /btw.
-  const [rightView, setRightView] = useState<RightPanelView>("diff");
+  const [btwPanelScopes, setBtwPanelScopes] = useState(
+    () => readBtwPanelScopes(sessionStorage));
+  const [rightView, setRightView] = useState<RightPanelView>(
+    btwPanelScopes.length ? "btw" : "diff");
   const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
   const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
   const setAgentDetailListener = useCallback(
@@ -431,8 +440,6 @@ export default function App() {
   }
   const stateRef = useRef(state);
   stateRef.current = state;
-  const rightViewRef = useRef(rightView);
-  rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
   const archivedBrowseRef = useRef<string | null>(null);
   // Reducer state becomes visible after React commits. Keep the command id in a
@@ -517,6 +524,7 @@ export default function App() {
   >>(new Map());
   const [terminalHistoryRepairEpoch, setTerminalHistoryRepairEpoch] =
     useState(0);
+  const btwHydrationKeyRef = useRef("");
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
     (context) => {
       dispatch({ type: "history_detail_cancelled", context });
@@ -580,11 +588,10 @@ export default function App() {
   const activeBtwByParentRef = useRef<Map<
     string, { requestId: string; sid: string }
   >>(new Map());
-  // Retain recently cancelled ids so a late response can be identified and
-  // discarded (and a late successful fork can be closed) without disturbing a
-  // newer opening spinner. Bounded because a peer may disappear permanently.
+  // Correlate each pending creation with its original parent. Navigating away
+  // never destroys the result: the owner-scoped open remains pinned there
+  // until its explicit close button is used.
   const btwRequestParentsRef = useRef<Map<string, string>>(new Map());
-  const discardedBtwSidsRef = useRef<Set<string>>(new Set());
   // A marker may arrive while its session is in the background and while an
   // IndexedDB read is already in flight. The set blocks new cache use; the
   // epoch rejects reads that started before the destructive mutation.
@@ -732,9 +739,9 @@ export default function App() {
     rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
-    closeBtw: () => void;
+    collapseBtw: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
-    getDiff: () => {}, openBtw: () => {}, closeBtw: () => {} });
+    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -762,7 +769,6 @@ export default function App() {
     pendingBtwByParentRef.current.clear();
     activeBtwByParentRef.current.clear();
     btwRequestParentsRef.current.clear();
-    discardedBtwSidsRef.current.clear();
     setBtwOpeningByParentSid({});
     setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
@@ -824,11 +830,49 @@ export default function App() {
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
-  const visibleParentSid = state.newChat ? null : focusedSid;
-  const activeBtw = visibleParentSid ? state.btwByParentSid[visibleParentSid] : undefined;
+  const visibleParentSid = state.newChat || previousMachineRef.current !== machineId
+    ? null : focusedSid;
+  const btwPanelKey = visibleParentSid
+    ? btwPanelScopeKey(machineId, space, engine, visibleParentSid) : null;
+  const btwPanelVisible = !!btwPanelKey && btwPanelScopes.includes(btwPanelKey);
+  const btwPanelVisibleRef = useRef(btwPanelVisible);
+  btwPanelVisibleRef.current = btwPanelVisible;
+  const activeBtwGroup = visibleParentSid
+    ? state.btwByParentSid[visibleParentSid] : undefined;
+  const activeBtw = activeBtwGroup?.chats.find(
+    (chat) => chat.sid === activeBtwGroup.activeSid);
   const activeBtwSid = activeBtw?.sid ?? null;
   const btwOpening = visibleParentSid
     ? !!btwOpeningByParentSid[visibleParentSid] : false;
+  // The rendered slot owns desktop split space, never retained chat data.
+  // A hidden BTW can keep running; an empty/opening visible BTW still needs room.
+  const btwShowing = btwPanelVisible && !!visibleParentSid;
+  const visibleRightPanel = agentPanel ? "agent"
+    : rightView === "btw" && btwShowing ? "btw"
+      : state.artifact ? "diff" : btwShowing ? "btw" : null;
+  // Questions, hydration and completion receipts must agree with the rendered
+  // slot, including when an agent or artifact covers a retained side chat.
+  const visibleBtwSid = visibleRightPanel === "btw" ? activeBtwSid : null;
+  const visibleBtwSidRef = useRef(visibleBtwSid);
+  visibleBtwSidRef.current = visibleBtwSid;
+  const activeBtwQuestionVisible = !!(
+    visibleBtwSid && state.runtimes[visibleBtwSid]?.pendingQuestion
+  );
+  useEffect(() => {
+    if (!visibleBtwSid
+        || state.connState !== "connected" || !state.wrapperOnline) {
+      btwHydrationKeyRef.current = "";
+      return;
+    }
+    if (btwHydrationKeyRef.current === visibleBtwSid) return;
+    if (wsRef.current?.sendSyncBtw(visibleBtwSid)) {
+      btwHydrationKeyRef.current = visibleBtwSid;
+    }
+  }, [
+    visibleBtwSid,
+    state.connState,
+    state.wrapperOnline,
+  ]);
   const completionBadgeSids = new Set([
     ...Object.keys(completionReceipts),
     ...state.sessions.filter(
@@ -1212,7 +1256,7 @@ export default function App() {
       const current = stateRef.current;
       const parentSid = current.newChat ? null : current.focusedSid;
       if (!parentSid) return;
-      const binding = current.btwByParentSid[parentSid];
+      const btwSid = visibleBtwSidRef.current;
       const completion = newestCompletionProjection(
         current.runtimes[parentSid]?.completion,
         catalogCompletionProjection(current.sessions.find(
@@ -1226,10 +1270,9 @@ export default function App() {
       setCompletionReceipts((receipts) => {
         let next = acknowledgeCompletion(
           receipts, parentSid, { main: mainAcknowledgementQueued });
-        if (binding
-            && (rightViewRef.current === "btw" || !current.artifact)) {
+        if (btwSid) {
           next = acknowledgeCompletion(
-            next, parentSid, { btwSid: binding.sid });
+            next, parentSid, { btwSid });
         }
         return next;
       });
@@ -1240,9 +1283,7 @@ export default function App() {
       "visibilitychange", acknowledgeVisible);
   }, [
     visibleParentSid,
-    activeBtwSid,
-    rightView,
-    state.artifact,
+    visibleBtwSid,
     rt.completion?.id,
     rt.completion?.unread,
     focusedSession?.completion_id,
@@ -1307,7 +1348,7 @@ export default function App() {
     const current = stateRef.current;
     const focusedSid = current.newChat ? null : current.focusedSid;
     const activeBtwSid = focusedSid
-      ? current.btwByParentSid[focusedSid]?.sid ?? null : null;
+      ? current.btwByParentSid[focusedSid]?.activeSid ?? null : null;
     if (!ws || (focusedSid !== sid && activeBtwSid !== sid)) return false;
     const cache = inlineImageAssetsRef.current;
     const assetKey = stablePreviewId ?? path;
@@ -1512,6 +1553,12 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        BTW_PANEL_SCOPES_KEY, JSON.stringify(btwPanelScopes));
+    } catch { /* storage is best-effort in private browsing */ }
+  }, [btwPanelScopes]);
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
   // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
@@ -2394,7 +2441,7 @@ export default function App() {
           if (msg.type === "turn_end" && msg.sid && !msg.result.is_error) {
             const current = stateRef.current;
             const btwOwner = Object.entries(current.btwByParentSid).find(
-              ([, binding]) => binding.sid === msg.sid,
+              ([, group]) => group.chats.some((chat) => chat.sid === msg.sid),
             );
             const isBtw = !!btwOwner;
             // A closed/stale fork can still drain one final terminal frame.
@@ -2404,10 +2451,11 @@ export default function App() {
               const sameVisibleParent = !document.hidden
                 && !current.newChat
                 && current.focusedSid === parentSid;
-              const btwPanelVisible = isBtw
+              const isBtwPanelVisible = isBtw
                 && sameVisibleParent
-                && (rightViewRef.current === "btw" || !current.artifact);
-              const alreadySeen = isBtw ? btwPanelVisible : sameVisibleParent;
+                && visibleBtwSidRef.current === msg.sid;
+              const alreadySeen = isBtw
+                ? isBtwPanelVisible : sameVisibleParent;
               if (!alreadySeen) {
                 setCompletionReceipts((receipts) => markCompletionUnread(
                   receipts,
@@ -2486,6 +2534,7 @@ export default function App() {
               );
             }
           } else if (msg.type === "replay_start" && msg.sid
+              && !msg.sid.startsWith("btw-")
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
             clearHistoryDetailRequests();
@@ -2866,39 +2915,75 @@ export default function App() {
               && stateRef.current.focusedSid === msg.session_id) {
             setEditPrompt(msg.prefill_text);
           }
+          if (msg.type === "btw_sync"
+              && msg.revision >= stateRef.current.btwRevision) {
+            const retained = new Set(msg.sessions.map((chat) => chat.btw_sid));
+            const removed = Object.entries(stateRef.current.btwByParentSid)
+              .flatMap(([parentSid, group]) => group.chats
+                .filter((chat) => !retained.has(chat.sid))
+                .map((chat) => [parentSid, chat] as const));
+            for (const [, chat] of removed) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${chat.sid}`,
+                ));
+              }
+            }
+            if (removed.length > 0) {
+              setBtwSendModeBySid((current) => {
+                const next = { ...current };
+                for (const [, chat] of removed) delete next[chat.sid];
+                return next;
+              });
+              setCompletionReceipts((current) => removed.reduce(
+                (next, [parentSid, chat]) => acknowledgeCompletion(
+                  next, parentSid, { btwSid: chat.sid }),
+                current,
+              ));
+            }
+          }
           if (msg.type === "btw_opened") {
+            const knownChat = Object.values(
+              stateRef.current.btwByParentSid).some((group) =>
+              group.chats.some((chat) => chat.sid === msg.btw_sid));
             const requestedParent = btwRequestParentsRef.current.get(
               msg.request_id) ?? null;
             const pendingRequestId = requestedParent
               ? pendingBtwByParentRef.current.get(requestedParent) ?? null
               : null;
+            if (msg.revision < stateRef.current.btwRevision) {
+              // A newer authoritative sync/close already decided this fork's
+              // existence. Settle this exact pending command as well: after a
+              // reload the catalog can restore the fork before its cached open
+              // response arrives, and leaving the spinner behind would disable
+              // creation of every later sibling side chat.
+              if (requestedParent && matchesBtwRequest(
+                pendingRequestId, msg.request_id)) {
+                pendingBtwByParentRef.current.delete(requestedParent);
+                setBtwOpeningFor(requestedParent, false);
+              }
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
+            if (knownChat && !matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
+              // Reliable response replay after BtwSync. The catalog already
+              // owns it, and re-applying the open would steal tab selection.
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
             const activeRequest = activeBtwByParentRef.current.get(
               msg.parent_sid)
               ?? (requestedParent
                 ? activeBtwByParentRef.current.get(requestedParent) : undefined)
               ?? null;
-            const disposition = classifyBtwOpened(
-              pendingRequestId, activeRequest, msg);
-            if (disposition === "duplicate") {
+            if (activeRequest?.requestId === msg.request_id
+                && activeRequest.sid === msg.btw_sid) {
               btwRequestParentsRef.current.delete(msg.request_id);
               return; // cached replay after a lost ACK; the fork is already open
             }
-            if (disposition === "stale") {
-              // The user cancelled, navigated, or started a newer request while
-              // this fork was connecting. Never let the stale response open the
-              // panel, and tear down the now-unowned ephemeral session.
-              const discarded = discardedBtwSidsRef.current;
-              discarded.add(msg.btw_sid);
-              while (discarded.size > 64) {
-                const oldest = discarded.values().next().value as string | undefined;
-                if (!oldest) break;
-                discarded.delete(oldest);
-              }
-              btwRequestParentsRef.current.delete(msg.request_id);
-              ws.sendCloseBtw(msg.btw_sid);
-              return;
-            }
-            if (requestedParent) {
+            if (requestedParent && matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
               pendingBtwByParentRef.current.delete(requestedParent);
               activeBtwByParentRef.current.delete(requestedParent);
               setBtwOpeningFor(requestedParent, false);
@@ -2908,7 +2993,29 @@ export default function App() {
               requestId: msg.request_id,
               sid: msg.btw_sid,
             });
-            setBtwOpeningFor(msg.parent_sid, false);
+          } else if (msg.type === "btw_closed") {
+            const group = stateRef.current.btwByParentSid[msg.parent_sid];
+            const chat = group?.chats.find(
+              (candidate) => candidate.sid === msg.btw_sid);
+            const tracked = activeBtwByParentRef.current.get(msg.parent_sid);
+            if (tracked?.sid === msg.btw_sid) {
+              activeBtwByParentRef.current.delete(msg.parent_sid);
+            }
+            if (chat) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${msg.btw_sid}`,
+                ));
+              }
+            }
+            setBtwSendModeBySid((current) => {
+              if (!(msg.btw_sid in current)) return current;
+              const next = { ...current };
+              delete next[msg.btw_sid];
+              return next;
+            });
+            setCompletionReceipts((current) => acknowledgeCompletion(
+              current, msg.parent_sid, { btwSid: msg.btw_sid }));
           } else if (msg.type === "error" && msg.request_id
               && btwRequestParentsRef.current.has(msg.request_id)) {
             const parentSid = btwRequestParentsRef.current.get(msg.request_id)!;
@@ -3064,7 +3171,6 @@ export default function App() {
             }
           }
           if (msg.type === "snapshot") {
-            if (consumeDiscardedBtwSnapshot(discardedBtwSidsRef.current, msg)) return;
             handleSnapshot(msg, ownership);
             return;
           }
@@ -3116,11 +3222,19 @@ export default function App() {
               if (!targetParentBtw) {
                 activeBtwByParentRef.current.set(
                   msg.session_id, activeParentBtw);
-              } else if (targetParentBtw.sid !== activeParentBtw.sid) {
-                ws.sendCloseBtw(activeParentBtw.sid);
               }
+              // This ref is only a response-replay hint. The reducer's BTW
+              // catalog owns every resident child, so a rekey collision must
+              // not discard either side chat.
             }
             if (ownership) {
+              setBtwPanelScopes((current) => rekeyBtwPanelScope(
+                current,
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.old_key),
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.session_id),
+              ));
               composerDraftsRef.current.rekey(
                 composerDraftKey(
                   ownership.machineId, ownership.space, ownership.engine,
@@ -3490,7 +3604,6 @@ export default function App() {
           setMigrateError(null);
           activeBtwByParentRef.current.clear();
           btwRequestParentsRef.current.clear();
-          discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
@@ -3545,11 +3658,11 @@ export default function App() {
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
-          discardedBtwSidsRef.current.clear();
           setCompletionReceipts(discardBtwCompletionReceipts);
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
           if (Object.keys(stateRef.current.btwByParentSid).length > 0
+              || stateRef.current.btwRevision > 0
               || pendingBtwByParentRef.current.size > 0
               || activeBtwByParentRef.current.size > 0
               || btwRequestParentsRef.current.size > 0) {
@@ -3864,7 +3977,9 @@ export default function App() {
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
-        if (latest.btwSid && latest.rightView === "btw") latest.closeBtw();
+        if (btwPanelVisibleRef.current && latest.rightView === "btw") {
+          latest.collapseBtw();
+        }
         else latest.openBtw();
       }
     };
@@ -4152,13 +4267,18 @@ export default function App() {
     return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
+  const runtimeIsReadOnly = (sid: string): boolean => {
+    const runtime = stateRef.current.runtimes[sid];
+    return runtime?.control
+      ? sessionControlLocksInput(runtime.control) : !!runtime?.external;
+  };
   const sendDeferredQuery = (
     sid: string,
     query: PendingQuery,
     delivery: "queue" | "replace",
   ): boolean => {
     const ws = wsRef.current;
-    if (!ws) return false;
+    if (!ws || runtimeIsReadOnly(sid)) return false;
     const currentState = stateRef.current;
     const unconfirmed = collectUnconfirmedQueries(
       currentState.runtimes,
@@ -4240,7 +4360,7 @@ export default function App() {
 
   const updateQueuedQuery = (prompt: string): boolean => {
     const current = queuedQueryEditor;
-    if (!current || current.saving) return false;
+    if (!current || current.saving || runtimeIsReadOnly(current.sid)) return false;
     if (current.state === "failed") {
       dispatch({
         type: "update_failed_deferred",
@@ -4387,6 +4507,22 @@ export default function App() {
       dispatch({ type: "return_to_latest", sid: focusedSid });
     }
     return true;
+  };
+  const replyAsyncQuestion = (
+    sid: string, prompt: string,
+    whenIdle: (text: string) => boolean, whenRunning: (text: string) => boolean,
+  ): boolean => {
+    const current = stateRef.current;
+    const ws = wsRef.current;
+    const runtime = current.runtimes[sid];
+    // The outbox latch updates synchronously, before React can disable sibling
+    // cards. A second answer must not enter the composer's replace-query path.
+    if (!ws || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime || ws.pendingQueryFor(sid) || runtime.acceptancePending
+        || (runtime.control
+          ? sessionControlLocksInput(runtime.control) : runtime.external)) return false;
+    return runtime.state === "running" ? whenRunning(prompt)
+      : runtime.state === "idle" ? whenIdle(prompt) : false;
   };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
@@ -4962,15 +5098,11 @@ export default function App() {
     dispatch({ type: "start_file_save", requestId, content });
     return requestId;
   };
-  // Each /btw stays pinned to its parent session. Navigation hides it without
-  // destroying the fork; returning to that parent restores it. Other sessions
-  // can open their own independent side conversations.
-  const openBtw = () => {
-    if (!confirmArtifactDiscard()) return;
-    setRightView("btw");
+  // Each side chat stays pinned to its parent. Panel visibility is a pure view
+  // concern; only closeBtw sends the destructive native-fork teardown.
+  const createBtw = () => {
     const parentSid = visibleParentSid;
-    if (!parentSid || activeBtw
-        || pendingBtwByParentRef.current.has(parentSid)) return;
+    if (!parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
     const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
     if (!requestId) {
       setBtwOpeningFor(parentSid, false);
@@ -4986,10 +5118,26 @@ export default function App() {
     }
     setBtwOpeningFor(parentSid, true);
   };
+  const openBtw = () => {
+    if (!confirmArtifactDiscard()) return;
+    if (!btwPanelKey) return;
+    setRightView("btw");
+    setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
+    if (!activeBtwGroup && !btwOpening) createBtw();
+  };
+  const collapseBtw = () => {
+    if (btwPanelKey) setBtwPanelScopes(
+      (current) => setBtwPanelScope(current, btwPanelKey, false));
+  };
+  const selectBtw = (sid: string) => {
+    const parentSid = visibleParentSid;
+    if (!parentSid) return;
+    dispatch({ type: "select_btw", parentSid, btwSid: sid });
+  };
   const sendBtw = (prompt: string): boolean => {
     const sid = activeBtwSid;
     const ws = wsRef.current;
-    if (!sid || !ws) return false;
+    if (!sid || !ws || runtimeIsReadOnly(sid)) return false;
     const runtime = stateRef.current.runtimes[sid];
     const awaitingAcceptance = !!(
       ws.pendingQueryFor(sid) || runtime?.acceptancePending
@@ -5021,7 +5169,7 @@ export default function App() {
   const steerBtw = (prompt: string): boolean => {
     const sid = activeBtwSid;
     const ws = wsRef.current;
-    if (!sid || !ws || activeBtw?.engine !== "codex") return false;
+    if (!sid || !ws || activeBtw?.engine !== "codex" || runtimeIsReadOnly(sid)) return false;
     const runtime = stateRef.current.runtimes[sid];
     if (ws.pendingQueryFor(sid) || runtime?.acceptancePending) return false;
     const msg_id = uuid();
@@ -5032,20 +5180,24 @@ export default function App() {
     return true;
   };
   const interruptBtw = (sid: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendInterruptTo(sid);
   };
   const setBtwModel = (sid: string, model: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetModelTo(sid, model);
   };
   const setBtwEffort = (sid: string, effort: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetEffortTo(sid, effort);
   };
   const setBtwAutoCompact = (
     sid: string, selection: AutoCompactSelection,
-  ): boolean => (
-    wsRef.current?.sendSetAutoCompactTo(
-      sid, selection.mode, selection.thresholdTokens) ?? false
-  );
+  ): boolean => {
+    if (runtimeIsReadOnly(sid)) return false;
+    return wsRef.current?.sendSetAutoCompactTo(
+      sid, selection.mode, selection.thresholdTokens) ?? false;
+  };
   const setBtwSendMode = (
     sid: string, mode: SendMode,
   ) => {
@@ -5053,31 +5205,35 @@ export default function App() {
       current[sid] === mode ? current : { ...current, [sid]: mode }
     ));
   };
-  const closeBtw = () => {
+  const closeBtw = (btwSid = activeBtwSid) => {
     const parentSid = visibleParentSid;
-    if (!parentSid) return;
-    const pendingRequestId = pendingBtwByParentRef.current.get(parentSid);
-    pendingBtwByParentRef.current.delete(parentSid);
-    activeBtwByParentRef.current.delete(parentSid);
-    setBtwOpeningFor(parentSid, false);
-    if (pendingRequestId) {
-      // Keep the request -> parent tombstone. A late success is classified as
-      // stale and its newly-created fork is closed immediately.
-      btwRequestParentsRef.current.set(pendingRequestId, parentSid);
-    }
-    if (activeBtw) {
-      btwDraftsRef.current.delete(activeBtwDraftKey);
-      setBtwSendModeBySid((current) => {
-        if (!(activeBtw.sid in current)) return current;
-        const next = { ...current };
-        delete next[activeBtw.sid];
-        return next;
-      });
-      setCompletionReceipts((receipts) => acknowledgeCompletion(
-        receipts, parentSid, { btwSid: activeBtw.sid }));
-      wsRef.current?.sendCloseBtw(activeBtw.sid);
-      dispatch({ type: "clear_btw", parentSid });
-    }
+    if (!parentSid || !btwSid) return;
+    const target = stateRef.current.runtimes[btwSid];
+    const hasActiveWork = !!target && (
+      target.state !== "idle" || target.mirroredRunning
+      || !!target.acceptancePending || !!target.pendingSend
+      || target.queue.length > 0
+    );
+    if (hasActiveWork && !window.confirm(
+      "这个侧边对话仍在工作或有排队消息，确定关闭并丢弃吗？")) return;
+    if (!wsRef.current?.sendCloseBtw(btwSid)) return;
+    const tracked = activeBtwByParentRef.current.get(parentSid);
+    if (tracked?.sid === btwSid) activeBtwByParentRef.current.delete(parentSid);
+    btwDraftsRef.current.delete(composerDraftKey(
+      machineId, space,
+      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine
+        === "codex" ? "codex" : "claude"),
+      `btw:${btwSid}`,
+    ));
+    setBtwSendModeBySid((current) => {
+      if (!(btwSid in current)) return current;
+      const next = { ...current };
+      delete next[btwSid];
+      return next;
+    });
+    setCompletionReceipts((receipts) => acknowledgeCompletion(
+      receipts, parentSid, { btwSid }));
+    dispatch({ type: "clear_btw", parentSid, btwSid });
   };
   // Header tab switch between the two right-slot views (opening the target lazily).
   const switchRight = (v: RightPanelView) => {
@@ -5090,7 +5246,7 @@ export default function App() {
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, closeBtw,
+    getDiff, openBtw, collapseBtw,
   };
   const logout = async () => {
     try {
@@ -5114,7 +5270,6 @@ export default function App() {
       sessionActivityPendingRef.current.clear();
       activeBtwByParentRef.current.clear();
       btwRequestParentsRef.current.clear();
-      discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
       historyInvalidationGenerationsRef.current.clear();
       historyCacheEpochRef.current.clear();
@@ -5188,7 +5343,7 @@ export default function App() {
     ? activeTurnCandidates : [];
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening || agentPanel) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + (visibleRightPanel !== null ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         engine={engine}
@@ -5427,6 +5582,18 @@ export default function App() {
                 ? undefined : loadHistoryTurnDetail}
               onEdit={historyView.recovering
                 ? undefined : (prompt) => setEditPrompt(prompt)}
+              onReplyAsyncQuestion={focusedEngine !== "codex"
+                || historyView.recovering || !state.wrapperOnline
+                || state.connState !== "connected"
+                || focusedSession?.tag === "archived"
+                || (rt.control ? sessionControlLocksInput(rt.control) : rt.external)
+                || rt.acceptancePending || (rt.state !== "idle" && rt.state !== "running")
+                ? undefined : (prompt) => {
+                  const current = stateRef.current;
+                  if (!focusedSid || current.focusedSid !== focusedSid
+                      || previousMachineRef.current !== machineId) return false;
+                  return replyAsyncQuestion(focusedSid, prompt, sendQuery, sendSteer);
+                }}
               onGetDiff={historyView.recovering ? undefined : getDiff}
               onOpenTurnDiff={historyView.recovering
                 ? undefined : openTurnDiff}
@@ -5647,9 +5814,9 @@ export default function App() {
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
-      {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
+      {/* Share the layout's selection: retained hidden chats reserve no space. */}
       {(() => {
-        if (agentPanel) {
+        if (visibleRightPanel === "agent" && agentPanel) {
           return <Suspense fallback={null}>
             <AgentDetailController
               key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
@@ -5659,17 +5826,27 @@ export default function App() {
               onOpenFile={previewAgentFile} />
           </Suspense>;
         }
-        const btwShowing = !!activeBtw || btwOpening;
-        const view = rightView === "btw" && btwShowing ? "btw"
-          : rightView === "diff" && state.artifact ? "diff"
-            : state.artifact ? "diff" : btwShowing ? "btw" : null;
-        if (view === "btw")
+        if (visibleRightPanel === "btw")
           return <Suspense fallback={null}>
             <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
-            engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
+            engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
+            chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
+              const runtime = state.runtimes[chat.sid];
+              const prompt = runtime?.turns.find(
+                (turn) => turn.prompt.trim().length > 0)?.prompt.trim();
+              return {
+                ...chat,
+                title: prompt ? prompt.slice(0, 36) : `侧聊 ${index + 1}`,
+                state: runtime?.state ?? "idle",
+                needsAnswer: !!runtime?.pendingQuestion,
+              };
+            })}
             active="btw" hasArtifact={!!state.artifact}
             artifactKind={state.artifact?.kind}
             onTab={switchRight}
+            onNew={createBtw}
+            onSelect={selectBtw}
+            onCloseChat={closeBtw}
             catalog={focusedCatalog}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
             sendMode={activeBtwSendMode}
@@ -5679,6 +5856,13 @@ export default function App() {
             replaceQueueCapacity={btwReplaceQueueCapacity}
             onSend={sendBtw}
             onSteer={steerBtw}
+            onReplyAsyncQuestion={state.connState !== "connected" || !state.wrapperOnline
+              ? undefined : (prompt) => {
+                if (!activeBtwSid || stateRef.current.newChat
+                    || stateRef.current.focusedSid !== visibleParentSid
+                    || previousMachineRef.current !== machineId) return false;
+                return replyAsyncQuestion(activeBtwSid, prompt, sendBtw, steerBtw);
+              }}
             onInterrupt={() => {
               if (activeBtwSid) interruptBtw(activeBtwSid);
             }}
@@ -5707,15 +5891,25 @@ export default function App() {
             }}
             onSetAutoCompact={(selection) => activeBtwSid
               ? setBtwAutoCompact(activeBtwSid, selection) : false}
-            onOpenFile={previewBtwFile} onClose={closeBtw}
+            onOpenFile={previewBtwFile} onCollapse={collapseBtw}
             imageAssets={btwInlineImageAssets}
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
+            onAnswerQuestion={(askId, answer) => {
+              if (!activeBtwSid) return;
+              if (!wsRef.current?.sendAnswerQuestion(
+                activeBtwSid, askId, answer)) return;
+              dispatch({
+                type: "answer_question",
+                sid: activeBtwSid,
+                ask_id: askId,
+              });
+            }}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />
           </Suspense>;
-        if (view === "diff" && state.artifact)
+        if (visibleRightPanel === "diff" && state.artifact)
           return <Suspense fallback={
             <div className="artifact-panel empty" role="status">
               <div className="spinner" aria-hidden="true" />
@@ -5723,7 +5917,7 @@ export default function App() {
             </div>
           }>
             <ArtifactPanel artifact={state.artifact} active="diff"
-              hasBtw={!!activeBtw}
+              hasBtw={!!activeBtwGroup}
               theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
@@ -5743,7 +5937,7 @@ export default function App() {
         }}
         onSave={updateQueuedQuery}
         onRetry={retryQueuedQuery} />
-      {rt.pendingQuestion && (
+      {rt.pendingQuestion && !activeBtwQuestionVisible && (
         <QuestionSheet
           key={rt.pendingQuestion.ask_id}
           header={rt.pendingQuestion.header}
@@ -5832,11 +6026,15 @@ export default function App() {
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
         onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
-      <WorkArtifactsSheet open={workArtifactsOpen && space === "work"
-          && !state.newChat && currentWorkArtifacts.length > 0}
-        artifacts={currentWorkArtifacts}
-        onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
-        onClose={() => setWorkArtifactsOpen(false)} />
+      {workArtifactsOpen && space === "work" && !state.newChat
+        && currentWorkArtifacts.length > 0 && <Suspense fallback={null}>
+          <WorkArtifactsSheet open artifacts={currentWorkArtifacts}
+            onOpen={(path) => {
+              setWorkArtifactsOpen(false);
+              previewFile(path);
+            }}
+            onClose={() => setWorkArtifactsOpen(false)} />
+        </Suspense>}
       <Suspense fallback={null}>
       <CapabilitiesSheet open={capabilitiesOpen}
         engine={focusedEngine}

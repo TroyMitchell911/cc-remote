@@ -4,6 +4,22 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v52。Codex 原生异步提问的
+  有界结构化元数据会保留在实时事件和历史中，显示为不阻塞任务的内联表单。回答复用
+  会话作用域内的 query/steer 发件箱，不伪装成审批，也不把运行中的回合标成完成。
+  旧版 Codex 历史投影会重新构建。
+- BTW 面板的打开状态按设备、工作空间、引擎和主会话隔离，切换会话时不再留下
+  无关的空面板；后台侧聊继续保留。旧的无作用域显示开关不再恢复，但不会删除任何
+  侧聊。支持安全的 Markdown details/summary 折叠内容，并修复 Mac 原生拖选滚动
+  在延迟布局更新时被拉回的问题。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v51。`/btw` 现在是常驻
+  侧边对话工作区：快捷键只收起面板而不销毁会话，每条主会话可同时保留多个可单独
+  关闭的侧聊；经 Relay 认证的 owner 权威目录与有界 ring replay 会在刷新、
+  重连以及同一账号的其他标签页或设备上恢复这些侧聊；页面级连接 ID 保证
+  复制出的标签页互不顶替。Codex 侧聊也会走 Codex 展示路径，隐藏成功的
+  hook 管线事件，仅保留需要处理的失败。新侧聊默认使用 `xhigh` 思考强度
+  （按所选模型能力自动夹取）；移动端输入法打开时，紧凑 Goal/计划条会临时让出
+  输入空间，并在输入法关闭后原样恢复。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v49，并将实验性的 Codex
   托管浏览器 / Computer Use 完整拆到独立功能分支。Claude runtime 主线不再携带
   Playwright、浏览器控制帧、动态浏览器工具和 `/browser` UI；图片、PDF、GIF、
@@ -13,11 +29,12 @@
   接口使用。兑换只允许在空闲会话进行，必须二次确认，结果仅回给请求端；可靠命令
   ID 同时作为原生幂等键。付费 credits 余额和消费控制仍不会离开本机。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v47。Remote 托管的 Claude
-  会话现在默认以真实的 500K 自动压缩阈值启动；降低窗口时会先执行原生压缩并确认
-  compact boundary，再用新阈值重连。desired/applied 状态会跨重启和 fork 持久化，
-  不会提前套用更小窗口。延迟到达的 SDK 标题元数据不再触发伪外部重载；真正需要
-  重载 transcript 时也会保留已选长上下文模型，避免 500K 压缩阈值与隐式 200K 模型
-  错配。cc-remote 不再拦截或改写 Claude 原生的图片/PDF `Read` 工具；模型上下文
+  会话默认不再覆盖自动压缩窗口，由 Claude Code 根据所选模型、账号、网关和原生
+  设置决定；v3 控制记录中由 cc-remote 短期强制写入的 500K 默认会迁回原生行为。
+  显式降低窗口时仍会先执行原生压缩并确认 compact boundary，再用新阈值重连；
+  desired/applied 状态会跨重启和 fork 持久化，不会提前套用更小窗口。延迟到达的 SDK
+  标题元数据不再触发伪外部重载；真正需要重载 transcript 时也会保留已选长上下文
+  模型。cc-remote 不再拦截或改写 Claude 原生的图片/PDF `Read` 工具；模型上下文
   限制、媒体处理和自动压缩全部交还 Claude Code。
 - Codex Work 的新建与已有会话现在都可选择 Fast 服务档位，同时保持 Claude Work
   使用引擎中立的命令面板。

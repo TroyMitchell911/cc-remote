@@ -46,6 +46,7 @@ from cc_remote.protocol import (
     ThreadGoal,
 )
 from cc_remote.wrapper.codex_daemon import (
+    CodexServerIdentity,
     CodexDaemonUpgradeRequired,
     CodexDaemonManager,
     codex_daemon_mode,
@@ -71,7 +72,6 @@ from cc_remote.wrapper.codex_runtime import (
     resolve_codex_bin as _runtime_resolve_codex_bin,
 )
 from cc_remote.wrapper.codex_permissions import normalize_permission_profiles
-from cc_remote.wrapper.process_scan import ProcessIdentity
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
@@ -312,6 +312,14 @@ class CodexTurnStartReconciliation:
 
 class _CodexDaemonGenerationChanged(RuntimeError):
     """The managed daemon child changed while a proxy was initializing."""
+
+
+class CodexEphemeralThreadGone(RuntimeError):
+    """The exact in-memory fork no longer exists; never silently re-fork it."""
+
+    def __init__(self, thread_id: str):
+        self.thread_id = thread_id
+        super().__init__("Codex ephemeral thread has been destroyed")
 
 
 class CodexAppServerError(RuntimeError):
@@ -1510,6 +1518,12 @@ class CodexHandle:
         )
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
+        # Separate native fork lifetime from this disposable transport. A proxy
+        # reconnect can preserve an ephemeral thread; replacing its server cannot.
+        self._ephemeral_thread_id: Optional[str] = None
+        self._ephemeral_server_identity: Optional[CodexServerIdentity] = None
+        self._ephemeral_private_generation: Optional[int] = None
+        self._ephemeral_thread_gone = False
         # A shared daemon can publish every subscribed thread immediately after
         # initialize, before thread/resume returns and assigns ``thread_id``.
         # Freeze the requested resume id across that bind window so only the
@@ -1565,7 +1579,7 @@ class CodexHandle:
         # session.  Keep this affinity across proxy reconnects so Machine can
         # preserve bidirectional ownership while the short-lived proxy is down.
         self._daemon_proxy_established = False
-        self._daemon_process_identity: Optional[ProcessIdentity] = None
+        self._daemon_process_identity: Optional[CodexServerIdentity] = None
         self._proxy_read_buffer = bytearray()
         self._proxy_close_sent = False
         self._send_lock = asyncio.Lock()
@@ -1769,6 +1783,43 @@ class CodexHandle:
                 )
 
     @property
+    def ephemeral_thread_destroyed(self) -> bool:
+        if not self._ephemeral_thread_id or self.thread_id != self._ephemeral_thread_id:
+            return False
+        if self._ephemeral_thread_gone:
+            return True
+        if self._ephemeral_private_generation is not None:
+            return bool(
+                self._generation != self._ephemeral_private_generation
+                or self.proc is None or self.proc.returncode is not None
+            )
+        expected = self._ephemeral_server_identity
+        observe = getattr(self.daemon_manager, "current_process_identity", None)
+        observed = observe() if expected is not None and callable(observe) else None
+        # A temporarily unreadable PID/socket, or a change in identity source,
+        # is not proof of destruction. Do not permanently lock recoverable chats.
+        return bool(expected is not None and observed is not None
+                    and type(expected) is type(observed) and expected != observed)
+
+    async def _require_loaded_ephemeral_thread(self, thread_id: str) -> None:
+        if thread_id != self._ephemeral_thread_id:
+            return
+        if self.ephemeral_thread_destroyed:
+            raise CodexEphemeralThreadGone(thread_id)
+        try:
+            await self._request("thread/read", {
+                "threadId": thread_id, "includeTurns": False,
+            })
+        except CodexAppServerError as exc:
+            # Only the official exact-identity miss is final. Transport, auth,
+            # malformed replies and generic JSON-RPC errors remain retryable.
+            if (exc.code == -32600 and isinstance(exc.error, dict)
+                    and exc.error.get("message") == f"thread not loaded: {thread_id}"):
+                self._ephemeral_thread_gone = True
+                raise CodexEphemeralThreadGone(thread_id) from exc
+            raise
+
+    @property
     def using_daemon_proxy(self) -> bool:
         """Whether this live handle is attached to the shared Codex daemon."""
         return bool(
@@ -1780,10 +1831,10 @@ class CodexHandle:
 
     @property
     def daemon_process_generation_current(self) -> bool:
-        """Whether this proxy still targets the official daemon child it joined.
+        """Whether this proxy still targets the server generation it joined.
 
         Managers without the official identity surface retain normal WebSocket
-        liveness. Once that surface exists, an unavailable or different child
+        liveness. Once that surface exists, an unavailable or different server
         is a stale generation even when the proxy subprocess has not observed
         EOF yet.
         """
@@ -2192,9 +2243,14 @@ class CodexHandle:
                             observe() if callable(observe) else None
                         )
                         if callable(observe) and (
-                            generation_before is None
-                            or generation_after is None
-                            or generation_before != generation_after
+                            generation_before is None or generation_after is None
+                        ):
+                            raise _CodexDaemonGenerationChanged(
+                                "Cannot verify Codex app-server identity during "
+                                "proxy initialize"
+                            )
+                        if callable(observe) and (
+                            generation_before != generation_after
                         ):
                             raise _CodexDaemonGenerationChanged(
                                 "Codex app-server changed during proxy initialize"
@@ -2218,8 +2274,9 @@ class CodexHandle:
                             >= _DAEMON_GENERATION_CONNECT_ATTEMPTS
                         ):
                             log.warning(
-                                "Codex daemon kept changing during proxy initialize",
+                                "Codex app-server identity verification failed",
                                 attempts=generation_attempt,
+                                reason=str(exc),
                             )
                             raise
                         refreshed = await self.daemon_manager.proxy_args(
@@ -2230,7 +2287,7 @@ class CodexHandle:
                             ) from exc
                         argv = refreshed
                         log.info(
-                            "retrying Codex proxy after daemon generation change",
+                            "retrying Codex proxy after app-server identity failure",
                             attempt=generation_attempt + 1,
                         )
                         continue
@@ -2317,7 +2374,13 @@ class CodexHandle:
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
                 bound_thread_id = self.thread_id
+                self._ephemeral_thread_id = self.thread_id
+                self._ephemeral_server_identity = self._daemon_process_identity
+                self._ephemeral_private_generation = (
+                    None if daemon_proxy else self._generation)
+                self._ephemeral_thread_gone = False
             elif resume_id:
+                await self._require_loaded_ephemeral_thread(resume_id)
                 # A replacement daemon reconstructs approval/profile from
                 # config defaults rather than the last live thread settings.
                 # Controlled reconnects repeat the exact settings that the old
@@ -4458,6 +4521,8 @@ class CodexHandle:
                               reason: str = "reconnect") -> None:
         log.warning("codex force-reconnect", reason=reason)
         target = resume_id or self.thread_id
+        if target == self._ephemeral_thread_id and self.ephemeral_thread_destroyed:
+            raise CodexEphemeralThreadGone(target)
         previous_thread_id = self.thread_id
         previous_model = self.model
         previous_cwd = self._cwd

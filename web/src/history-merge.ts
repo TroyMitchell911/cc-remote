@@ -300,6 +300,7 @@ function mergeBlocks(
         return !matchedTextIndexes.has(index)
           && !reservedExactHistoryIndexes.has(index)
           && textChannel(candidate) === textChannel(block)
+          && candidate.delivery === block.delivery
           && canCompatibilityMatchText(candidate);
       });
       let bestScore = 0;
@@ -333,6 +334,10 @@ function mergeBlocks(
         : combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
+      if (block.delivery === "async") {
+        existing.delivery = "async";
+        if (block.questions?.length) existing.questions = block.questions;
+      }
       if (block.liveOrder != null) {
         existing.liveOrder = existing.liveOrder == null
           ? block.liveOrder : Math.min(existing.liveOrder, block.liveOrder);
@@ -355,6 +360,7 @@ function mergeBlocks(
         const candidate = out[index] as TextBlock;
         return candidate.done
           && textChannel(candidate) === textChannel(block)
+          && candidate.delivery === block.delivery
           && candidate.text === block.text;
       });
       if (!canonicalDuplicate) out.push({ ...block });

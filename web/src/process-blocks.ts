@@ -45,6 +45,7 @@ export function processBlocks(blocks: Block[]): Block[] {
   return blocks.filter((block) => {
     if (block.kind === "text") {
       return block.text.length > 0
+        && block.delivery !== "async"
         && (block.channel === "thinking" || block.channel === "commentary");
     }
     // Keep ToolUse in reducer state for result correlation and older peers,
@@ -83,7 +84,8 @@ export function presentableProcessBlocks(
 export function finalTextBlocks(blocks: Block[]): TextBlock[] {
   return blocks.filter((block): block is TextBlock => block.kind === "text"
     && block.text.length > 0
-    && (block.channel == null || block.channel === "final" || block.channel === "unknown"));
+    && (block.delivery === "async"
+      || block.channel == null || block.channel === "final" || block.channel === "unknown"));
 }
 
 /** A main answer can finish before a background task or agent reports its

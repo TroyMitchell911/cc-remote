@@ -91,6 +91,22 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
             )
 
 
+def test_repository_deployment_contract_is_the_agent_entrypoint():
+    agents = (ROOT / "AGENTS.md").read_text()
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
+    normalized = " ".join(deploy_readme.split())
+
+    assert "[`deploy/README.md`](deploy/README.md)" in agents
+    assert "out-of-tree instructions" in agents
+    assert "## Deployment contract for automation" in deploy_readme
+    assert "never guess them" in normalized
+    assert "Freeze those tested bytes once" in normalized
+    assert "unknown result" in normalized
+    assert "Never start a second installer" in normalized
+    assert "must not be its own only deployment controller" in normalized
+    assert "stable PIDs without restart loops" in normalized
+
+
 def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
     public_files = [
         ROOT / "README.md",
@@ -763,7 +779,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v49_layout():
+def test_release_docs_and_examples_describe_one_atomic_v52_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -776,11 +792,11 @@ def test_release_docs_and_examples_describe_one_atomic_v49_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v49" in deploy_readme
+    assert "Protocol v52" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v49" in document
+        assert "v52" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -824,7 +840,7 @@ def test_release_docs_and_examples_describe_one_atomic_v49_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.151" in claude
-    assert "protocol v49" in claude
+    assert "protocol v52" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

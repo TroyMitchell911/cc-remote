@@ -16,7 +16,7 @@ export const MAX_RUNTIME_COMPLETED_UNITS = 16 * 1024 * 1024;
 
 interface SizedImage { media_type?: string; data?: string }
 interface SizedFile { filename?: string; data?: string }
-interface SizedTextBlock { kind: "text"; message_id?: string; text?: string }
+interface SizedTextBlock { kind: "text"; message_id?: string; text?: string; questions?: unknown }
 interface SizedToolBlock {
   kind: "tool";
   done?: boolean;
@@ -75,6 +75,8 @@ function turnUnits(turn: BoundedTurn, stopAfter: number): number {
     units += 128;
     if (block.kind === "text") {
       units += textUnits(block.message_id) + textUnits(block.text);
+      try { units += JSON.stringify(block.questions ?? []).length; }
+      catch { units = stopAfter + 1; }
     } else if (block.kind === "tool") {
       units += textUnits(block.message_id) + textUnits(block.tool_use_id) + textUnits(block.tool)
         + textUnits(block.output) + textUnits(block.progress) + textUnits(block.diff)

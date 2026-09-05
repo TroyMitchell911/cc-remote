@@ -318,7 +318,8 @@ def test_btw_turn_end_routes_owner_only_and_points_notification_to_parent():
         )))
 
         live = transport.sent[-1]
-        assert live.to == "owner-client"
+        assert live.to is None
+        assert live.owner_id == "owner-client"
         assert live.sid == "btw-private"
         assert live.notification_context == TurnNotificationContext(
             engine="claude",
@@ -392,6 +393,40 @@ def test_capture_does_not_steal_focus_from_background_session():
     asyncio.run(run())
 
 
+def test_capture_reparents_btw_catalog_before_session_rekey_is_published():
+    async def run():
+        machine, transport = _mk_machine()
+        parent = _mk_ctx(key="tmp-parent", session_id=None)
+        child = _mk_ctx(key="btw-child", session_id=None)
+        child.btw = True
+        child.parent_sid = parent.key
+        child.owner_client_id = "owner-1"
+        child.btw_created_at = 1.0
+        child.btw_announced = True
+        machine.sessions = {parent.key: parent, child.key: child}
+
+        original_send = transport.send
+
+        async def observe_send(message):
+            if isinstance(message, SessionRekey):
+                # SessionRekey is the browser's migration edge. By the time it
+                # can leave the wrapper, a concurrent Hello must no longer be
+                # able to snapshot the child under the old parent key.
+                assert child.parent_sid == "real-parent"
+                assert machine._btw_revision == 1
+            await original_send(message)
+
+        transport.send = observe_send
+        await machine._capture_session_id(parent, "real-parent")
+
+        assert child.parent_sid == "real-parent"
+        assert machine._btw_revision == 1
+        assert [message.type for message in transport.sent
+                if isinstance(message, SessionRekey)] == ["session_rekey"]
+
+    asyncio.run(run())
+
+
 def test_lost_rekey_is_replayed_before_cursor_catchup():
     async def run():
         machine, transport = _mk_machine()
@@ -415,11 +450,11 @@ def test_lost_rekey_is_replayed_before_cursor_catchup():
             generations={"tmp-lost": machine.instance_id}))
 
         assert [message.type for message in transport.sent] == [
-            "session_rekey", "replay_start", "state", "replay_end",
+            "btw_sync", "session_rekey", "replay_start", "state", "replay_end",
             "ask_user_sync", "background_process_sync", "session_control", "query_queue",
             "completion_state", "perm", "auto_compact"]
-        assert transport.sent[0].old_key == "tmp-lost"
-        assert transport.sent[0].session_id == "real-1"
+        assert transport.sent[1].old_key == "tmp-lost"
+        assert transport.sent[1].session_id == "real-1"
         assert all(message.to == "client-1" for message in transport.sent)
         assert all(message.route_id == "route-1" for message in transport.sent)
 

@@ -259,7 +259,6 @@ def test_claude_work_uses_minimal_isolated_runtime():
     assert options.sandbox is None
     assert options.extra_args == {
         "replay-user-messages": None,
-        "autocompact": "500000",
         "safe-mode": None,
     }
     assert options.system_prompt == WORK_SYSTEM_PROMPT
@@ -610,7 +609,6 @@ def test_claude_code_keeps_official_prompt_preset_and_runtime_surface():
     assert options.hooks is None
     assert options.extra_args == {
         "replay-user-messages": None,
-        "autocompact": "500000",
     }
 
 

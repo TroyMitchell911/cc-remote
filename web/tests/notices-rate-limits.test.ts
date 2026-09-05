@@ -6,6 +6,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import type { Notice, ServerEvent, StatusReport } from "../src/protocol.ts";
+import {
+  resetCreditConfirmation, resetCreditPresentation,
+} from "../src/rate-limit-reset.ts";
 
 const harness = await createServer({
   root: process.cwd(),
@@ -584,6 +587,50 @@ try {
   assert.match(resetStatusMarkup, /使用下一张/,
     "a capped detail list must retain the backend-selects-next action");
   assert.doesNotMatch(resetStatusMarkup, /SECRET|paidCredits|balance/);
+  const localizedCredit = {
+    ...resetStatus.reset_credits.credits[0],
+    title: "Full reset",
+    description: "Thanks for using Codex! You've been granted one free rate limit reset.",
+  };
+  const originalCredit = JSON.stringify(localizedCredit);
+  assert.deepEqual(resetCreditPresentation(localizedCredit), {
+    title: "完整额度重置券",
+    description: "感谢使用 Codex！你已获赠一次免费的额度重置机会。",
+  });
+  const confirmation = resetCreditConfirmation(localizedCredit);
+  assert.match(confirmation, /确定使用完整额度重置券吗/);
+  assert.match(confirmation, /感谢使用 Codex！你已获赠一次免费的额度重置机会。/);
+  assert.match(confirmation, /消耗一张重置券，并重置当前符合条件的额度窗口/);
+  assert.doesNotMatch(confirmation, /Full reset|Thanks for using|You've been granted/);
+  assert.deepEqual(resetCreditPresentation(), {
+    title: "Codex 额度重置券", description: "",
+  });
+  assert.match(resetCreditConfirmation(), /确定使用一张 Codex 额度重置券吗/);
+  assert.deepEqual(resetCreditPresentation({ title: " ", description: null }), {
+    title: "Codex 额度重置券", description: "",
+  });
+  for (const copy of [
+    { title: "中文券名", description: "仅用于符合条件的窗口。" },
+    { title: "Future credit", description: "Only resets the weekly window." },
+    { title: "constructor", description: "__proto__" },
+  ]) {
+    assert.deepEqual(resetCreditPresentation(copy), copy,
+      "Chinese copy and unknown upstream conditions must not be overwritten");
+  }
+  const localizedMarkup = renderToStaticMarkup(createElement(StatusSheet, {
+    open: true,
+    report: { ...quotaReport, reset_credits: {
+      available_count: 1, credits: [localizedCredit],
+    } },
+    onClose: () => {}, onRefresh: () => {}, onConsumeResetCredit: () => true,
+  }));
+  assert.match(localizedMarkup, /<b>完整额度重置券<\/b>/);
+  assert.match(localizedMarkup, /感谢使用 Codex！你已获赠一次免费的额度重置机会。/);
+  assert.match(localizedMarkup, /到期/);
+  assert.match(localizedMarkup, />使用<\/button>/);
+  assert.doesNotMatch(localizedMarkup, /Full reset|Thanks for using|You've been granted/);
+  assert.equal(JSON.stringify(localizedCredit), originalCredit,
+    "localization must not mutate upstream coupon data or its redemption id");
   const claudeUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
     engine: "claude",
     open: true,

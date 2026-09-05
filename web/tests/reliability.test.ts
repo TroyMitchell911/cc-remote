@@ -4,6 +4,10 @@ import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
+import {
+  BTW_PANEL_SCOPES_KEY, btwPanelScopeKey, readBtwPanelScopes,
+  rekeyBtwPanelScope, setBtwPanelScope,
+} from "../src/btw-panel-state.ts";
 
 import {
   clearLegacyAuthMarkers,
@@ -86,15 +90,15 @@ import {
 } from "../src/runtime-bounds.ts";
 import { ImeSubmitGuard, shouldSubmitTextKey } from "../src/ime-submit.ts";
 import {
-  classifyBtwOpened,
-  consumeDiscardedBtwSnapshot,
   makeOpenBtwCommand,
   matchesBtwRequest,
   normalizeDiffTheme,
   normalizeEngine,
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
-import { protocolRecoveryAction, RelayWs } from "../src/ws.ts";
+import {
+  protocolRecoveryAction, RelayWs, stableTabClientId,
+} from "../src/ws.ts";
 import {
   dismissGoalUi,
   GOAL_UI_PREFERENCES_KEY,
@@ -1328,8 +1332,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /requestHistoryTurnDetail = useCallback\([\s\S]{0,120}autoLoad = false/,
   "every detail entry point must default to one bounded page");
-assert.match(cacheSource, /const CACHE_VER = 24/,
-  "Claude terminal-time and oversized detail repair must invalidate polluted browser rows");
+assert.match(cacheSource, /const CACHE_VER = 26/,
+  "async-question repair must invalidate browser summaries missing unphased replies");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -10861,6 +10865,10 @@ try {
   const btwDraftStore = new ComposerDraftStore();
   const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
     sid: "btw-render",
+    chats: [{
+      sid: "btw-render", engine: "codex", title: "侧聊 1", state: "running",
+      needsAnswer: false,
+    }],
     rt: {
       ...createRuntime(),
       state: "running",
@@ -10899,6 +10907,9 @@ try {
     queueCapacity: {},
     replaceQueueCapacity: {},
     onTab: () => {},
+    onNew: () => {},
+    onSelect: () => {},
+    onCloseChat: () => {},
     onSend: () => true,
     onSteer: () => true,
     onInterrupt: () => {},
@@ -10909,8 +10920,10 @@ try {
     onInspectQueued: () => {},
     onSetModel: () => {},
     onSetEffort: () => {},
+    onSetAutoCompact: () => true,
+    onAnswerQuestion: () => {},
     onOpenFile: () => {},
-    onClose: () => {},
+    onCollapse: () => {},
     onDismissNotice: () => {},
   }));
   assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
@@ -16830,7 +16843,10 @@ try {
     ...initialState,
     focusedSid: "parent-a",
     btwByParentSid: {
-      "parent-a": { sid: pinnedBtwSid, engine: "codex" },
+      "parent-a": {
+        chats: [{ sid: pinnedBtwSid, engine: "codex", createdAt: 1 }],
+        activeSid: pinnedBtwSid,
+      },
     },
     runtimes: {
       "parent-a": createRuntime(),
@@ -16854,10 +16870,15 @@ try {
       btw_sid: "btw-parent-b",
       parent_sid: "parent-b",
       engine: "claude",
+      created_at: 2,
+      revision: 1,
     }),
   });
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "each parent session keeps an independent BTW binding");
   pinnedBtwState = reduce(pinnedBtwState, {
     type: "restore_session_list",
@@ -16867,7 +16888,8 @@ try {
     type: "enter_new_chat", cwd: "~", cwdSource: "default",
   });
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-a"], {
-    sid: pinnedBtwSid, engine: "codex",
+    chats: [{ sid: pinnedBtwSid, engine: "codex", createdAt: 1 }],
+    activeSid: pinnedBtwSid,
   });
   assert.deepEqual(
     pinnedBtwState.runtimes[pinnedBtwSid]?.turns,
@@ -16927,13 +16949,16 @@ try {
     ["btw-queue"],
   );
   pinnedBtwState = reduce(pinnedBtwState, {
-    type: "clear_btw", parentSid: "parent-a",
+    type: "clear_btw", parentSid: "parent-a", btwSid: pinnedBtwSid,
   });
   assert.equal(pinnedBtwState.btwByParentSid["parent-a"], undefined);
   assert.equal(pinnedBtwSid in pinnedBtwState.runtimes, false,
     "explicit close discards only that parent's ephemeral BTW runtime");
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "closing one session's BTW must not close a sibling session's BTW");
   assert.equal("btw-parent-b" in pinnedBtwState.runtimes, true);
 
@@ -16947,7 +16972,10 @@ try {
   });
   assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined);
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-real"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "a parent id capture must carry its BTW binding to the real session id");
 
   pinnedBtwState = reduce(pinnedBtwState, { type: "clear_all_btw" });
@@ -17007,23 +17035,6 @@ assert.equal(openFrame.ts, 123);
 assert.equal(matchesBtwRequest("btw-request-1", "btw-request-1"), true);
 assert.equal(matchesBtwRequest("btw-request-new", "btw-request-old"), false);
 assert.equal(matchesBtwRequest(null, "btw-request-old"), false);
-assert.equal(classifyBtwOpened(
-  "btw-request-1", null,
-  { request_id: "btw-request-1", btw_sid: "btw-1" }), "accept");
-assert.equal(classifyBtwOpened(
-  null, { requestId: "btw-request-1", sid: "btw-1" },
-  { request_id: "btw-request-1", btw_sid: "btw-1" }), "duplicate");
-assert.equal(classifyBtwOpened(
-  "btw-request-new", null,
-  { request_id: "btw-request-old", btw_sid: "btw-old" }), "stale");
-const discardedBtwSids = new Set(["btw-stale"]);
-assert.equal(consumeDiscardedBtwSnapshot(
-  discardedBtwSids, { sid: "normal-session" }), false);
-assert.equal(discardedBtwSids.has("btw-stale"), true);
-assert.equal(consumeDiscardedBtwSnapshot(
-  discardedBtwSids, { sid: "btw-stale" }), true);
-assert.equal(discardedBtwSids.size, 0);
-
 const boundedCache = boundCachedTurns(Array.from(
   { length: 120 }, (_, id) => ({ id, prompt: `turn-${id}` })));
 assert.equal(boundedCache.length, 100);
@@ -17343,6 +17354,15 @@ Object.assign(globalThis, {
   WebSocket: FakeWebSocket,
   sessionStorage: browserSessionStorage,
 });
+
+sessionValues.set("cc-remote:tab-client-id", "copied-tab-id-must-be-ignored");
+const persistentClientId = stableTabClientId();
+assert.match(persistentClientId,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+assert.notEqual(persistentClientId, "copied-tab-id-must-be-ignored",
+  "a duplicated tab must receive its own connection identity");
+assert.equal(stableTabClientId(), persistentClientId,
+  "reconnects within one page lifetime must retain their routing identity");
 
 assert.deepEqual(
   protocolRecoveryAction(null, PROTOCOL_VERSION), { kind: "wait" });
@@ -17820,12 +17840,59 @@ assert.match(appSource,
 assert.doesNotMatch(appSource,
   /sendCloseBtw\(s\); dispatch\(\{ type: "clear_btw" \}\); \}\s*[\s\S]{0,120}\}, \[focusedSid, engine\]\)/,
   "session and harness navigation must retain a session-scoped BTW");
+function testBtwPanelScopes() {
+  const btwScope = btwPanelScopeKey("machine-a", "code", "codex", "parent-a");
+  const otherBtwScopes = [
+    btwPanelScopeKey("machine-b", "code", "codex", "parent-a"),
+    btwPanelScopeKey("machine-a", "work", "codex", "parent-a"),
+    btwPanelScopeKey("machine-a", "code", "claude", "parent-a"),
+    btwPanelScopeKey("machine-a", "code", "codex", "parent-b"),
+  ];
+  const openedBtwScopes = setBtwPanelScope([], btwScope, true);
+  assert.ok(otherBtwScopes.every((key) => !openedBtwScopes.includes(key)),
+    "visibility must not leak between machines, surfaces, engines or parents");
+  assert.deepEqual(setBtwPanelScope(openedBtwScopes, btwScope, false), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: (key) => (
+    key === BTW_PANEL_SCOPES_KEY ? JSON.stringify(openedBtwScopes) : null
+  ) }), openedBtwScopes, "refresh restores only the explicitly opened parent");
+  assert.deepEqual(readBtwPanelScopes({ getItem: (key) => (
+    key === "cc-remote:btw-panel-visible" ? "1" : null
+  ) }), [], "a legacy global open flag has no trustworthy parent and cannot migrate");
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => "{broken" }), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => { throw new Error("private"); } }), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => JSON.stringify([
+    btwScope, "true", "null", "{}", "[]", '["a","invalid","codex","b"]', btwScope,
+  ]) }), openedBtwScopes, "untrusted storage is shape-checked and deduplicated");
+  let boundedBtwScopes: string[] = [];
+  for (let i = 0; i < 100; i++) boundedBtwScopes = setBtwPanelScope(
+    boundedBtwScopes, btwPanelScopeKey("m", "code", "codex", String(i)), true);
+  assert.equal(boundedBtwScopes.length, 64);
+  assert.deepEqual(rekeyBtwPanelScope(openedBtwScopes, btwScope, otherBtwScopes[3]),
+    [otherBtwScopes[3]], "native id capture moves only the original parent's preference");
+  assert.equal(rekeyBtwPanelScope(openedBtwScopes, "missing", btwScope), openedBtwScopes);
+}
+testBtwPanelScopes();
 assert.match(appSource,
-  /const activeBtw = visibleParentSid \? state\.btwByParentSid\[visibleParentSid\] : undefined/,
-  "only the focused parent session may expose its BTW binding");
+  /const activeBtwGroup = visibleParentSid[\s\S]{0,100}state\.btwByParentSid\[visibleParentSid\][\s\S]{0,160}activeBtwGroup\.activeSid/,
+  "only the focused parent session may expose its selected side chat");
 assert.match(appSource,
-  /const closeBtw = \(\) => \{[\s\S]*?sendCloseBtw\(activeBtw\.sid\)/,
-  "the explicit close action must target only the visible session's BTW");
+  /const openBtw = \(\) => \{\s*if \(!confirmArtifactDiscard\(\)\) return;/,
+  "opening side chat must preserve the dirty Markdown discard guard");
+assert.match(appSource,
+  /const closeBtw = \(btwSid = activeBtwSid\) => \{[\s\S]*?sendCloseBtw\(btwSid\)/,
+  "the explicit close action must target only the selected side chat");
+assert.match(appSource,
+  /latest\.collapseBtw\(\);[\s\S]{0,80}else latest\.openBtw\(\)/,
+  "the keyboard shortcut must collapse the panel without destroying a chat");
+assert.match(appSource, /onNew=\{createBtw\}/,
+  "the visible side-chat panel must expose creation of additional chats");
+assert.doesNotMatch(appSource, /sendCloseBtw\(msg\.btw_sid\)/,
+  "navigation or a late open response must never destroy a side chat");
+assert.match(appSource,
+  /msg\.revision < stateRef\.current\.btwRevision[\s\S]{0,650}pendingBtwByParentRef\.current\.delete\(requestedParent\)[\s\S]{0,450}setBtwOpeningFor\(requestedParent, false\)/,
+  "a newer BTW catalog must settle its stale cached open response");
+assert.equal((appSource.match(/sendCloseBtw\(/g) ?? []).length, 1,
+  "only the explicit per-chat close action may destroy a side chat");
 assert.match(appSource,
   /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
   "BTW file actions must stay bound to the visible session's fork");
@@ -17839,8 +17906,10 @@ assert.match(appSource,
   /focusedSid !== sid[\s\S]{0,180}activeBtwSid !== sid/,
   "background sessions outside the focused main and visible BTW stay unable to read files");
 assert.match(btwPanelSource,
-  /<ChatView[\s\S]{0,220}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
+  /<ChatView[\s\S]{0,400}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
   "BTW chat rendering must receive the same bounded image authorization channel");
+assert.match(btwPanelSource, /<ChatView[\s\S]{0,100}engine=\{p\.engine\}/,
+  "BTW rendering must use its real engine so Codex hook plumbing stays filtered");
 assert.match(appSource, /sendInterruptTo\(sid\)/,
   "BTW stop must target the captured fork sid");
 assert.match(appSource, /sendSetModelTo\(sid, model\)/,
@@ -18512,7 +18581,7 @@ assert.equal(relay.lastSeqFor("s1"), 1);
 // only notified the App when a per-btw generation had already been recorded.
 socket.receive({
   type: "btw_opened", request_id: "btw-gap", btw_sid: "btw-old",
-  parent_sid: "s1", engine: "claude",
+  parent_sid: "s1", engine: "claude", created_at: 1, revision: 1,
 });
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g2",
@@ -18530,6 +18599,24 @@ socket.receive({
   state: "idle", tail_text: "",
 });
 assert.equal(wrapperGenerationChanges, 1); // one notice per wrapper generation
+
+// BtwSync itself may be the first new-generation frame after a sleeping
+// browser reconnects. Its newly installed catalog must survive generation
+// invalidation so the selected chat's following bounded replay is accepted.
+socket.receive({
+  type: "btw_sync", generation: "g3", revision: 1,
+  sessions: [{
+    btw_sid: "btw-restored", parent_sid: "s2", engine: "codex",
+    created_at: 3, state: "running",
+  }],
+});
+socket.receive({
+  type: "model", sid: "btw-restored", seq: 1, model: "gpt-restored",
+});
+assert.equal(wrapperGenerationChanges, 2);
+assert.equal(observed.filter((event) => event.type === "model"
+  && event.sid === "btw-restored" && event.model === "gpt-restored").length, 1,
+"a BtwSync catalog must remain authoritative after it changes generation");
 relay.stop();
 
 // A separate socket exercises the v15 control watermark without perturbing

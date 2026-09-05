@@ -157,6 +157,8 @@ def test_codex_work_btw_uses_private_profile_bound_runtime(
         assert handle.permission_profile == "cc_remote_work"
         assert handle.web_search_override is None
         assert handle.web_search == "cached"
+        assert handle.effort == handle.applied_effort == "xhigh"
+        assert handle.display_effort == "xhigh"
 
     asyncio.run(run())
 
@@ -3131,23 +3133,23 @@ def test_machine_resolves_nullable_codex_effort_without_loading_forever(
         ctx.sdk.display_effort_model = None
 
         async def clamp(_model, effort, *, codex_home=None):
-            assert effort == "low"
+            assert effort == "xhigh"
             return effort
 
         monkeypatch.setattr(machine_module, "clamp_effort", clamp)
         assert await machine._resolve_codex_session_effort(
-            ctx, preferred="low") == "low"
-        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
-        assert ctx.sdk.display_effort == "low"
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
+        assert ctx.sdk.display_effort == "xhigh"
         assert ctx.sdk.display_effort_model == "gpt-default"
 
         # thread/fork may echo the parent's explicit setting. BTW's wrapper-
-        # owned low choice must still win before its first query.
+        # owned xhigh choice must still win before its first query.
         ctx.sdk.effort = "high"
         ctx.sdk.applied_effort = "high"
         assert await machine._resolve_codex_session_effort(
-            ctx, preferred="low") == "low"
-        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
 
     asyncio.run(run())
 

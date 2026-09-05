@@ -457,10 +457,15 @@ try {
   assert.equal(unrequestedContextState.runtimes[sid].contextReport?.total_tokens,
     160);
 
-  const newChat = reduce(reduce(initialState, {
+  const defaultNewChat = reduce(initialState, {
     type: "enter_new_chat",
     cwd: "/repo",
-  }), {
+  });
+  assert.equal(defaultNewChat.newChat?.autoCompactMode, "inherit");
+  assert.equal(defaultNewChat.newChat?.autoCompactThresholdTokens, null,
+    "new Claude chats must not override the native autocompact window");
+
+  const newChat = reduce(defaultNewChat, {
     type: "set_new_chat_auto_compact",
     mode: "custom",
     thresholdTokens: 500_000,

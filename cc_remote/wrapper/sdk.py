@@ -49,7 +49,6 @@ from cc_remote.wrapper.claude_rewind import (
 from cc_remote.wrapper.claude_runtime import inspect_claude_runtime
 from cc_remote.wrapper.claude_controls import (
     CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
-    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     claude_auto_compact_cli_value,
     valid_claude_auto_compact,
     valid_claude_model,
@@ -200,8 +199,7 @@ class SdkHandle:
         # applied values separate so a busy turn can drain to ResultMessage before
         # the wrapper reconnects this exact session with the new threshold.
         self.auto_compact_mode = CLAUDE_DEFAULT_AUTO_COMPACT_MODE
-        self.auto_compact_threshold_tokens: int | None = (
-            CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS)
+        self.auto_compact_threshold_tokens: int | None = None
         self.applied_auto_compact_mode: str | None = None
         self.applied_auto_compact_threshold_tokens: int | None = None
         self.effective_auto_compact_threshold_tokens: int | None = None

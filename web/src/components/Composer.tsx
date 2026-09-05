@@ -49,7 +49,6 @@ import { UsageMeter } from "./UsageMeter";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
 import {
-  DEFAULT_AUTO_COMPACT_TOKENS,
   normalizeAutoCompactSelection,
   parseAutoCompactArgument,
   type AutoCompactSelection,
@@ -726,8 +725,8 @@ export function Composer(p: Props) {
     ? workContextMetrics(exactContextReport)
     : null;
   const autoCompactSelection = normalizeAutoCompactSelection(
-    p.autoCompact?.mode ?? "custom",
-    p.autoCompact?.threshold_tokens ?? DEFAULT_AUTO_COMPACT_TOKENS,
+    p.autoCompact?.mode ?? "inherit",
+    p.autoCompact?.threshold_tokens ?? null,
   );
   const autoCompactControl = (
     <Suspense fallback={

@@ -69,6 +69,20 @@ class CodexDaemonInfo:
     nofile_verified: bool = False
 
 
+@dataclass(frozen=True)
+class CodexSocketIdentity:
+    """A profile-scoped standalone listener generation, not a daemon PID."""
+
+    codex_home: str
+    socket_path: str
+    device: int
+    inode: int
+    created_ns: int
+
+
+CodexServerIdentity = ProcessIdentity | CodexSocketIdentity
+
+
 class CodexDaemonUpgradeRequired(RuntimeError):
     """The managed shared daemon could not be aligned with the selected CLI."""
 
@@ -309,7 +323,8 @@ def _managed_pid(path: Path) -> Optional[int]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
@@ -345,6 +360,43 @@ def _managed_daemon_process_identity(
     if pid is None or process_owner_uid(pid) != os.getuid():
         return None
     return process_identity(pid)
+
+
+def _standalone_socket_identity(
+    codex_home: str, socket_path: str,
+) -> Optional[CodexSocketIdentity]:
+    """Observe a private native listener without connecting or scanning PIDs.
+
+    A standalone app-server has no managed PID record. Its Unix listener is
+    replaced on restart, so inode/ctime changes fence old proxies just as a
+    PID/start-token change does for a managed daemon. Never substitute another
+    account's socket, follow a socket symlink, or accept a shared-writable path.
+    The proxy handshake still proves that the observed listener speaks Codex.
+    """
+    try:
+        home = Path(codex_home).resolve()
+        path = Path(socket_path)
+        if not path.is_absolute():
+            return None
+        parent = path.parent.resolve()
+        parent.relative_to(home)
+        parent_stat = parent.stat()
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.getuid()
+            or parent_stat.st_mode & 0o022
+            or not stat.S_ISSOCK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            return None
+        return CodexSocketIdentity(
+            str(home), str(parent / path.name),
+            info.st_dev, info.st_ino, info.st_ctime_ns,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def _linux_process_start_ticks(pid: int) -> Optional[int]:
@@ -643,6 +695,8 @@ class CodexDaemonManager:
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
         self._ready_codex_home: Optional[str] = None
+        self._standalone_socket_path: Optional[str] = None
+        self._managed_identity_required = False
 
     @property
     def info(self) -> Optional[CodexDaemonInfo]:
@@ -668,12 +722,31 @@ class CodexDaemonManager:
         # Clearing it here would make one proxy EOF look like a daemon swap to
         # every healthy sibling handle and cause a reconnect cascade.
 
-    def current_process_identity(self) -> Optional[ProcessIdentity]:
-        """Observe the current official app-server child, if one was verified."""
+    def current_process_identity(self) -> Optional[CodexServerIdentity]:
+        """Observe the discovered server generation (PID or native listener).
+
+        Keep this historical method name for handle/test manager compatibility.
+        Once a managed PID is observed, missing/unreadable PID state is an
+        outage, never permission to downgrade to standalone socket tracking.
+        invalidate() must preserve this barrier for healthy sibling handles.
+        """
         home = self._ready_codex_home
         if home is None:
             return None
-        return _managed_daemon_process_identity(home)
+        identity = _managed_daemon_process_identity(home)
+        if identity is not None:
+            self._managed_identity_required = True
+        if self._managed_identity_required or self._standalone_socket_path is None:
+            return identity
+        # Only a genuinely absent PID file permits the standalone identity.
+        # Broken symlinks, corrupt records and permission errors fail closed.
+        try:
+            (Path(home) / "app-server-daemon" / "app-server.pid").lstat()
+        except FileNotFoundError:
+            return _standalone_socket_identity(home, self._standalone_socket_path)
+        except OSError:
+            pass
+        return None
 
     async def _run(
         self, codex_bin: str, env: Mapping[str, str], *args: str,
@@ -887,6 +960,11 @@ class CodexDaemonManager:
                 self._ready_identity = identity
                 self._ready = existing
                 self._ready_codex_home = codex_home
+                self._standalone_socket_path = (
+                    existing.socket_path
+                    if self.socket_path in {None, existing.socket_path}
+                    else None
+                )
                 return existing
 
             # Only a successful enable proves that this is the official managed
@@ -949,6 +1027,8 @@ class CodexDaemonManager:
             self._ready_identity = identity
             self._ready = info
             self._ready_codex_home = codex_home
+            self._managed_identity_required = True
+            self._standalone_socket_path = None
             return info
 
     async def proxy_args(

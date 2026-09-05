@@ -53,7 +53,7 @@ _RESULT_FIELDS = {
     "restored_turns", "conflicts", "prefill_text", "detail",
 }
 _RESULT_ENVELOPE_FIELDS = {
-    "type", "v", "ts", "sid", "seq", "to", "route_id",
+    "type", "v", "ts", "sid", "seq", "to", "route_id", "owner_id",
 }
 
 

@@ -207,6 +207,154 @@ try {
     v: 37, ts: 10, ...body,
   } as ServerEvent);
 
+  let multiBtwState = reduce(initialState, {
+    type: "event", event: event({
+      type: "btw_opened", sid: "btw-one", request_id: "open-one",
+      btw_sid: "btw-one", parent_sid: "parent", engine: "codex",
+      created_at: 1, revision: 1,
+    }),
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_opened", sid: "btw-two", request_id: "open-two",
+      btw_sid: "btw-two", parent_sid: "parent", engine: "codex",
+      created_at: 2, revision: 2,
+    }),
+  });
+  assert.deepEqual(
+    multiBtwState.btwByParentSid.parent.chats.map(
+      (chat: { sid: string }) => chat.sid),
+    ["btw-one", "btw-two"],
+    "opening another BTW appends a side chat instead of replacing the first",
+  );
+  assert.equal(multiBtwState.btwByParentSid.parent.activeSid, "btw-two");
+  multiBtwState = reduce(multiBtwState, {
+    type: "select_btw", parentSid: "parent", btwSid: "btw-one",
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_opened", sid: "btw-two", request_id: "open-two",
+      btw_sid: "btw-two", parent_sid: "parent", engine: "codex",
+      created_at: 2, revision: 2,
+    }),
+  });
+  assert.equal(multiBtwState.btwByParentSid.parent.activeSid, "btw-one",
+    "a duplicate open response cannot steal the user's selected side chat");
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_sync", generation: "wrapper-one", revision: 2,
+      sessions: [
+        { btw_sid: "btw-two", parent_sid: "parent", engine: "codex", created_at: 2 },
+        { btw_sid: "btw-one", parent_sid: "parent", engine: "codex", created_at: 1 },
+      ],
+    }),
+  });
+  assert.equal(multiBtwState.btwByParentSid.parent.activeSid, "btw-one",
+    "an equal/new authoritative refresh catalog preserves the selected tab");
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "snapshot", sid: "btw-one", cc_session_id: null,
+      state: "idle", tail_text: "", generation: "wrapper-one",
+    }),
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "state", sid: "btw-one", state: "running", seq: 1,
+    }),
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_sync", generation: "wrapper-one", revision: 3,
+      sessions: [
+        { btw_sid: "btw-two", parent_sid: "parent", engine: "codex",
+          created_at: 2, state: "idle" },
+        { btw_sid: "btw-one", parent_sid: "parent", engine: "codex",
+          created_at: 1, state: "idle" },
+      ],
+    }),
+  });
+  assert.equal(multiBtwState.runtimes["btw-one"].state, "running",
+    "a catalog snapshot cannot overwrite newer live state on a synced socket");
+  multiBtwState = reduce(multiBtwState, {
+    type: "conn", connState: "reconnecting",
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_sync", generation: "wrapper-one", revision: 4,
+      sessions: [
+        { btw_sid: "btw-two", parent_sid: "parent", engine: "codex",
+          created_at: 2, state: "idle" },
+        { btw_sid: "btw-one", parent_sid: "parent", engine: "codex",
+          created_at: 1, state: "idle" },
+      ],
+    }),
+  });
+  assert.equal(multiBtwState.runtimes["btw-one"].state, "idle",
+    "authoritative BTW sync repairs state missed while the tab was offline");
+  const retainedSideTurn = {
+    id: "retained-side-turn", prompt: "older side question",
+    blocks: [], done: true, ts: 1,
+  };
+  multiBtwState = reduce(multiBtwState, {
+    type: "set_turns", sid: "btw-one", turns: [retainedSideTurn],
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "replay_start", sid: "btw-one", from_seq: 10, to_seq: 20,
+      truncated: true, generation: "wrapper-one",
+    }),
+  });
+  assert.deepEqual(multiBtwState.runtimes["btw-one"].turns,
+    [retainedSideTurn],
+    "a truncated ephemeral replay keeps its bounded projection instead of "
+      + "waiting forever for an unavailable History endpoint");
+  assert.equal(multiBtwState.runtimes["btw-one"].historyInvalidated, false);
+  assert.equal(multiBtwState.historyRecovery, null);
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "replay_end", sid: "btw-one", to_seq: 20, truncated: true,
+    }),
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_closed", sid: "btw-one", btw_sid: "btw-one",
+      parent_sid: "parent", revision: 5,
+    }),
+  });
+  assert.deepEqual(multiBtwState.btwByParentSid.parent, {
+    chats: [{
+      sid: "btw-two", engine: "codex", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-two",
+  }, "closing the selected tab chooses the remaining neighbor");
+  assert.equal("btw-one" in multiBtwState.runtimes, false);
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "snapshot", sid: "btw-one", cc_session_id: null,
+      state: "idle", tail_text: "", generation: "old",
+    }),
+  });
+  multiBtwState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_opened", sid: "btw-one", request_id: "stale-open",
+      btw_sid: "btw-one", parent_sid: "parent", engine: "codex",
+      created_at: 1, revision: 2,
+    }),
+  });
+  assert.equal("btw-one" in multiBtwState.runtimes, false,
+    "late replay and an older open revision cannot resurrect a closed chat");
+  const closedCatalogState = reduce(multiBtwState, {
+    type: "event", event: event({
+      type: "btw_closed", sid: "btw-two", btw_sid: "btw-two",
+      parent_sid: "parent", revision: 6,
+    }),
+  });
+  assert.equal(closedCatalogState.btwRevision, 6);
+  assert.equal(reduce(closedCatalogState, {
+    type: "clear_all_btw",
+  }).btwRevision, 0,
+  "a wrapper generation change resets revision even after every tab closed");
+
   const agentPanelMarkup = renderToStaticMarkup(createElement(
     AgentDetailPanel,
     {
@@ -228,14 +376,30 @@ try {
   btwRuntime.syncReady = true;
   btwRuntime.liveOwner = { turnId: "btw-previous-turn", seq: 8 };
   btwRuntime.acceptancePending = "btw-new-turn";
+  btwRuntime.pendingQuestion = {
+    ask_id: "btw-question", question: "继续侧边任务吗？",
+    options: [{ label: "继续" }, { label: "停止" }],
+  };
   btwRuntime.turns = [{
     id: "btw-previous-turn", prompt: "previous prompt", done: true,
-    blocks: [],
+    blocks: [{
+      kind: "process", item_id: "btw-successful-hook", processKind: "hook",
+      phase: "end", status: "succeeded", title: "BTW hook plumbing",
+      done: true,
+    }, {
+      kind: "process", item_id: "btw-failed-hook", processKind: "hook",
+      phase: "end", status: "failed", title: "BTW hook failure",
+      done: true,
+    }],
   }, {
     id: "btw-new-turn", prompt: "new prompt", done: false, blocks: [],
   }];
   const btwMarkup = renderToStaticMarkup(createElement(BtwPanel, {
     sid: "btw-session", rt: btwRuntime, engine: "codex", opening: false,
+    chats: [{
+      sid: "btw-session", engine: "codex", title: "侧聊 1", state: "idle",
+      needsAnswer: true,
+    }],
     active: "btw", hasArtifact: false, catalog: {},
     draftKey: "btw-session-draft",
     draftStore: {
@@ -244,15 +408,24 @@ try {
     },
     sendMode: "steer", unconfirmedQueued: [], unconfirmedReplaceable: [],
     queueCapacity: {}, replaceQueueCapacity: {}, onTab: () => {},
+    onNew: () => {}, onSelect: () => {}, onCloseChat: () => {},
     onSend: () => true, onSteer: () => true, onInterrupt: () => {},
     onSetSendMode: () => {}, onEnqueue: () => true,
     onSetPending: () => true, onRemoveQueued: () => {},
     onInspectQueued: () => {}, onSetModel: () => {}, onSetEffort: () => {},
-    onClose: () => {}, onDismissNotice: () => {},
+    onSetAutoCompact: () => true, onAnswerQuestion: () => {},
+    onCollapse: () => {}, onDismissNotice: () => {},
   }));
   assert.equal((btwMarkup.match(/思考中/g) ?? []).length, 1);
   assert.ok(btwMarkup.indexOf("思考中") > btwMarkup.indexOf("new prompt"),
     "BTW paints the pending submit spark on the new row, not its stale owner");
+  assert.doesNotMatch(btwMarkup, /BTW hook plumbing/,
+    "successful Codex hook plumbing stays hidden in the side chat");
+  assert.match(btwMarkup, /1 项/,
+    "the actionable Codex hook failure remains in the collapsed side-chat count");
+  assert.match(btwMarkup, /待回答/);
+  assert.match(btwMarkup, /继续侧边任务吗？/,
+    "a pending BTW question is actionable inside the side panel");
 
   const claudeEchoGapSid = "claude-user-echo-keeps-working-owner";
   const claudeEchoGapMessage = "claude-browser-message";

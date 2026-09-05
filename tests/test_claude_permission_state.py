@@ -110,6 +110,8 @@ def test_claude_control_state_survives_sdk_reconnect_and_failed_set(
         handle = SdkHandle(WrapperConfig())
         await handle.connect(cwd="/tmp")
         assert handle.model == "claude-mythos-5"
+        assert "autocompact" not in (
+            _FakeClaudeClient.created[-1].options.extra_args or {})
 
         await handle.set_model("claude-opus-4-8")
         assert handle.model == "claude-opus-4-8"
@@ -399,9 +401,10 @@ def test_unrelated_reconnect_does_not_apply_a_pending_smaller_window(
             None, "/tmp", reason="effort change")
 
         replacement = _FakeClaudeClient.created[-1]
-        assert replacement.options.extra_args["autocompact"] == "500000"
+        assert "autocompact" not in (replacement.options.extra_args or {})
         assert handle.auto_compact_threshold_tokens == 200_000
-        assert handle.applied_auto_compact_threshold_tokens == 500_000
+        assert handle.applied_auto_compact_mode == "inherit"
+        assert handle.applied_auto_compact_threshold_tokens is None
         await handle.disconnect()
 
     asyncio.run(go())
@@ -444,9 +447,10 @@ def test_reconnect_uses_immutable_spawn_snapshot_without_losing_newer_choice(
         await reconnect
 
         replacement = BlockingDisconnect.created[-1]
-        assert replacement.options.extra_args["autocompact"] == "500000"
+        assert "autocompact" not in (replacement.options.extra_args or {})
         assert replacement.options.effort == "max"
-        assert handle.applied_auto_compact_threshold_tokens == 500_000
+        assert handle.applied_auto_compact_mode == "inherit"
+        assert handle.applied_auto_compact_threshold_tokens is None
         assert handle.applied_effort == "max"
         assert handle.auto_compact_threshold_tokens == 300_000
         assert handle.effort == "high"
@@ -1408,8 +1412,8 @@ def test_cold_claude_resume_restores_private_remote_controls(
             model="claude-opus-4-6[1m]",
             effort="high",
             permission_mode="plan",
-            applied_auto_compact_mode="custom",
-            applied_auto_compact_threshold_tokens=500_000,
+            applied_auto_compact_mode="inherit",
+            applied_auto_compact_threshold_tokens=None,
         )
         await ctx.sdk.disconnect()
 
@@ -1464,7 +1468,7 @@ def test_cold_resume_keeps_pending_lower_window_out_of_launch(
     asyncio.run(go())
 
 
-def test_cold_resume_without_control_record_does_not_fake_500k_launch(
+def test_cold_resume_without_control_record_uses_native_autocompact(
     monkeypatch, tmp_path,
 ):
     session_id = "11111111-1111-4111-8111-111111111111"
@@ -1494,16 +1498,16 @@ def test_cold_resume_without_control_record_does_not_fake_500k_launch(
         assert ctx is not None
         client = _FakeClaudeClient.created[-1]
         assert "autocompact" not in (client.options.extra_args or {})
-        assert ctx.sdk.auto_compact_mode == "custom"
-        assert ctx.sdk.auto_compact_threshold_tokens == 500_000
+        assert ctx.sdk.auto_compact_mode == "inherit"
+        assert ctx.sdk.auto_compact_threshold_tokens is None
         assert ctx.sdk.applied_auto_compact_mode == "inherit"
         assert ctx.sdk.applied_auto_compact_threshold_tokens is None
         event = machine._claude_auto_compact_event(ctx)
-        assert event.pending is True
-        assert event.phase == "waiting_terminal"
+        assert event.pending is False
+        assert event.phase == "stable"
         saved = machine._claude_controls.get(session_id)
-        assert saved.auto_compact_mode == "custom"
-        assert saved.auto_compact_threshold_tokens == 500_000
+        assert saved.auto_compact_mode == "inherit"
+        assert saved.auto_compact_threshold_tokens is None
         assert saved.applied_auto_compact_mode == "inherit"
         assert saved.applied_auto_compact_threshold_tokens is None
         await ctx.sdk.disconnect()
@@ -1605,9 +1609,11 @@ def test_claude_btw_inherits_parent_permission_before_connect(monkeypatch):
             self.permission_mode = "bypassPermissions"
             self.effort = "max"
             self.connected_permission = None
+            self.connected_effort = None
 
         async def connect(self, **_kwargs):
             self.connected_permission = self.permission_mode
+            self.connected_effort = self.effort
 
         async def disconnect(self):
             return None
@@ -1624,6 +1630,7 @@ def test_claude_btw_inherits_parent_permission_before_connect(monkeypatch):
 
         assert fork.sdk.permission_mode == "plan"
         assert fork.sdk.connected_permission == "plan"
+        assert fork.sdk.connected_effort == "xhigh"
 
     asyncio.run(go())
 
@@ -1821,6 +1828,7 @@ def test_open_btw_emits_its_permission_frame():
         async def spawn(_parent, owner_client_id=None):
             assert owner_client_id == "client-1"
             fork.owner_client_id = owner_client_id
+            machine.sessions[fork.key] = fork
             return fork
 
         machine._spawn_btw = spawn

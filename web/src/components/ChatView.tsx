@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -74,6 +76,8 @@ import {
   HISTORY_REQUEST_TIMEOUT_MS,
 } from "../history-requests";
 import { mergeDetailWithLiveTail } from "../history-merge";
+
+const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -187,7 +191,7 @@ interface TextSelectionRetention {
   scope: string;
   anchorTurnId: string;
   focusTurnId: string;
-  pointerId: number;
+  pointerId: number | null;
   interactionToken: number | null;
   dragging: boolean;
   releaseAnchorTurnId: string | null;
@@ -197,6 +201,13 @@ interface TextSelectionRetention {
 interface TextSelectionCandidate {
   scope: string;
   pointerId: number;
+}
+
+function nativeSelectionBoundary(selection: Selection) {
+  return {
+    anchor: selection.anchorNode, anchorOffset: selection.anchorOffset,
+    focus: selection.focusNode, focusOffset: selection.focusOffset,
+  };
 }
 
 const TEXT_SELECTION_EXCLUDED_SELECTOR = [
@@ -218,6 +229,7 @@ function selectionTurnId(
 ): string | null {
   if (!root || !node || !root.contains(node)) return null;
   const element = node instanceof Element ? node : node.parentElement;
+  if (element?.closest("input, textarea, select, [contenteditable='true']")) return null;
   return element?.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId ?? null;
 }
 
@@ -335,7 +347,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
-  onLoadDetail, onEdit, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onReplyAsyncQuestion, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
@@ -374,6 +386,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     autoLoad?: boolean,
   ) => boolean;
   onEdit?: (prompt: string) => void;
+  onReplyAsyncQuestion?: (prompt: string) => boolean;
   onGetDiff?: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
   onPreviewMarkdown?: (file: string) => void;
@@ -438,6 +451,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
   const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
   const textSelectionRef = useRef<TextSelectionRetention | null>(null);
+  const nativeSelectionBoundaryRef = useRef<ReturnType<typeof nativeSelectionBoundary> | null>(null);
+  const textSelectionReleaseFrameRef = useRef<number | null>(null);
+  const selectionScrollIntentFnRef = useRef<(() => void) | null>(null);
   const [textSelection, setTextSelection] =
     useState<TextSelectionRetention | null>(null);
   const detailAnchorRef = useRef<DetailAnchorTransaction | null>(null);
@@ -1039,21 +1055,34 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!active || !active.dragging
         || (pointerId != null && active.pointerId !== pointerId)) return;
-    const releaseBoundary = captureHistoryBoundary();
-    if (active.interactionToken !== null) {
-      // Finishing a text drag must never replay a bottom command queued while
-      // the browser owned native selection auto-scroll.
-      scrollCoordinatorRef.current.endInteraction(
-        active.interactionToken, false,
-      );
-      setScrollPolicyEpoch((value) => value + 1);
-    }
-    commitTextSelection({
-      ...active,
-      dragging: false,
-      interactionToken: null,
-      releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
-      releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+    if (textSelectionReleaseFrameRef.current !== null) return;
+    // Mouseup's native default action can finish one last auto-scroll / range
+    // update. Keep ownership until that action has settled, then snapshot both
+    // the selection and viewport together; its queued selectionchange is not
+    // a new gesture and must not disable stationary resize protection.
+    textSelectionReleaseFrameRef.current = window.requestAnimationFrame(() => {
+      textSelectionReleaseFrameRef.current = null;
+      const current = textSelectionRef.current;
+      if (!current || current.interactionToken !== active.interactionToken) return;
+      const releaseBoundary = captureHistoryBoundary();
+      const native = window.getSelection();
+      const valid = !!native && !native.isCollapsed && native.rangeCount > 0;
+      nativeSelectionBoundaryRef.current = valid ? nativeSelectionBoundary(native) : null;
+      if (current.interactionToken !== null) {
+        // Finishing a text drag must never replay a bottom command queued while
+        // the browser owned native selection auto-scroll.
+        scrollCoordinatorRef.current.endInteraction(
+          current.interactionToken, false,
+        );
+        setScrollPolicyEpoch((value) => value + 1);
+      }
+      commitTextSelection(valid ? {
+        ...current,
+        dragging: false,
+        interactionToken: null,
+        releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
+        releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+      } : null);
     });
   }, [captureHistoryBoundary, commitTextSelection]);
 
@@ -1073,7 +1102,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection]);
 
   const clearTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     const active = textSelectionRef.current;
     if (active?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -1089,6 +1123,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection, publishTextSelection]);
 
   const disposeTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     const selection = textSelectionRef.current;
     if (selection?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -1097,6 +1135,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
     textSelectionRef.current = null;
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     onTextSelectionGuardChange?.(null);
   }, [onTextSelectionGuardChange]);
 
@@ -1106,11 +1145,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!nativeSelection || nativeSelection.isCollapsed
         || nativeSelection.rangeCount === 0) {
-      if (active) clearTextSelection();
+      // Native edge selection can transiently expose an empty range while
+      // the mouse remains held. Release on the real pointer boundary instead.
+      if (active && !active.dragging) clearTextSelection();
       return;
     }
-    if (!candidate && !active) return;
-    const expectedScope = active?.scope ?? candidate?.scope;
+    const expectedScope = active?.scope ?? candidate?.scope ?? scrollScope;
     if (expectedScope !== scrollScope) {
       clearTextSelection();
       return;
@@ -1125,29 +1165,42 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       if (!active || !active.dragging) clearTextSelection();
       return;
     }
+    const previous = nativeSelectionBoundaryRef.current;
+    const boundary = nativeSelectionBoundary(nativeSelection);
+    nativeSelectionBoundaryRef.current = boundary;
     if (active) {
-      if (active.anchorTurnId === anchorTurnId
-          && active.focusTurnId === focusTurnId) return;
+      if (previous && previous.anchor === boundary.anchor
+          && previous.anchorOffset === boundary.anchorOffset
+          && previous.focus === boundary.focus
+          && previous.focusOffset === boundary.focusOffset) return;
+      // Native selection handles and keyboard extension can move without a
+      // pointerdown/wheel reaching this element, including within ONE turn.
+      // Yield the old stationary viewport anchor before native auto-scroll.
+      if (!active.dragging) selectionScrollIntentFnRef.current?.();
+      if (active.anchorTurnId === anchorTurnId && active.focusTurnId === focusTurnId) return;
       commitTextSelection({
-        ...active,
+        ...textSelectionRef.current!,
         anchorTurnId,
         focusTurnId,
       });
       return;
     }
-    if (!candidate || !sid) return;
+    if (!sid) return;
     cancelDetailAnchorFnRef.current?.();
     setMeasurementBoundary(null);
     pauseOutputFollow();
-    const interactionToken =
-      scrollCoordinatorRef.current.beginInteraction(false);
+    // Touch handles / a selectionchange delivered after mouseup have no
+    // pressed mouse candidate. Retain their DOM without a never-ending lock.
+    const interactionToken = candidate
+      ? scrollCoordinatorRef.current.beginInteraction(false) : null;
+    if (!candidate) selectionScrollIntentFnRef.current?.();
     const selection: TextSelectionRetention = {
       scope: scrollScope,
       anchorTurnId,
       focusTurnId,
-      pointerId: candidate.pointerId,
+      pointerId: candidate?.pointerId ?? null,
       interactionToken,
-      dragging: true,
+      dragging: !!candidate,
       releaseAnchorTurnId: null,
       releaseAnchorOffset: null,
     };
@@ -1779,6 +1832,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       USER_SCROLL_INTENT_IDLE_MS,
     );
   };
+  selectionScrollIntentFnRef.current = () => markUserScrollIntent("unknown");
 
   const leaveHistoryBrowse = useCallback((): boolean => {
     if (!browseMode || !onReturnLatest) return false;
@@ -2927,11 +2981,18 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                         )}
                       </div>
                     )}
-                    <MessageBlock text={block.text}
+                    {block.delivery === "async" && block.questions?.length
+                      ? <Suspense fallback={<MessageBlock text={block.text} done={block.done} />}>
+                          <AsyncQuestionCard questions={block.questions}
+                            onReply={onReplyAsyncQuestion}>
+                            <MessageBlock text={block.text} done onOpenFile={onOpenFile} />
+                          </AsyncQuestionCard>
+                        </Suspense>
+                      : <MessageBlock text={block.text}
                       done={block.done} onOpenFile={onOpenFile}
                       imageAssets={imageAssets} onLoadImage={onLoadImage}
                       onAuthorizeImage={onAuthorizeImage}
-                      onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+                      onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />}
                   </div>
                 ))}
                 {showCompletionFooter && (

@@ -65,7 +65,9 @@ const SCHEMA = 1;
 // compaction row split from the real user message that owns the turn.
 // v24 discards Claude rows whose completion clock could include late internal
 // resume bookkeeping, and projections bloated by automatic full-detail paging.
-const CACHE_VER = 24;
+// v25 reprojects native async questions instead of preserving plain-answer shells.
+// v26 discards summaries where those questions hid ordinary unphased replies.
+const CACHE_VER = 26;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

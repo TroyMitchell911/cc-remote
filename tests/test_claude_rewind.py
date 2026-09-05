@@ -33,7 +33,6 @@ def test_claude_options_enable_file_checkpoints_and_user_message_replay():
     assert options.enable_file_checkpointing is True
     assert options.extra_args == {
         "replay-user-messages": None,
-        "autocompact": "500000",
     }
 
 

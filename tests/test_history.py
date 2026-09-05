@@ -6936,6 +6936,7 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
         assert types == [
+            "btw_sync",
             "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
             "completion_state", "perm", "auto_compact",
             "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
@@ -7009,11 +7010,12 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
+            "btw_sync",
             "replay_start", "user_msg", "replay_end", "ask_user_sync",
             "background_process_sync", "session_control", "query_queue",
             "completion_state", "perm",
             "auto_compact"]
-        assert tr.sent[1].msg_id == "m3"
+        assert tr.sent[2].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
     asyncio.run(go())
@@ -7037,11 +7039,12 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
             client_id="c1", cursors=None, generations=None, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
+            "btw_sync",
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
             "ask_user_sync", "background_process_sync", "query_queue",
             "completion_state", "perm",
             "auto_compact"]
-        assert tr.sent[2].prompt == "current"
+        assert tr.sent[3].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
     asyncio.run(go())

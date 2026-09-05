@@ -3,8 +3,10 @@ import { resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 
 const DIST = resolve(import.meta.dirname, "../dist");
-const MAX_ENTRY_BYTES = 515 * 1024;
-const MAX_INITIAL_BYTES = 908 * 1024;
+// Selection tracking, async routing, parent-scoped BTW visibility and lazy
+// loaders add <4 KiB to startup. The ~164 KiB HTML parser and form stay lazy.
+const MAX_ENTRY_BYTES = 518 * 1024;
+const MAX_INITIAL_BYTES = 912 * 1024;
 const MAX_INITIAL_GZIP_BYTES = 280 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 

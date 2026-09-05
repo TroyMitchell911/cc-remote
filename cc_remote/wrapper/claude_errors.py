@@ -81,7 +81,8 @@ def provider_request_too_large_message(
     """Return an actionable message without over-claiming the 413 cause."""
     if kind == "context":
         return (
-            "上游拒绝了过大的上下文请求。Claude 未能在发送前完成原生自动压缩；"
+            "上游按其 token 口径拒绝了上下文请求；这不代表 Claude Code 显示的"
+            "原生上下文已经达到上限，网关计量或媒体请求体可能与其不一致。"
             "请运行 /compact，或 Fork/新建会话后继续。"
         )
     return (

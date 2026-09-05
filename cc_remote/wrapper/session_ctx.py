@@ -227,7 +227,20 @@ class SessionContext:
     # discarded on close. Its turns reuse the normal _run_turn path.
     btw: bool = False
     parent_sid: Optional[str] = None
+    # Relay-authenticated account identity for a private side chat. The legacy
+    # attribute name is retained for state/test compatibility; this is not a
+    # page-lifetime WebSocket client id.
     owner_client_id: Optional[str] = None
+    # Stable wall-clock ordering for the owner-scoped side-chat catalog. This
+    # is process-local just like the ephemeral native fork itself.
+    btw_created_at: float = 0.0
+    # The native fork is inserted before its one-shot open response is sent.
+    # Hello must not catalog/replay it until that response has established the
+    # browser runtime, otherwise a reconnect can receive Snapshot first.
+    btw_announced: bool = False
+    # A proven-lost native ephemeral fork remains resident for read-only replay
+    # until its owner explicitly closes it. Never reuse its routing identity.
+    btw_destroyed: bool = False
     # cc fork_session persists a transcript under a new id (unlike codex's
     # ephemeral fork); capture it here so close_btw can hard-delete it.
     btw_real_id: Optional[str] = None

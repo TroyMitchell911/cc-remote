@@ -5,7 +5,10 @@ import asyncio
 import base64
 import hashlib
 import os
+from pathlib import Path
 import signal
+import socket
+import tempfile
 
 import pytest
 
@@ -15,6 +18,7 @@ from cc_remote.wrapper.codex_daemon import (
     CodexDaemonManager,
     CodexProfileDaemonUnavailable,
     CodexDaemonUpgradeRequired,
+    CodexSocketIdentity,
 )
 from cc_remote.wrapper.codex_handle import (
     CodexAppServerDisconnected,
@@ -240,6 +244,227 @@ def test_managed_daemon_identity_uses_same_user_pid_and_start_token(
         lambda _pid: os.getuid() + 1,
     )
     assert daemon_module._managed_daemon_process_identity(tmp_path) is None
+
+
+@pytest.fixture
+def standalone_listener():
+    # Keep the path below macOS's Unix socket length limit.
+    with tempfile.TemporaryDirectory(prefix="cc-sock-", dir="/tmp") as root:
+        home = Path(root).resolve()
+        control = home / "app-server-control"
+        control.mkdir(mode=0o700)
+        path = control / "app-server-control.sock"
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path))
+            path.chmod(0o600)
+            listener.listen()
+            yield home, path
+
+
+def _standalone_manager(home, path):
+    manager = CodexDaemonManager("auto", require_shared=True)
+
+    async def command(_bin, _env, *args):
+        if args[-1] == "--help":
+            return _result(0)
+        if args[-1] == "version":
+            return _result(0, {
+                "status": "running", "socketPath": str(path),
+                "managedCodexPath": str(home / "codex"),
+                "managedCodexVersion": "0.149.0",
+                "cliVersion": "0.153.4", "appServerVersion": "0.149.0",
+            })
+        assert args[-1] == "enable-remote-control"
+        return _result(1)
+
+    manager._run = command
+    return manager
+
+
+def test_standalone_generation_survives_invalidate_and_detects_replacement(
+    standalone_listener,
+):
+    home, path = standalone_listener
+    manager = _standalone_manager(home, path)
+    asyncio.run(manager.proxy_args("/bin/codex", {"CODEX_HOME": str(home)}))
+    original = manager.current_process_identity()
+    assert isinstance(original, CodexSocketIdentity)
+    assert manager.current_process_identity() == original
+    manager.invalidate()
+    assert manager.current_process_identity() == original
+    handle = CodexHandle(_Cfg(), daemon_manager=manager)
+    handle.proc = _Process()
+    handle._using_daemon_proxy = True
+    handle._daemon_process_identity = original
+    assert handle.daemon_process_generation_current is True
+    path.unlink()
+    with socket.socket(socket.AF_UNIX) as replacement:
+        replacement.bind(str(path))
+        path.chmod(0o600)
+        assert manager.current_process_identity() != original
+        assert handle.daemon_process_generation_current is False
+    path.unlink()
+    assert manager.current_process_identity() is None
+
+
+@pytest.mark.parametrize("record", ["corrupt", "symlink", "fifo"])
+def test_standalone_generation_does_not_ignore_unverifiable_pid_record(
+    standalone_listener, record,
+):
+    home, path = standalone_listener
+    daemon_root = home / "app-server-daemon"
+    daemon_root.mkdir()
+    record_path = daemon_root / "app-server.pid"
+    if record == "corrupt":
+        record_path.write_text("not a pid")
+    elif record == "symlink":
+        record_path.symlink_to(home / "missing")
+    else:
+        os.mkfifo(record_path)
+    manager = _standalone_manager(home, path)
+    asyncio.run(manager.proxy_args("/bin/codex", {"CODEX_HOME": str(home)}))
+    assert manager.current_process_identity() is None
+
+
+def test_managed_identity_cannot_downgrade_after_pid_disappears(
+    monkeypatch, standalone_listener,
+):
+    home, path = standalone_listener
+    manager = _standalone_manager(home, path)
+    env = {"CODEX_HOME": str(home)}
+    asyncio.run(manager.proxy_args("/bin/codex", env))
+    observed = ProcessIdentity(4321, 100)
+    monkeypatch.setattr(
+        daemon_module, "_managed_daemon_process_identity", lambda _home: observed,
+    )
+    assert manager.current_process_identity() == observed
+    observed = None
+    assert manager.current_process_identity() is None
+    manager.invalidate()
+    asyncio.run(manager.proxy_args("/bin/codex", env))
+    assert manager.current_process_identity() is None
+
+
+@pytest.mark.parametrize("unsafe", [
+    "other_profile", "socket_permissions", "parent_permissions", "owner",
+    "regular_file", "symlink", "override",
+])
+def test_standalone_generation_rejects_unsafe_or_cross_profile_socket(
+    monkeypatch, standalone_listener, unsafe,
+):
+    home, path = standalone_listener
+    manager = _standalone_manager(home, path)
+    if unsafe == "override":
+        manager.socket_path = str(home / "other.sock")
+    asyncio.run(manager.proxy_args("/bin/codex", {"CODEX_HOME": str(home)}))
+    if unsafe == "other_profile":
+        manager._ready_codex_home = str(home / "other_profile")
+    elif unsafe == "socket_permissions":
+        path.chmod(0o666)
+    elif unsafe == "parent_permissions":
+        path.parent.chmod(0o770)
+    elif unsafe == "owner":
+        uid = os.getuid()
+        monkeypatch.setattr(daemon_module.os, "getuid", lambda: uid + 1)
+    elif unsafe in {"regular_file", "symlink"}:
+        renamed = path.with_name("original.sock")
+        path.rename(renamed)
+        if unsafe == "regular_file":
+            path.write_text("not a socket")
+        else:
+            path.symlink_to(renamed)
+    assert manager.current_process_identity() is None
+
+
+@pytest.mark.parametrize("replace_at", [None, "initialize", "thread/resume"])
+def test_real_manager_standalone_connect_and_restart_fences(
+    monkeypatch, standalone_listener, replace_at,
+):
+    async def run():
+        home, path = standalone_listener
+        manager = _standalone_manager(home, path)
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(argv)
+            return _Process(_Reader(_handshake_response(nonce)), 50000 + len(spawned))
+
+        monkeypatch.setattr(handle_module.asyncio, "create_subprocess_exec", spawn)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager, codex_home=str(home))
+        replaced = False
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, _params=None):
+            nonlocal replaced
+            if method == replace_at and not replaced:
+                replaced = True
+                path.unlink()
+                with socket.socket(socket.AF_UNIX) as replacement:
+                    replacement.bind(str(path))
+                    path.chmod(0o600)
+            if method == "initialize":
+                return {"serverInfo": {"version": "0.149.0"}}
+            assert method == "thread/resume"
+            return {"thread": {"id": "existing-thread"}}
+
+        handle._read_loop = idle
+        handle._request = request
+        handle._notify = lambda *_args: asyncio.sleep(0)
+        await handle.connect(resume_id="existing-thread", cwd="/tmp")
+        assert len(spawned) == (2 if replace_at else 1)
+        assert all(argv[1:3] == ("app-server", "proxy") for argv in spawned)
+        assert handle.thread_id == "existing-thread"
+        assert handle.daemon_process_generation_current is True
+        await handle.disconnect()
+
+    asyncio.run(run())
+
+
+def test_unavailable_pid_is_not_reported_as_a_confirmed_restart(
+    monkeypatch, standalone_listener,
+):
+    async def run():
+        home, path = standalone_listener
+        manager = _standalone_manager(home, path)
+        manager._managed_identity_required = True
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(argv)
+            return _Process(_Reader(_handshake_response(nonce)))
+
+        monkeypatch.setattr(handle_module.asyncio, "create_subprocess_exec", spawn)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager, codex_home=str(home))
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, _params=None):
+            assert method == "initialize"
+            return {"serverInfo": {"version": "0.153.4"}}
+
+        handle._read_loop = idle
+        handle._request = request
+        handle._notify = lambda *_args: asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="Cannot verify Codex app-server identity"):
+            await handle.connect(resume_id="existing-thread", cwd="/tmp")
+        assert len(spawned) == 2
+        assert all(argv[1:3] == ("app-server", "proxy") for argv in spawned)
+        assert handle.proc is None
+
+    asyncio.run(run())
 
 
 def test_linux_managed_daemon_nofile_fails_closed_on_low_hard_limit(

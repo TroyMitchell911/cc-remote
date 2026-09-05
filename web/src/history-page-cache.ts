@@ -19,7 +19,9 @@ const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
 // empty row after a hard refresh, so they must be rebuilt from History.
 // v5 stores v36's exact/unknown process-detail state. A v4 page can only infer
 // process presence from a generic deferred-event count and is unsafe to paint.
-const RECORD_VERSION = 5;
+// v6 restores async question metadata. v7 rebuilds pages where those questions
+// suppressed an ordinary unphased reply; the source revision alone cannot tell.
+const RECORD_VERSION = 7;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;

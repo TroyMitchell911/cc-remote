@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
 
+from pydantic import ValidationError
+
 from cc_remote.attachments import (
     ALLOWED_IMAGE_TYPES,
     MAX_IMAGE_DIMENSION,
@@ -28,6 +30,7 @@ from cc_remote.attachments import (
 )
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult, AssistantMsgEnd,
+    AsyncQuestionSpec,
     ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
     StateEvent, ERR_CC_CRASH,
 )
@@ -93,6 +96,30 @@ _MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES = 64 * 1024 * 1024
 _MAX_STREAM_BINDING_SCAN_BYTES = 64 * 1024 * 1024
 _MAX_STREAM_BINDING_MESSAGE_IDS = 64
 MIN_PROCESS_DURATION_MS = 500
+
+
+def _async_message_fields(item: dict) -> dict:
+    """Project only native async metadata, never infer a question from prose.
+
+    Keep oversized/unrecognized payloads readable as text instead of failing an
+    entire stream. Do not partially truncate a question or its selectable labels.
+    """
+    if item.get("delivery") != "async":
+        return {}
+    fields: dict = {"delivery": "async"}
+    questions = item.get("questions")
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 16:
+        return fields
+    if len(json.dumps(questions, ensure_ascii=False)) > 16 * 1024:
+        return fields
+    try:
+        parsed = [AsyncQuestionSpec.model_validate(q) for q in questions]
+        if len(json.dumps([q.model_dump() for q in parsed],
+                          ensure_ascii=False)) <= 16 * 1024:
+            fields["questions"] = parsed
+    except ValidationError:
+        pass
+    return fields
 
 
 @dataclass(frozen=True)
@@ -2084,6 +2111,7 @@ class CodexStreamTranslator:
         self._started: set[str] = set()
         self._text_seen: set[str] = set()
         self._message_channels: dict[str, str] = {}
+        self._async_messages: set[str] = set()
         self._tools_started: set[str] = set()
         self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
@@ -2140,7 +2168,7 @@ class CodexStreamTranslator:
             if isinstance(delta, str) and delta:
                 self._text_seen.add(iid)
                 self._visible_output = True
-                if channel == "final":
+                if channel == "final" and iid not in self._async_messages:
                     self._final_output = True
                 out.append(Delta(message_id=iid, text=delta, channel=channel))
 
@@ -2153,6 +2181,8 @@ class CodexStreamTranslator:
                     return out
                 channel = _assistant_channel(item.get("phase"))
                 self._message_channels[iid] = channel
+                if item.get("delivery") == "async":
+                    self._async_messages.add(iid)
                 if iid not in self._started:
                     if self._open_msg is not None and self._open_msg != iid:
                         self._close_open(out)
@@ -2202,11 +2232,18 @@ class CodexStreamTranslator:
                     self._visible_output = True
                     out.append(Delta(
                         message_id=iid, text=text, channel=channel))
-                if text and channel == "final":
+                if item.get("delivery") == "async":
+                    self._async_messages.add(iid)
+                    self._final_output = any(
+                        mid not in self._async_messages
+                        and self._message_channels.get(mid) == "final"
+                        for mid in self._text_seen)
+                elif text and channel == "final":
                     self._final_output = True
                 if iid in self._started:
                     out.append(AssistantMsgEnd(
-                        message_id=iid, channel=channel))
+                        message_id=iid, channel=channel,
+                        **_async_message_fields(item)))
                     if self._open_msg == iid:
                         self._open_msg = None
                         self._open_channel = "unknown"
@@ -3751,11 +3788,11 @@ def codex_translate_history(
             events.append(AssistantMsgStart(
                 message_id=cur_mid, channel=channel))
 
-    def close_assistant():
+    def close_assistant(**message_fields):
         nonlocal assistant_open, cur_mid, cur_channel
         if assistant_open and cur_mid:
             events.append(AssistantMsgEnd(
-                message_id=cur_mid, channel=cur_channel))
+                message_id=cur_mid, channel=cur_channel, **message_fields))
         assistant_open = False
         cur_mid = None
         cur_channel = "unknown"
@@ -3953,7 +3990,8 @@ def codex_translate_history(
         channel = _assistant_channel(payload.get("phase"))
         key = (
             str(active_turn_id or pending_turn_id or ""),
-            channel,
+            (f"async:{channel}:{item_id or payload.get('id') or line_no}"
+             if payload.get("delivery") == "async" else channel),
             text,
         )
         if not text or key in seen_agent_messages:
@@ -3968,11 +4006,11 @@ def codex_translate_history(
         )
         turn_visible = True
         turn_text_visible = True
-        if channel == "final":
+        if channel == "final" and payload.get("delivery") != "async":
             turn_final_visible = True
         events.append(Delta(
             message_id=cur_mid, text=text, channel=channel))
-        close_assistant()
+        close_assistant(**_async_message_fields(payload))
 
     def emit_completed_plan_answer(
         line_no: int,

@@ -10,7 +10,6 @@ import pytest
 
 from cc_remote.wrapper import claude_controls as controls_module
 from cc_remote.wrapper.claude_controls import (
-    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     ClaudeControls,
     ClaudeControlStore,
     ClaudeControlStoreError,
@@ -44,13 +43,13 @@ def test_remote_control_store_is_private_bounded_and_roundtrips(tmp_path):
     assert ClaudeControlStore(tmp_path).get(SESSION_ID) == saved
 
 
-def test_missing_session_record_never_claims_default_was_already_applied(
+def test_missing_session_record_delegates_autocompact_to_claude(
     tmp_path,
 ):
     saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
 
-    assert saved.auto_compact_mode == "custom"
-    assert saved.auto_compact_threshold_tokens == 500_000
+    assert saved.auto_compact_mode == "inherit"
+    assert saved.auto_compact_threshold_tokens is None
     assert saved.applied_auto_compact_mode == "inherit"
     assert saved.applied_auto_compact_threshold_tokens is None
 
@@ -65,11 +64,8 @@ def test_remote_control_store_drops_untrusted_values(tmp_path):
     )
 
     assert saved.as_dict() == {
-        "auto_compact_mode": "custom",
-        "auto_compact_threshold_tokens": CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
-        "applied_auto_compact_mode": "custom",
-        "applied_auto_compact_threshold_tokens": (
-            CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS),
+        "auto_compact_mode": "inherit",
+        "applied_auto_compact_mode": "inherit",
     }
     assert store.get(SESSION_ID) == saved
 
@@ -135,7 +131,7 @@ def test_work_autocompact_store_clears_stale_code_controls(tmp_path):
 
 
 @pytest.mark.parametrize("version", [1, 2, 3])
-def test_missing_autocompact_migrates_to_pending_real_default(
+def test_missing_autocompact_delegates_to_native_default(
     tmp_path, version,
 ):
     path = tmp_path / "claude-session-controls.json"
@@ -147,13 +143,76 @@ def test_missing_autocompact_migrates_to_pending_real_default(
 
     saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
 
-    assert saved.auto_compact_mode == "custom"
-    assert (
-        saved.auto_compact_threshold_tokens
-        == CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS
-    )
+    assert saved.auto_compact_mode == "inherit"
+    assert saved.auto_compact_threshold_tokens is None
     assert saved.applied_auto_compact_mode == "inherit"
     assert saved.applied_auto_compact_threshold_tokens is None
+
+
+@pytest.mark.parametrize(
+    ("applied_mode", "applied_threshold"),
+    [("inherit", None), ("custom", 500_000)],
+)
+def test_v3_forced_500k_default_migrates_to_native_behavior(
+    tmp_path, applied_mode, applied_threshold,
+):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": 3,
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 500_000,
+            "applied_auto_compact_mode": applied_mode,
+            **({"applied_auto_compact_threshold_tokens": applied_threshold}
+               if applied_threshold is not None else {}),
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "inherit"
+    assert saved.auto_compact_threshold_tokens is None
+    assert saved.applied_auto_compact_mode == "inherit"
+    assert saved.applied_auto_compact_threshold_tokens is None
+
+
+def test_native_policy_explicit_500k_choice_is_preserved(tmp_path):
+    path = tmp_path / "claude-session-controls.json"
+    path.write_text(json.dumps({
+        "version": 3,
+        "auto_compact_policy": "native",
+        "sessions": {SESSION_ID: {
+            "auto_compact_mode": "custom",
+            "auto_compact_threshold_tokens": 500_000,
+            "applied_auto_compact_mode": "custom",
+            "applied_auto_compact_threshold_tokens": 500_000,
+        }},
+    }))
+    os.chmod(path, 0o600)
+
+    saved = ClaudeControlStore(tmp_path).get(SESSION_ID)
+
+    assert saved.auto_compact_mode == "custom"
+    assert saved.auto_compact_threshold_tokens == 500_000
+    assert saved.applied_auto_compact_mode == "custom"
+    assert saved.applied_auto_compact_threshold_tokens == 500_000
+
+
+def test_native_policy_marker_is_written_without_breaking_v3_format(tmp_path):
+    store = ClaudeControlStore(tmp_path)
+
+    store.update(
+        SESSION_ID,
+        model=None,
+        effort=None,
+        permission_mode=None,
+    )
+
+    payload = json.loads(
+        (tmp_path / "claude-session-controls.json").read_text())
+    assert payload["version"] == 3
+    assert payload["auto_compact_policy"] == "native"
 
 
 def test_v3_explicit_inherit_remains_explicit(tmp_path):

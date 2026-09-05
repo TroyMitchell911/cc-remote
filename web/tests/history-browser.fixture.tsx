@@ -1058,6 +1058,7 @@ function HistoryConversationBrowserFixture() {
   const growthDelayMs = Number(params.get("growth-delay") ?? "500");
   const manualGrowth = params.has("manual-growth");
   const largeCount = Number(params.get("large") ?? "0");
+  const paragraphs = Number(params.get("paragraphs") ?? "2");
   const pageCount = Math.max(1, Number(params.get("pages") ?? "1"));
   const large = largeCount > 0;
   const timeline = params.has("timeline");
@@ -1135,7 +1136,7 @@ function HistoryConversationBrowserFixture() {
     }
     if (large) {
       return Array.from({ length: largeCount }, (_, index) =>
-        finalTurn(`m${index + 1}`, 2));
+        finalTurn(`m${index + 1}`, paragraphs));
     }
     if (deepBrowse) {
       return Array.from({ length: 20 }, (_, index) =>
@@ -1167,7 +1168,7 @@ function HistoryConversationBrowserFixture() {
     actualMermaid, compactTools, detailPaging, detailRetainedPreview,
     detailScrollCancel, dualImage,
     interactiveTimeline, math, streamingMath,
-    deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
+    deepBrowse, invalidMermaid, large, largeCount, paragraphs, mermaid, mermaidHistory,
     historicalPlan, persistentPlan, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
@@ -2693,6 +2694,44 @@ function CodexVisualizationFixture() {
   </main>;
 }
 
+function MarkdownDisclosureFixture() {
+  const [complete, setComplete] = useState(false);
+  const [opened, setOpened] = useState("");
+  const params = new URLSearchParams(window.location.search);
+  const title = params.has("long-title")
+    ? `文件清单：${"long_source_filename_".repeat(12)}.tsx，21 个源文件，无删除`
+    : "文件清单：21 个源文件，无删除";
+  const files = ["README.md", ...[
+    ".gitattributes", ".gitignore", "README.md", "DESIGN.md", "tools/model.py",
+    "tools/build.py", "tools/check.py", "tools/assembly_check.py",
+    "tools/structural_screen.py", "tools/verify.py", "tools/publish.py",
+    "tools/visual_qa.mjs", "viewer/index.html", "viewer/style.css",
+    "viewer/app.js", "tests/test_model.py", "tests/test_assembly.py",
+    "config/assembly.json", "config/materials.json", "output/manifest.json",
+  ].map((path) => `modules/assembly/${path}`)];
+  const body = params.has("file-list")
+    ? "仓库：example-workspace\n\n" + files.map((path, index) =>
+      `- ${index === 0 ? "修改" : "新建"}：\`${path}\``,
+    ).join("\n") + "\n\n"
+    : "- **Added** `README.md`\n- [source](/tmp/source.py)\n\n"
+      + "<details open>\n<summary>嵌套内容</summary>\n\nInner body\n\n</details>\n\n";
+  const text = `Before\n\n<details>\n<summary>${title}</summary>\n\n`
+    + body
+    + (complete ? "- Last streamed item\n\n</details>\n\nAfter" : "");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <button type="button" onClick={() => setComplete(true)}>Finish stream</button>
+    <output data-testid="disclosure-opened-path">{opened}</output>
+    <section data-testid="markdown-disclosure">
+      <MessageBlock text={text} done={complete} onOpenFile={setOpened} />
+    </section>
+    <section data-testid="inert-disclosure-html">
+      <MessageBlock done text={'<details>\n<summary>Unsafe content</summary>\n\n'
+        + '<img src="https://example.com/raw-image" onerror="alert(1)">\n\n'
+        + '<script>alert(2)</script>\n\n</details>'} />
+    </section>
+  </main>;
+}
+
 function CodexFileCitationFixture() {
   const [opened, setOpened] = useState("");
   return <main style={{ minHeight: "100dvh", padding: 24 }}>
@@ -2738,6 +2777,8 @@ createRoot(document.getElementById("root")!).render(
     ? <CodexVisualizationFixture />
     : rootParams.has("codex-file-citation")
     ? <CodexFileCitationFixture />
+    : rootParams.has("markdown-disclosure")
+    ? <MarkdownDisclosureFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

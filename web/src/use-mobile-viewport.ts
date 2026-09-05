@@ -39,6 +39,7 @@ const APP_OFFSET_TOP = "--app-offset-top";
 const KEYBOARD_INSET = "--keyboard-inset";
 const SHORT_VIEWPORT_ATTRIBUTE = "data-short-viewport";
 const SHORT_VIEWPORT_MAX_HEIGHT = 720;
+const KEYBOARD_OPEN_MIN_INSET = 80;
 const SETTLE_DELAYS_MS = [80, 260] as const;
 
 function finitePositive(value: number, fallback: number): number {
@@ -82,9 +83,15 @@ export function createMobileViewportSync(bindings: MobileViewportBindings): () =
     bindings.setCssProperty(APP_HEIGHT, px(height));
     bindings.setCssProperty(APP_OFFSET_TOP, px(scale <= 1.01 ? offsetTop : 0));
     bindings.setCssProperty(KEYBOARD_INSET, px(keyboardInset));
+    // A browser toolbar or pinch zoom can also shorten visualViewport. Only
+    // expose the keyboard state when a real editor owns focus and the inset is
+    // large enough to be an input method. Auxiliary controls can then yield
+    // without disappearing on ordinary mobile viewport chrome changes.
     bindings.setRootAttribute(
       SHORT_VIEWPORT_ATTRIBUTE,
-      (scale <= 1.01 ? height : layoutHeight) <= SHORT_VIEWPORT_MAX_HEIGHT
+      keyboardInset >= KEYBOARD_OPEN_MIN_INSET && bindings.isEditableFocused()
+        ? "ime"
+        : (scale <= 1.01 ? height : layoutHeight) <= SHORT_VIEWPORT_MAX_HEIGHT
         ? "true"
         : "false",
     );

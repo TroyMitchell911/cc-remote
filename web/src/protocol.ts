@@ -39,6 +39,7 @@ interface Base {
   route_id?: string | null;
   cmd_id?: string | null;
   client_id?: string | null;
+  owner_id?: string | null;
 }
 
 export interface Hello extends Base {
@@ -142,7 +143,11 @@ export interface Fast extends Base { type: "fast"; on: boolean }
 export interface CollaborationMode extends Base { type: "collaboration_mode"; mode: CollaborationModeName }
 export interface OpenBtw extends Base { type: "open_btw"; request_id: string; client_id?: string }
 export interface CloseBtw extends Base { type: "close_btw" }
-export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: string }
+export interface SyncBtw extends Base { type: "sync_btw"; cursor?: number | null; generation?: string | null }
+export interface BtwOpened extends Base { type: "btw_opened"; request_id: string; btw_sid: string; parent_sid: string; engine: Engine; created_at: number; revision: number }
+export interface BtwSessionInfo { btw_sid: string; parent_sid: string; engine: Engine; created_at: number; state?: State }
+export interface BtwSync extends Base { type: "btw_sync"; generation: string; revision: number; sessions: BtwSessionInfo[] }
+export interface BtwClosed extends Base { type: "btw_closed"; btw_sid: string; parent_sid: string; revision: number }
 export interface ForkSession extends Base {
   type: "fork_session";
   session_id: string;
@@ -218,7 +223,8 @@ export interface ToolResult extends Base {
   exit_code?: number | null;
   duration_ms?: number | null;
 }
-export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel }
+export interface AsyncQuestionSpec { title: string; options?: string[] | null }
+export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel; delivery?: "async" | null; questions?: AsyncQuestionSpec[] | null }
 export interface ProcessEvent extends Base {
   type: "process";
   item_id: string;
@@ -655,7 +661,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | BtwSync | BtwClosed | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
@@ -663,7 +669,7 @@ export type ServerEvent =
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 49;
+export const PROTOCOL_VERSION = 52;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 
@@ -804,32 +810,4 @@ export function matchesBtwRequest(
   pendingRequestId: string | null, responseRequestId: string | null | undefined,
 ): boolean {
   return pendingRequestId !== null && responseRequestId === pendingRequestId;
-}
-
-export type BtwOpenedDisposition = "accept" | "duplicate" | "stale";
-
-/** Classify success replies so an ACK-loss replay cannot close the active fork. */
-export function classifyBtwOpened(
-  pendingRequestId: string | null,
-  active: { requestId: string; sid: string } | null,
-  response: Pick<BtwOpened, "request_id" | "btw_sid">,
-): BtwOpenedDisposition {
-  if (active?.requestId === response.request_id && active.sid === response.btw_sid) {
-    return "duplicate";
-  }
-  return matchesBtwRequest(pendingRequestId, response.request_id)
-    ? "accept" : "stale";
-}
-
-/** A successful OpenBtw reply is followed by a Snapshot.  When the success is
- * stale we close the fork and remember its sid so that trailing Snapshot cannot
- * recreate an unreferenced runtime in the reducer. */
-export function consumeDiscardedBtwSnapshot(
-  discardedSids: Set<string>,
-  snapshot: Pick<Snapshot, "sid">,
-): boolean {
-  const sid = snapshot.sid;
-  if (!sid || !discardedSids.has(sid)) return false;
-  discardedSids.delete(sid);
-  return true;
 }

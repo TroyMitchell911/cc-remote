@@ -5,8 +5,9 @@ out live events.
   is rejected while different self-hosted machines may share the relay.
 - Clients register by `client_id` (from their hello). A reconnecting phone
   reuses its client_id, replacing any stale connection.
-- Wrapper frames with `to=<client_id>` are routed to that client only (per-
-  client replay); frames without `to` are broadcast to every client.
+- Wrapper frames with `to=<client_id>` are routed to that client only. Frames
+  with `owner_id` are limited to connections for that authenticated account;
+  frames with neither are broadcast to every client on the machine.
 - wrapper hello announces (re)connection -> broadcast `wrapper_reconnected` so
   clients re-hello with per-session cursors and recover missing live tails.
 """
@@ -278,10 +279,19 @@ class RelayHub:
             ), machine_id)
             return
         to = getattr(msg, "to", None)
+        owner_id = getattr(msg, "owner_id", None)
         if to:
             async with self._lock:
                 conn = self._clients_for(machine_id).get(to)
             route_id = getattr(msg, "route_id", None)
+            if (conn is not None and owner_id is not None
+                    and conn.owner_id != owner_id):
+                log.warning(
+                    "owner-mismatched routed frame dropped",
+                    to=to,
+                    type=msg.type,
+                )
+                return
             if (conn is not None and route_id is not None
                     and conn.route_id != route_id):
                 log.debug(
@@ -300,6 +310,8 @@ class RelayHub:
                     await self._drop_client(conn, machine_id=machine_id)
             else:
                 log.debug("routed frame for unknown client, dropping", to=to, type=msg.type)
+        elif owner_id:
+            await self._broadcast_owner(msg, owner_id, machine_id)
         else:
             await self._broadcast(msg, machine_id)
         # Replay is routed to one client via ``to`` and must never generate a
@@ -307,6 +319,7 @@ class RelayHub:
         if (
             msg.type == "turn_end"
             and not to
+            and not owner_id
             and getattr(msg, "notification_context", None) is not None
             and self._on_live_turn_end is not None
         ):
@@ -329,7 +342,8 @@ class RelayHub:
     # ---- client side ----
 
     async def serve_client(self, ws: WebSocket,
-                           machine_id: str = "default") -> None:
+                           machine_id: str = "default",
+                           owner_id: str | None = None) -> None:
         conn: Optional[ClientConn] = None
         client_id: Optional[str] = None
         slot = id(ws)
@@ -391,11 +405,13 @@ class RelayHub:
             conn = ClientConn(
                 ws, self.cfg.client_queue_cap, client_id,
                 getattr(self.cfg, "client_queue_bytes", 16 * 1024 * 1024),
+                owner_id,
             )
             conn.start()
             # Never trust a client-supplied routing generation. It belongs to
             # this accepted WebSocket and is meaningful only inside the relay.
             msg.route_id = conn.route_id
+            msg.owner_id = conn.owner_id
             over_capacity = False
             async with self._wrapper_send_lock:
                 async with self._lock:
@@ -443,6 +459,9 @@ class RelayHub:
                     break
                 if hasattr(msg, "client_id"):
                     msg.client_id = client_id
+                # Both routing identities are relay authority. Never allow a
+                # browser frame to select another account's private forks.
+                msg.owner_id = conn.owner_id
                 # route_id is reserved for the first Hello catch-up response.
                 msg.route_id = None
                 if not await self._forward_client_msg(
@@ -516,6 +535,24 @@ class RelayHub:
         for c in dead:
             await self._drop_client(
                 c, code=4008, reason="slow client", machine_id=machine_id)
+
+    async def _broadcast_owner(
+        self, msg, owner_id: str, machine_id: str = "default",
+    ) -> None:
+        async with self._lock:
+            conns = [
+                conn for conn in self._clients_for(machine_id).values()
+                if conn.owner_id == owner_id
+            ]
+        dead: list[ClientConn] = []
+        for conn in conns:
+            try:
+                await conn.send(msg)
+            except (SlowClientError, ConnectionError):
+                dead.append(conn)
+        for conn in dead:
+            await self._drop_client(
+                conn, code=4008, reason="slow client", machine_id=machine_id)
 
     async def _drop_client(self, conn: ClientConn, *, code: int | None = None,
                            reason: str = "", machine_id: str = "default") -> None:

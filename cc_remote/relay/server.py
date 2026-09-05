@@ -12,6 +12,8 @@ The relay never imports claude_agent_sdk and never touches the model API.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -397,6 +399,16 @@ def _device_subject(claims: SessionClaims) -> str:
     return claims.subject or "legacy"
 
 
+def _btw_owner_id(claims: SessionClaims, secret: str) -> str:
+    """Derive an opaque, reload-stable BTW owner from authenticated claims."""
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"cc-remote:btw-owner:{_device_subject(claims)}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"owner-{digest[:32]}"
+
+
 async def _claims_allow_machine(
     claims: SessionClaims,
     machine_id: str,
@@ -479,6 +491,7 @@ async def _serve_client_until_expiry(
     expires_at: int,
     revoked: asyncio.Event,
     machine_id: str = "default",
+    owner_id: str | None = None,
 ) -> None:
     """Serve until disconnect, signed expiry, or server-side revocation."""
     remaining = max(0.0, expires_at - time.time())
@@ -502,7 +515,13 @@ async def _serve_client_until_expiry(
 
     guard_task = asyncio.create_task(guard())
     try:
-        if machine_id == "default":
+        bound_owner = owner_id or getattr(
+            getattr(websocket, "state", None), "btw_owner_id", None)
+        if bound_owner is not None:
+            await hub.serve_client(websocket, machine_id, bound_owner)
+        elif machine_id == "default":
+            # Preserve the small embedded/test hub surface when no account
+            # identity was attached by the authenticated endpoint.
             await hub.serve_client(websocket)
         else:
             await hub.serve_client(websocket, machine_id)
@@ -1064,9 +1083,13 @@ def create_app(
                 # Keep the legacy call shape for embedded relays and tests that
                 # replace the expiry guard. Named machines use the extended
                 # route-aware form below.
+                websocket.state.btw_owner_id = _btw_owner_id(
+                    claims, cfg.session_secret)
                 await _serve_client_until_expiry(
                     websocket, hub, claims.expires_at, revoked)
             else:
+                websocket.state.btw_owner_id = _btw_owner_id(
+                    claims, cfg.session_secret)
                 await _serve_client_until_expiry(
                     websocket, hub, claims.expires_at, revoked, machine_id)
 

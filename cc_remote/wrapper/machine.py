@@ -119,7 +119,8 @@ from cc_remote.protocol import (
     Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort,
     AutoCompact, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
-    BtwOpened, ContextReport, StatusReport, RateLimitResetResult, Notice,
+    BtwOpened, BtwSessionInfo, BtwSync, BtwClosed, SyncBtw,
+    ContextReport, StatusReport, RateLimitResetResult, Notice,
     RateLimitUpdate, DiffReport, FilePreview,
     FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
@@ -158,7 +159,6 @@ from cc_remote.wrapper.session_presentation import (
 )
 from cc_remote.wrapper.claude_controls import (
     CLAUDE_DEFAULT_AUTO_COMPACT_MODE,
-    CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS,
     ClaudeControlStore,
     ClaudeControlStoreError,
     ClaudeControls,
@@ -261,7 +261,7 @@ from cc_remote.wrapper.stream import (
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexAppServerError, CodexArchiveOutcomeUnknown,
+    CodexAppServerError, CodexArchiveOutcomeUnknown, CodexEphemeralThreadGone,
     CodexDaemonProxyClosed, CodexHandle, CodexTurnStartDisconnected,
     CodexManagedOverflow,
     CodexNoActiveTurnError, CodexNoActiveTurnFence,
@@ -393,6 +393,7 @@ CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
 CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS = 1.0
 CODEX_EFFORT_RESOLVE_RETRY_SECONDS = 30.0
+BTW_DEFAULT_EFFORT = "xhigh"
 CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS = 45.0
 CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS = 0.25
 CODEX_TURN_START_RECONCILE_DEADLINE_SECONDS = 120.0
@@ -1826,6 +1827,11 @@ class WrapperMachine:
     # number of resident sessions allowed by config validation.
     PRIVATE_BTW_CAP = 64
     PRIVATE_BTW_FILE_MAX_BYTES = 2 * 1024 * 1024
+    # Leave ample headroom under the relay's 16 MiB / 4096-item per-client queue
+    # for envelopes and concurrent control state. Only the selected BTW is
+    # hydrated, and both queue dimensions must stay bounded.
+    BTW_REPLAY_MAX_BYTES = 4 * 1024 * 1024
+    BTW_REPLAY_MAX_EVENTS = 1024
     PRIVATE_BTW_PROFILE_META_KEY = "__cc_remote_profile__"
     PREVIEW_WRITE_CANDIDATE_CAP = 64
     PREVIEW_AUTHORIZATION_CAP = 256
@@ -1903,7 +1909,7 @@ class WrapperMachine:
         "get_preview_asset", "get_goal", "dismiss_goal",
         "acknowledge_completion",
         "get_queued_query", "list_dir",
-        "get_work_dashboard",
+        "get_work_dashboard", "sync_btw",
     })
     # Commands whose target is a runtime ``sid``.  A /btw runtime is private to
     # the client that created it, so every operation against that sid must pass
@@ -1913,6 +1919,7 @@ class WrapperMachine:
         "update_queued_query", "steer", "interrupt", "takeover",
         "set_model", "set_effort", "set_auto_compact",
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
+        "sync_btw",
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
         "get_context", "get_status", "consume_rate_limit_reset_credit",
@@ -1920,6 +1927,12 @@ class WrapperMachine:
         "get_preview_asset", "authorize_preview",
         "answer_question", "get_goal", "set_goal", "clear_goal",
         "dismiss_goal", "acknowledge_completion",
+    })
+    BTW_DESTROYED_MESSAGE = "当前临时对话已经销毁，请创建新的临时对话"
+    BTW_DESTROYED_ALLOWED_COMMANDS = frozenset({
+        "sync_btw", "close_btw", "open_btw", "get_queued_query",
+        "cancel_queued_query", "get_file_preview", "get_preview_asset",
+        "authorize_preview", "acknowledge_completion", "dismiss_goal",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -2181,6 +2194,11 @@ class WrapperMachine:
         # Secondary Codex accounts therefore remain ``profile@native`` here.
         self.sessions: dict[str, SessionContext] = {}
         self.focused_sid: Optional[str] = None  # pool key of the viewed session
+        # Side chats are resident, owner-scoped state rather than one-shot UI
+        # events. Serialize their catalog mutations with reconnect snapshots so
+        # Hello can never publish a half-open or already-closed fork.
+        self._btw_lock = asyncio.Lock()
+        self._btw_revision = 0
         self.transport.on_connected = self._on_transport_connected
         # Transcript mirror: sessions a client has opened (registered on GetHistory),
         # sid -> {"path", "size", "engine"}. The watcher polls each file's SIZE and,
@@ -4912,6 +4930,11 @@ class WrapperMachine:
             reason,
             bool(can_takeover),
         )
+        if ctx.btw and ctx.btw_destroyed:
+            values = ("codex_shared" if self._codex_shared_affinity(ctx) else "remote",
+                      "read_only", False, self.BTW_DESTROYED_MESSAGE, False)
+            (control_mode, write_state, terminal_attached,
+             reason, can_takeover) = values
         current = (
             ctx.control_mode,
             ctx.write_state,
@@ -4973,6 +4996,8 @@ class WrapperMachine:
         """Restore one interrupted shared proxy without changing ownership."""
         if not self._codex_shared_affinity(ctx):
             return False
+        if await self._refresh_btw_availability(ctx):
+            return False
         if self._codex_shared_live(ctx) and not force:
             return True
         route_sid = self._ctx_wire_sid(ctx) or ""
@@ -4991,6 +5016,11 @@ class WrapperMachine:
                 cwd=ctx.cwd,
                 reason=reason,
             )
+        except CodexEphemeralThreadGone as exc:
+            if ctx.btw and exc.thread_id == getattr(ctx.sdk, "thread_id", None):
+                await self._mark_btw_destroyed(ctx)
+                return False
+            raise
         except Exception as exc:
             log.warning(
                 "Codex shared proxy reconnect failed",
@@ -5699,6 +5729,8 @@ class WrapperMachine:
     ) -> bool:
         """Cross an intentional restart only between native Codex turns."""
         if not self._codex_shared_affinity(ctx):
+            return False
+        if await self._refresh_btw_availability(ctx):
             return False
         # Waiting is deliberately outside the lock. Automatic status reads run
         # in background tasks and must not make a Query wait behind the hook's
@@ -6881,8 +6913,7 @@ class WrapperMachine:
         ):
             return current_threshold >= target
         # ``inherit``/``auto`` without a successful control reading is an
-        # unknown upper bound, not proof that the current context fits. This is
-        # also how v1/v2 sessions safely adopt the new real 500k default.
+        # unknown upper bound, not proof that the current context fits.
         return event.applied_mode in {"inherit", "auto", None}
 
     async def _compact_managed_claude_context(
@@ -7496,8 +7527,8 @@ class WrapperMachine:
         completed native model through the same curated Code policy used by a
         cold resume; if the append has no completed assistant row, retain the
         last explicit Remote selection. This still adopts a genuine external
-        switch to another model family while preventing a metadata-only reload
-        from silently pairing a 200k model with a larger autocompact threshold.
+        switch to another model family without silently erasing an explicit
+        long-context selection during a metadata-only reload.
         """
         if adopt_native is None:
             adopt_native = ctx.claude_native_controls_dirty
@@ -8090,6 +8121,46 @@ class WrapperMachine:
                 return ctx
         return None
 
+    async def _mark_btw_destroyed(self, ctx: SessionContext) -> None:
+        if not ctx.btw or ctx.btw_destroyed or not self._is_resident_context(ctx):
+            return
+        ctx.btw_destroyed = True
+        control = await self._set_session_control(
+            ctx, control_mode=ctx.control_mode, write_state="read_only",
+            terminal_attached=False, reason=self.BTW_DESTROYED_MESSAGE,
+            can_takeover=False, emit=False,
+        )
+        await self._cancel_pending_asks(ctx)
+        # Preserve queued prompts for inspection/copy/cancel, but never retry
+        # them against a destroyed native thread or send them to its parent.
+        async with ctx.emit_lock:
+            async with ctx.queued_query_lock:
+                for query in ctx.queued_queries:
+                    ctx.queued_query_errors[query.msg_id] = self.BTW_DESTROYED_MESSAGE
+                ctx.queued_query_wakeup.set()
+                if ctx.queued_queries:
+                    try:
+                        await self._emit_locked(ctx, self._query_queue_state(ctx))
+                    except Exception as exc:
+                        log.warning("destroyed btw queue projection delayed",
+                                    error_type=type(exc).__name__)
+        try:
+            await self._emit(ctx, control)
+        except Exception as exc:
+            # SyncBtw reads the authoritative control even if this edge could
+            # not reach a disconnected owner. Cleanup must not depend on WS I/O.
+            log.warning("destroyed btw control projection delayed",
+                        error_type=type(exc).__name__)
+        log.info("btw native thread destroyed; retaining read-only history", btw_sid=ctx.key)
+
+    async def _refresh_btw_availability(self, ctx: SessionContext) -> bool:
+        if not ctx.btw:
+            return False
+        if (ctx.engine == "codex" and not ctx.btw_destroyed
+                and getattr(ctx.sdk, "ephemeral_thread_destroyed", False) is True):
+            await self._mark_btw_destroyed(ctx)
+        return ctx.btw_destroyed
+
     async def _reject_nonowner_btw_command(self, cmd) -> Optional[Error]:
         """Fail closed when a client tries to operate another client's fork."""
         ctx = self._btw_ctx_for_command(cmd)
@@ -8100,6 +8171,8 @@ class WrapperMachine:
         if ctx is None and not tombstoned:
             return None
         client_id = getattr(cmd, "client_id", None)
+        owner_id = (getattr(cmd, "owner_id", None)
+                    or getattr(cmd, "client_id", None))
         owner = ctx.owner_client_id if ctx is not None else None
         # Only the stable btw-* key is a valid live target. The persisted Claude
         # session id is internal, and session-store operations (switch/history/
@@ -8109,12 +8182,13 @@ class WrapperMachine:
             or cmd.type in self.BTW_SESSION_COMMANDS
             or (ctx is not None and target == ctx.btw_real_id)
         )
-        if (not invalid_private_target and client_id and client_id == owner):
+        if (not invalid_private_target and client_id and owner_id
+                and owner_id == owner):
             return None
-        # Relay-bound commands always carry a client id.  If an internal/legacy
-        # caller omits it, route the denial to the owner rather than accidentally
-        # broadcasting a frame about a private runtime.
-        recipient = client_id or owner
+        # Relay-bound commands always carry a connection id. An owner id is not
+        # itself an exact route, so an internal caller without client_id gets no
+        # response rather than a broadcast or a misrouted private error.
+        recipient = client_id
         error = Error(
             code=ERR_AUTH,
             message="btw session belongs to another client",
@@ -8122,6 +8196,11 @@ class WrapperMachine:
             msg_id=getattr(cmd, "msg_id", None),
             sid=(ctx.key if ctx is not None else target),
             to=recipient,
+            # The text is deliberately generic and belongs to the requester.
+            # Stamping the victim's owner here makes the relay's exact-route
+            # guard drop the rejection, leaving the attacking/stale tab with a
+            # silent ACK and no actionable result.
+            owner_id=owner_id,
         )
         if recipient:
             await self.transport.send(error)
@@ -9847,7 +9926,7 @@ class WrapperMachine:
                 log.error("dropping frame for ownerless btw", sid=ctx.key,
                           type=getattr(msg, "type", None))
                 return
-            msg.to = ctx.owner_client_id
+            msg.owner_id = ctx.owner_client_id
         background_membership_changed = (
             self._observe_claude_background_process_event(ctx, msg)
             if ctx.engine == "claude"
@@ -10508,7 +10587,8 @@ class WrapperMachine:
         return result
 
     def _schedule_query_queue_drain(self, ctx: SessionContext) -> None:
-        if not ctx.queued_queries or not self._is_resident_context(ctx):
+        if (not ctx.queued_queries or not self._is_resident_context(ctx)
+                or ctx.btw_destroyed):
             return
         current = ctx.queued_query_drain_task
         if current is not None and not current.done():
@@ -10527,6 +10607,8 @@ class WrapperMachine:
         cancelled = False
         try:
             while ctx.queued_queries and self._is_resident_context(ctx):
+                if await self._refresh_btw_availability(ctx):
+                    return
                 active = next((
                     task for task in (
                         ctx.turn_task, ctx.codex_spontaneous_task)
@@ -11209,6 +11291,17 @@ class WrapperMachine:
         rejected = await self._reject_nonowner_btw_command(cmd)
         if rejected is not None:
             return rejected
+        ctx = self._btw_ctx_for_command(cmd)
+        if (ctx is not None and await self._refresh_btw_availability(ctx)
+                and cmd.type not in self.BTW_DESTROYED_ALLOWED_COMMANDS):
+            error = Error(
+                code=ERR_NOT_RUNNING, message=self.BTW_DESTROYED_MESSAGE,
+                request_id=getattr(cmd, "cmd_id", None),
+                msg_id=getattr(cmd, "msg_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         result = await self._command_router.dispatch(cmd)
         if result is UNHANDLED_COMMAND:
             log.warning(
@@ -11306,6 +11399,98 @@ class WrapperMachine:
                              if replay_end_index is not None else len(frames))
         return [*frames[:insert_at], seed, *frames[insert_at:]]
 
+    def _btw_session_info(self, ctx: SessionContext) -> BtwSessionInfo:
+        """Build the bounded public identity for one announced private fork."""
+        if not ctx.btw or not ctx.key or not ctx.parent_sid:
+            raise ValueError("incomplete BTW context")
+        return BtwSessionInfo(
+            btw_sid=ctx.key,
+            parent_sid=ctx.parent_sid,
+            engine="codex" if ctx.engine == "codex" else "claude",
+            created_at=max(0.0, ctx.btw_created_at),
+            state=ctx.buffer.latest_state() or ctx.state,
+        )
+
+    def _owned_btw_sessions(self, owner_id: str | None) -> list[BtwSessionInfo]:
+        if not owner_id:
+            return []
+        sessions = [
+            self._btw_session_info(ctx)
+            for ctx in self.sessions.values()
+            if (
+                ctx.btw
+                and ctx.btw_announced
+                and ctx.owner_client_id == owner_id
+                and ctx.key
+                and ctx.parent_sid
+            )
+        ]
+        sessions.sort(key=lambda item: (item.created_at, item.btw_sid))
+        return sessions
+
+    async def _send_btw_sync(self, cmd) -> None:
+        """Send one authoritative owner catalog before per-session replay."""
+        client_id = getattr(cmd, "client_id", None)
+        owner_id = (getattr(cmd, "owner_id", None)
+                    or getattr(cmd, "client_id", None))
+        if not client_id or not owner_id:
+            return
+        async with self._btw_lock:
+            await self.transport.send(BtwSync(
+                generation=self.instance_id,
+                revision=self._btw_revision,
+                sessions=self._owned_btw_sessions(owner_id),
+                to=client_id,
+                owner_id=owner_id,
+                route_id=getattr(cmd, "route_id", None),
+            ))
+
+    async def _publish_btw_sync(self, owner_id: str) -> None:
+        """Publish a catalog mutation to every tab for one authenticated owner."""
+        await self.transport.send(BtwSync(
+            generation=self.instance_id,
+            revision=self._btw_revision,
+            sessions=self._owned_btw_sessions(owner_id),
+            owner_id=owner_id,
+        ))
+
+    async def _detach_btw_catalog(
+        self, ctx: SessionContext,
+    ) -> tuple[bool, BtwClosed | None]:
+        """Atomically remove a resident BTW and publish its catalog revision.
+
+        The boolean distinguishes an already-detached context from a malformed
+        catalog entry that was removed but could not produce a public close
+        edge. Callers must still tear down the latter's tasks and SDK handle.
+        """
+        async with self._btw_lock:
+            if (not ctx.btw or not ctx.key
+                    or self.sessions.get(ctx.key) is not ctx):
+                return False, None
+            self.sessions.pop(ctx.key, None)
+            self._btw_revision += 1
+            if not ctx.parent_sid or not ctx.owner_client_id:
+                log.error("detached incomplete btw catalog entry", sid=ctx.key)
+                return True, None
+            event = BtwClosed(
+                btw_sid=ctx.key,
+                parent_sid=ctx.parent_sid,
+                revision=self._btw_revision,
+                sid=ctx.key,
+                owner_id=ctx.owner_client_id,
+            )
+            try:
+                await self.transport.send(event)
+            except Exception as exc:
+                # Removal remains authoritative. The next owner BtwSync repairs
+                # presentation even when this best-effort edge was lost.
+                log.warning(
+                    "btw close event could not be sent",
+                    btw_sid=ctx.key,
+                    error_type=type(exc).__name__,
+                )
+            return True, event
+
     @staticmethod
     def _hello_replay_frame_visible(frame, client_id: str | None) -> bool:
         """Apply the original frame's audience before client-local routing.
@@ -11331,6 +11516,10 @@ class WrapperMachine:
         supplied_generations = getattr(cmd, "generations", None)
         generations = (dict(supplied_generations)
                        if isinstance(supplied_generations, dict) else {})
+        # Side-chat existence is durable for this wrapper generation but is not
+        # narrative history. Publish its complete owner-scoped catalog even for
+        # a cursor-less page reload, before any fork Snapshot can be considered.
+        await self._send_btw_sync(cmd)
         # Compatibility for the TUI/live scripts that predate per-session cursor
         # maps. It is necessarily scoped to the wrapper's focused session.
         legacy_cursor = getattr(cmd, "last_seq", None)
@@ -11359,8 +11548,11 @@ class WrapperMachine:
             self._session_aliases.move_to_end(old_key)
         replayed = 0
         for key, ctx in list(self.sessions.items()):
-            if ctx.btw and ctx.owner_client_id != cmd.client_id:
-                continue  # ephemeral fork replay is private to its creating client
+            # Hello restores only the lightweight owner catalog for BTW. The
+            # visible side chat requests one bounded suffix via SyncBtw; eagerly
+            # enqueueing every private ring can exceed the relay client queue.
+            if ctx.btw:
+                continue
             sid = self._ctx_wire_sid(ctx) or key
             async with ctx.emit_lock:
                 # A sleeping timeout task must not let Hello revive an already
@@ -16867,6 +17059,11 @@ class WrapperMachine:
         *,
         launch_receipt: asyncio.Future[bool] | None = None,
     ):
+        if await self._refresh_btw_availability(ctx):
+            error = Error(code=ERR_NOT_RUNNING, message=self.BTW_DESTROYED_MESSAGE,
+                          msg_id=getattr(cmd, "msg_id", None))
+            await self._emit(ctx, error)
+            return error
         if ctx.state != "idle":
             error = Error(
                 code=ERR_BUSY, message="该会话正忙,先 interrupt",
@@ -16905,7 +17102,8 @@ class WrapperMachine:
         ):
             error = Error(
                 code=ERR_NOT_RUNNING,
-                message="Codex 共享通道重连失败，本次未发送；请重试",
+                message=(self.BTW_DESTROYED_MESSAGE if ctx.btw_destroyed
+                         else "Codex 共享通道重连失败，本次未发送；请重试"),
                 msg_id=getattr(cmd, "msg_id", None),
             )
             await self._emit(ctx, error)
@@ -18397,7 +18595,7 @@ class WrapperMachine:
 
         ``reasoningEffort: null`` means "no thread override", not "the control
         is still loading". Prefer a wrapper-owned explicit choice (notably BTW's
-        low setting), then app-server's effective configured fallback. If no
+        default), then app-server's effective configured fallback. If no
         configured level exists, publish a truthful model-default sentinel while
         leaving ``sdk.effort`` unset so turn/start keeps following app-server.
         """
@@ -18860,12 +19058,15 @@ class WrapperMachine:
         same terminal response if its first copy or ACK was lost.
         """
         client_id = getattr(cmd, "client_id", None)
+        owner_id = (getattr(cmd, "owner_id", None)
+                    or getattr(cmd, "client_id", None))
         error = Error(
             code=code,
             message=message,
             request_id=cmd.request_id,
             sid=getattr(cmd, "sid", None),
             to=client_id,
+            owner_id=owner_id,
         )
         if client_id:
             await self.transport.send(error)
@@ -18878,7 +19079,7 @@ class WrapperMachine:
     async def _handle_open_btw(self, cmd):
         if not getattr(cmd, "client_id", None):
             return await self._send_btw_error(
-                cmd, ERR_AUTH, "btw requires a bound client")
+                cmd, ERR_AUTH, "btw requires an authenticated owner")
         parent = self._ctx_for(getattr(cmd, "sid", None))
         if parent is None:
             return await self._send_btw_error(
@@ -18887,26 +19088,49 @@ class WrapperMachine:
             parent = self._ctx_by_sid(parent.parent_sid or "") or parent
         try:
             btw = await self._spawn_btw(
-                parent, owner_client_id=getattr(cmd, "client_id", None))
+                parent,
+                owner_client_id=(getattr(cmd, "owner_id", None)
+                                 or getattr(cmd, "client_id", None)))
         except _BtwSpawnFailure as exc:
             return await self._send_btw_error(cmd, exc.code, exc.message)
-        ev = BtwOpened(
-            request_id=cmd.request_id,
-            btw_sid=btw.key,
-            parent_sid=parent.key or parent.session_id,
-            engine=btw.engine,
-        )
-        ev.sid = btw.key
         cid = getattr(cmd, "client_id", None)
-        if cid:
-            ev.to = cid
-        await self.transport.send(ev)
+        owner_id = (getattr(cmd, "owner_id", None)
+                    or getattr(cmd, "client_id", None))
+        async with self._btw_lock:
+            # Spawning performs native I/O before the fork can be announced.
+            # Parent cleanup may remove that resident context while we await it;
+            # never publish a creation edge for a fork the authoritative pool no
+            # longer owns.
+            if self.sessions.get(btw.key) is not btw:
+                return await self._send_btw_error(
+                    cmd, ERR_NOT_RUNNING,
+                    "侧边对话在打开完成前已经关闭，请重试。",
+                )
+            self._btw_revision += 1
+            ev = BtwOpened(
+                request_id=cmd.request_id,
+                btw_sid=btw.key,
+                parent_sid=parent.key or parent.session_id,
+                engine=btw.engine,
+                created_at=btw.btw_created_at,
+                revision=self._btw_revision,
+                owner_id=owner_id,
+            )
+            ev.sid = btw.key
+            if cid:
+                ev.to = cid
+            await self.transport.send(ev)
+            # The open response is the creation boundary for browser state.
+            # A concurrent Hello cannot include this fork before that boundary.
+            btw.btw_announced = True
+            await self._publish_btw_sync(owner_id)
         # a fresh Snapshot so the requester builds a runtime for the fork's key.
         snap = Snapshot(
             cc_session_id=None, state="idle", tail_text="", cwd=btw.cwd,
             generation=self.instance_id,
             control=self._session_control(btw))
         snap.sid = btw.key
+        snap.owner_id = owner_id
         if cid:
             snap.to = cid
         await self.transport.send(snap)
@@ -18929,7 +19153,8 @@ class WrapperMachine:
             auto_event = None
         permission_mode = _session_permission_mode(btw)
         btw.announced_perm = permission_mode
-        permission = Perm(mode=permission_mode, sid=btw.key, to=cid)
+        permission = Perm(
+            mode=permission_mode, sid=btw.key, to=cid, owner_id=owner_id)
         await self.transport.send(permission)
         responses = [ev, snap]
         if auto_event is not None:
@@ -18939,14 +19164,16 @@ class WrapperMachine:
             permission_profile = _session_permission_profile(btw)
             btw.announced_permission_profile = permission_profile
             profile_event = PermissionProfile(
-                profile=permission_profile, sid=btw.key, to=cid)
+                profile=permission_profile, sid=btw.key, to=cid,
+                owner_id=owner_id)
             await self.transport.send(profile_event)
             responses.append(profile_event)
             web_search = _session_web_search(btw)
             if web_search:
                 btw.announced_web_search = web_search
                 search_event = WebSearch(
-                    mode=web_search, sid=btw.key, to=cid)
+                    mode=web_search, sid=btw.key, to=cid,
+                    owner_id=owner_id)
                 await self.transport.send(search_event)
                 responses.append(search_event)
             # BtwOpened + Snapshot create the owner-only browser runtime before
@@ -18957,13 +19184,15 @@ class WrapperMachine:
         # lost response. Reliable-command retries replay them without re-forking.
         return tuple(responses)
 
-    async def _handle_close_btw(self, cmd) -> None:
+    async def _handle_close_btw(self, cmd):
         sid = getattr(cmd, "sid", None)
         ctx = self.sessions.get(sid) if sid else None
         if ctx is None or not ctx.btw:
-            return
+            return None
+        detached, close_event = await self._detach_btw_catalog(ctx)
+        if not detached:
+            return None
         await self._discard_query_queue(ctx)
-        self.sessions.pop(ctx.key, None)
         self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
         if ctx.key:
             await self._drop_preview_session(ctx.engine, ctx.key)
@@ -18998,6 +19227,122 @@ class WrapperMachine:
                 claude_profile_id=ctx.claude_profile_id,
             )
         log.info("btw closed", btw_sid=sid)
+        return close_event
+
+    async def _handle_sync_btw(self, cmd: SyncBtw):
+        """Hydrate one selected side chat without replaying every BTW on Hello."""
+        client_id = getattr(cmd, "client_id", None)
+        owner_id = (getattr(cmd, "owner_id", None)
+                    or getattr(cmd, "client_id", None))
+        ctx = self.sessions.get(cmd.sid) if cmd.sid else None
+        if (ctx is None or not ctx.btw or not ctx.btw_announced
+                or not client_id or not owner_id
+                or ctx.owner_client_id != owner_id):
+            error = Error(
+                code=ERR_NOT_RUNNING,
+                message="这个侧边对话已经关闭或不可用",
+                sid=cmd.sid,
+                to=client_id,
+                owner_id=owner_id,
+            )
+            if client_id:
+                await self.transport.send(error)
+            return error
+
+        route = {
+            "sid": ctx.key,
+            "to": client_id,
+            "owner_id": owner_id,
+        }
+        # Metadata-only generation proof: reading a retained side chat must not
+        # spawn/resume a model session just to determine whether it is writable.
+        await self._refresh_btw_availability(ctx)
+
+        async def send(message) -> None:
+            await self.transport.send(message.model_copy(
+                deep=True, update=route))
+
+        async with ctx.emit_lock:
+            now = asyncio.get_running_loop().time()
+            for ask_id, ask_state in tuple(ctx.pending_asks.items()):
+                if now >= ask_state.deadline:
+                    await self._close_pending_ask_locked(
+                        ctx, ask_id, reason="timeout")
+
+            same_generation = cmd.generation == self.instance_id
+            cursor = cmd.cursor if same_generation else 0
+            frames = ctx.buffer.replay_from_bounded(
+                cursor,
+                max_bytes=self.BTW_REPLAY_MAX_BYTES,
+                max_events=self.BTW_REPLAY_MAX_EVENTS,
+                rebuild=not same_generation,
+                generation=self.instance_id,
+            )
+            frames = self._reseed_active_binding_for_hello(
+                ctx,
+                frames,
+                cursor=cursor,
+                same_generation=same_generation,
+            )
+            for frame in frames:
+                if not self._hello_replay_frame_visible(frame, client_id):
+                    continue
+                await send(frame)
+
+            state = ctx.buffer.latest_state() or ctx.state
+            await send(Snapshot(
+                cc_session_id=None,
+                state=state,
+                tail_text=ctx.buffer.latest_tail_text(),
+                cwd=ctx.cwd,
+                generation=self.instance_id,
+                control=self._session_control(ctx),
+            ))
+            await send(AskUserSync())
+            for ask_state in tuple(ctx.pending_asks.values()):
+                if (ask_state.target is not None
+                        and ask_state.target != client_id):
+                    continue
+                await send(ask_state.event.model_copy(
+                    deep=True, update={"seq": None}))
+            if ctx.engine == "claude":
+                await send(self._background_process_sync(ctx).model_copy(
+                    deep=True, update={"seq": None}))
+
+            await send(self._session_control(ctx))
+            async with ctx.queued_query_lock:
+                queue_state = self._query_queue_state(ctx)
+            await send(queue_state)
+
+            permission_mode = _session_permission_mode(ctx)
+            ctx.announced_perm = permission_mode
+            await send(Perm(mode=permission_mode))
+            model = _session_model(ctx)
+            effort = _session_effort(ctx)
+            if ctx.engine == "codex" and not effort:
+                effort = MODEL_DEFAULT_EFFORT
+            if model:
+                ctx.announced_model = model
+                await send(Model(model=model))
+            if effort:
+                ctx.announced_effort = effort
+                await send(Effort(effort=effort))
+
+            if ctx.engine == "claude":
+                await send(self._claude_auto_compact_event(ctx))
+            else:
+                permission_profile = _session_permission_profile(ctx)
+                ctx.announced_permission_profile = permission_profile
+                await send(PermissionProfile(profile=permission_profile))
+                web_search = _session_web_search(ctx)
+                if web_search:
+                    ctx.announced_web_search = web_search
+                    await send(WebSearch(mode=web_search))
+                await send(CollaborationMode(
+                    mode=getattr(ctx.sdk, "collaboration_mode", "default")))
+                await send(Fast(on=_codex_fast_on(
+                    getattr(ctx.sdk, "service_tier", None))))
+        return None
 
     async def _handle_set_perm(self, cmd):
         ctx = self._ctx_for(getattr(cmd, "sid", None))
@@ -25841,7 +26186,7 @@ class WrapperMachine:
                     "cwd": ctx.cwd, "created_at": time.time(),
                 }
                 await self._discard_query_queue(ctx)
-                self.sessions.pop(ctx.key, None)
+                await self._detach_btw_catalog(ctx)
                 self._purge_preview_image_snapshots(
                     ctx.preview_snapshot_token)
                 await self._drop_preview_session(ctx.engine, ctx.key)
@@ -25968,6 +26313,18 @@ class WrapperMachine:
             ctx.key = route_sid
             if self.focused_sid == old_key:
                 self.focused_sid = route_sid
+            # Reparent the authoritative BTW catalog before publishing the
+            # rekey. A concurrent Hello must observe either old catalog + later
+            # SessionRekey, or the new catalog; it must never receive a stale
+            # old-parent BtwSync after already applying SessionRekey.
+            async with self._btw_lock:
+                reparented = False
+                for resident in self.sessions.values():
+                    if resident.btw and resident.parent_sid == old_key:
+                        resident.parent_sid = route_sid
+                        reparented = True
+                if reparented:
+                    self._btw_revision += 1
             await self._emit(ctx, SessionRekey(
                 old_key=old_key, session_id=route_sid, cwd=ctx.cwd))
             self._rekey_cached_create_responses(
@@ -28067,7 +28424,10 @@ class WrapperMachine:
                 deleted_ctx.key is not None
                 and self.sessions.get(deleted_ctx.key) is deleted_ctx
             ):
-                self.sessions.pop(deleted_ctx.key, None)
+                if deleted_ctx.btw:
+                    await self._detach_btw_catalog(deleted_ctx)
+                else:
+                    self.sessions.pop(deleted_ctx.key, None)
         return deleted_sids, deleted_contexts, deleted_context_sids
 
     async def _delete_loaded_codex_thread(
@@ -28489,7 +28849,10 @@ class WrapperMachine:
                 ))
             if candidate_sids.isdisjoint(identities):
                 continue
-            self.sessions.pop(key, None)
+            if candidate.btw:
+                await self._detach_btw_catalog(candidate)
+            else:
+                self.sessions.pop(key, None)
             uncertain_keys.add(key)
             if id(candidate) not in uncertain_ids:
                 uncertain_ids.add(id(candidate))
@@ -28578,7 +28941,10 @@ class WrapperMachine:
             archived_contexts.append(candidate)
         for key, candidate in tuple(self.sessions.items()):
             if id(candidate) in archived_context_ids:
-                self.sessions.pop(key, None)
+                if candidate.btw:
+                    await self._detach_btw_catalog(candidate)
+                else:
+                    self.sessions.pop(key, None)
         return confirmed_sids, archived_contexts
 
     @staticmethod
@@ -33844,8 +34210,7 @@ class WrapperMachine:
 
         if engine == "claude" and auto_compact_mode is None:
             auto_compact_mode = CLAUDE_DEFAULT_AUTO_COMPACT_MODE
-            auto_compact_threshold_tokens = (
-                CLAUDE_DEFAULT_AUTO_COMPACT_TOKENS)
+            auto_compact_threshold_tokens = None
 
         codex_resume_model_reconcile: Optional[str] = None
         if engine == "codex":
@@ -34570,6 +34935,18 @@ class WrapperMachine:
         discarded on close. Its turns reuse the normal _run_turn path."""
         if not owner_client_id:
             raise _BtwSpawnFailure(ERR_AUTH, "btw requires a bound client")
+        max_owner_forks = max(
+            0, min(8, self.cfg.max_concurrent_sessions - 1))
+        owner_forks = sum(
+            1 for resident in self.sessions.values()
+            if resident.btw
+            and resident.owner_client_id == owner_client_id
+        )
+        if owner_forks >= max_owner_forks:
+            raise _BtwSpawnFailure(
+                ERR_BUSY,
+                "侧边对话已满，请关闭一个后再新建。",
+            )
         pending_private_forks = sum(
             1 for resident in self.sessions.values()
             if resident.btw and resident.engine != "codex"
@@ -34763,10 +35140,11 @@ class WrapperMachine:
                 sdk.auto_compact_threshold_tokens = auto_threshold
                 sdk.applied_auto_compact_mode = auto_mode
                 sdk.applied_auto_compact_threshold_tokens = auto_threshold
-        # /btw is a quick side question — run the fork at LOW effort so the first
-        # reply is snappy (the parent's own effort can be high/xhigh, which makes a
-        # context-inheriting fork slow). Applied at connect (cc) / per-turn (codex).
-        sdk.effort = "low"
+        # Side chats are independent working conversations, not disposable
+        # low-effort probes. Start them at the product default while preserving
+        # the existing per-session effort control. Claude applies this at
+        # connect; Codex clamps it against the forked model before its first turn.
+        sdk.effort = BTW_DEFAULT_EFFORT
         ctx = SessionContext(
             session_id=None, sdk=sdk,
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
@@ -34842,7 +35220,7 @@ class WrapperMachine:
                     ctx.sdk.approval = "never"
                     ctx.sdk.permission_profile = "cc_remote_work"
                 await self._resolve_codex_session_effort(
-                    ctx, preferred="low")
+                    ctx, preferred=BTW_DEFAULT_EFFORT)
             await self._stamp_codex_daemon_epoch(ctx)
         except asyncio.CancelledError:
             try:
@@ -34866,6 +35244,7 @@ class WrapperMachine:
         key = f"btw-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
+        ctx.btw_created_at = time.time()
         log.info("btw fork spawned", parent=parent_id, key=key, engine=engine,
                  fork_thread=getattr(ctx.sdk, "thread_id", None))
         return ctx

@@ -48,8 +48,11 @@ from cc_remote.protocol import ConversationTurn
 # rebuilds Claude pages/details whose terminal clock could be extended by a
 # cold-resume task notification appended after the final answer. v27 rebuilds
 # Claude narrative projections so image-producing Read results use the lazy
-# view-image projection instead of cached textual tool output.
-_SCHEMA_VERSION = 27
+# view-image projection instead of cached textual tool output. v28 rebuilds
+# Codex narrative projections that discarded native async question metadata.
+# v29 rebuilds Codex summary pages where an async question hid a normal answer
+# without phase metadata. Source-complete details and binary assets remain valid.
+_SCHEMA_VERSION = 29
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -554,6 +557,7 @@ def materialize_history_turns(
         text_last_ms: dict[str, int] = {}
         text_done_ms: dict[str, int] = {}
         text_background: set[str] = set()
+        async_messages: dict[str, dict[str, Any]] = {}
         detail_items: set[str] = set()
         process_evidence: dict[str, dict[str, Any]] = {}
         live_blocks: list[dict[str, Any]] = []
@@ -671,6 +675,10 @@ def materialize_history_turns(
             elif event_type == "assistant_msg_end":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
+                    if event.get("delivery") == "async":
+                        async_messages[message_id] = {
+                            "delivery": "async", "questions": event.get("questions"),
+                        }
                     if event.get("background") is True:
                         text_background.add(message_id)
                     text_done.add(message_id)
@@ -908,16 +916,24 @@ def materialize_history_turns(
                 if isinstance(detail_id, str):
                     detail_items.add(detail_id)
 
-        final_ids = [
+        # Async questions are displayable content, not evidence of a formal
+        # final answer. Select ordinary answers (including the legacy unphased
+        # fallback) independently, then include questions in source order.
+        final_id_set = {
             message_id for message_id in text_order
             if channels.get(message_id) == "final"
-        ]
-        if not final_ids:
-            final_ids = [
+            and message_id not in async_messages
+        }
+        if not final_id_set:
+            final_id_set = {
                 message_id for message_id in text_order
                 if channels.get(message_id) in {None, "unknown"}
-            ]
-        final_id_set = set(final_ids)
+                and message_id not in async_messages
+            }
+        final_id_set.update(async_messages)
+        final_ids = [
+            message_id for message_id in text_order if message_id in final_id_set
+        ]
         for message_id in text_order:
             if message_id not in final_id_set and any(texts.get(message_id, ())):
                 detail_items.add(message_id)
@@ -1039,6 +1055,17 @@ def materialize_history_turns(
                     "done": done,
                     "channel": "final",
                 }
+                metadata = async_messages.get(message_id)
+                if metadata:
+                    text_block["delivery"] = "async"
+                    metadata_chars = len(json.dumps(metadata, ensure_ascii=False))
+                    if metadata_chars <= remaining_summary_chars:
+                        text_block["questions"] = metadata["questions"]
+                        remaining_summary_chars -= metadata_chars
+                    else:
+                        # Detail retains the complete native card. Summary
+                        # budgets must also count its structured text/options.
+                        summary_truncated = True
                 if message_id in text_background:
                     text_block["background"] = True
                     started_ts = text_first_ms.get(message_id)
@@ -1181,6 +1208,19 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if current in range(10, 28):
+                # v28 retains native async questions. Rollout bytes and source
+                # fingerprints are unchanged; rebuild Codex narrative only.
+                # Claude state, binary assets and Agent/compact indexes survive.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            if current == 28:
+                # v29 changes only the summary selection. The source token is
+                # unchanged, so old pages need an explicit invalidation; keep
+                # complete details, Claude history and all independent assets.
+                connection.execute(
+                    "DELETE FROM history_pages WHERE engine='codex'")
             if current in (10, 11, 12, 13, 14):
                 # v14 corrected Claude browser-message identity and v15
                 # narrowly restores completed tails bypassed by delayed
@@ -1245,8 +1285,8 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25, 26):
-                # The independent v22-v27 invalidations above suffice.
+            elif current in (21, 22, 23, 24, 25, 26, 27, 28):
+                # The independent v22-v29 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows

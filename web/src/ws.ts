@@ -82,6 +82,16 @@ const MAX_REPLAY_SESSIONS = 128;
 const PROTOCOL_RELOAD_KEY = "cc-remote:protocol-reload";
 const PROTOCOL_RECOVERY_POLL_MS = 1000;
 const PROTOCOL_RECOVERY_TIMEOUT_MS = 120000;
+let pageClientId: string | null = null;
+
+/** A page-lifetime connection identity. Durable BTW ownership is derived from
+ * authenticated relay claims, so duplicated tabs must never reuse this id and
+ * replace one another's WebSocket generation.
+ */
+export function stableTabClientId(): string {
+  pageClientId ??= uuid();
+  return pageClientId;
+}
 
 function readProtocolReloadMarker(): string | null | undefined {
   try {
@@ -208,11 +218,12 @@ export class RelayWs {
   private pingSeq = 0;
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
+  private readonly knownBtwSids = new Set<string>();
 
   constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
     this.machineId = machineId;
-    this.clientId = uuid();
+    this.clientId = stableTabClientId();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = new URL(`${proto}//${window.location.host}/ws`);
     if (machineId !== "default") url.searchParams.set("machine", machineId);
@@ -306,6 +317,7 @@ export class RelayWs {
   }
 
   private dropBtwReplayState(): void {
+    this.knownBtwSids.clear();
     for (const knownSid of Object.keys(this.generationBySession)) {
       if (!knownSid.startsWith("btw-")) continue;
       delete this.generationBySession[knownSid];
@@ -585,8 +597,23 @@ export class RelayWs {
     });
     return queued ? requestId : null;
   }
-  sendCloseBtw(btwSid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
+  sendCloseBtw(btwSid: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs(),
+    });
+  }
+
+  sendSyncBtw(btwSid: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "sync_btw",
+      sid: btwSid,
+      cursor: this.lastSeqFor(btwSid),
+      ts: nowTs(),
+    };
+    const generation = this.generationFor(btwSid);
+    if (generation) command.generation = generation;
+    return this.send(command);
   }
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
@@ -1650,6 +1677,30 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        // A BtwSync can be the first proof of a replacement Wrapper when this
+        // browser slept through wrapper_reconnected. Invalidate the old
+        // generation before installing the new catalog; doing this afterward
+        // would immediately clear the ids below and drop their SyncBtw replay.
+        if (msg.type === "btw_sync") {
+          this.noteWrapperGeneration(msg.generation);
+        }
+        // The lightweight owner catalog establishes which private routing keys
+        // this account may consume. A live BTW frame can race ahead of Hello's
+        // catalog response; drop it without advancing its cursor so SyncBtw can
+        // recover that exact suffix after the catalog arrives.
+        if (msg.type === "btw_sync") {
+          this.knownBtwSids.clear();
+          for (const session of msg.sessions) {
+            this.knownBtwSids.add(session.btw_sid);
+          }
+        } else if (msg.type === "btw_opened") {
+          this.knownBtwSids.add(msg.btw_sid);
+        } else if (msg.type === "btw_closed") {
+          this.knownBtwSids.delete(msg.btw_sid);
+        } else if (msg.sid?.startsWith("btw-")
+            && !this.knownBtwSids.has(msg.sid)) {
+          return;
+        }
         if (msg.type === "session_list_invalidated") {
           this.refreshInvalidatedSessionList(
             msg.engine, msg.space ?? "code", socketGeneration);

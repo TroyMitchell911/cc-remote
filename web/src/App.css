@@ -188,6 +188,13 @@
   box-shadow:var(--shadow-sm); }
 .goal-suspense { align-self:center; width:36px; height:36px; margin:0 auto 8px;
   flex:none; border-radius:50%; background:var(--accent-weak); animation:pulse 1.2s infinite; }
+/* The compact Goal/Plan monitor is an auxiliary row above the composer. When
+   an on-screen keyboard is actually editing text, keeping this row in the
+   flex stack pushes it into the middle of the conversation. Yield that space
+   temporarily; the authoritative Goal remains mounted and returns unchanged
+   as soon as the keyboard closes. */
+:root[data-short-viewport="ime"] .goal-chip-wrap,
+:root[data-short-viewport="ime"] .goal-suspense { display:none; }
 .goal-chip { min-width:0; display:flex; align-items:center; gap:7px; padding:0 9px 0 7px;
   color:var(--text); text-align:left; }
 .goal-chip:hover { background:var(--accent-weak); }
@@ -514,3 +521,98 @@
   .fork-worktree-actions { padding-left:14px; padding-right:14px; }
   .fork-worktree-primary { flex:1; }
 }
+/* Document folds use a quiet text header. Keep native details/summary behavior;
+   animate only the chevron, never content height or position (which would fight
+   history anchoring and text selection). Body text aligns with the title. */
+.message-disclosure {
+  margin: 10px 0;
+  padding-inline-start: 22px;
+  border: 0;
+}
+.message-disclosure > summary {
+  position: relative;
+  display: block;
+  inline-size: fit-content;
+  max-inline-size: calc(100% + 22px);
+  min-block-size: 38px;
+  margin-inline-start: -22px;
+  padding: 8px 8px 8px 22px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dim);
+  font-size: .9em;
+  font-weight: 500;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  list-style: none;
+  cursor: pointer;
+  transition: color .16s var(--ease);
+}
+.message-disclosure > summary::marker { content: ""; }
+.message-disclosure > summary::-webkit-details-marker { display: none; }
+.message-disclosure > summary::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: 4px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-top: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+  opacity: .65;
+  transform: translateY(-50%) rotate(45deg);
+  transition: transform .16s var(--ease);
+}
+.message-disclosure > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.message-disclosure[open] > summary {
+  margin-bottom: 4px;
+  color: var(--text);
+}
+.message-disclosure[open] > summary::before { transform: translateY(-50%) rotate(135deg); }
+.message-disclosure .message-disclosure { margin: 6px 0; }
+.prose .message-disclosure > :is(ul, ol) { margin-block: 6px; padding-inline-start: 20px; }
+.prose .message-disclosure > :is(p, ul, ol):last-child { margin-bottom: 0; }
+.prose .message-disclosure :not(pre) > code {
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+@media (hover: hover) {
+  .message-disclosure > summary:hover {
+    color: var(--text);
+    text-decoration: underline;
+    text-decoration-color: var(--border-strong);
+    text-underline-offset: 4px;
+  }
+}
+@media (pointer: coarse) {
+  .message-disclosure > summary { min-block-size: 44px; padding-block: 11px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .message-disclosure > summary,
+  .message-disclosure > summary::before { transition: none; }
+}
+
+.async-question-card {
+  margin: 12px 0; padding: 16px; border: 1px solid var(--border);
+  border-radius: 14px; overflow-wrap: anywhere;
+}
+.async-question-heading { font-weight: 650; }
+.async-question-hint, .async-question-text, .async-question-actions > span {
+  color: var(--muted); font-size: 13px;
+}
+.async-question-card fieldset { border: 0; padding: 0; margin: 16px 0; min-width: 0; }
+.async-question-card legend { margin-bottom: 10px; font-weight: 550; }
+.async-question-option { display: flex; align-items: baseline; gap: 8px; padding: 7px 0; }
+.async-question-text { display: block; margin: 8px 0 4px; }
+.async-question-card textarea {
+  width: 100%; resize: vertical; min-height: 64px; max-height: 240px;
+  box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; color: inherit; font: inherit; padding: 8px;
+}
+.async-question-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.async-question-actions button { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }

@@ -513,7 +513,10 @@ def test_failed_and_private_btw_turns_do_not_create_shared_receipts():
         btw.owner_client_id = "owner"
         await machine._emit(btw, _success("btw-turn"))
         assert [message.type for message in transport.sent] == ["turn_end"]
-        assert transport.sent[0].to == "owner"
+        # Account ownership is broader than an individual page connection:
+        # every tab/device signed in as this owner sees the side-chat terminal.
+        assert transport.sent[0].to is None
+        assert transport.sent[0].owner_id == "owner"
 
     asyncio.run(run())
 

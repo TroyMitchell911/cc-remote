@@ -1493,6 +1493,8 @@ def test_claude_takeover_adopts_only_completed_native_controls(
             model="claude-opus-4-6[1m]",
             effort="high",
             permission_mode="bypassPermissions",
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=500_000,
             applied_auto_compact_mode="custom",
             applied_auto_compact_threshold_tokens=500_000,
         )

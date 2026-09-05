@@ -1,5 +1,6 @@
 import type {
   AssistantChannel,
+  AsyncQuestionSpec,
   ConversationImageRef,
   PlanEntry,
   ProcessKind,
@@ -23,6 +24,8 @@ export interface TextBlock {
   text: string;
   done: boolean;
   channel?: AssistantChannel;
+  delivery?: "async";
+  questions?: AsyncQuestionSpec[];
   /** Source event time and detached-follow-up scope, preserved for chronology. */
   startedTs?: number;
   doneTs?: number;

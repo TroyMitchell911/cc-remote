@@ -521,6 +521,45 @@ try {
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const { preloadMarkdownExtras } = await harness.ssrLoadModule(
+    "/src/use-markdown-extras.ts");
+  await preloadMarkdownExtras();
+  const disclosureMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "Before\n\n<details>\n<summary>文件清单</summary>\n\n"
+      + "- **new** `README.md`\n- [source](/tmp/source.py)\n\n"
+      + "<details open>\n<summary>Nested</summary>\n\nInner body\n\n</details>\n\n"
+      + "</details>\n\nAfter",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.match(disclosureMarkup, /<details class="message-disclosure">\s*<summary>文件清单<\/summary>/);
+  assert.match(disclosureMarkup, /<strong>new<\/strong>/);
+  assert.match(disclosureMarkup, /message-file-link/);
+  assert.match(disclosureMarkup, /<details class="message-disclosure" open="">\s*<summary>Nested<\/summary>/);
+  assert.match(disclosureMarkup, /<p>After<\/p>/);
+  const unsafeDisclosure = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '<details>\n<summary>Safe</summary>\n\n'
+      + '<script>alert(1)</script><img src=x onerror="alert(2)">\n\n'
+      + '<iframe src="https://example.com"></iframe>\n\n</details>',
+    done: true,
+  }));
+  assert.doesNotMatch(unsafeDisclosure, /<(script|img|iframe)\b/);
+  assert.match(unsafeDisclosure, /&lt;script&gt;/);
+  const literalDisclosure = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '```html\n<details><summary>Example</summary></details>\n```',
+    done: true,
+  }));
+  assert.doesNotMatch(literalDisclosure, /<details>/);
+  assert.match(literalDisclosure, /&lt;details&gt;/);
+  for (const raw of [
+    '<details ontoggle="alert(1)"><summary>Title</summary></details>',
+    '<details style="position:fixed"><summary>Title</summary></details>',
+    '<details>\n<summary>Title</summary>\n\n<a href="javascript:alert(1)">x</a>\n</details>',
+    '<details>\n<summary>Title</summary>\n\n<svg><script>alert(1)</script></svg>\n</details>',
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, { text: raw, done: true }));
+    assert.doesNotMatch(markup, /<(?:a|svg|script)\b|<details[^>]+(?:ontoggle|style)=/);
+  }
   const codeCopyMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "请执行：\n\n```sh\necho ready\n```",
     done: true,

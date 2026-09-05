@@ -125,6 +125,69 @@ class RingBuffer:
         frames.append(ReplayEnd(to_seq=to_seq, truncated=truncated))
         return frames
 
+    def replay_from_bounded(
+        self,
+        last_seq: Optional[int],
+        *,
+        max_bytes: int,
+        max_events: int,
+        rebuild: bool = False,
+        generation: Optional[str] = None,
+    ) -> list:
+        """Return a newest contiguous replay suffix under strict queue budgets.
+
+        BTW sessions have no durable History endpoint, but replaying every
+        resident side-chat ring during Hello can overflow the relay's bounded
+        client queue. The catalog is restored separately and the visible chat
+        calls this method on demand. A dropped prefix is explicit via
+        ``truncated``; the cursor still advances to the logical tail.
+        """
+        byte_budget = max(1024, max_bytes)
+        event_budget = max(1, max_events)
+        cursor = 0 if last_seq is None else last_seq
+        effective_rebuild = rebuild or cursor > self.tail_seq
+        if effective_rebuild:
+            retained = list(self._buf)
+            truncated = self._dropped_through_seq > 0
+        else:
+            retained = [(seq, message) for seq, message in self._buf
+                        if seq > cursor]
+            truncated = (
+                (bool(self._buf) and cursor + 1 < self.head_seq)
+                or self._has_gap_after(cursor)
+            )
+        compacted = self._compact_current_turn_suffix(retained)
+        selected_reversed: list[object] = []
+        used = 0
+        for message in reversed(compacted):
+            size = self._size(message)
+            if (len(selected_reversed) >= event_budget
+                    or used + size > byte_budget):
+                truncated = True
+                break
+            selected_reversed.append(message)
+            used += size
+        selected = list(reversed(selected_reversed))
+        if len(selected) < len(compacted):
+            truncated = True
+        from_seq = (
+            int(getattr(selected[0], "seq", 0) or 0)
+            if selected else self.tail_seq + 1
+        )
+        frames: list = [ReplayStart(
+            from_seq=from_seq,
+            to_seq=self.tail_seq,
+            truncated=truncated,
+            rebuild=effective_rebuild,
+            generation=generation,
+        )]
+        frames.extend(selected)
+        frames.append(ReplayEnd(
+            to_seq=self.tail_seq,
+            truncated=truncated,
+        ))
+        return frames
+
     @staticmethod
     def _delta_replay_key(message: Delta) -> tuple:
         """Fields which must agree before adjacent deltas may be coalesced."""

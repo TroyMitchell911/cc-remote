@@ -6,6 +6,10 @@ import threading
 
 from cc_remote.protocol import (
     AssistantMsgStart,
+    AskUser,
+    AskUserSync,
+    BtwClosed,
+    BtwSync,
     CommandAck,
     Delta,
     Hello,
@@ -13,9 +17,11 @@ from cc_remote.protocol import (
     NewSession,
     ReplayEnd,
     ReplayStart,
+    SyncBtw,
     SessionFocus,
     SessionList,
     SessionListInvalidated,
+    StateEvent,
     TurnBinding,
     TurnEnd,
     TurnResult,
@@ -26,7 +32,7 @@ from cc_remote.protocol import (
     serialize,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
-from cc_remote.wrapper.session_ctx import ActiveTurnBinding
+from cc_remote.wrapper.session_ctx import ActiveTurnBinding, PendingAskState
 from cc_remote.wrapper import machine as mm
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -123,6 +129,211 @@ def test_client_hello_does_not_retarget_another_clients_ring_frame():
     asyncio.run(run())
 
 
+def test_client_hello_restores_btw_catalog_then_hydrates_only_selected_chat():
+    async def run():
+        machine, transport = _mk_machine()
+        first = _mk_ctx("btw-first")
+        first.engine = "codex"
+        first.btw = True
+        first.parent_sid = "parent"
+        first.owner_client_id = "owner"
+        first.btw_created_at = 1.0
+        first.btw_announced = True
+        second = _mk_ctx("btw-second")
+        second.engine = "codex"
+        second.btw = True
+        second.parent_sid = "parent"
+        second.owner_client_id = "owner"
+        second.btw_created_at = 2.0
+        second.btw_announced = True
+        _buffer(
+            first,
+            UserMsg(msg_id="btw-user", prompt="remember this side chat"),
+            Delta(message_id="btw-answer", text="restored answer"),
+            TurnEnd(result=TurnResult(
+                subtype="success", duration_ms=10, is_error=False)),
+        )
+        machine.sessions = {first.key: first, second.key: second}
+        machine._btw_revision = 2
+
+        await machine._handle_client_hello(Hello(
+            role="client", client_id="owner", route_id="route-owner"))
+
+        sync = transport.sent[0]
+        assert isinstance(sync, BtwSync)
+        assert sync.revision == 2
+        assert [item.btw_sid for item in sync.sessions] == [
+            "btw-first", "btw-second",
+        ]
+        assert all(item.parent_sid == "parent" for item in sync.sessions)
+        first_frames = [event for event in transport.sent
+                        if event.sid == "btw-first"]
+        assert first_frames == []
+        assert all(event.to == "owner" for event in transport.sent)
+        assert all(event.route_id == "route-owner" for event in transport.sent)
+
+        transport.sent.clear()
+        await machine._handle_sync_btw(SyncBtw(
+            sid="btw-first",
+            cursor=0,
+            client_id="owner-tab-2",
+            owner_id="owner",
+        ))
+        assert [event.type for event in transport.sent[:6]] == [
+            "replay_start", "user_msg", "delta", "turn_end", "replay_end",
+            "snapshot",
+        ]
+        assert all(event.to == "owner-tab-2" for event in transport.sent)
+        assert all(event.owner_id == "owner" for event in transport.sent)
+
+        transport.sent.clear()
+        await machine._handle_client_hello(Hello(
+            role="client", client_id="other", route_id="route-other"))
+
+        assert len(transport.sent) == 1
+        assert isinstance(transport.sent[0], BtwSync)
+        assert transport.sent[0].sessions == []
+        assert transport.sent[0].to == "other"
+
+    asyncio.run(run())
+
+
+def test_btw_sync_restores_pending_question_to_another_tab_of_same_owner():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("btw-question")
+        ctx.engine = "claude"
+        ctx.btw = True
+        ctx.parent_sid = "parent"
+        ctx.owner_client_id = "account-owner"
+        ctx.btw_announced = True
+        question = AskUser(
+            ask_id="ask-private",
+            question="继续吗？",
+            options=[{"label": "继续"}, {"label": "停止"}],
+        )
+        loop = asyncio.get_running_loop()
+        ctx.pending_asks[question.ask_id] = PendingAskState(
+            event=question,
+            future=loop.create_future(),
+            labels=frozenset({"继续", "停止"}),
+            allow_text=False,
+            multi_select=False,
+            created_at=loop.time(),
+            deadline=loop.time() + 60,
+        )
+        machine.sessions = {ctx.key: ctx}
+
+        await machine._handle_sync_btw(SyncBtw(
+            sid=ctx.key,
+            client_id="second-tab",
+            owner_id="account-owner",
+        ))
+
+        sync_index = next(
+            index for index, event in enumerate(transport.sent)
+            if isinstance(event, AskUserSync)
+        )
+        restored = transport.sent[sync_index + 1]
+        assert isinstance(restored, AskUser)
+        assert restored.ask_id == "ask-private"
+        assert restored.to == "second-tab"
+        assert restored.owner_id == "account-owner"
+        assert question.seq is None and question.to is None
+
+    asyncio.run(run())
+
+
+def test_btw_replay_uses_newest_bounded_suffix_and_advances_cursor():
+    ring = RingBuffer(max_events=100, max_bytes=100_000)
+    for seq in range(1, 7):
+        message = Delta(
+            seq=seq,
+            message_id=f"message-{seq}",
+            text=str(seq) * 360,
+        )
+        ring.append(message)
+
+    frames = ring.replay_from_bounded(
+        0,
+        max_bytes=1024,
+        max_events=100,
+        generation="wrapper-generation",
+    )
+
+    assert isinstance(frames[0], ReplayStart)
+    assert isinstance(frames[-1], ReplayEnd)
+    assert frames[0].truncated is True
+    assert frames[0].to_seq == frames[-1].to_seq == ring.tail_seq == 6
+    payload = frames[1:-1]
+    assert payload
+    assert [event.seq for event in payload] == list(
+        range(payload[0].seq, 7))
+    assert frames[0].from_seq == payload[0].seq
+    assert sum(ring._size(event) for event in payload) <= 1024
+
+
+def test_btw_replay_uses_newest_event_bounded_suffix():
+    ring = RingBuffer(max_events=100, max_bytes=1_000_000)
+    for seq in range(1, 21):
+        ring.append(StateEvent(seq=seq, state="running"))
+
+    frames = ring.replay_from_bounded(
+        0,
+        max_bytes=1_000_000,
+        max_events=6,
+        generation="wrapper-generation",
+    )
+
+    assert isinstance(frames[0], ReplayStart)
+    assert isinstance(frames[-1], ReplayEnd)
+    assert frames[0].truncated is True
+    assert frames[0].from_seq == 15
+    assert frames[0].to_seq == frames[-1].to_seq == 20
+    assert [event.seq for event in frames[1:-1]] == list(range(15, 21))
+
+
+def test_close_btw_removes_only_the_exact_fork_and_publishes_catalog_revision():
+    class Disconnectable:
+        async def disconnect(self):
+            return None
+
+    async def run():
+        machine, transport = _mk_machine()
+        first = _mk_ctx("btw-first")
+        first.engine = "codex"
+        first.sdk = Disconnectable()
+        first.btw = True
+        first.parent_sid = "parent"
+        first.owner_client_id = "owner"
+        first.btw_created_at = 1.0
+        first.btw_announced = True
+        second = _mk_ctx("btw-second")
+        second.engine = "codex"
+        second.sdk = Disconnectable()
+        second.btw = True
+        second.parent_sid = "parent"
+        second.owner_client_id = "owner"
+        second.btw_created_at = 2.0
+        second.btw_announced = True
+        machine.sessions = {first.key: first, second.key: second}
+        machine._btw_revision = 2
+
+        result = await machine._handle_close_btw(
+            type("Close", (), {"sid": first.key})())
+
+        assert isinstance(result, BtwClosed)
+        assert result.btw_sid == "btw-first"
+        assert result.parent_sid == "parent"
+        assert result.revision == 3
+        assert result.to is None
+        assert result.owner_id == "owner"
+        assert list(machine.sessions) == ["btw-second"]
+        assert transport.sent[0] is result
+
+    asyncio.run(run())
+
+
 def test_client_hello_reseeds_binding_before_tail_after_cursor_passed_owner():
     async def run():
         machine, transport = _mk_machine()
@@ -152,7 +363,8 @@ def test_client_hello_reseeds_binding_before_tail_after_cursor_passed_owner():
             generations={"s-replay": machine.instance_id},
         ))
 
-        replay = transport.sent[:7]
+        assert transport.sent[0].type == "btw_sync"
+        replay = transport.sent[1:8]
         assert [event.type for event in replay] == [
             "replay_start", "turn_binding", "assistant_msg_start", "delta",
             "replay_end", "ask_user_sync", "session_control",
@@ -258,13 +470,14 @@ def test_client_hello_preseeds_proven_current_suffix_after_binding_eviction():
 
         reseed = next(index for index, event in enumerate(transport.sent)
                       if isinstance(event, TurnBinding))
-        assert isinstance(transport.sent[0], ReplayStart)
-        assert transport.sent[0].truncated is True
+        assert transport.sent[0].type == "btw_sync"
+        assert isinstance(transport.sent[1], ReplayStart)
+        assert transport.sent[1].truncated is True
         # The retained head is strictly newer than the evicted binding. Every
         # replayed narrative frame is therefore a proven suffix of that exact
         # logical turn and must see the owner seed before it is reduced.
-        assert transport.sent[0].from_seq > ctx.active_turn_binding.seq
-        assert reseed == 1
+        assert transport.sent[1].from_seq > ctx.active_turn_binding.seq
+        assert reseed == 2
         assert transport.sent[reseed].seq is None
 
     asyncio.run(run())
@@ -323,13 +536,13 @@ def test_fresh_hello_reseeds_owner_when_current_boundary_left_ring():
         await machine._handle_client_hello(Hello(
             role="client", client_id="client-1"))
 
-        assert [event.type for event in transport.sent[:7]] == [
-            "snapshot", "replay_start", "turn_binding",
+        assert [event.type for event in transport.sent[:8]] == [
+            "btw_sync", "snapshot", "replay_start", "turn_binding",
             "assistant_msg_start", "delta", "replay_end", "ask_user_sync",
         ]
-        assert transport.sent[1].truncated is True
-        assert transport.sent[2].seq is None
-        assert transport.sent[4].text == "tail"
+        assert transport.sent[2].truncated is True
+        assert transport.sent[3].seq is None
+        assert transport.sent[5].text == "tail"
 
         await machine._emit_locked(ctx, TurnEnd(
             turn_id="native-turn",

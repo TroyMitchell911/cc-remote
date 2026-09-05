@@ -25,7 +25,6 @@ import {
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
 import {
-  DEFAULT_AUTO_COMPACT_TOKENS,
   autoCompactSelectionLabel,
   parseAutoCompactArgument,
   type AutoCompactSelection,
@@ -264,9 +263,7 @@ function displayEffort(
 export function NewChatView({ cwd, controlScopeKey,
   space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
-  autoCompact = {
-    mode: "custom", thresholdTokens: DEFAULT_AUTO_COMPACT_TOKENS,
-  },
+  autoCompact = { mode: "inherit", thresholdTokens: null },
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
   claudeProfiles = [], defaultClaudeProfileId = null, claudeProfileId = null,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,

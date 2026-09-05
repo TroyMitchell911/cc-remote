@@ -45,17 +45,25 @@ import {
 } from "../process-blocks";
 import { PanelResizer } from "./PanelResizer";
 import {
-  DEFAULT_AUTO_COMPACT_TOKENS,
   autoCompactSelectionLabel,
   parseAutoCompactArgument,
   type AutoCompactSelection,
 } from "../auto-compact";
 import { AutoCompactControl } from "./AutoCompactControl";
+import { QuestionSheet } from "./QuestionSheet";
+import { sessionControlLocksInput } from "../protocol";
 
 interface Props {
   sid?: string;
   rt: SessionRuntime | undefined;
-  engine?: string;
+  engine: "claude" | "codex";
+  chats: Array<{
+    sid: string;
+    engine: "claude" | "codex";
+    title: string;
+    state: "idle" | "running" | "interrupting" | "draining";
+    needsAnswer: boolean;
+  }>;
   opening?: boolean;
   active: RightPanelView;
   hasArtifact: boolean;
@@ -69,8 +77,12 @@ interface Props {
   queueCapacity: QueueCapacity;
   replaceQueueCapacity: QueueCapacity;
   onTab: (v: RightPanelView) => void;
+  onNew: () => void;
+  onSelect: (sid: string) => void;
+  onCloseChat: (sid: string) => void;
   onSend: (prompt: string) => boolean;
   onSteer: (prompt: string) => boolean;
+  onReplyAsyncQuestion?: (prompt: string) => boolean;
   onInterrupt: () => void;
   onSetSendMode: (mode: SendMode) => void;
   onEnqueue: (query: PendingQuery) => boolean;
@@ -87,7 +99,8 @@ interface Props {
     authorization: PreviewAuthorizationState,
     decision: "allow" | "deny",
   ) => boolean;
-  onClose: () => void;
+  onAnswerQuestion: (askId: string, answer: string | string[]) => void;
+  onCollapse: () => void;
   onDismissNotice: (noticeId: string) => void;
 }
 
@@ -110,8 +123,17 @@ export function BtwPanel(p: Props) {
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
   const input = draft.input;
+  const chats = p.chats;
   const turns = p.rt?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
+  const inputLocked = p.rt?.control
+    ? sessionControlLocksInput(p.rt.control) : !!p.rt?.external;
+  const lockReason = inputLocked
+    ? p.rt?.control?.reason ?? "当前侧边对话仅供查看，暂时不能发送消息"
+    : null;
+  const inputLockedRef = useRef(inputLocked);
+  inputLockedRef.current = inputLocked;
+  const awaitingFirstChat = !!p.opening && !p.sid;
   const activeTurnCandidates = activeTurnCandidateIds(
     turns,
     displayActiveTurnOwnerId(
@@ -131,7 +153,7 @@ export function BtwPanel(p: Props) {
   const submitState = runtimeState === "idle" && acceptancePending
     ? "draining" : runtimeState;
   const runtimeBusy = isComposerBusy(submitState);
-  const busy = !!p.opening || runtimeBusy;
+  const busy = awaitingFirstChat || runtimeBusy;
   const hasText = input.trim().length > 0 || draft.pastes.length > 0;
 
   const updateDraft = useCallback((
@@ -168,8 +190,15 @@ export function BtwPanel(p: Props) {
   }, [p.draftKey, p.draftStore]);
 
   useEffect(() => {
-    if (busy) setSheetKind(null);
-  }, [busy]);
+    if (busy || inputLocked) setSheetKind(null);
+    if (inputLocked) {
+      setAutoCompactOpen(false);
+      if (buttonSendTimerRef.current !== null) {
+        window.clearTimeout(buttonSendTimerRef.current);
+        buttonSendTimerRef.current = null;
+      }
+    }
+  }, [busy, inputLocked]);
 
   useEffect(() => () => {
     if (buttonSendTimerRef.current !== null) {
@@ -199,10 +228,10 @@ export function BtwPanel(p: Props) {
   };
   useLayoutEffect(() => {
     if (taRef.current) grow(taRef.current);
-  }, [input, p.draftKey]);
+  }, [input, p.draftKey, lockReason]);
 
   const submit = (value = taRef.current?.value ?? input) => {
-    if (p.opening || !p.sid) return;
+    if (awaitingFirstChat || !p.sid || inputLockedRef.current) return;
     const command = parseSlash(value.trim());
     if (command?.slash === "autocompact") {
       if (p.engine === "codex") {
@@ -279,9 +308,10 @@ export function BtwPanel(p: Props) {
     }
   };
   const requestButtonAction = () => {
-    if (buttonSendTimerRef.current !== null) return;
+    if (inputLockedRef.current || buttonSendTimerRef.current !== null) return;
     buttonSendTimerRef.current = window.setTimeout(() => {
       buttonSendTimerRef.current = null;
+      if (inputLockedRef.current) return;
       const value = taRef.current?.value ?? input;
       // Stopping is an explicit button action. Empty Enter goes through submit
       // and remains a no-op.
@@ -309,7 +339,7 @@ export function BtwPanel(p: Props) {
     + ((stopping || (runtimeBusy && p.sendMode === "steer"
       && primaryIsInterrupt && hasText))
       ? " interrupt" : "");
-  const sendDisabled = !!p.opening || !p.sid
+  const sendDisabled = inputLocked || awaitingFirstChat || !p.sid
     || (!runtimeBusy && !hasText)
     || isSettlingStopDisabled(submitState, hasText);
 
@@ -327,34 +357,77 @@ export function BtwPanel(p: Props) {
               </span>
               <span className="btw-sub">基于当前会话上下文,不写回主线</span>
             </div>}
-        <button className="iconbtn" onClick={p.onClose}
-          aria-label="关闭 btw" title="关闭并丢弃这个侧边对话">
+        <button className="iconbtn btw-new" onClick={p.onNew}
+          disabled={!!p.opening}
+          aria-label="新建侧边对话" title="新建侧边对话">
+          <Icon name="plus" />
+        </button>
+        <button className="iconbtn" onClick={p.onCollapse}
+          aria-label="收起侧边对话" title="收起侧边对话">
           <Icon name="chevrons-right" />
         </button>
       </div>
+      {chats.length > 0 && (
+        <div className="btw-chat-tabs" role="tablist"
+          aria-label="侧边对话列表">
+          {chats.map((chat) => (
+            <div className={"btw-chat-tab-wrap"
+              + (chat.sid === p.sid ? " active" : "")} key={chat.sid}>
+              <button className="btw-chat-tab" role="tab"
+                aria-selected={chat.sid === p.sid}
+                title={chat.title}
+                onClick={() => p.onSelect(chat.sid)}>
+                <span className={"btw-chat-state " + chat.state}
+                  aria-hidden="true" />
+                <span className="btw-chat-label">{chat.title}</span>
+                {chat.needsAnswer && (
+                  <span className="btw-chat-question" title="等待回答">
+                    待回答
+                  </span>
+                )}
+              </button>
+              <button className="btw-chat-close"
+                aria-label={`关闭 ${chat.title}`}
+                title="关闭并丢弃这个侧边对话"
+                onClick={() => p.onCloseChat(chat.sid)}>
+                <Icon name="close" size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <NoticeStack notices={p.rt?.notices ?? []}
         onDismiss={p.onDismissNotice} />
       <div className="btw-body">
-        {p.opening
+        {awaitingFirstChat
           ? <div className="btw-empty">
               <span className="thinking"><span/><span/><span/></span>
               {" "}正在打开侧边对话…
             </div>
           : turns.length === 0
             ? <div className="btw-empty">
-                问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。
+                {p.sid
+                  ? "问一个基于当前会话的侧边问题 —— 回答不会写进主线。"
+                  : "暂无侧边对话。点 + 新建一个基于当前会话上下文的对话。"}
               </div>
             : <ChatView sid={p.sid ?? null} turns={turns}
+                engine={p.engine}
                 activeTurnId={activeTurnId}
                 onEdit={() => {}} onGetDiff={() => {}}
                 onOpenFile={p.onOpenFile}
                 imageAssets={p.imageAssets}
                 onLoadImage={p.onLoadImage}
                 onAuthorizeImage={p.onAuthorizeImage}
+                onReplyAsyncQuestion={p.engine !== "codex" || !p.sid
+                  || acceptancePending
+                  || (p.rt?.control ? sessionControlLocksInput(p.rt.control) : p.rt?.external)
+                  || (runtimeState !== "idle" && runtimeState !== "running")
+                  ? undefined : p.onReplyAsyncQuestion}
                 ambiguousActiveTurnIds={activeTurnCandidates.length > 1
                   ? activeTurnCandidates : []} />}
       </div>
       <div className="btw-composer">
+        {lockReason && <div className="btw-readonly-notice" role="status">{lockReason}</div>}
         {notice && <div className="btw-composer-notice">{notice}</div>}
         {(
           (p.rt?.queue.length ?? 0) > 0
@@ -376,13 +449,13 @@ export function BtwPanel(p: Props) {
         {draft.pastes.length > 0 && (
           <div className="attach show btw-pastes">
             <PasteCards pastes={draft.pastes}
-              disabled={!!p.opening || !p.sid}
+              disabled={inputLocked || awaitingFirstChat || !p.sid}
               onChange={(pastes) => updateDraft((current) => ({
                 ...current, pastes,
               }))} />
           </div>
         )}
-        {runtimeBusy && (
+        {runtimeBusy && !inputLocked && (
           <div className="btw-runbar">
             <div className="seg">
               <button className={p.sendMode === "steer" ? "on" : ""}
@@ -401,14 +474,14 @@ export function BtwPanel(p: Props) {
           <textarea
             ref={taRef}
             value={input}
-            placeholder={p.opening ? "正在打开…"
+            placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
               : runtimeBusy
                 ? (primaryIsInterrupt
                   ? "可输入后打断并发送或排队…"
                   : "输入以引导当前任务，或选择排队…")
-                : "问点什么"}
+                : "问点什么")}
             rows={1}
-            disabled={!!p.opening || !p.sid}
+            disabled={inputLocked || awaitingFirstChat || !p.sid}
             onChange={(event) => {
               setInput(event.target.value);
               grow(event.target);
@@ -457,9 +530,9 @@ export function BtwPanel(p: Props) {
         <div className="btw-controls">
           <span>BTW 设置</span>
           <button className="hint-ctl" onClick={() => setSheetKind("models")}
-            disabled={busy}>{model?.name ?? "模型读取中"}</button>
+            disabled={inputLocked || busy || !p.sid}>{model?.name ?? "模型读取中"}</button>
           <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
-            disabled={busy}>{effortName ?? "强度读取中"}</button>
+            disabled={inputLocked || busy || !p.sid}>{effortName ?? "强度读取中"}</button>
         </div>
       </div>
       <CommandSheet
@@ -471,11 +544,11 @@ export function BtwPanel(p: Props) {
         currentEffort={p.rt?.effort}
         onClose={() => setSheetKind(null)}
         onPickModel={(nextModel) => {
-          if (!busy) p.onSetModel(nextModel);
+          if (!busy && !inputLockedRef.current) p.onSetModel(nextModel);
           setSheetKind(null);
         }}
         onPickEffort={(nextEffort) => {
-          if (!busy) p.onSetEffort(nextEffort);
+          if (!busy && !inputLockedRef.current) p.onSetEffort(nextEffort);
           setSheetKind(null);
         }}
       />
@@ -489,13 +562,12 @@ export function BtwPanel(p: Props) {
           <div className="sheet-title">BTW 自动压缩</div>
           <div className="sheet-scroll">
             <AutoCompactControl value={{
-              mode: p.rt?.autoCompact?.mode ?? "custom",
-              thresholdTokens:
-                p.rt?.autoCompact?.threshold_tokens
-                  ?? DEFAULT_AUTO_COMPACT_TOKENS,
+              mode: p.rt?.autoCompact?.mode ?? "inherit",
+              thresholdTokens: p.rt?.autoCompact?.threshold_tokens ?? null,
             }} state={p.rt?.autoCompact}
-              disabled={!p.sid}
+              disabled={inputLocked || !p.sid}
               onChange={(selection) => {
+                if (inputLockedRef.current) return;
                 if (!p.onSetAutoCompact(selection)) {
                   flash("自动压缩设置暂未发送，请稍后重试。");
                 }
@@ -503,6 +575,21 @@ export function BtwPanel(p: Props) {
           </div>
         </div>
       </>
+      {!inputLocked && p.rt?.pendingQuestion && (
+        <QuestionSheet
+          key={p.rt.pendingQuestion.ask_id}
+          header={p.rt.pendingQuestion.header}
+          question={p.rt.pendingQuestion.question}
+          options={p.rt.pendingQuestion.options}
+          allowText={p.rt.pendingQuestion.allow_text}
+          secret={p.rt.pendingQuestion.secret}
+          multiSelect={p.rt.pendingQuestion.multi_select}
+          onAnswer={(answer) => {
+            const question = p.rt?.pendingQuestion;
+            if (question) p.onAnswerQuestion(question.ask_id, answer);
+          }}
+        />
+      )}
     </div>
   );
 }

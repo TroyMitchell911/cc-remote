@@ -27,6 +27,7 @@ COMMAND_HANDLER_NAMES = MappingProxyType({
     "set_collaboration_mode": "_handle_set_collaboration_mode",
     "open_btw": "_handle_open_btw",
     "close_btw": "_handle_close_btw",
+    "sync_btw": "_handle_sync_btw",
     "set_perm": "_handle_set_perm",
     "get_permission_profiles": "_handle_get_permission_profiles",
     "set_permission_profile": "_handle_set_permission_profile",

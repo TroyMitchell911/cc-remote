@@ -1583,13 +1583,18 @@ def test_real_run_turn_final_guard_never_writes_or_reports_crash():
     [
         (
             "status_code=413, input tokens exceed system limit",
-            "原生自动压缩",
+            "上游按其 token 口径",
             "较大附件",
+        ),
+        (
+            "status_code=413, 输入Tokens数量(1126006)超过系统限制(1000000)",
+            "媒体请求体可能与其不一致",
+            "Claude 未能在发送前完成原生自动压缩",
         ),
         (
             "status_code=413, payload too large",
             "较大附件",
-            "原生自动压缩",
+            "上游按其 token 口径",
         ),
     ],
 )

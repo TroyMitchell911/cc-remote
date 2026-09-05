@@ -10,6 +10,23 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **control link** (this repo) — client ⇄ relay ⇄ wrapper ⇄ Claude Agent SDK /
   Codex app-server. Native CLI ownership is detected and mirrored separately.
 
+## Deployment
+
+The repository-owned deployment procedure is [`deploy/README.md`](deploy/README.md).
+Read its automation contract and the relevant installation path completely
+before any deploy, redeploy, recovery, verification, or rollback. Do not depend
+on out-of-tree instructions, and do not add an operator's host aliases,
+usernames, IPs, domains, home directories, or credentials to this repository.
+Resolve that inventory from the environment the operator placed in scope.
+
+Use one tested source snapshot or one set of release artifacts for all protocol
+tiers, stage and validate before touching live services, preserve external
+configuration and private state, and use the repository's immutable activation
+transactions. A dropped SSH/control connection is an unknown result: inspect
+the original transaction and live state before deciding whether a retry is
+safe. Deployment is complete only after protocol/build identity, service
+stability, public health, and expected Wrapper connectivity are verified.
+
 ## Critical constraints / traps
 - **Drain footgun**: after `ClaudeSDKClient.interrupt()`, the SDK does NOT kill
   the session — the current turn's stream still emits a terminal
@@ -60,7 +77,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v49 is declared by
+- **Protocol version gate**: current wire protocol v52 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all

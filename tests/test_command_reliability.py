@@ -11,7 +11,10 @@ from starlette.websockets import WebSocketDisconnect
 from cc_remote.protocol import (
     AnswerQuestion,
     AskUser,
+    BtwClosed,
     BtwOpened,
+    BtwSessionInfo,
+    BtwSync,
     CloseBtw,
     CommandAck,
     DeleteSession,
@@ -136,9 +139,32 @@ def test_open_btw_request_id_roundtrip_is_required_on_both_frames():
         btw_sid="btw-1",
         parent_sid="parent-1",
         engine="claude",
+        created_at=1.0,
+        revision=1,
         to="client-1",
     )
     assert deserialize(serialize(opened)) == opened
+    sync = BtwSync(
+        generation="wrapper-1",
+        revision=2,
+        sessions=[BtwSessionInfo(
+            btw_sid="btw-1",
+            parent_sid="parent-1",
+            engine="claude",
+            created_at=1.0,
+        )],
+        to="client-1",
+    )
+    assert deserialize(serialize(sync)) == sync
+    closed = BtwClosed(
+        btw_sid="btw-1",
+        parent_sid="parent-1",
+        revision=3,
+        to="client-1",
+    )
+    assert deserialize(serialize(closed)) == closed
+    assert is_downstream(sync) is False
+    assert is_downstream(closed) is False
     with pytest.raises(ValidationError):
         OpenBtw(sid="parent-1")
     with pytest.raises(ValidationError):
@@ -697,6 +723,7 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
             # Mirror _spawn_btw(): every live fork must be owner-bound before
             # its first sequenced frame is emitted.
             fork.owner_client_id = owner_client_id
+            machine.sessions[fork.key] = fork
             return fork
 
         machine._spawn_btw = fake_spawn
@@ -742,12 +769,12 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
                   if isinstance(message, Model)]
         efforts = [message for message in transport.sent
                    if isinstance(message, Effort)]
-        assert [(message.model, message.sid, message.to)
+        assert [(message.model, message.sid, message.to, message.owner_id)
                 for message in models] == [
-                    ("gpt-btw", fork.key, "client-1")]
-        assert [(message.effort, message.sid, message.to)
+                    ("gpt-btw", fork.key, None, "client-1")]
+        assert [(message.effort, message.sid, message.to, message.owner_id)
                 for message in efforts] == [
-                    ("high", fork.key, "client-1")]
+                    ("high", fork.key, None, "client-1")]
         assert models[0].seq == 1 and efforts[0].seq == 2
         # Model/effort are mutable after the fork opens. They belong to the
         # sequenced owner-only ring, not the static OpenBtw response cache:
@@ -757,6 +784,38 @@ def test_open_btw_success_response_is_correlated_and_replayed_without_refork():
             "model", "effort", "auto_compact"]
         assert len([message for message in transport.sent
                     if isinstance(message, CommandAck)]) == 2
+
+    asyncio.run(run())
+
+
+def test_open_btw_does_not_announce_fork_removed_during_spawn():
+    async def run():
+        machine, transport = _mk_machine()
+        parent = _mk_ctx("parent-race", session_id="parent-race")
+        fork = _mk_ctx("btw-race", session_id=None)
+        fork.btw = True
+        fork.parent_sid = parent.session_id
+        machine.sessions[parent.key] = parent
+
+        async def fake_spawn(_parent, owner_client_id=None):
+            fork.owner_client_id = owner_client_id
+            # Model the cleanup task winning after native spawn but before the
+            # command can publish BtwOpened.
+            return fork
+
+        machine._spawn_btw = fake_spawn
+        result = await machine._handle_open_btw(OpenBtw(
+            sid=parent.key,
+            request_id="btw-race-request",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == "not_running"
+        assert result.request_id == "btw-race-request"
+        assert not any(isinstance(message, BtwOpened)
+                       for message in transport.sent)
+        assert machine._btw_revision == 0
 
     asyncio.run(run())
 
@@ -773,10 +832,12 @@ def test_btw_live_frames_are_routed_and_buffered_for_owner_only():
 
         sent = transport.sent[-1]
         assert sent.sid == "btw-private"
-        assert sent.to == "owner-client"
+        assert sent.to is None
+        assert sent.owner_id == "owner-client"
         buffered = list(fork.buffer._buf)
         assert len(buffered) == 1
-        assert buffered[0][1].to == "owner-client"
+        assert buffered[0][1].to is None
+        assert buffered[0][1].owner_id == "owner-client"
 
     asyncio.run(run())
 
@@ -796,26 +857,29 @@ def test_nonowner_cannot_control_query_close_or_focus_btw_runtime():
             Query(
                 sid=fork.key, prompt="steal", msg_id="private-query",
                 cmd_id="query-command", client_id="other-client",
+                owner_id="other-owner",
             ),
             Interrupt(
                 sid=fork.key, cmd_id="interrupt-command",
-                client_id="other-client",
+                client_id="other-client", owner_id="other-owner",
             ),
             SetModel(
                 sid=fork.key, model="gpt-stolen",
                 cmd_id="model-command", client_id="other-client",
+                owner_id="other-owner",
             ),
             SetEffort(
                 sid=fork.key, effort="high",
                 cmd_id="effort-command", client_id="other-client",
+                owner_id="other-owner",
             ),
             CloseBtw(
                 sid=fork.key, cmd_id="close-command",
-                client_id="other-client",
+                client_id="other-client", owner_id="other-owner",
             ),
             SwitchSession(
                 session_id=fork.key, cmd_id="switch-command",
-                client_id="other-client",
+                client_id="other-client", owner_id="other-owner",
             ),
         ]
         for command in commands:
@@ -828,6 +892,7 @@ def test_nonowner_cannot_control_query_close_or_focus_btw_runtime():
             message.code == "auth"
             and message.sid == fork.key
             and message.to == "other-client"
+            and message.owner_id == "other-owner"
             for message in errors
         )
         assert len([message for message in transport.sent
@@ -869,16 +934,18 @@ def test_owner_controls_and_interrupts_only_its_btw_runtime():
 
         await machine._process_command(SetModel(
             sid=fork.key, model="claude-after",
-            cmd_id="model-command", client_id="owner-client",
+            cmd_id="model-command", client_id="owner-tab-2",
+            owner_id="owner-client",
         ))
         await machine._process_command(SetEffort(
             sid=fork.key, effort="high",
-            cmd_id="effort-command", client_id="owner-client",
+            cmd_id="effort-command", client_id="owner-tab-2",
+            owner_id="owner-client",
         ))
         fork.state = "running"
         await machine._process_command(Interrupt(
             sid=fork.key, cmd_id="interrupt-command",
-            client_id="owner-client",
+            client_id="owner-tab-2", owner_id="owner-client",
         ))
 
         assert fork.sdk.model == "claude-after"
@@ -892,10 +959,10 @@ def test_owner_controls_and_interrupts_only_its_btw_runtime():
             message for message in transport.sent
             if isinstance(message, (Model, Effort))
         ]
-        assert [(message.type, message.sid, message.to)
+        assert [(message.type, message.sid, message.to, message.owner_id)
                 for message in emitted] == [
-                    ("model", fork.key, "owner-client"),
-                    ("effort", fork.key, "owner-client"),
+                    ("model", fork.key, None, "owner-client"),
+                    ("effort", fork.key, None, "owner-client"),
                 ]
 
     asyncio.run(run())
@@ -1242,11 +1309,14 @@ def test_btw_capture_persistence_failure_terminates_and_deletes_fork(
             self.disconnected = True
 
     async def run():
-        machine, _ = _mk_machine()
+        machine, transport = _mk_machine()
         real_id = "99999999-8888-4777-8666-555555555555"
         fork = _mk_ctx("btw-private", session_id=None)
         fork.btw = True
+        fork.parent_sid = "parent-session"
         fork.owner_client_id = "owner-client"
+        fork.btw_created_at = 1.0
+        fork.btw_announced = True
         fork.sdk = Sdk()
         machine.sessions[fork.key] = fork
         artifact = tmp_path / "outside.md"
@@ -1283,6 +1353,12 @@ def test_btw_capture_persistence_failure_terminates_and_deletes_fork(
         assert machine._preview_capability_store.snapshot(
             "claude", "code", fork.key,
         ) == {}
+        closed = [message for message in transport.sent
+                  if isinstance(message, BtwClosed)]
+        assert len(closed) == 1
+        assert closed[0].btw_sid == fork.key
+        assert closed[0].parent_sid == "parent-session"
+        assert closed[0].owner_id == "owner-client"
 
     asyncio.run(run())
 

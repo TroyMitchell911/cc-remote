@@ -4,6 +4,59 @@ Reference files for the production deploy (public VPS relay + wrapper on your
 machine). The **full step-by-step guide is in the main [README](../README.md#生产部署公网-vps-中继--你机器上的-wrapper)**
 ([English](../README_en.md#production-deploy-public-vps-relay--wrapper-on-your-machine)).
 
+## Deployment contract for automation
+
+This directory is the deployment source of truth for humans and automation.
+Machine inventory is deliberately external: host aliases, usernames, domains,
+addresses, home directories, and credentials belong to the operator's
+environment, not this repository. Replace documented placeholders only with
+values the operator supplied or that were read from the existing installation;
+never guess them.
+
+Before changing a live service:
+
+1. Inspect the source worktree, target installation, current release, service
+   manager, and health. Preserve unrelated changes; do not normalize a dirty
+   worktree or silently replace a custom installation layout.
+2. Select the matching supported path. Use `install.sh` for a published release.
+   Use the main README's source-staging/manual production path for the current
+   source tree. An existing nonstandard installation must retain its established
+   service ownership and configuration boundaries rather than being overwritten
+   with a first-install template.
+3. Run the complete gate in `AGENTS.md`, build `web/dist`, and validate the
+   Python/Web protocol pair with `validate_protocol_bundle.py`.
+4. Freeze those tested bytes once. Every Relay, Web client, and Wrapper in the
+   maintenance window must come from that same snapshot or coordinated artifact
+   set. Do not rebuild independently on different hosts.
+5. Stage and validate every target before activation. Keep `.env`, device
+   authority, profile configuration, private databases, and other runtime state
+   outside immutable release trees. Never upload secrets as part of a source
+   snapshot.
+
+Activate a coordinated protocol change in the order documented by the current
+protocol note below: stop incompatible old Wrappers, activate Relay + Web as one
+transaction, then activate/start every Wrapper and hard-refresh clients. Use the
+repository installers' immutable `releases/` plus atomic `current` switch; never
+overlay the live tree with `rsync --delete`. If Wrapper state requires a schema
+snapshot, create it while the Wrapper is stopped and keep it with the previous
+release.
+
+A command that loses SSH, terminal, or cc-remote connectivity has an **unknown
+result**, not a failed result. Inspect the exact service/job, `current` target,
+logs, health endpoint, PID, and restart count before retrying. Never start a
+second installer merely because the first caller stopped receiving output.
+A Wrapper must not be its own only deployment controller: activate it from an
+independent terminal/SSH connection or from exactly one OS-owned one-shot job
+that can finish after the old Wrapper exits.
+
+Success requires all of the following: the expected immutable releases are
+active, Python and served Web build metadata report the same protocol/product,
+services have stable PIDs without restart loops, the public health endpoint is
+healthy, expected Wrappers reconnect, and recent logs contain no new fatal
+errors. On failure, use the installer-owned rollback or the retained previous
+release and matching state snapshot; do not delete old releases during the
+deployment.
+
 - `install.sh` — versioned GitHub Release bootstrap. It requires an explicit
   `relay` or `wrapper` role, detects OS/CPU, downloads that one role archive,
   verifies its `SHA256SUMS` entry before extraction, rejects unsafe archive
@@ -78,11 +131,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   restores the matching pre-release data before an older wrapper is restarted,
   and verifies the v34 Codex ownership backfill.
 
-Protocol v49 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v52 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v49 relay/web release; then start the v49 wrapper.
+activate the v52 relay/web release; then start the v52 wrapper.
 
 The wrapper installer treats local Work data and versioned private control state
 as part of the release
@@ -94,8 +147,8 @@ restores and starts the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v49, and retain that snapshot with the previous release. To roll back,
-stop v49, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v52, and retain that snapshot with the previous release. To roll back,
+stop v52, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state

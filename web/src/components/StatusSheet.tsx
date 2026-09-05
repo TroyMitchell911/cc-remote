@@ -4,7 +4,9 @@ import type {
   StatusRateLimitResetCredit, StatusRateWindow, StatusReport,
 } from "../protocol";
 import { Icon } from "../icons";
-import { resetCreditOutcomeMessage } from "../rate-limit-reset";
+import {
+  resetCreditConfirmation, resetCreditOutcomeMessage, resetCreditPresentation,
+} from "../rate-limit-reset";
 import { accountStatsNote } from "../status-capabilities";
 import { statusNotices } from "../notice-presentation";
 import {
@@ -43,11 +45,7 @@ function resetTime(value?: number | null): string {
 }
 
 function confirmResetCredit(credit?: StatusRateLimitResetCredit): boolean {
-  const name = credit?.title || "一张 Codex 额度重置券";
-  const detail = credit?.description ? `\n${credit.description}` : "";
-  return window.confirm(
-    `确定使用${name}吗？${detail}\n\n这会消耗一张重置券，并重置当前符合条件的额度窗口。`,
-  );
+  return window.confirm(resetCreditConfirmation(credit));
 }
 
 function ResetCredit({ credit, loading, disabled, onConsume }: {
@@ -57,10 +55,11 @@ function ResetCredit({ credit, loading, disabled, onConsume }: {
   onConsume?: (credit: StatusRateLimitResetCredit) => void;
 }) {
   const available = credit.status === "available";
+  const copy = resetCreditPresentation(credit);
   return <article className="status-reset-credit">
     <span>
-      <b>{credit.title || "Codex 额度重置券"}</b>
-      {credit.description && <small>{credit.description}</small>}
+      <b>{copy.title}</b>
+      {copy.description && <small>{copy.description}</small>}
       <small>{credit.expires_at
         ? `${resetTime(credit.expires_at)} 到期`
         : "长期有效"}</small>
