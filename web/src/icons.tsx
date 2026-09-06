@@ -22,6 +22,7 @@ const PATHS: Record<string, string> = {
   'eye-off': '<path d="M3 3l18 18M10.6 5.2A9.7 9.7 0 0112 5c6 0 9.5 7 9.5 7a15 15 0 01-2.3 3.2M6.2 6.2C3.8 8 2.5 12 2.5 12s3.5 7 9.5 7a9.7 9.7 0 004-1M9.9 9.9a3 3 0 004.2 4.2"/>',
   user: '<circle cx="12" cy="8" r="3.4"/><path d="M5.5 20a6.5 6.5 0 0113 0"/>',
   spark: '<path d="M12 3l1.6 4.9L18.5 9.5l-4.9 1.6L12 16l-1.6-4.9L5.5 9.5l4.9-1.6L12 3z"/>',
+  message: '<path d="M20 14a3 3 0 01-3 3H9l-5 4v-4a3 3 0 01-2-3V6a3 3 0 013-3h12a3 3 0 013 3z"/><path d="M7 8h8M7 12h5"/>',
   read: '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/>',
   'file-plus': '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5M9 14h6M12 11v6"/>',
   bash: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7 10l2.5 2L7 14M12.5 14.5H16"/>',

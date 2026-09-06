@@ -1,4 +1,24 @@
-import type { Block, TextBlock, Turn } from "./domain/conversation";
+import type { Block, ProcessBlock, TextBlock, Turn } from "./domain/conversation";
+
+export function generatedImageIdentity(block: ProcessBlock): string {
+  const ref = block.input?.history_image as { image_id?: unknown } | undefined;
+  return typeof ref?.image_id === "string" ? ref.image_id : block.item_id;
+}
+
+/** Show distinct output images, not duplicate live/history views of the same
+ * content. Every native activity stays in the timeline; only the gallery is
+ * deduplicated. Prefer its live snapshot handle while available. */
+export function generatedOutputImages(blocks: readonly Block[]): ProcessBlock[] {
+  const images = new Map<string, ProcessBlock>();
+  for (const block of blocks) {
+    if (block.kind !== "process" || block.tool !== "image_generation"
+        || block.status !== "succeeded" || block.phase !== "end" || !block.done) continue;
+    const identity = generatedImageIdentity(block);
+    const previous = images.get(identity);
+    if (!previous || typeof block.input?.preview_id === "string") images.set(identity, block);
+  }
+  return [...images.values()].slice(-8);
+}
 
 /** Resolve runtime activity onto exactly one displayed narrative row. Session
  * state alone is deliberately insufficient: aliases can collide in migrated

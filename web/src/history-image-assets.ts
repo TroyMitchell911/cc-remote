@@ -91,9 +91,24 @@ export function historyImageAssetKey(
   return `${turnId}\u0000${imageId}\u0000${variant}`;
 }
 
+/** Generated-image ids bind native task + content hash. Their public history
+ * turn ids can change on refresh. Reuse ready originals in the caller's already
+ * session-scoped, bounded cache; never alias uploads, pending requests, errors
+ * or thumbnails, or retain bytes outside that cache. */
+export function readyGeneratedImageAsset(
+  assets: Record<string, HistoryImageAsset> | undefined,
+  imageId: string,
+): HistoryImageAsset | undefined {
+  if (!assets) return undefined;
+  const suffix = `\u0000${imageId}\u0000full`;
+  return Object.entries(assets).find(([key, asset]) =>
+    key.endsWith(suffix) && asset.status === "ready"
+    && asset.data && asset.mediaType)?.[1];
+}
+
 /** Bounded in-memory cache for summary-page images. Summary history carries
  * metadata only; thumbnails enter this cache near the viewport and originals
- * only after an explicit preview gesture. */
+ * on preview or for full-width generated output near the viewport. */
 export class HistoryImageAssetCache {
   private readonly entries = new Map<string, AssetEntry>();
   private readonly pending = new Map<string, PendingAsset>();

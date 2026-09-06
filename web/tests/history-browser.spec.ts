@@ -11,18 +11,22 @@ type PanelRelayEvent<T = ServerEvent> = T extends ServerEvent
 async function mockRightPanelRelay(
   page: import("@playwright/test").Page,
   { visible = false, retained = true, engine = "codex", seedTurns = [],
-    secondParent = false, btwReadOnly = false }: {
+    secondParent = false, btwReadOnly = false, imageAssets = false, imageData, externalPreview }: {
     visible?: boolean;
     retained?: boolean;
     engine?: "codex" | "claude";
     seedTurns?: NonNullable<Extract<ServerEvent, { type: "history" }>["turns"]>;
     secondParent?: boolean;
     btwReadOnly?: boolean;
+    imageAssets?: boolean;
+    imageData?: { data: string; width: number; height: number };
+    externalPreview?: "allow" | "replace";
   } = {},
 ) {
   const parentSid = "layout-parent";
   const btwSid = "btw-layout-child";
   const commands: Record<string, unknown>[] = [];
+  const allowedReads = new Set<string>();
   let emit: (message: PanelRelayEvent) => void = () => {
     throw new Error("layout relay has not connected");
   };
@@ -86,6 +90,43 @@ async function mockRightPanelRelay(
           sid: String(command.session_id),
           revision: "layout-history", generation: "layout-generation",
           detail: "summary", events: [], turns: seedTurns, has_more: false });
+      } else if (externalPreview && (command.type === "get_file_preview" || command.type === "get_preview_asset")) {
+        const requestId = String(command.request_id);
+        const path = String(command.path);
+        const isFile = command.type === "get_file_preview";
+        if (!allowedReads.has(requestId) || externalPreview === "replace") {
+          emit({ type: "preview_authorization_required", sid: String(command.sid),
+            authorization_id: `${allowedReads.has(requestId) ? "replaced" : "original"}-${requestId}`,
+            request_id: requestId, operation: isFile ? "file_preview" : "preview_asset",
+            path, resolved_path: path, format: isFile ? "markdown" : "image",
+            preview_id: isFile ? null : String(command.preview_id) });
+        } else if (isFile) {
+          emit({ type: "file_preview", sid: String(command.sid), request_id: requestId,
+            path, format: "markdown", content: "# 外部预览已经打开", size: 30,
+            mtime_ns: "1", revision: "a".repeat(64), writable: false });
+        } else {
+          emit({ type: "preview_asset", sid: String(command.sid), request_id: requestId,
+            path, preview_id: String(command.preview_id), media_type: "image/png", data: TEST_GENERATED_PNG });
+        }
+      } else if (externalPreview && command.type === "authorize_preview") {
+        const requestId = String(command.request_id);
+        allowedReads.add(requestId);
+        emit({ type: "preview_authorization_result", sid: String(command.sid),
+          authorization_id: String(command.authorization_id), request_id: requestId,
+          status: "granted" });
+      } else if (imageAssets && command.type === "get_history_image") {
+        emit({ type: "history_image", sid: String(command.session_id),
+          session_id: String(command.session_id), turn_id: String(command.turn_id),
+          image_id: String(command.image_id), variant: command.variant as "thumbnail" | "full",
+          request_id: String(command.request_id), revision: "layout-history",
+          media_type: "image/png", width: 1, height: 1,
+          data: TEST_GENERATED_PNG,
+          ...(command.variant === "full" ? imageData : {}) });
+      } else if (imageAssets && command.type === "get_preview_asset") {
+        emit({ type: "preview_asset", sid: String(command.sid),
+          path: String(command.path), preview_id: String(command.preview_id),
+          request_id: String(command.request_id), media_type: "image/png",
+          data: imageData?.data ?? TEST_GENERATED_PNG });
       } else if (command.type === "sync_btw") {
         if (btwReadOnly) {
           emit({ type: "user_msg", sid: String(command.sid),
@@ -175,6 +216,15 @@ test("transient BTW reconnect notice does not permanently disable the composer",
   await expect(panel.locator(".btw-readonly-notice")).toHaveCount(0);
 });
 
+async function openAsyncQuestion(page: import("@playwright/test").Page, index = 0) {
+  // The scroll-to-bottom affordance can cover the middle of the last row in a
+  // narrow BTW pane. Use the card's leading icon hit area, just like a user tap.
+  await page.locator(".async-question-card").nth(index).click({ position: { x: 24, y: 24 } });
+  const dialog = page.getByRole("dialog", { name: "助手询问", exact: true });
+  await expect(dialog).toBeVisible();
+  return dialog;
+}
+
 const ASYNC_QUESTIONS = [
   { title: "在哪个设备发生？", options: ["Mac", "手机"] },
   { title: "用的是什么手势？", options: null },
@@ -186,21 +236,578 @@ const ASYNC_HISTORY_TURN = {
     delivery: "async", questions: ASYNC_QUESTIONS }],
 };
 
+const TEST_GENERATED_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6RkAAAAASUVORK5CYII=";
+
+test("async question compact styling shows each question once on desktop and mobile", async ({ page }, testInfo) => {
+  const title = "这几次恢复，是你在板子失联后手动重启或断电的吗？失联前是否也有主动重启或改 IP？这能帮助区分程序触发的故障与外部操作。";
+  await mockRightPanelRelay(page, { seedTurns: [{
+    ...ASYNC_HISTORY_TURN, blocks: [{ ...ASYNC_HISTORY_TURN.blocks[0],
+      text: title, questions: [{ title, options: null }] }],
+  }] });
+  await page.goto("/");
+  const entry = page.locator(".async-question-card");
+  await expect(entry).toBeVisible();
+  expect((await entry.boundingBox())!.height).toBeLessThan(110);
+  await expect(page.getByRole("dialog", { name: "助手询问" })).toHaveCount(0);
+  const card = await openAsyncQuestion(page);
+  await expect(card).toBeVisible();
+  const metrics = await card.evaluate((node) => ({
+    width: node.getBoundingClientRect().width,
+    height: node.getBoundingClientRect().height,
+    overflow: node.scrollWidth - node.clientWidth,
+    weight: Number(getComputedStyle(node.querySelector("legend")!).fontWeight),
+  }));
+  expect(metrics.width).toBeLessThanOrEqual(560);
+  expect(metrics.height).toBeLessThan(page.viewportSize()!.height);
+  expect(metrics.overflow).toBeLessThanOrEqual(1);
+  expect(metrics.weight).toBeLessThan(600);
+  expect(await card.evaluate(node => parseFloat(getComputedStyle(node).borderRadius))).toBeGreaterThanOrEqual(28);
+  await expect(card).toHaveCSS("border-top-width", "1px");
+  await card.getByLabel("你的回答", { exact: true }).fill("三指拖拽");
+  await page.screenshot({ path: testInfo.outputPath("async-question-compact.png") });
+  await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+  await page.screenshot({ path: testInfo.outputPath("async-question-compact-dark.png") });
+  await expect(card.getByText(title, { exact: true })).toHaveCount(1);
+  await expect(card.locator("details, .async-question-source, .async-question-original")).toHaveCount(0);
+  await expect(card).not.toContainText("原始提问");
+  await expect(card).not.toContainText("发送后将开始新一轮对话");
+  await expect(card.locator(".async-question-footer .async-question-hint")).toHaveCount(0);
+  expect(await card.getAttribute("aria-describedby")).toBeNull();
+  await expect(card.getByLabel("你的回答", { exact: true })).toHaveValue("三指拖拽");
+});
+
+test("generated image live snapshot renders outside collapsed process and duplicate events stay idempotent", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { imageAssets: true });
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some((c) => c.type === "get_history")).toBe(true);
+  const sid = "layout-parent";
+  relay.emit({ type: "user_msg", sid, msg_id: "image-user", prompt: "画一张图" });
+  relay.emit({ type: "process", sid, item_id: "generated-1", kind: "server_tool",
+    phase: "start", status: "running", title: "生成图片", tool: "image_generation" });
+  await expect(page.locator(".generated-image-gallery")).toHaveCount(0);
+  for (let i = 0; i < 2; i++) relay.emit({ type: "process", sid,
+    item_id: "generated-1", kind: "server_tool", phase: "end", status: "succeeded",
+    title: "生成图片", tool: "image_generation",
+    input: { file_path: "/generated/image.png", preview_id: "generated-1" } });
+  const image = page.getByRole("button", { name: "预览生成的图片" });
+  await expect(image).toHaveCount(1);
+  await expect(image).toBeVisible();
+  expect(relay.commands.filter((c) => c.type === "get_preview_asset")).toHaveLength(1);
+  await image.click();
+  await expect(page.locator(".image-lightbox-image")).toBeVisible();
+});
+
+test("async question first layout keeps optional notes visible with vertical choices and a separate send button", async ({ page }, testInfo) => {
+  const title = "按这版目标开始可行性设计？先确认目标，再逐项验证哪些能做到。";
+  const relay = await mockRightPanelRelay(page, { seedTurns: [{
+    ...ASYNC_HISTORY_TURN, blocks: [{ ...ASYNC_HISTORY_TURN.blocks[0], text: title,
+      questions: [{ title, options: ["确认，按这版做可行性设计", "需要调整，我补充说明"] }] }],
+  }] });
+  await page.goto("/");
+  const card = await openAsyncQuestion(page);
+  await expect(card).toBeVisible();
+  await expect(card.getByRole("textbox")).toBeVisible();
+  await expect(card.getByRole("textbox")).toHaveValue("");
+  await expect(card.getByRole("textbox")).not.toBeFocused();
+  await expect(card.locator(".async-question-notes")).toHaveCount(0);
+  const send = card.getByRole("button", { name: "发送回答", exact: true });
+  await expect(send).toBeEnabled();
+  await expect(send).toHaveCSS("border-top-left-radius", "999px");
+  await expect(card.locator(".async-question-option").first()).toHaveCSS("border-top-left-radius", "999px");
+  await expect(card.locator(".async-question-composer .async-question-send")).toHaveCount(0);
+  const options = card.locator(".async-question-option");
+  const first = await options.nth(0).boundingBox();
+  const second = await options.nth(1).boundingBox();
+  expect(second!.y).toBeGreaterThanOrEqual(first!.y + first!.height);
+  await page.screenshot({ path: testInfo.outputPath("async-question-first-layout.png") });
+  await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+  await page.screenshot({ path: testInfo.outputPath("async-question-first-layout-dark.png") });
+  expect(relay.commands.filter(c => ["query", "steer"].includes(String(c.type)))).toHaveLength(0);
+  await card.getByRole("radio", { name: "需要调整，我补充说明" }).check();
+  await expect(card.getByRole("textbox")).toBeVisible();
+  // The editor is always visible. Changing a choice neither submits nor steals
+  // focus, and does not discard text that will override the selected option.
+  await expect(card.getByRole("textbox")).not.toBeFocused();
+  expect(relay.commands.filter(c => ["query", "steer"].includes(String(c.type)))).toHaveLength(0);
+  await card.getByRole("textbox").fill("需要先验证续航。\n不要直接加工。");
+  await card.getByRole("radio", { name: "确认，按这版做可行性设计" }).check();
+  await expect(card.getByRole("textbox")).toBeVisible();
+  await card.getByRole("button", { name: "稍后回答", exact: true }).click();
+  await openAsyncQuestion(page);
+  await expect(card.getByRole("radio", { name: "确认，按这版做可行性设计" })).toBeChecked();
+  await expect(card.getByRole("textbox")).toHaveValue("需要先验证续航。\n不要直接加工。");
+  await card.getByRole("button", { name: "发送回答", exact: true }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+  const query = relay.commands.find(c => c.type === "query")!;
+  expect(query.prompt).toContain("回答：需要先验证续航。\n不要直接加工。");
+  expect(query.prompt).not.toContain("回答：确认");
+});
+
+test("async question option presses avoid native tap flashes and retain rounded keyboard focus", async ({ page, isMobile }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [{
+    ...ASYNC_HISTORY_TURN, blocks: [{ ...ASYNC_HISTORY_TURN.blocks[0], questions: [ASYNC_QUESTIONS[0]] }],
+  }] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  const option = dialog.locator(".async-question-option").nth(1);
+  const radio = option.getByRole("radio");
+  // Both the label and the transparent, full-size native input participate in
+  // touch hit testing. Neither may paint the browser's rectangular tap overlay.
+  for (const target of [option, radio]) {
+    await expect(target).toHaveCSS("-webkit-tap-highlight-color", "rgba(0, 0, 0, 0)");
+  }
+  await expect(option).toHaveCSS("border-top-left-radius", "999px");
+  const box = (await radio.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  try {
+    await expect(option).toHaveCSS("outline-style", "none");
+    await page.screenshot({ path: testInfo.outputPath("async-question-option-pressed.png") });
+  } finally {
+    await page.mouse.up();
+  }
+  await expect(radio).toBeChecked();
+  if (isMobile) {
+    await dialog.getByRole("radio", { name: "Mac", exact: true }).tap();
+    await radio.tap();
+    await expect(radio).toBeChecked();
+  }
+  await expect(dialog.getByRole("textbox")).toBeVisible();
+  // No blanket outline removal: tabbing back to the selected radio still
+  // exposes a visible focus ring following the option's rounded shape.
+  // Mobile Safari need not focus a radio when tapped. Start the keyboard path
+  // from a known control and tab to the selected option on both platforms.
+  await dialog.getByRole("button", { name: "关闭助手询问" }).focus();
+  await page.keyboard.press("Tab");
+  await expect(radio).toBeFocused();
+  await expect(option).toHaveCSS("outline-style", "solid");
+  await expect(option).toHaveCSS("outline-width", "2px");
+  await expect(option).toHaveCSS("border-top-left-radius", "999px");
+  expect(relay.commands.filter(c => ["query", "steer", "answer_question", "interrupt"].includes(String(c.type))))
+    .toHaveLength(0);
+  // The visible textarea remains optional; an option-only answer still sends.
+  await dialog.getByRole("button", { name: "发送回答" }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+  expect(relay.commands.find(c => c.type === "query")?.prompt).toBe("补充回答：\n\n问题：在哪个设备发生？\n回答：手机");
+});
+
+test("generated image canonical summary survives refresh and loads original without detail", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { imageAssets: true, seedTurns: [{
+    id: "image-user", prompt: "画一张图", done: true, detailLoaded: false,
+    processDetailState: "present", detailReasons: ["process"],
+    processStartedTs: 1788621175000, processDoneTs: 1788621261221,
+    blocks: [{ kind: "process", item_id: "generated-1", processKind: "server_tool",
+      phase: "end", status: "succeeded", done: true, title: "生成图片",
+      tool: "image_generation", input: { history_image: {
+        image_id: "img-native", media_type: "image/png", width: 1, height: 1, byte_size: 68,
+      } } }],
+  }] });
+  await page.goto("/");
+  const image = page.getByRole("button", { name: "预览生成的图片" });
+  await expect(image).toBeEnabled();
+  const process = page.getByRole("button", { name: /已处理 1m 26s/ });
+  await expect(process).toBeVisible();
+  await expect(process).toHaveAttribute("aria-expanded", "false");
+  await page.reload();
+  await expect(image).toBeEnabled();
+  await expect(process).toBeVisible();
+  await expect(process).toHaveAttribute("aria-expanded", "false");
+  expect(relay.commands.filter((c) => c.type === "get_turn_detail")).toHaveLength(0);
+  const reads = relay.commands.filter((c) => c.type === "get_history_image");
+  expect(reads.length).toBeGreaterThanOrEqual(2);
+  expect(reads.every((c) => c.turn_id === "image-user" && c.variant === "full")).toBe(true);
+  await image.click();
+  await expect(page.locator(".image-lightbox-image")).toBeVisible();
+  expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(reads.length);
+});
+
+test("generated image stays loaded when a new message renames the historical turn", async ({ page }) => {
+  const turns: NonNullable<Extract<ServerEvent, { type: "history" }>["turns"]> = [{
+    id: "msg-old", forkPointId: "native-task", prompt: "画图", done: true, detailLoaded: true,
+    blocks: [{ kind: "process", item_id: "image-old", processKind: "server_tool",
+      phase: "end", status: "succeeded", done: true, title: "生成图片", tool: "image_generation",
+      input: { history_image: { image_id: "img-stable", media_type: "image/png", width: 1, height: 1, byte_size: 68 } } }],
+  }];
+  const relay = await mockRightPanelRelay(page, { imageAssets: true, seedTurns: turns });
+  await page.goto("/");
+  const image = page.locator(".generated-output img");
+  await expect(image).toHaveCount(1);
+  const src = await image.getAttribute("src");
+  const reads = relay.commands.filter(c => c.type === "get_history_image").length;
+  expect(reads).toBe(1);
+  await page.locator(".composer textarea").fill("继续");
+  await page.locator(".composer").getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+  const query = relay.commands.find(c => c.type === "query")!;
+  await expect(image).toHaveAttribute("src", src!);
+  turns[0] = { ...turns[0], id: "item-123" };
+  turns.push({ id: "next-message", clientMsgId: String(query.msg_id), prompt: "继续", done: false, blocks: [] });
+  relay.emit({ type: "user_msg", sid: "layout-parent", msg_id: "next-message",
+    client_msg_id: String(query.msg_id), prompt: "继续" });
+  relay.emit({ type: "state", sid: "layout-parent", state: "running", msg_id: "next-message" });
+  relay.emit({ type: "history", sid: "layout-parent", session_id: "layout-parent",
+    revision: "layout-history", generation: "layout-generation",
+    detail: "summary", events: [], turns, has_more: false });
+  await expect(page.getByText("继续", { exact: true })).toBeVisible();
+  await expect(image).toHaveCount(1);
+  await expect(image).toHaveAttribute("src", src!);
+  await expect(page.locator(".generated-output .history-image-placeholder")).toHaveCount(0);
+  await page.getByRole("button", { name: "查看大图" }).click();
+  await expect(page.locator(".image-lightbox-image")).toHaveAttribute("src", src!);
+  expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(reads);
+  await page.keyboard.press("Escape");
+  // A hard reload still uses the canonical id and full original, not a 360px thumbnail.
+  await page.reload();
+  await expect(image).toHaveAttribute("src", src!);
+  expect(relay.commands.filter(c => c.type === "get_history_image").at(-1))
+    .toMatchObject({ turn_id: "item-123", variant: "full" });
+});
+
+test("generated image live snapshot survives canonical item identity handoff", async ({ page }) => {
+  const turns: NonNullable<Extract<ServerEvent, { type: "history" }>["turns"]> = [];
+  const relay = await mockRightPanelRelay(page, { imageAssets: true, seedTurns: turns });
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(c => c.type === "get_history")).toBe(true);
+  const sid = "layout-parent";
+  const ref = { image_id: "img-live-stable", media_type: "image/png", width: 1, height: 1, byte_size: 68 };
+  relay.emit({ type: "user_msg", sid, msg_id: "draw-user", prompt: "画图" });
+  relay.emit({ type: "turn_binding", sid, msg_id: "draw-user", turn_id: "draw-task" });
+  relay.emit({ type: "process", sid, item_id: "live-image", kind: "server_tool",
+    phase: "end", status: "succeeded", tool: "image_generation", title: "生成图片",
+    input: { history_image: ref, file_path: "/generated/live.png", preview_id: "live-image" } });
+  const image = page.locator(".generated-output img");
+  await expect(image).toHaveCount(1);
+  const src = await image.getAttribute("src");
+  // Completion can trigger an automatic history read. The mock's canonical
+  // store must advance with the emitted page, not later return an empty store
+  // and erase the completed turn depending on request timing.
+  turns.push({
+    id: "draw-user", forkPointId: "draw-task", prompt: "画图", done: true, detailLoaded: false,
+    blocks: [{ kind: "process", item_id: "item-image-123", processKind: "server_tool",
+      phase: "end", status: "succeeded", done: true, tool: "image_generation", title: "生成图片",
+      input: { history_image: ref } }],
+  });
+  relay.emit({ type: "turn_end", sid, turn_id: "draw-task", result: { subtype: "success", is_error: false } });
+  relay.emit({ type: "history", sid, session_id: sid,
+    revision: "layout-history", generation: "layout-generation",
+    detail: "summary", events: [], has_more: false, turns });
+  await expect(image).toHaveCount(1);
+  await expect(image).toHaveAttribute("src", src!);
+  await expect(page.locator(".generated-output .history-image-placeholder")).toHaveCount(0);
+  expect(relay.commands.filter(c => c.type === "get_preview_asset")).toHaveLength(1);
+  expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(0);
+});
+
+test("generated image uses full reply width and remains visible through process collapse", async ({ page }, testInfo) => {
+  const desktop = testInfo.project.name === "chromium";
+  if (desktop) await page.setViewportSize({ width: 1360, height: 900 });
+  const imageData = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1693;
+    canvas.height = 929;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#26334d";
+    ctx.font = "24px sans-serif";
+    for (let y = 50; y < 900; y += 40) ctx.fillText("Generated image — original resolution / 原图清晰度", 30, y);
+    return { data: canvas.toDataURL("image/png").split(",")[1], width: canvas.width, height: canvas.height };
+  });
+  const relay = await mockRightPanelRelay(page, { imageAssets: true, imageData, seedTurns: [{
+    id: "large-image", prompt: "画一张图", done: true, detailLoaded: true,
+    blocks: [{ kind: "process", item_id: "generated-large", processKind: "server_tool",
+      phase: "end", status: "succeeded", done: true, title: "生成图片", tool: "image_generation",
+      input: { history_image: { image_id: "img-large", media_type: "image/png", width: 1693, height: 929, byte_size: 68 } } }],
+  }] });
+  await page.goto("/");
+  const figure = page.locator(".generated-output");
+  const image = figure.getByRole("button", { name: "预览生成的图片" });
+  await expect(image).toBeEnabled();
+  await expect.poll(() => image.locator("img").evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(1693);
+  const bounds = await image.boundingBox();
+  expect(bounds!.width).toBeGreaterThan(desktop ? 600 : 300);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  expect(Math.abs(bounds!.width / bounds!.height - 1693 / 929)).toBeLessThan(.02);
+  const process = page.locator('.turn[data-turn-id="large-image"]').getByRole("button", { name: /已处理/ }).first();
+  for (let i = 0; i < 2; i++) {
+    await process.click();
+    await expect(figure).toBeVisible();
+  }
+  await figure.getByRole("button", { name: "查看大图" }).click();
+  await expect(page.locator(".image-lightbox-image")).toBeVisible();
+  expect(relay.commands.filter(c => c.type === "get_turn_detail")).toHaveLength(0);
+  await page.keyboard.press("Escape");
+  await page.screenshot({ path: testInfo.outputPath("generated-image-wide.png") });
+});
+
+test("async question answered presentation survives refresh without rewriting or hiding the user reply", async ({ page }, testInfo) => {
+  const prompt = "补充回答：\n\n问题：在哪个设备发生？\n回答：Mac 浏览器\n\n问题：用的是什么手势？\n回答：三指拖拽\n拖到页面下方";
+  const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN, {
+    id: "supplemental-reply", prompt, done: false, blocks: [],
+  }] });
+  await page.goto("/");
+  for (let i = 0; i < 2; i++) {
+    if (i) await page.reload();
+    const entry = page.locator(".async-question-card");
+    const card = page.getByRole("dialog", { name: "助手询问", exact: true });
+    await expect(entry).toContainText("已回答");
+    await expect(card.getByRole("textbox")).toHaveCount(0);
+    const answer = page.locator(".supplemental-answer");
+    await expect(answer).toContainText("三指拖拽\n拖到页面下方");
+    await expect(answer.locator("details")).not.toHaveAttribute("open");
+    await answer.locator("summary").click();
+    await expect(answer.getByText("在哪个设备发生？", { exact: true })).toBeVisible();
+    await answer.locator("summary").click();
+    if (i === 1) await page.screenshot({ path: testInfo.outputPath("async-question-answered.png") });
+    await openAsyncQuestion(page);
+    await expect(card.getByRole("textbox")).toHaveCount(2);
+    await card.getByLabel("你的回答", { exact: true }).fill("还没有发送的补充草稿");
+    await card.getByRole("button", { name: "稍后回答", exact: true }).click();
+    const reopen = entry;
+    await expect(card).toHaveCount(0);
+    await expect(card.getByRole("textbox")).toHaveCount(0);
+    await reopen.click();
+    await expect(card.getByLabel("你的回答", { exact: true })).toHaveValue("还没有发送的补充草稿");
+    await card.getByRole("button", { name: "关闭助手询问" }).click();
+  }
+  expect(relay.commands.filter(c => ["query", "steer", "interrupt", "get_turn_detail"].includes(String(c.type)))).toHaveLength(0);
+});
+
+test("async question unanswered draft and choices survive repeated collapse without sending", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN] });
+  await page.goto("/");
+  const card = await openAsyncQuestion(page);
+  await expect(card).not.toContainText("发送后将开始新一轮对话");
+  await card.getByLabel("手机", { exact: true }).check();
+  await card.getByLabel("你的回答", { exact: true }).fill("选区手柄\n这是保留的草稿");
+  for (let i = 0; i < 2; i++) {
+    await card.getByRole("button", { name: "稍后回答", exact: true }).click();
+    await expect(card.getByRole("textbox")).toHaveCount(0);
+    await expect(page.locator(".async-question-card")).toContainText("待回答");
+    await openAsyncQuestion(page);
+    await expect(card.getByLabel("手机", { exact: true })).toBeChecked();
+    await expect(card.getByLabel("你的回答", { exact: true })).toHaveValue("选区手柄\n这是保留的草稿");
+  }
+  expect(relay.commands.filter(c => ["query", "steer", "answer_question", "interrupt"].includes(String(c.type))))
+    .toHaveLength(0);
+});
+
+test("async question dialog keeps independent drafts and restores keyboard focus", async ({ page }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [{ ...ASYNC_HISTORY_TURN,
+    blocks: [ASYNC_HISTORY_TURN.blocks[0], { ...ASYNC_HISTORY_TURN.blocks[0], message_id: "other-question" }],
+  }] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  await dialog.getByLabel("你的回答", { exact: true }).fill("第一个问题的草稿");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  if (testInfo.project.name === "chromium") await expect(page.locator(".async-question-card").first()).toBeFocused();
+  await openAsyncQuestion(page, 1);
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toHaveValue("");
+  await dialog.getByLabel("你的回答", { exact: true }).fill("第二个问题的草稿");
+  await dialog.getByRole("button", { name: "关闭助手询问" }).click();
+  await openAsyncQuestion(page);
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toHaveValue("第一个问题的草稿");
+  // The native modal owns focus; tabbing cannot activate the main composer.
+  for (let i = 0; i < 9; i++) {
+    await page.keyboard.press("Tab");
+    expect(await dialog.evaluate(node => node.contains(document.activeElement))).toBe(true);
+  }
+  await page.mouse.click(4, 4);
+  await expect(dialog).toHaveCount(0);
+  expect(relay.commands.filter(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toHaveLength(0);
+});
+
+test("async question dialog fits a keyboard-sized viewport without moving into a side panel", async ({ page }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  await dialog.getByLabel("你的回答", { exact: true }).fill("保留输入中的草稿");
+  await page.evaluate(() => {
+    // Drive the real viewport synchronizer; writing its CSS output directly
+    // races the delayed focus/keyboard settling reads in the App shell.
+    Object.defineProperties(window.visualViewport!, {
+      height: { configurable: true, value: 360 },
+      offsetTop: { configurable: true, value: 40 },
+    });
+    window.visualViewport!.dispatchEvent(new Event("resize"));
+  });
+  await expect.poll(async () => {
+    const rect = await dialog.boundingBox();
+    return !!rect && rect.y >= 40 && rect.y + rect.height <= 400;
+  }).toBe(true);
+  expect(await dialog.evaluate(node => node.parentElement === document.body)).toBe(true);
+  const box = (await dialog.boundingBox())!;
+  expect(Math.abs(box.x + box.width / 2 - page.viewportSize()!.width / 2)).toBeLessThan(2);
+  await expect(dialog.getByRole("button", { name: "发送回答" })).toBeInViewport();
+  await expect(dialog.getByRole("button", { name: "关闭助手询问" })).toBeInViewport();
+  const body = dialog.locator(".async-question-body");
+  expect(await body.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toBeInViewport({ ratio: 1 });
+  await expect.poll(() => dialog.getByLabel("你的回答", { exact: true }).evaluate(input => {
+    const viewport = input.closest(".async-question-body")!.getBoundingClientRect();
+    const editor = input.getBoundingClientRect();
+    return editor.top >= viewport.top - 1 && editor.bottom <= viewport.bottom + 1;
+  })).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("async-question-keyboard.png") });
+  expect(relay.commands.filter(c => ["query", "steer"].includes(String(c.type)))).toHaveLength(0);
+});
+
+test("async question dialog omits raw source previews and preserves its draft on reopen", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { externalPreview: "allow", seedTurns: [{
+    ...ASYNC_HISTORY_TURN, blocks: [{ ...ASYNC_HISTORY_TURN.blocks[0],
+      text: "请看[设计说明](/tmp/proposal.md)，用的是什么手势？" }],
+  }] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  await expect(dialog.getByText("用的是什么手势？", { exact: true })).toHaveCount(1);
+  await expect(dialog.locator("details, .async-question-source, .async-question-original")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "在 Remote 中打开 /tmp/proposal.md" })).toHaveCount(0);
+  await dialog.getByLabel("你的回答", { exact: true }).fill("保留的回答草稿");
+  await dialog.getByRole("button", { name: "关闭助手询问" }).click();
+  await expect(dialog).toHaveCount(0);
+  await openAsyncQuestion(page);
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toHaveValue("保留的回答草稿");
+  expect(relay.commands.filter(c => ["query", "steer", "get_file_preview", "authorize_preview"].includes(String(c.type)))).toHaveLength(0);
+});
+
+test("async question dialog survives source row virtualization without losing its draft", async ({ page }) => {
+  const older = Array.from({ length: 40 }, (_, i) => ({ id: `old-${i}`, prompt: `以前的问题 ${i}`,
+    done: true, detailLoaded: true, blocks: [{ kind: "text" as const, message_id: `old-answer-${i}`,
+      channel: "final" as const, text: "这是一条以前的回复。".repeat(20), done: true }] }));
+  const relay = await mockRightPanelRelay(page, { seedTurns: [...older, ASYNC_HISTORY_TURN] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  await dialog.getByLabel("你的回答", { exact: true }).fill("虚拟列表外也要保留");
+  await waitForScrollIdle(page);
+  // Simulate a history viewport transition while the modal stays mounted. Use
+  // the normal scroll ownership path so the old reader anchor can be released.
+  await page.locator(".thread").dispatchEvent("wheel", { deltaY: -1000 });
+  await pauseOutputAndScrollToHistoryStart(page);
+  await expect(page.locator(".async-question-card")).toHaveCount(0);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toHaveValue("虚拟列表外也要保留");
+  await dialog.getByRole("button", { name: "发送回答" }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+  expect(relay.commands.find(c => c.type === "query")?.prompt).toContain("虚拟列表外也要保留");
+  expect(relay.commands.find(c => c.type === "query")?.sid).toBe("layout-parent");
+});
+
+test("async question dialog closes on a session switch and never leaks drafts", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN], secondParent: true });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  await dialog.getByLabel("你的回答", { exact: true }).fill("只属于当前会话的草稿");
+  // Drive an explicit navigation intent through the real sidebar handler.
+  // Unsolicited remote focus frames are correctly ignored by the WS client.
+  await page.getByText("Second parent", { exact: true }).evaluate(node => (node as HTMLElement).click());
+  await expect(page.getByText("session layout-o", { exact: true })).toBeAttached();
+  await expect(dialog).toHaveCount(0);
+  await openAsyncQuestion(page);
+  await expect(dialog.getByLabel("你的回答", { exact: true })).toHaveValue("");
+  expect(relay.commands.filter(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toHaveLength(0);
+});
+
+test("async question dialog retains an IME draft when control becomes read-only", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN] });
+  await page.goto("/");
+  const dialog = await openAsyncQuestion(page);
+  const input = dialog.getByLabel("你的回答", { exact: true });
+  await input.fill("三指拖拽的补充");
+  await input.dispatchEvent("compositionstart");
+  await input.dispatchEvent("keydown", { key: "Enter", code: "Enter", keyCode: 229, isComposing: true });
+  await input.dispatchEvent("compositionend", { data: "补充" });
+  expect(relay.commands.filter(c => ["query", "steer"].includes(String(c.type)))).toHaveLength(0);
+  relay.emit({ type: "session_control", sid: "layout-parent", generation: "layout-generation", revision: 1,
+    control_mode: "codex_shared", write_state: "read_only", terminal_attached: false,
+    can_takeover: false, reason: "当前会话只读" });
+  await expect(input).toBeDisabled();
+  await expect(input).toHaveValue("三指拖拽的补充");
+  await expect(dialog).toContainText("当前会话暂不可写，回答草稿会保留");
+  expect(await dialog.getAttribute("aria-describedby")).toBeTruthy();
+  await expect(dialog.getByRole("button", { name: "发送回答" })).toBeDisabled();
+  await dialog.getByRole("button", { name: "稍后回答" }).click();
+  await openAsyncQuestion(page);
+  await expect(input).toHaveValue("三指拖拽的补充");
+  expect(relay.commands.filter(c => ["query", "steer"].includes(String(c.type)))).toHaveLength(0);
+});
+
+for (const processDetailState of ["none", "unknown"] as const) {
+  test(`direct reply summary has no empty detail entry across refresh (${processDetailState})`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { seedTurns: [{
+      id: "direct-reply", prompt: "在吗？", done: true,
+      processDetailState, detailReasons: [], detailLoaded: false, detailEventCount: 0,
+      blocks: [{ kind: "text", message_id: "direct-answer", channel: "final", done: true, text: "在，请说。" }],
+    }] });
+    await page.goto("/");
+    for (let i = 0; i < 2; i++) {
+      if (i) await page.reload();
+      await expect(page.getByText("在，请说。", { exact: true })).toBeVisible();
+      await expect(page.locator(".turn-detail-entry")).toHaveCount(0);
+      await expect(page.getByText(/已处理|查看本轮详情|查看完整内容/)).toHaveCount(0);
+    }
+    expect(relay.commands.filter(c => c.type === "get_turn_detail")).toHaveLength(0);
+  });
+}
+
+for (const type of ["file", "image"] as const) {
+  test(`external preview ${type} opens without a second permission prompt`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { externalPreview: "allow", seedTurns: [{
+      id: "external-output", prompt: "查看结果", done: true, detailLoaded: true,
+      blocks: [{ kind: "text", message_id: "external-link", done: true, channel: "final",
+        text: type === "file" ? "[打开预览](/tmp/external.md)" : "![外部生成图](/tmp/external.png)" }],
+    }] });
+    await page.goto("/");
+    if (type === "file") {
+      await page.getByRole("button", { name: "在 Remote 中打开 /tmp/external.md" }).click();
+      await expect(page.locator(".artifact-panel")).toContainText("外部预览已经打开");
+      await expect(page.getByRole("button", { name: "保存", exact: true })).toBeDisabled();
+    } else {
+      await expect(page.getByRole("img", { name: "外部生成图", exact: true })).toBeVisible();
+    }
+    await expect(page.getByRole("button", { name: "允许查看" })).toHaveCount(0);
+    const grants = relay.commands.filter(c => c.type === "authorize_preview");
+    expect(grants).toHaveLength(1);
+    expect(grants[0].decision).toBe("allow");
+    expect(grants[0].sid).toBe("layout-parent");
+    expect(relay.commands.some(c => c.type === "save_markdown")).toBe(false);
+  });
+}
+
+test("external preview replacement stops automatic grant retries and allows a fresh read", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { externalPreview: "replace", seedTurns: [{
+    id: "external-output", prompt: "查看结果", done: true, blocks: [{ kind: "text", message_id: "external-link", done: true, channel: "final", text: "[打开预览](/tmp/external.md)" }],
+  }] });
+  await page.goto("/");
+  await page.getByRole("button", { name: "在 Remote 中打开 /tmp/external.md" }).click();
+  await expect(page.locator(".artifact-panel")).toContainText("读取未完成");
+  expect(relay.commands.filter(c => c.type === "authorize_preview")).toHaveLength(1);
+  expect(relay.commands.filter(c => c.type === "get_file_preview")).toHaveLength(2);
+  await page.getByRole("button", { name: "刷新文件" }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "authorize_preview").length).toBe(2);
+  await expect(page.locator(".artifact-panel")).toContainText("读取未完成");
+  expect(relay.commands.filter(c => c.type === "get_file_preview")).toHaveLength(4);
+});
+
 test("async question history restores a nonblocking card and replies through the scoped query outbox", async ({ page }) => {
   const relay = await mockRightPanelRelay(page, { seedTurns: [ASYNC_HISTORY_TURN] });
   await page.goto("/");
-  const card = page.getByRole("form", { name: "助手的补充问题" });
-  await expect(card).toBeVisible();
+  const entry = page.locator(".async-question-card");
+  const card = page.getByRole("dialog", { name: "助手询问", exact: true });
+  await expect(entry).toBeVisible();
   await expect(page.getByRole("dialog", { name: "操作确认" })).toHaveCount(0);
   // This is server-backed History, not a local pendingQuestion or replay ring.
   await page.reload();
-  await expect(card).toBeVisible();
+  await expect(entry).toBeVisible();
+  await openAsyncQuestion(page);
+  await expect(card).not.toContainText("发送后将开始新一轮对话");
   await expect(card.getByLabel("Mac", { exact: true })).toBeChecked();
+  await expect(card.getByLabel("其他回答（填写后替代选项）")).toBeVisible();
   await card.getByLabel("其他回答（填写后替代选项）").fill("Mac 浏览器");
   await card.getByLabel("你的回答", { exact: true }).fill("三指拖拽");
   await card.getByLabel("你的回答", { exact: true }).press("Enter");
   expect(relay.commands.filter((c) => c.type === "query")).toHaveLength(0);
-  await card.getByRole("button", { name: "发送补充" }).click();
+  await card.getByRole("button", { name: "发送回答" }).click();
   await expect.poll(() => relay.commands.filter((c) => c.type === "query").length).toBe(1);
   const query = relay.commands.find((c) => c.type === "query")!;
   expect(query.sid).toBe("layout-parent");
@@ -208,7 +815,7 @@ test("async question history restores a nonblocking card and replies through the
   expect(query.prompt).toContain("回答：三指拖拽");
   expect(relay.commands.filter((c) => ["interrupt", "answer_question", "steer"].includes(String(c.type))))
     .toHaveLength(0);
-  await expect(card).toContainText("发送状态请查看会话中的消息");
+  await expect(card).toHaveCount(0);
 });
 
 test("async question summary keeps its ordinary answer visible after refresh without detail loading", async ({ page }) => {
@@ -222,10 +829,10 @@ test("async question summary keeps its ordinary answer visible after refresh wit
     }],
   }] });
   await page.goto("/");
-  await expect(page.getByRole("form", { name: "助手的补充问题" })).toHaveCount(1);
+  await expect(page.locator(".async-question-card")).toHaveCount(1);
   await expect(page.getByText(answer, { exact: true })).toBeVisible();
   await page.reload();
-  await expect(page.getByRole("form", { name: "助手的补充问题" })).toHaveCount(1);
+  await expect(page.locator(".async-question-card")).toHaveCount(1);
   await expect(page.getByText(answer, { exact: true })).toHaveCount(1);
   await expect(page.getByText(answer, { exact: true })).toBeVisible();
   expect(relay.commands.filter((c) => ["query", "steer", "get_turn_detail"].includes(String(c.type))))
@@ -246,15 +853,54 @@ test("async question live delivery preserves running state and uses steer instea
   for (let i = 0; i < 2; i++) relay.emit({ type: "assistant_msg_end", sid,
     message_id: "async-item", turn_id: "async-task", channel: "final",
     delivery: "async", questions: ASYNC_QUESTIONS });
-  const card = page.getByRole("form", { name: "助手的补充问题" });
+  const card = await openAsyncQuestion(page);
   await expect(card).toHaveCount(1);
-  await expect(card).toContainText("任务不会因此暂停");
+  await expect(card).toContainText("补充会发送给当前任务，不会中断执行");
+  await expect(card).not.toContainText("发送后将开始新一轮对话");
   await card.getByLabel("你的回答", { exact: true }).fill("三指拖拽");
-  await card.getByRole("button", { name: "发送补充" }).click();
+  await card.getByRole("button", { name: "发送回答" }).click();
   await expect.poll(() => relay.commands.filter((c) => c.type === "steer").length).toBe(1);
   expect(relay.commands.find((c) => c.type === "steer")?.sid).toBe(sid);
   expect(relay.commands.filter((c) => ["interrupt", "answer_question", "query"].includes(String(c.type))))
     .toHaveLength(0);
+});
+
+test("async question completion updates reply mode while preserving a collapsed draft", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page);
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(c => c.type === "get_history")).toBe(true);
+  const sid = "layout-parent";
+  relay.emit({ type: "user_msg", sid, msg_id: "async-user", prompt: "继续修复" });
+  relay.emit({ type: "turn_binding", sid, msg_id: "async-user", turn_id: "async-task" });
+  relay.emit({ type: "state", sid, state: "running", msg_id: "async-user" });
+  relay.emit({ type: "assistant_msg_start", sid, message_id: "async-item", turn_id: "async-task", channel: "final" });
+  relay.emit({ type: "delta", sid, message_id: "async-item", turn_id: "async-task", channel: "final", text: "用的是什么手势？" });
+  relay.emit({ type: "assistant_msg_end", sid, message_id: "async-item", turn_id: "async-task", channel: "final",
+    delivery: "async", questions: [{ title: "用的是什么手势？", options: null }] });
+  const card = await openAsyncQuestion(page);
+  await expect(card).toContainText("补充会发送给当前任务，不会中断执行");
+  await card.getByLabel("你的回答", { exact: true }).fill("三指拖拽");
+  await card.getByRole("button", { name: "稍后回答", exact: true }).click();
+  relay.emit({ type: "turn_end", sid, turn_id: "async-task", result: { subtype: "success", is_error: false } });
+  relay.emit({ type: "state", sid, state: "idle" });
+  await expect(page.locator(".async-question-card")).toBeVisible();
+  await expect(card.getByRole("textbox")).toHaveCount(0);
+  await openAsyncQuestion(page);
+  await expect(card.getByLabel("你的回答", { exact: true })).toHaveValue("三指拖拽");
+  await expect(card).not.toContainText("发送后将开始新一轮对话");
+  await expect(card.locator(".async-question-footer .async-question-hint")).toHaveCount(0);
+  expect(await card.getAttribute("aria-describedby")).toBeNull();
+  await expect(card).not.toContainText("不会中断执行");
+  await card.getByRole("button", { name: "发送回答" }).click();
+  await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+  expect(relay.commands.filter(c => ["steer", "interrupt", "answer_question"].includes(String(c.type)))).toHaveLength(0);
+  await expect(card.getByRole("textbox")).toHaveCount(0);
+  // Submission locks input until native acceptance, not the view-only toggle.
+  await openAsyncQuestion(page);
+  await expect(card.getByRole("textbox")).toBeVisible();
+  await expect(card.getByRole("textbox")).toBeDisabled();
+  await card.getByRole("button", { name: "稍后回答", exact: true }).click();
+  expect(relay.commands.filter(c => c.type === "query")).toHaveLength(1);
 });
 
 test("async question from a hidden side chat never steals the main view", async ({ page }) => {
@@ -267,18 +913,19 @@ test("async question from a hidden side chat never steals the main view", async 
   relay.emit({ type: "delta", sid, message_id: "async-item", channel: "final", text: "在哪个设备发生？" });
   relay.emit({ type: "assistant_msg_end", sid, message_id: "async-item", channel: "final",
     delivery: "async", questions: ASYNC_QUESTIONS });
-  await expect(page.getByRole("form", { name: "助手的补充问题" })).toHaveCount(0);
+  await expect(page.locator(".async-question-card")).toHaveCount(0);
   await expect(page.locator(".btw-panel")).toHaveCount(0);
   await page.keyboard.press("Control+Shift+k");
-  const card = page.locator(".btw-panel").getByRole("form", { name: "助手的补充问题" });
+  await expect(page.locator(".btw-panel .async-question-card")).toBeVisible();
+  const card = await openAsyncQuestion(page);
   await expect(card).toBeVisible();
-  await card.getByRole("button", { name: "发送补充" }).click();
+  await card.getByRole("button", { name: "发送回答" }).click();
   await expect.poll(() => relay.commands.filter((c) => c.type === "steer").length).toBe(1);
   expect(relay.commands.find((c) => c.type === "steer")?.sid).toBe(sid);
 });
 
 for (const sideChat of [false, true]) {
-  test(`async question simultaneous submissions preserve the first answer in ${sideChat ? "side chat" : "main chat"}`, async ({ page }) => {
+  test(`async question double submissions preserve the first answer in ${sideChat ? "side chat" : "main chat"}`, async ({ page }) => {
     const twoCards = {
       ...ASYNC_HISTORY_TURN,
       blocks: [ASYNC_HISTORY_TURN.blocks[0],
@@ -304,15 +951,19 @@ for (const sideChat of [false, true]) {
       }
       relay.emit({ type: "state", sid: "btw-layout-child", state: "idle", seq: seq++ });
     }
-    const cards = page.getByRole("form", { name: "助手的补充问题" });
-    await expect(cards).toHaveCount(2);
-    await cards.evaluateAll((forms) => {
-      // Both callbacks see the same pre-commit React render. The synchronous
-      // native-query acceptance latch, not a disabled button, owns this race.
-      forms.forEach((form) => (form as HTMLFormElement).requestSubmit());
+    const entries = page.locator(".async-question-card");
+    await expect(entries).toHaveCount(2);
+    const dialog = await openAsyncQuestion(page);
+    await dialog.getByRole("form").evaluate((form: HTMLFormElement) => {
+      form.requestSubmit();
+      form.requestSubmit();
     });
-    await expect.poll(() => relay.commands.filter((c) => c.type === "query").length).toBe(1);
-    await expect(cards.nth(1)).toContainText("暂时无法发送");
+    await expect.poll(() => relay.commands.filter(c => c.type === "query").length).toBe(1);
+    await expect(dialog).toHaveCount(0);
+    await openAsyncQuestion(page, 1);
+    await expect(dialog.getByRole("button", { name: "发送回答" })).toBeDisabled();
+    await dialog.getByRole("form").evaluate((form: HTMLFormElement) => form.requestSubmit());
+    expect(relay.commands.filter(c => c.type === "query")).toHaveLength(1);
     const query = relay.commands.find((c) => c.type === "query")!;
     expect(query.sid).toBe(sideChat ? "btw-layout-child" : "layout-parent");
     expect(query.delivery).not.toBe("replace");
@@ -785,11 +1436,15 @@ async function gotoWithProductionCsp(
   await page.goto(path);
 }
 
-test("HTML preview retains head CSS and runs scripts only after explicit consent", async ({
+test("HTML preview opens interactive by default and stays isolated under production CSP", async ({
   page,
 }) => {
-  await page.goto("/tests/history-browser.html?artifact-html=1");
-  await applyProductionCsp(page);
+  const outbound: string[] = [];
+  await page.route("https://cc-remote-preview-test.invalid/**", (route) => {
+    outbound.push(route.request().url());
+    return route.fulfill({ body: "unexpected network request" });
+  });
+  await gotoWithProductionCsp(page, "/tests/history-browser.html?artifact-html=1");
 
   const previewGeometry = async () => page.locator(
     ".artifact-html-stage",
@@ -811,31 +1466,25 @@ test("HTML preview retains head CSS and runs scripts only after explicit consent
     }).toBe(true);
   };
 
-  const staticFrame = page.frameLocator('iframe[title="HTML 静态预览"]');
+  const interactiveFrame = page.frameLocator('iframe[title="HTML 交互预览"]');
   await expectPreviewFillsBody();
-  await expect(staticFrame.locator("#head-style")).toHaveCSS(
+  await expect(interactiveFrame.locator("#head-style")).toHaveCSS(
     "color",
     "rgb(12, 34, 56)",
   );
-  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+  await expect(interactiveFrame.locator("#visualization-theme")).toHaveCSS(
     "color",
     "rgb(236, 237, 243)",
   );
-  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+  await expect(interactiveFrame.locator("#visualization-theme")).toHaveCSS(
     "background-color",
     "rgb(13, 14, 21)",
   );
-  await expect(staticFrame.locator("#visualization-theme")).toHaveCSS(
+  await expect(interactiveFrame.locator("#visualization-theme")).toHaveCSS(
     "border-top-color",
     "rgb(49, 50, 63)",
   );
-  await expect(staticFrame.locator("body")).not.toHaveAttribute(
-    "data-script-ran",
-    "yes",
-  );
-
-  await page.getByRole("button", { name: "运行交互预览" }).click();
-  const interactiveFrame = page.frameLocator('iframe[title="HTML 交互预览"]');
+  await expect(page.getByRole("button", { name: /运行交互预览|停止交互预览/ })).toHaveCount(0);
   await expectPreviewFillsBody();
   await expect(interactiveFrame.locator("body")).toHaveAttribute(
     "data-script-ran",
@@ -849,9 +1498,14 @@ test("HTML preview retains head CSS and runs scripts only after explicit consent
     "data-preview-escaped",
     "yes",
   );
+  await expect(interactiveFrame.locator("body")).toHaveAttribute("data-network-blocked", "yes");
+  await expect(interactiveFrame.locator("body")).toHaveAttribute("data-storage-blocked", "yes");
+  await interactiveFrame.getByRole("button", { name: "计数 0", exact: true }).click();
+  await expect(interactiveFrame.getByRole("button", { name: "计数 1", exact: true })).toBeVisible();
+  expect(outbound).toHaveLength(0);
 
-  await page.getByRole("button", { name: "停止交互预览" }).click();
-  await page.getByRole("button", { name: "运行交互预览" }).click();
+  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await page.getByRole("button", { name: "预览", exact: true }).click();
   const warmInteractiveFrame = page.frameLocator(
     'iframe[title="HTML 交互预览"]',
   );

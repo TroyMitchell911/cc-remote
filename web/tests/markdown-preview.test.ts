@@ -24,6 +24,27 @@ import {
   mermaidSourceProblem,
 } from "../src/mermaid.ts";
 import type { ServerEvent } from "../src/protocol.ts";
+import type { Turn } from "../src/domain/conversation.ts";
+import { asyncQuestionKey, presentAsyncQuestionReplies, supplementalAnswerPrompt } from "../src/async-question-presentation.ts";
+
+const nativeQuestion: Turn = { id: "question-turn", prompt: "检查日志", done: true,
+  blocks: [{ kind: "text", message_id: "question-message", text: "native question", done: true,
+    delivery: "async", questions: [{ title: "在哪个设备？" }, { title: "用的什么手势？" }] }] };
+const nativeReply: Turn = { id: "reply-turn", done: false, blocks: [],
+  prompt: supplementalAnswerPrompt([{ question: "用的什么手势？", answer: "三指拖拽\n第二行也要保留" }]) };
+const presentation = presentAsyncQuestionReplies([nativeQuestion, nativeReply]);
+assert.deepEqual(presentation.replies.get(nativeReply.id), [{ question: "用的什么手势？", answer: "三指拖拽\n第二行也要保留" }]);
+assert.equal(presentation.answered.has(asyncQuestionKey(nativeQuestion.id, "question-message")), true);
+assert.equal(presentAsyncQuestionReplies([nativeReply]).replies.size, 0, "never guess from a prefix without the native question");
+assert.equal(presentAsyncQuestionReplies([nativeReply, nativeQuestion]).replies.size, 0, "a future question cannot own this reply");
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeQuestion, id: "ambiguous" }, nativeReply]).replies.size, 0);
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, error: "rejected" }]).answered.size, 0);
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, prompt: "补充回答：\n\n问题：其他问题\n回答：保留原文" }]).replies.size, 0);
+const multiReply = { ...nativeReply, prompt: supplementalAnswerPrompt([
+  { question: "在哪个设备？", answer: "Mac" }, { question: "用的什么手势？", answer: "三指拖拽" },
+]) };
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, multiReply]).replies.get(nativeReply.id)?.length, 2);
+assert.equal(nativeReply.prompt, "补充回答：\n\n问题：用的什么手势？\n回答：三指拖拽\n第二行也要保留", "presentation never rewrites the wire payload");
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
   kind: "local", value: "docs/img/a.png",
@@ -1355,9 +1376,10 @@ $$`,
 
   const artifactPanelSource = readFileSync(
     resolve(process.cwd(), "src/components/ArtifactPanel.tsx"), "utf8");
-  assert.match(artifactPanelSource, /DOMPurify\.sanitize/);
-  assert.match(artifactPanelSource, /sandbox=""/);
-  assert.match(artifactPanelSource, /FORBID_TAGS/);
+  assert.match(artifactPanelSource, /new DOMParser\(\)\.parseFromString/);
+  assert.match(artifactPanelSource, /sandbox="allow-scripts"/);
+  assert.doesNotMatch(artifactPanelSource, /allow-same-origin/);
+  assert.match(artifactPanelSource, /iframe,object,embed,form,base,link,meta\[http-equiv\],script\[src\]/);
   assert.match(artifactPanelSource, /\["md", "html"\]\.includes\(artifact\.kind\)/);
   assert.match(artifactPanelSource, /artifact\.kind === "html" && mode === "preview"/);
   assert.match(artifactPanelSource, /mode === "source"[\s\S]*?<SourceFile content=\{artifact\.content/);

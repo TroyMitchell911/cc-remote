@@ -10,7 +10,7 @@ import {
   restoreCachedTurnDetails,
 } from "../src/history-merge.ts";
 import type { ServerEvent } from "../src/protocol.ts";
-import type { Turn } from "../src/reducer.ts";
+import type { ProcessBlock, Turn } from "../src/reducer.ts";
 import {
   acceptAgentDetail,
   emptyAgentRun,
@@ -201,8 +201,46 @@ try {
     "/src/components/BtwPanel.tsx");
   const { AgentDetailPanel } = await harness.ssrLoadModule(
     "/src/components/AgentDetailPanel.tsx");
-  const { activeTurnCandidateIds, displayActiveTurnOwnerId } =
+  const { activeTurnCandidateIds, displayActiveTurnOwnerId, generatedOutputImages } =
     await harness.ssrLoadModule("/src/process-blocks.ts");
+  const generated: ProcessBlock = {
+    kind: "process", processKind: "server_tool", tool: "image_generation",
+    item_id: "canonical", phase: "end", status: "succeeded", done: true,
+    title: "生成图片",
+    input: { history_image: { image_id: "img-content-native-1" } },
+  };
+  const liveGenerated = { ...generated, item_id: "live", input: {
+    ...generated.input, preview_id: "snapshot-id",
+  } };
+  assert.deepEqual(generatedOutputImages([generated, liveGenerated]), [liveGenerated]);
+  assert.deepEqual(generatedOutputImages([liveGenerated, generated]), [liveGenerated]);
+  assert.equal(generatedOutputImages([generated, { ...generated,
+    input: { history_image: { image_id: "img-different-native-or-content" } },
+  }]).length, 2, "distinct native/content image references remain distinct");
+  assert.deepEqual(generatedOutputImages([{ ...generated, done: false },
+    { ...generated, status: "failed" }]), []);
+  assert.equal(generatedOutputImages(Array.from({ length: 12 }, (_, index) => ({
+    ...generated, input: { history_image: { image_id: `img-${index}` } },
+  }))).length, 8, "the generated gallery stays bounded");
+  const imageSummary: Turn = {
+    ...sourceTimedProcess, blocks: [generated],
+  };
+  const imageFreeDetail: Turn = {
+    ...imageSummary, blocks: exactDirectDetail.blocks,
+  };
+  for (const projection of [undefined, {
+    segments: [], blocks: imageFreeDetail.blocks, capped: false,
+    hasMore: true, oldestCursor: "older", hasNewer: false, newerCursor: null,
+  }]) {
+    const paged = installAuthoritativeTurnDetailPage(
+      imageSummary, imageFreeDetail,
+      { hasMore: true, oldestCursor: "older", hasNewer: false }, projection,
+    );
+    assert.equal(generatedOutputImages(paged.blocks).length, 1,
+      "an image-free process detail page must not erase a known output image");
+    assert.equal(paged.processStartedTs, imageSummary.processStartedTs);
+    assert.equal(paged.processDoneTs, imageSummary.processDoneTs);
+  }
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: 37, ts: 10, ...body,
   } as ServerEvent);
@@ -770,8 +808,34 @@ try {
   }));
   assert.doesNotMatch(unknownDetailMarkup, /已处理/,
     "an opaque native summary must not claim that a process exists");
-  assert.match(unknownDetailMarkup, /查看本轮详情/,
-    "completed unknown detail keeps an honest on-demand entry");
+  assert.doesNotMatch(unknownDetailMarkup,
+    /查看本轮详情|查看完整内容|turn-detail-entry/,
+    "uncertainty alone must not create an empty disclosure for a direct reply");
+
+  const pagedUnknownMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "paged-unknown-session", turns: [partialDirectDetail],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(pagedUnknownMarkup, /查看更多内容/,
+    "an actual unread detail page remains reachable without an empty placeholder");
+
+  const restoredProcessMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "restored-process-session", turns: [restoredUnknownProcess],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(restoredProcessMarkup, /已处理/,
+    "cached concrete process evidence still refines and renders an opaque summary");
+
+  const failedUnknownMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "failed-unknown-session", turns: [{
+      ...opaqueDirectSummary, detailError: "详细过程暂时不可用",
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(failedUnknownMarkup, /重试加载详情/,
+    "an explicit failed read keeps its retry even without process evidence");
 
   const incompleteKnownProcessMarkup = renderToStaticMarkup(createElement(
     ProcessTimeline,

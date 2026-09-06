@@ -5,8 +5,12 @@ import { gzipSync } from "node:zlib";
 const DIST = resolve(import.meta.dirname, "../dist");
 // Selection tracking, async routing, parent-scoped BTW visibility and lazy
 // loaders add <4 KiB to startup. The ~164 KiB HTML parser and form stay lazy.
-const MAX_ENTRY_BYTES = 518 * 1024;
-const MAX_INITIAL_BYTES = 912 * 1024;
+// Native generated-output thumbnails reuse existing image loaders/lightbox;
+// their presentation and accessible labels add <2 KiB, no new dependencies.
+// Exact supplemental-answer presentation, full-width image actions and bounded
+// automatic preview reads add <3 KiB; keep the gzip/dependency-count gates fixed.
+const MAX_ENTRY_BYTES = 523 * 1024;
+const MAX_INITIAL_BYTES = 917 * 1024;
 const MAX_INITIAL_GZIP_BYTES = 280 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 

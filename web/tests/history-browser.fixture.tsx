@@ -2599,10 +2599,19 @@ function ArtifactPreviewFixture({ kind }: {
         <style>#head-style { color: rgb(12, 34, 56); }</style>
         </head><body><div id="head-style">head css retained</div>
         <div id="visualization-theme" style="color:var(--foreground);background:var(--background);border:1px solid var(--border)">visualization theme</div>
+        <button id="counter">计数 0</button>
         <script>
           document.body.dataset.scriptRan = "yes";
           try { parent.document.body.dataset.previewEscaped = "yes"; }
           catch (_) { document.body.dataset.parentBlocked = "yes"; }
+          try { localStorage.getItem("preview-isolation-test"); }
+          catch (_) { document.body.dataset.storageBlocked = "yes"; }
+          fetch("https://cc-remote-preview-test.invalid/should-not-load")
+            .catch(() => { document.body.dataset.networkBlocked = "yes"; });
+          let count = 0;
+          document.getElementById("counter").onclick = event => {
+            event.currentTarget.textContent = "计数 " + (++count);
+          };
         </script></body></html>`,
       size: 360,
       mtimeNs: "1",

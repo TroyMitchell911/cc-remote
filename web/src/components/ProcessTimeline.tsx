@@ -6,6 +6,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type ComponentProps,
 } from "react";
 import type {
   Block,
@@ -16,6 +17,7 @@ import type {
 import { Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import { HistoryUserImage } from "./HistoryUserImage";
 import { ToolGroup } from "./ToolGroup";
 import {
   hasActiveProcess,
@@ -29,6 +31,7 @@ import type { InlineImageAsset } from "../inline-image-assets";
 import type { PreviewAuthorizationState } from "../reducer";
 import {
   historyImageAssetKey,
+  readyGeneratedImageAsset,
   type HistoryImageAsset,
   type HistoryImageVariant,
 } from "../history-image-assets";
@@ -217,6 +220,7 @@ function ProcessImagePreview({
   onLoadHistoryImage,
   onPreviewImage,
   onPreviewHistoryImage,
+  generated = false,
 }: {
   path: string;
   previewId?: string;
@@ -236,16 +240,16 @@ function ProcessImagePreview({
   ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
+  generated?: boolean;
 }) {
-  const historyAsset = historyTurnId && historyRef
+  const liveAsset = !historyRef && previewId ? imageAssets?.[previewId] : undefined;
+  const useHistory = !!historyRef;
+  const historyAsset = historyTurnId && historyRef && useHistory
     ? historyImageAssets?.[historyImageAssetKey(
         historyTurnId, historyRef.image_id, "thumbnail")]
     : undefined;
-  const liveAsset = !historyRef && previewId
-    ? imageAssets?.[previewId]
-    : undefined;
   useEffect(() => {
-    if (historyTurnId && historyRef) {
+    if (useHistory && historyTurnId && historyRef) {
       if (!historyAsset) {
         onLoadHistoryImage?.(
           historyTurnId, historyRef.image_id, "thumbnail");
@@ -264,49 +268,103 @@ function ProcessImagePreview({
     onLoadImage,
     path,
     previewId,
+    useHistory,
   ]);
-  const asset = historyRef ? historyAsset : liveAsset;
+  const asset = useHistory ? historyAsset : liveAsset;
   const src = asset?.status === "ready" && asset.data && asset.mediaType
     ? `data:${asset.mediaType};base64,${asset.data}`
     : null;
   const canLoad = Boolean(
     (historyTurnId && historyRef) || previewId,
   );
-  if (!historyRef && liveAsset?.authorization) {
+  if (!useHistory && liveAsset?.authorization) {
     return <PreviewAuthorizationPrompt
       authorization={liveAsset.authorization}
       compact
       onDecision={onAuthorizeImage} />;
   }
   return (
-    <button type="button" className="process-image-preview"
+    <button type="button" className={"process-image-preview" + (generated ? " generated-image-preview" : "")}
       disabled={!canLoad}
       aria-label={
-        src
+        generated ? (src ? "预览生成的图片" : "加载生成的图片") : src
           ? "预览查看过的图片"
           : canLoad ? "加载查看过的图片" : "等待图片读取完成"
       }
       onClick={() => {
-        if (historyTurnId && historyRef) {
+        if (useHistory && historyTurnId && historyRef) {
           onLoadHistoryImage?.(
             historyTurnId, historyRef.image_id, "full");
           onPreviewHistoryImage?.(historyTurnId, historyRef.image_id);
           return;
         }
         if (src) {
-          onPreviewImage?.(src, path || "查看过的图片");
+          onPreviewImage?.(src, path || (generated ? "生成的图片" : "查看过的图片"));
         } else if (previewId) {
           onLoadImage?.(path, previewId);
         }
       }}>
       {src
-        ? <img src={src} alt="" />
+        ? <img src={src} alt="" width={asset?.width} height={asset?.height} />
         : <span className="process-image-placeholder">
             <Icon name="read" size={16} />
           </span>}
-      <span>{path || "查看过的图片"}</span>
+      {(!generated || !src) && <span>{generated
+        ? (asset?.status === "error" ? "图片加载失败 · 点击重试"
+          : !canLoad ? "生成的图片暂不可用" : "正在加载图片…")
+        : path || "查看过的图片"}</span>}
     </button>
   );
+}
+
+export function GeneratedImagePreview({ block, ...props }: {
+  block: ProcessBlock;
+} & Omit<ComponentProps<typeof ProcessImagePreview>, "path" | "previewId" | "historyRef" | "generated">) {
+  const ref = processImageRef(block.input);
+  // Retain only the snapshot id through live -> canonical projection changes.
+  // Bytes remain in the scoped LRU: eviction and invalidation still win.
+  const snapshotRef = useRef<{ imageId?: string; previewId?: string }>({});
+  if (snapshotRef.current.imageId !== ref?.image_id) {
+    snapshotRef.current = { imageId: ref?.image_id };
+  }
+  if (typeof block.input?.preview_id === "string") {
+    snapshotRef.current.previewId = block.input.preview_id;
+  }
+  const previewId = snapshotRef.current.previewId;
+  const live = previewId ? props.imageAssets?.[previewId] : undefined;
+  const readyHistory = ref
+    ? readyGeneratedImageAsset(props.historyImageAssets, ref.image_id) : undefined;
+  const historyAsset = readyHistory ?? (ref && props.historyTurnId
+    ? props.historyImageAssets?.[historyImageAssetKey(props.historyTurnId, ref.image_id, "full")]
+    : undefined);
+  const history = ref && props.historyTurnId && (readyHistory || !previewId || live?.status === "error");
+  const dimensions = history ? ref : live;
+  const path = filePathsFromInput(block.input)[0] ?? "";
+  const open = () => {
+    if (readyHistory) {
+      props.onPreviewImage?.(`data:${readyHistory.mediaType};base64,${readyHistory.data}`, "生成的图片");
+    } else if (history && ref && props.historyTurnId) {
+      props.onLoadHistoryImage?.(props.historyTurnId, ref.image_id, "full");
+      props.onPreviewHistoryImage?.(props.historyTurnId, ref.image_id);
+    } else if (live?.status === "ready" && live.data && live.mediaType) {
+      props.onPreviewImage?.(`data:${live.mediaType};base64,${live.data}`, "生成的图片");
+    } else if (previewId) props.onLoadImage?.(path, previewId);
+  };
+  return <figure className="generated-output">
+    {history && ref && props.historyTurnId ? <div className="generated-history-image">
+      {/* Reuse history intersection loading and eviction guards. */}
+      <HistoryUserImage turnId={props.historyTurnId} imageId={ref.image_id}
+        width={ref.width} height={ref.height} label="生成的图片" variant="full"
+        asset={historyAsset}
+        onLoad={props.onLoadHistoryImage}
+        onPreview={open} />
+    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId} />}
+    <figcaption><Icon name="read" size={14} /><span>生成的图片</span>
+      {!!dimensions?.width && !!dimensions.height && <span className="generated-image-size">· {dimensions.width} × {dimensions.height}</span>}
+      {(history || previewId) && <button type="button" className="generated-image-open" onClick={open}>
+        <Icon name="expand" size={13} />查看大图</button>}
+    </figcaption>
+  </figure>;
 }
 
 export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,

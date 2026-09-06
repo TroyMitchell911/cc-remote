@@ -14,7 +14,6 @@ import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
 import {
   buildInteractiveSandboxDocument,
-  buildSandboxDocument,
   type HtmlPreviewTheme,
 } from "../html-preview";
 import { isMermaidFenceClass } from "../mermaid";
@@ -75,10 +74,9 @@ function HtmlArtifactPreview({ content, theme }: {
   content: string;
   theme?: HtmlPreviewTheme;
 }) {
-  const [document, setDocument] = useState<string | null>(null);
   const [interactiveDocument, setInteractiveDocument] =
     useState<string | null>(null);
-  const [interactive, setInteractive] = useState(false);
+  const [frameRevision, setFrameRevision] = useState(0);
   const interactiveFrameRef = useRef<HTMLIFrameElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -86,33 +84,6 @@ function HtmlArtifactPreview({ content, theme }: {
     let cancelled = false;
     const prepare = async () => {
       try {
-        const { default: DOMPurify } = await import("dompurify");
-        const clean = DOMPurify.sanitize(content, {
-          WHOLE_DOCUMENT: true,
-          FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
-          FORBID_ATTR: ["srcset", "action", "formaction"],
-        });
-        const parsed = new DOMParser().parseFromString(clean, "text/html");
-        for (const element of parsed.documentElement.querySelectorAll("*")) {
-          for (const attribute of Array.from(element.attributes)) {
-            const name = attribute.name.toLowerCase();
-            const value = attribute.value.trim();
-            if (name.startsWith("on")) {
-              element.removeAttribute(attribute.name);
-            } else if (URL_ATTRIBUTES.has(name)) {
-              const allowedAnchor = name === "href" && value.startsWith("#");
-              const allowedImage = name === "src"
-                && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(value);
-              if (!allowedAnchor && !allowedImage) element.removeAttribute(attribute.name);
-            } else if (name === "style" && UNSAFE_CSS.test(value)) {
-              element.removeAttribute(attribute.name);
-            }
-          }
-        }
-        for (const style of parsed.documentElement.querySelectorAll("style")) {
-          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
-        }
-
         const runnable = new DOMParser().parseFromString(content, "text/html");
         for (const element of Array.from(runnable.querySelectorAll(
           "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
@@ -143,21 +114,15 @@ function HtmlArtifactPreview({ content, theme }: {
           if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
         }
         if (cancelled) return;
-        setDocument(buildSandboxDocument(
-          parsed.body.innerHTML,
-          parsed.head.innerHTML,
-          theme,
-        ));
         setInteractiveDocument(buildInteractiveSandboxDocument(
           runnable.body.innerHTML,
           runnable.head.innerHTML,
           theme,
         ));
-        setInteractive(false);
+        setFrameRevision(value => value + 1);
         setError(null);
       } catch {
         if (cancelled) return;
-        setDocument(null);
         setInteractiveDocument(null);
         setError("HTML 安全处理失败");
       }
@@ -175,21 +140,12 @@ function HtmlArtifactPreview({ content, theme }: {
   }, [interactiveDocument]);
 
   if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
-  if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
+  if (!interactiveDocument) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
   return <div className="artifact-html-stage">
-    <div className="artifact-html-controls">
-      <span>外部资源已禁用</span>
-      <button type="button" onClick={() => setInteractive((value) => !value)}>
-        {interactive ? "停止交互预览" : "运行交互预览"}
-      </button>
-    </div>
-    {interactive
-      ? <iframe ref={interactiveFrameRef} className="artifact-html-preview"
+    <iframe key={frameRevision} ref={interactiveFrameRef} className="artifact-html-preview"
           title="HTML 交互预览" sandbox="allow-scripts"
           referrerPolicy="no-referrer" src="/html-preview-runner.html"
           onLoad={loadInteractiveDocument} />
-      : <iframe className="artifact-html-preview" title="HTML 静态预览"
-          sandbox="" referrerPolicy="no-referrer" srcDoc={document} />}
   </div>;
 }
 

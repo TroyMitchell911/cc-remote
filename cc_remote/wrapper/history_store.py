@@ -52,7 +52,9 @@ from cc_remote.protocol import ConversationTurn
 # Codex narrative projections that discarded native async question metadata.
 # v29 rebuilds Codex summary pages where an async question hid a normal answer
 # without phase metadata. Source-complete details and binary assets remain valid.
-_SCHEMA_VERSION = 29
+# v30 rebuilds Codex narrative rows with bounded generated-image references.
+# Binary assets and other engines' projections remain source-valid.
+_SCHEMA_VERSION = 30
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -564,6 +566,7 @@ def materialize_history_turns(
         live_texts: dict[str, dict[str, Any]] = {}
         live_tools: dict[str, dict[str, Any]] = {}
         live_processes: dict[str, dict[str, Any]] = {}
+        generated_images: dict[str, dict[str, Any]] = {}
 
         def short(value: Any) -> str | None:
             if not isinstance(value, str) or not value:
@@ -621,6 +624,34 @@ def materialize_history_turns(
 
         for event in group:
             event_type = event.get("type")
+            if (event_type == "process" and event.get("tool") == "image_generation"
+                    and event.get("phase") == "end"
+                    and event.get("status") == "succeeded"
+                    and isinstance(event.get("item_id"), str)):
+                # A generated image is output, not just heavy process detail.
+                # Keep a bounded reference in summary; never its result/prompt.
+                image_input: dict[str, Any] = {}
+                raw_input = event.get("input")
+                if isinstance(raw_input, dict):
+                    path = short(raw_input.get("file_path"))
+                    if path:
+                        image_input["file_path"] = path
+                    ref = raw_input.get("history_image")
+                    if isinstance(ref, dict):
+                        image_input["history_image"] = {
+                            key: ref[key] for key in (
+                                "image_id", "media_type", "width", "height", "byte_size"
+                            ) if key in ref
+                        }
+                generated_images[event["item_id"]] = {
+                    "kind": "process", "item_id": event["item_id"],
+                    "processKind": "server_tool", "phase": "end",
+                    "status": "succeeded", "done": True, "title": "生成图片",
+                    "turn_id": event.get("turn_id"), "tool": "image_generation",
+                    "input": image_input,
+                }
+                while len(generated_images) > 8:
+                    generated_images.pop(next(iter(generated_images)))
             if started_ms is None:
                 started_ms = _event_ms(event.get("ts"))
             if event_type == "user_msg":
@@ -954,19 +985,24 @@ def materialize_history_turns(
                 and (started_ms is None or started_ms > done_ms)):
             started_ms = max(0, done_ms - (duration_ms or 0))
         blocks = []
+        final_block_count = sum(
+            bool("".join(texts.get(message_id, ())))
+            for message_id in final_ids
+        )
+        image_limit = max(0, _SUMMARY_BLOCK_MAX - final_block_count)
+        image_summaries = list(generated_images.values())[-image_limit:] if image_limit else []
         if include_live_detail:
             final_id_set = set(final_ids)
-            final_block_count = sum(
-                bool("".join(texts.get(message_id, ())))
-                for message_id in final_ids
-            )
             live_block_limit = max(
                 0,
                 min(_SUMMARY_LIVE_BLOCK_MAX,
-                    _SUMMARY_BLOCK_MAX - final_block_count),
+                    _SUMMARY_BLOCK_MAX - final_block_count - len(image_summaries)),
             )
             candidates: list[dict[str, Any]] = []
             for block in live_blocks:
+                if (block.get("tool") == "image_generation"
+                        and block.get("status") == "succeeded"):
+                    continue
                 if (block.get("kind") == "text"
                         and block.get("message_id") in final_id_set):
                     continue
@@ -1031,6 +1067,7 @@ def materialize_history_turns(
                 block["text"] = text[:keep]
                 remaining_live_chars -= keep
             blocks.extend(candidates)
+        blocks.extend(image_summaries)
         remaining_summary_chars = _SUMMARY_TEXT_MAX_CHARS
         summary_truncated = False
         for message_id in final_ids:
@@ -1208,6 +1245,10 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if current in range(10, 30):
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
             if current in range(10, 28):
                 # v28 retains native async questions. Rollout bytes and source
                 # fingerprints are unchanged; rebuild Codex narrative only.
@@ -1285,8 +1326,8 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25, 26, 27, 28):
-                # The independent v22-v29 invalidations above suffice.
+            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29):
+                # The independent v22-v30 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows

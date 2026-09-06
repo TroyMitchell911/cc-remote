@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -24,10 +25,13 @@ import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
 import {
   BackgroundProcessDock,
+  GeneratedImagePreview,
   ProcessTimeline,
 } from "./ProcessTimeline";
 import {
   finalTextBlocks,
+  generatedImageIdentity,
+  generatedOutputImages,
   hasActiveProcess,
   presentableProcessBlocks,
 } from "../process-blocks";
@@ -76,8 +80,10 @@ import {
   HISTORY_REQUEST_TIMEOUT_MS,
 } from "../history-requests";
 import { mergeDetailWithLiveTail } from "../history-merge";
+import { asyncQuestionKey, presentAsyncQuestionReplies } from "../async-question-presentation";
 
 const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
+const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -347,7 +353,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
-  onLoadDetail, onEdit, onReplyAsyncQuestion, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onReplyAsyncQuestion, asyncReplyMode, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
@@ -387,6 +393,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   ) => boolean;
   onEdit?: (prompt: string) => void;
   onReplyAsyncQuestion?: (prompt: string) => boolean;
+  asyncReplyMode?: "query" | "steer";
   onGetDiff?: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
   onPreviewMarkdown?: (file: string) => void;
@@ -556,6 +563,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     hasNewer,
     windowEpoch: historyWindowEpoch,
   } = scopedPresentedHistory;
+  const supplemental = useMemo(() => presentAsyncQuestionReplies(turns), [turns]);
+  const asyncQuestionScope = JSON.stringify([historyScopeKey ?? "", sid]);
+  const [openAsyncQuestion, setOpenAsyncQuestion] = useState<{
+    scope: string; messageId: string | null;
+  } | null>(null);
+  useLayoutEffect(() => { setOpenAsyncQuestion(null); }, [asyncQuestionScope]);
   turnImagePreviewCacheRef.current.update(sid, turns);
 
   useLayoutEffect(() => {
@@ -2721,6 +2734,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeTimeline = activeProcess
               || foregroundProcessItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
+            const generatedImages = generatedOutputImages(timelineBlocks);
             const followupBoundaries = backgroundFollowupBoundaries(
               finalBlocks, timelineBlocks);
             const enclosingTaskActive = activeTurnId === t.id;
@@ -2759,10 +2773,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
             const showProcessTimeline = hasProcessTimeline;
+            // Unknown native summaries don't prove that there is anything to
+            // expand. Keep that uncertainty in the projection, not as a button
+            // which disappears after an empty read. Real deferred content,
+            // unread detail pages and explicit failures retain their controls.
+            const hasUnreadDetailPages = !!t.detailHasMore || !!t.detailHasNewer;
             const showStandaloneDetail = t.done && !t.detailLoaded
-              && (hasDeferredContent || processDetailState === "unknown");
+              && (hasDeferredContent || hasUnreadDetailPages);
             const standaloneDetailLabel = hasDeferredContent
-              ? "查看完整内容" : "查看本轮详情";
+              ? "查看完整内容" : hasUnreadDetailPages ? "查看更多内容" : "重试加载详情";
             // Keep the live affordance at the physical tail of the turn. The
             // process disclosure can be far above the viewport once a long
             // tool stream grows, so it must not be the only place which tells
@@ -2830,7 +2849,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               }}>
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
-                {t.prompt && <div className="ubub">{t.prompt}</div>}
+                {t.prompt && <div className="ubub">{supplemental.replies.has(t.id)
+                  ? <div className="supplemental-answer">
+                      <details className="supplemental-answer-context">
+                        <summary><Icon name="message" size={13} />查看问题<Icon name="chev" size={12} /></summary>
+                        <div>{supplemental.replies.get(t.id)!.map((answer, index) =>
+                          <p key={index}>{answer.question}</p>)}</div>
+                      </details>
+                      {supplemental.replies.get(t.id)!.map((answer, index) =>
+                        <p key={index}>{answer.answer}</p>)}
+                    </div>
+                  : t.prompt}</div>}
                 {t.images && t.images.length > 0 && (
                   <div className="ubub-imgs">
                     {t.images.map((img, i) => {
@@ -2959,6 +2988,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 )}
                 onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
             )}
+            {generatedImages.length > 0 && <div className="generated-image-gallery">
+              {generatedImages.map((block) => <GeneratedImagePreview key={generatedImageIdentity(block)}
+                block={block} imageAssets={imageAssets} onLoadImage={onLoadImage}
+                onAuthorizeImage={onAuthorizeImage}
+                historyTurnId={historyTurnId} historyImageAssets={historyImageAssets}
+                onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })}
+                onPreviewHistoryImage={(turnId, imageId) => setZoom({
+                  kind: "history", turnId, imageId, alt: "生成的图片",
+                })} />)}
+            </div>}
             {t.blocks.length > 0 && (
               <>
                 {finalBlocks.map((block) => (
@@ -2982,11 +3022,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                       </div>
                     )}
                     {block.delivery === "async" && block.questions?.length
-                      ? <Suspense fallback={<MessageBlock text={block.text} done={block.done} />}>
+                      ? <Suspense fallback={<span className="async-question-hint">助手询问…</span>}>
                           <AsyncQuestionCard questions={block.questions}
-                            onReply={onReplyAsyncQuestion}>
-                            <MessageBlock text={block.text} done onOpenFile={onOpenFile} />
-                          </AsyncQuestionCard>
+                            answered={supplemental.answered.has(asyncQuestionKey(t.id, block.message_id))}
+                            onOpen={() => {
+                              pauseOutputFollow();
+                              setOpenAsyncQuestion({ scope: asyncQuestionScope, messageId: block.message_id });
+                            }} />
                         </Suspense>
                       : <MessageBlock text={block.text}
                       done={block.done} onOpenFile={onOpenFile}
@@ -3079,6 +3121,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       </div>
       <BackgroundProcessDock processes={backgroundProcesses}
         onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
+      {openAsyncQuestion?.scope === asyncQuestionScope && <Suspense fallback={null}>
+        <AsyncQuestionHost key={asyncQuestionScope}
+          messageId={openAsyncQuestion.messageId}
+          turns={turns} answeredKeys={supplemental.answered}
+          replyMode={asyncReplyMode} onReply={onReplyAsyncQuestion}
+          onClose={() => setOpenAsyncQuestion(q => q ? { ...q, messageId: null } : null)} />
+      </Suspense>}
       {zoom && (() => {
         const asset = zoom.kind === "history" ? historyImageAssets?.[
           historyImageAssetKey(zoom.turnId, zoom.imageId, "full")

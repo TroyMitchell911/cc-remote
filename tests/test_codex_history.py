@@ -20,6 +20,7 @@ from cc_remote.wrapper.codex_rpc import (
 from cc_remote.wrapper.codex_stream import (
     codex_history_boundary_process_start,
     codex_history_native_witness,
+    codex_history_process_append,
     codex_history_process_witnesses,
     codex_history_image_views,
     codex_rollout_task_bindings,
@@ -719,13 +720,103 @@ def test_older_history_process_witness_starts_after_browser_cursor(tmp_path):
     assert set(witnesses.process_by_visible_id) == {"native-3", "native-2"}
     assert set(witnesses.offset_by_visible_id) == {"native-3", "native-2"}
 
+    # Cold official pages can use synthetic item ids absent from the rollout.
+    # No offset from the preceding (byte-bounded) head is required to recover
+    # this exact requested page, and neighboring native tasks must not leak in.
+    cold = codex_history_process_witnesses(
+        str(path), before="item-opaque", max_turns=2,
+        native_turn_ids=("native-3", "native-2"),
+    )
+    assert cold.process_by_native_segment == witnesses.process_by_native_segment
+    assert cold.offset_by_native_segment == witnesses.offset_by_native_segment
+    assert codex_history_process_witnesses(
+        str(path), before="item-opaque", max_turns=1,
+        native_turn_ids=("missing-native",),
+    ).process_by_native_segment == {}
+
     next_page = codex_history_process_witnesses(
         str(path),
         before="native-2",
         before_offset=witnesses.offset_by_visible_id["native-2"],
         max_turns=2,
+        native_turn_ids=("native-1", "native-0"),
     )
     assert set(next_page.process_by_visible_id) == {"native-1", "native-0"}
+
+
+@pytest.mark.parametrize("payload", [
+    {"type": "task_started", "turn_id": "next-native"},
+    {"type": "user_message", "turn_id": "native", "message": "steer"},
+    {"type": "item_completed", "item": {"type": "UserMessage", "content": []}},
+    {"type": "message", "role": "user", "id": "paired-steer"},
+    {"type": "thread_goal_updated", "objective": "next goal"},
+])
+def test_process_append_rejects_changed_user_or_task_ownership(tmp_path, payload):
+    path = tmp_path / "process-append-boundary.jsonl"
+    path.write_text(
+        '{"type":"event_msg","payload":{"type":"task_started","turn_id":"native"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"test"}}\n')
+    previous = codex_history_process_witnesses(
+        str(path), before="item", max_turns=1, native_turn_ids=("native",))
+    assert previous.append_segment == ("native", 0)
+    start = path.stat().st_size
+    with path.open("a") as output:
+        output.write(json.dumps({"type": "event_msg", "payload": payload}) + "\n")
+    assert codex_history_process_append(
+        str(path), previous=previous, start_offset=start,
+        end_offset=path.stat().st_size,
+    ) is None
+
+
+@pytest.mark.parametrize("partial_prefix", [False, True])
+def test_process_append_requires_complete_jsonl_seam(tmp_path, partial_prefix):
+    path = tmp_path / "process-partial-append.jsonl"
+    path.write_text(
+        '{"type":"event_msg","payload":{"type":"task_started","turn_id":"native"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"test"}}\n')
+    previous = codex_history_process_witnesses(
+        str(path), before="item", max_turns=1, native_turn_ids=("native",))
+    if partial_prefix:
+        with path.open("a") as output:
+            output.write('{"type":"event_msg",')
+    start = path.stat().st_size
+    with path.open("a") as output:
+        output.write('"payload":{"type":"exec_command_end"}}\n' if partial_prefix
+                     else '{"type":"event_msg",')
+    assert codex_history_process_append(
+        str(path), previous=previous, start_offset=start,
+        end_offset=path.stat().st_size,
+    ) is None
+
+
+def test_process_append_coordinates_require_the_frozen_native_head(tmp_path):
+    path = tmp_path / "frozen-process-head.jsonl"
+    old = (
+        '{"type":"event_msg","payload":{"type":"task_started","turn_id":"old"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"old"}}\n')
+    path.write_text(old)
+    frozen_end = path.stat().st_size
+    with path.open("a") as output:
+        output.write(
+            '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"old"}}\n'
+            '{"type":"event_msg","payload":{"type":"task_started","turn_id":"new"}}\n'
+            '{"type":"event_msg","payload":{"type":"user_message","message":"new"}}\n')
+    snapshot = codex_history_process_witnesses(
+        str(path), before="item", max_turns=1,
+        native_turn_ids=("old",), source_end_offset=frozen_end)
+    assert snapshot.append_segment == ("old", 0)
+    # A stale official page may lag behind the physical rollout head. Its old
+    # native coordinates must never absorb the newer task's tool appends.
+    current = codex_history_process_witnesses(
+        str(path), before="item", max_turns=1, native_turn_ids=("old",))
+    assert current.append_segment is None
+    # Automatic no-user task continuation is intentionally left to the full
+    # ownership parser, rather than inferring a native task from a visible row.
+    path.write_text(old +
+                    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"auto"}}\n')
+    continuation = codex_history_process_witnesses(
+        str(path), before="item", max_turns=1, native_turn_ids=("old",))
+    assert continuation.append_segment is None
 
 
 def test_required_native_witness_extends_past_initial_tail_budget(tmp_path):

@@ -8,6 +8,7 @@ import {
   type TurnDetailProjection,
 } from "./domain/conversation.ts";
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
+import { generatedImageIdentity, generatedOutputImages } from "./process-blocks.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
@@ -1139,7 +1140,8 @@ export function mergeAuthoritativeTurnDetail(
  *
  * Pages are source-disjoint and may be visited in either direction, so the
  * visible process window is replaced instead of accumulated. Keep the summary's
- * final answer outside that window when an older page does not contain it. */
+ * final answer and generated output images outside that window when a page
+ * does not contain them. */
 export function installAuthoritativeTurnDetailPage(
   summary: Turn,
   detail: Turn,
@@ -1214,6 +1216,12 @@ export function installAuthoritativeTurnDetailPage(
   const restoreIncomplete =
     summary.detailRestoreIncomplete === true && hasMore;
   const processBlocks = detailProjection?.blocks ?? detailWithoutFinals;
+  // Output images are bounded narrative assets, not members of the currently
+  // selected heavy-process page. Expanding or paging details must not make
+  // their gallery disappear again. Retain references only, never image bytes.
+  const outputImages = generatedOutputImages([...summary.blocks, ...processBlocks]);
+  const detailImageIds = new Set(generatedOutputImages(detailWithoutFinals)
+    .map(generatedImageIdentity));
   let processDetailState = mergedProcessDetailState(
     summary, detail, processBlocks);
   // A bounded page containing only the final answer is not an exact
@@ -1240,7 +1248,10 @@ export function installAuthoritativeTurnDetailPage(
     // ordinary live-turn 256 item / 16 MiB cap cannot evict them. Legacy
     // callers without a projection retain the pre-v21 behavior.
     blocks: detailProjection
-      ? canonicalFinals : [...detailWithoutFinals, ...canonicalFinals],
+      ? [...outputImages, ...canonicalFinals]
+      : [...detailWithoutFinals,
+          ...outputImages.filter(image => !detailImageIds.has(generatedImageIdentity(image))),
+          ...canonicalFinals],
     done: summary.done,
     doneTs: summary.doneTs,
     durationMs: summary.durationMs,

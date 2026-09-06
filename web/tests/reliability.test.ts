@@ -71,6 +71,7 @@ import {
   historyImageAssetCacheSnapshot,
   HISTORY_IMAGE_REQUEST_TIMEOUT_MS,
   shouldAutoloadHistoryImage,
+  readyGeneratedImageAsset,
 } from "../src/history-image-assets.ts";
 import {
   InlineImageAssetCache,
@@ -17507,6 +17508,25 @@ Object.assign(globalThis, {
   sessionStorage: browserSessionStorage,
 });
 
+function assertAutomaticPreviewReads() {
+  const previewRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  previewRelay.start();
+  const previewSocket = FakeWebSocket.instances.at(-1)!;
+  previewSocket.onopen?.();
+  try {
+    const read = previewRelay.sendAuthorizePreview("file-identity-1", "read-intent-1", "allow", "preview-session");
+    assert.ok(read);
+    const count = previewSocket.sent.length;
+    assert.equal(previewRelay.sendAuthorizePreview("file-identity-1", "read-intent-1", "allow", "preview-session"), read);
+    assert.equal(previewSocket.sent.length, count, "duplicate preview mounts share the exact request");
+    assert.equal(previewRelay.sendAuthorizePreview("file-identity-2", "read-intent-1", "allow", "preview-session"), null);
+    assert.equal(previewSocket.sent.length, count, "replacement files must not trigger an automatic authorization loop");
+    assert.ok(previewRelay.sendAuthorizePreview("file-identity-2", "read-intent-2", "allow", "preview-session"), "explicit refresh starts a fresh read");
+    assert.ok(previewRelay.sendAuthorizePreview("other-file", "read-intent-1", "allow", "other-preview-session"), "read guards are session-scoped");
+  } finally { previewRelay.stop(); }
+}
+assertAutomaticPreviewReads();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({
@@ -19663,5 +19683,38 @@ aliasSteerSocket.receive({
 assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
   "UserMsg.client_msg_id releases a full-history steer acceptance latch");
 aliasSteerRelay.stop();
+
+function testGeneratedImageCacheAliases() {
+const generatedImagesCache = new HistoryImageAssetCache(2);
+assert.equal(generatedImagesCache.begin({
+  sid: "generated-session", turnId: "old-public-id", imageId: "img-native-hash",
+  variant: "full", requestId: "generated-full", revision: "generated-r1",
+}), true);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash"), undefined,
+"an unfinished image request must not be aliased");
+assert.equal(generatedImagesCache.accept({
+  v: 52, ts: 1, type: "history_image", session_id: "generated-session",
+  turn_id: "old-public-id", image_id: "img-native-hash", variant: "full",
+  request_id: "generated-full", revision: "generated-r1",
+  data: "original-bytes", media_type: "image/png", width: 1400, height: 900,
+}), true);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash")?.data, "original-bytes");
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("another-session"), "img-native-hash"), undefined);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "another-image"), undefined);
+assert.equal(readyGeneratedImageAsset({
+  [historyImageAssetKey("old-public-id", "img-native-hash", "thumbnail")]: {
+    status: "ready", data: "low-res", mediaType: "image/png",
+  },
+}, "img-native-hash"), undefined, "a thumbnail must not replace a full-width generated image");
+generatedImagesCache.dropSession("generated-session");
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash"), undefined,
+"hard history invalidation must also drop the warm image alias");
+}
+testGeneratedImageCacheAliases();
 
 console.log("web reliability tests passed");

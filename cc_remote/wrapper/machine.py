@@ -293,10 +293,12 @@ from cc_remote.wrapper.codex_stream import (
     codex_live_user_message,
     codex_rollout_task_bindings,
     codex_history_image_views, codex_session_id, is_turn_terminal,
+    codex_generated_image_ref,
     codex_history_boundary_process_start, codex_history_boundary_user,
     codex_history_turn_user,
     codex_history_turn_users,
     codex_history_native_witness, codex_history_process_witnesses,
+    codex_history_process_append,
     codex_history_window_info,
     codex_native_rollback_turns,
     codex_translate_history,
@@ -1087,7 +1089,8 @@ def _merge_codex_history_image_views(
     for index, row in enumerate(merged):
         if (
             row.get("type") == "process"
-            and _normalized_tool_name(row.get("tool")) == "viewimage"
+            and _normalized_tool_name(row.get("tool")) in {
+                "viewimage", "imagegeneration"}
         ):
             official_indexes.append(index)
 
@@ -1106,12 +1109,26 @@ def _merge_codex_history_image_views(
         matched_index = next((
             index for index in official_indexes
             if index not in used_official
+            and _normalized_tool_name(merged[index].get("tool"))
+            == _normalized_tool_name(event.get("tool"))
             and merged[index].get("item_id") == event.get("item_id")
         ), None)
+        image_ref = event_input.get("history_image") if isinstance(event_input, dict) else None
+        if matched_index is None and isinstance(image_ref, dict):
+            matched_index = next((
+                index for index in official_indexes
+                if index not in used_official
+                and _normalized_tool_name(merged[index].get("tool"))
+                == _normalized_tool_name(event.get("tool"))
+                and isinstance(merged[index].get("input"), dict)
+                and merged[index]["input"].get("history_image") == image_ref
+            ), None)
         if matched_index is None and isinstance(image_path, str):
             matched_index = next((
                 index for index in official_indexes
                 if index not in used_official
+                and _normalized_tool_name(merged[index].get("tool"))
+                == _normalized_tool_name(event.get("tool"))
                 and isinstance(merged[index].get("input"), dict)
                 and (
                     merged[index]["input"].get("file_path")
@@ -1133,7 +1150,7 @@ def _merge_codex_history_image_views(
             if image_path:
                 official_input.setdefault("file_path", image_path)
             official["input"] = official_input or None
-            official["tool"] = "view_image"
+            official["tool"] = event["tool"]
             merged[matched_index] = official
             matched_official_calls.add(view.call_id)
 
@@ -1490,11 +1507,13 @@ class _CodexProcessWitnessCache:
     """Append-safe offsets and positive process proof for official pages."""
 
     source: HistorySourceFingerprint
+    head_source: HistorySourceFingerprint | None = None
     head_native_turn_ids: tuple[str, ...] = ()
     head: CodexHistoryNativeWitness | None = None
     offsets: dict[str, int] = dataclass_field(default_factory=dict)
     pages: OrderedDict[
-        tuple[str, int], CodexHistoryProcessPageWitness
+        tuple[str, int, tuple[str, ...]],
+        tuple[HistorySourceFingerprint, CodexHistoryProcessPageWitness, bool],
     ] = dataclass_field(default_factory=OrderedDict)
 
 
@@ -1593,7 +1612,7 @@ def _codex_official_projection_outcome(
 def _apply_codex_process_witness(
     page: CodexHistoryPage,
     witness: CodexHistoryNativeWitness,
-) -> None:
+) -> set[str]:
     """Overlay source-bound public-process proof onto opaque native summaries.
 
     The official ``itemsView=summary`` response intentionally omits tools and
@@ -1602,6 +1621,7 @@ def _apply_codex_process_witness(
     projection omitted tools. Absence is never used to claim a direct reply
     because a bounded scan may have skipped a large record or started mid-turn.
     """
+    image_turns: set[str] = set()
     for turn in page.turns:
         current_started = turn.get("processStartedTs")
         current_done = turn.get("processDoneTs")
@@ -1610,11 +1630,6 @@ def _apply_codex_process_witness(
             and isinstance(current_done, int)
             and current_done - current_started >= MIN_PROCESS_DURATION_MS
         )
-        if (
-            turn.get("processDetailState") == "present"
-            and current_timing_is_exact
-        ):
-            continue
         visible_id = turn.get("id")
         process = (
             witness.process_by_visible_id.get(visible_id)
@@ -1626,6 +1641,11 @@ def _apply_codex_process_witness(
                 process = witness.process_by_native_segment.get(
                     native_segment)
         if process is None:
+            continue
+        if process.generated_images and isinstance(visible_id, str):
+            image_turns.add(visible_id)
+        if (turn.get("processDetailState") == "present"
+                and current_timing_is_exact):
             continue
         turn["processDetailState"] = "present"
         reasons = list(turn.get("detailReasons") or [])
@@ -1649,6 +1669,7 @@ def _apply_codex_process_witness(
             # with the parser-time ``0s`` produced by a hydrated native turn.
             turn.pop("processStartedTs", None)
             turn.pop("processDoneTs", None)
+    return image_turns
 
 
 def _apply_codex_process_clocks(
@@ -3768,6 +3789,80 @@ class WrapperMachine:
         while len(self._codex_process_witness_caches) > 64:
             self._codex_process_witness_caches.popitem(last=False)
         return cache
+
+    async def _refine_codex_page_process(
+        self,
+        sid: str,
+        page: CodexHistoryPage,
+        source: HistorySourceFingerprint,
+        *,
+        revision: str,
+        before: str,
+        before_offset: int | None,
+        max_turns: int,
+        native_turn_ids: tuple[str, ...],
+        stable: bool,
+    ) -> set[str]:
+        """Recover only requested process metadata, never full turn contents.
+
+        Closed older native tasks are immutable across appends. A proven head
+        segment can be extended using only newly appended records. Unknown or
+        changed ownership still requires the exact source-bound parser.
+        """
+        cache = self._codex_process_witness_cache(sid, source)
+        key = (before, max_turns, native_turn_ids)
+        cached = cache.pages.get(key)
+        witness = None
+        try:
+            if cached is not None:
+                cached_source, cached_witness, cached_stable = cached
+                if cached_source == source:
+                    witness = cached_witness
+                elif history_source_extends(cached_source, source):
+                    if cached_stable:
+                        witness = cached_witness
+                    elif cached_witness.append_segment is not None:
+                        witness = await asyncio.to_thread(
+                            codex_history_process_append, source.path,
+                            previous=cached_witness,
+                            start_offset=cached_source.size,
+                            end_offset=source.size,
+                        )
+            if witness is None:
+                witness = await asyncio.to_thread(
+                    codex_history_process_witnesses,
+                    source.path,
+                    before=before,
+                    before_offset=before_offset,
+                    max_turns=max_turns,
+                    native_turn_ids=native_turn_ids,
+                    source_end_offset=source.size,
+                )
+            after = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, source.path)
+        except OSError:
+            return set()
+        if self._history_revision(sid) != revision or not (
+            source == after or history_source_extends(source, after)
+        ):
+            return set()
+        complete_coordinates = bool(native_turn_ids) and all(
+            (native, 0) in witness.offset_by_native_segment
+            for native in native_turn_ids
+        )
+        cache.source = after
+        cache.pages[key] = (source, witness, stable and complete_coordinates)
+        cache.pages.move_to_end(key)
+        while len(cache.pages) > 256:
+            cache.pages.popitem(last=False)
+        cache.offsets.update(_codex_visible_process_offsets(
+            page, visible=witness.offset_by_visible_id,
+            native_segments=witness.offset_by_native_segment,
+        ))
+        return _apply_codex_process_witness(page, CodexHistoryNativeWitness(
+            process_by_visible_id=witness.process_by_visible_id,
+            process_by_native_segment=witness.process_by_native_segment,
+        ))
 
     def _codex_rollout_history_active(self, sid: str) -> bool:
         return self._codex_rollout_history_revisions.get(
@@ -9426,10 +9521,11 @@ class WrapperMachine:
     async def _observe_preview_image_event(
         self, ctx: SessionContext, msg,
     ) -> None:
-        """Capture cwd-external images only after their tool read succeeds."""
+        """Capture images only after a native image read/generation succeeds."""
         if isinstance(msg, ProcessEvent):
             tool = re.sub(r"[^a-z0-9]", "", (msg.tool or "").lower())
-            if msg.kind != "server_tool" or tool != "viewimage":
+            if msg.kind != "server_tool" or tool not in {
+                    "viewimage", "imagegeneration"}:
                 if msg.phase == "end":
                     # An extension-classified Read can resolve to ordinary text
                     # or an error. Its terminal event deliberately changes back
@@ -9472,6 +9568,8 @@ class WrapperMachine:
             if msg.status in {
                     "failed", "declined", "cancelled", "interrupted"}:
                 return
+            if tool == "imagegeneration" and msg.status != "succeeded":
+                return
             try:
                 capability = self._preview_capability_store.inspect_path(
                     ctx.engine,
@@ -9489,6 +9587,17 @@ class WrapperMachine:
                 )
             except (OSError, ValueError, PreviewCapabilityError):
                 return
+            if tool == "imagegeneration" and isinstance(msg.input, dict):
+                expected_ref = msg.input.get("history_image")
+                dimensions = image_dimensions(data, media_type)
+                if isinstance(expected_ref, dict) and (
+                    not msg.turn_id or dimensions is None
+                    or codex_generated_image_ref(
+                        msg.turn_id, (media_type, *dimensions, data)) != expected_ref
+                ):
+                    # The output path may already have been overwritten. Never
+                    # show that new file as the old native generated result.
+                    return
             self._store_preview_image_snapshot(
                 ctx.preview_snapshot_token,
                 candidate,
@@ -15126,60 +15235,16 @@ class WrapperMachine:
                 raise OSError(
                     "Codex rollout identity changed during History read")
 
+        generated_image_turns: set[str] = set()
         if before is not None and source_path and source_before is not None:
             process_cache = self._codex_process_witness_cache(
                 sid, source_before)
-            process_page_turns = max(
-                limit or 4,
-                len(page.native_turn_ids),
-            )
-            process_page_key = (before, process_page_turns)
-            process_page = process_cache.pages.get(process_page_key)
-            try:
-                if process_page is None:
-                    process_page = await asyncio.to_thread(
-                        codex_history_process_witnesses,
-                        source_path,
-                        before=before,
-                        before_offset=process_cache.offsets.get(before),
-                        max_turns=process_page_turns,
-                    )
-                source_after = await asyncio.to_thread(
-                    HistorySourceFingerprint.capture, source_path)
-            except OSError:
-                process_page = None
-            else:
-                if (
-                    (
-                        source_after == source_before
-                        or history_source_extends(
-                            source_before, source_after)
-                    )
-                    and self._history_revision(sid) == revision
-                    and process_page is not None
-                ):
-                    process_cache.source = source_after
-                    process_cache.offsets.update(
-                        _codex_visible_process_offsets(
-                            page,
-                            visible=process_page.offset_by_visible_id,
-                            native_segments=(
-                                process_page.offset_by_native_segment),
-                        )
-                    )
-                    process_cache.pages[process_page_key] = process_page
-                    process_cache.pages.move_to_end(process_page_key)
-                    while len(process_cache.pages) > 256:
-                        process_cache.pages.popitem(last=False)
-                    _apply_codex_process_witness(
-                        page,
-                        CodexHistoryNativeWitness(
-                            process_by_visible_id=(
-                                process_page.process_by_visible_id),
-                            process_by_native_segment=(
-                                process_page.process_by_native_segment),
-                        ),
-                    )
+            generated_image_turns.update(await self._refine_codex_page_process(
+                sid, page, source_before, revision=revision, before=before,
+                before_offset=process_cache.offsets.get(before),
+                max_turns=max(limit or 4, len(page.native_turn_ids)),
+                native_turn_ids=page.native_turn_ids, stable=True,
+            ))
 
         projection_outcome = "not-applicable"
         if before is None and source_path:
@@ -15191,7 +15256,7 @@ class WrapperMachine:
                         sid, source_before)
                     head_ids = tuple(page.native_turn_ids)
                     exact_cached_head = (
-                        process_cache.source == source_before
+                        process_cache.head_source == source_before
                         and process_cache.head_native_turn_ids == head_ids
                         and process_cache.head is not None
                     )
@@ -15255,8 +15320,10 @@ class WrapperMachine:
                         # completeness still requires the exact frozen source
                         # below, so this refinement cannot make a moving page
                         # authoritative.
-                        _apply_codex_process_witness(page, process_witness)
+                        generated_image_turns.update(
+                            _apply_codex_process_witness(page, process_witness))
                         process_cache.source = source_after
+                        process_cache.head_source = source_before
                         process_cache.head_native_turn_ids = head_ids
                         process_cache.head = process_witness
                         process_cache.offsets.update(
@@ -15277,6 +15344,31 @@ class WrapperMachine:
                     else:
                         projection_outcome = _codex_official_projection_outcome(
                             page, witness)
+                    if (same_revision and source_compatible
+                            and projection_outcome != "mismatch"):
+                        # A large latest task can consume the entire bounded
+                        # head scan. Its missing older page rows are unknown,
+                        # not process/image-free. Resolve those exact native
+                        # coordinates separately; never widen the completeness
+                        # witness or load all of their heavy turn details.
+                        missing_ids = tuple(
+                            native for native in page.native_turn_ids
+                            if (native, 0) not in
+                            process_witness.offset_by_native_segment
+                        )
+                        if missing_ids:
+                            first_missing = page.native_turn_ids.index(missing_ids[0])
+                            anchor_offset = None
+                            if first_missing:
+                                anchor_offset = process_witness.offset_by_native_segment.get(
+                                    (page.native_turn_ids[first_missing - 1], 0))
+                            generated_image_turns.update(await self._refine_codex_page_process(
+                                sid, page, source_after, revision=revision,
+                                before=page.oldest_id or "head",
+                                before_offset=anchor_offset,
+                                max_turns=len(missing_ids), native_turn_ids=missing_ids,
+                                stable=first_missing > 0,
+                            ))
         if projection_outcome == "mismatch" and not in_progress:
             raise _CodexOfficialProjectionIncomplete(
                 "stable rollout contains turns omitted by official history")
@@ -15284,6 +15376,28 @@ class WrapperMachine:
             projection_outcome = "inconclusive"
 
         _apply_codex_process_clocks(page.turns, process_clocks)
+
+        # Official summary intentionally omits imageGeneration items. Only
+        # positive, source-bound witnesses on this requested page trigger the
+        # existing lazy image supplement; ordinary histories do no extra I/O.
+        for turn in page.turns:
+            if turn["id"] not in generated_image_turns:
+                continue
+            summary_rows = self._codex_history.summary_events(sid, turn["id"])
+            if summary_rows is None:
+                continue
+            image_rows = await self._supplement_codex_history_image_views(
+                sid, turn["id"], summary_rows)
+            materialized = materialize_history_turns(image_rows)
+            if len(materialized) != 1 or materialized[0]["id"] != turn["id"]:
+                continue
+            images = [block for block in materialized[0]["blocks"]
+                      if block.get("tool") == "image_generation"]
+            if images:
+                existing = [block for block in turn["blocks"]
+                            if block.get("tool") != "image_generation"]
+                slots = max(0, 32 - len(existing))
+                turn["blocks"] = [*(images[-slots:] if slots else []), *existing]
 
         control_rows: list[dict] = []
         if before is None and ctx is not None:
@@ -15687,8 +15801,13 @@ class WrapperMachine:
             parsed = False
             if cached is not None:
                 cached_source, cached_views = cached
-                if await asyncio.to_thread(
-                    history_source_extends, cached_source, source,
+                # Appends can contain a new image in this same active segment.
+                # Source extension is sufficient for existing binary assets,
+                # but not for reusing an exhaustive list of image activities.
+                if cached_source == source or (
+                    cached_views and all(view.source_complete for view in cached_views)
+                    and await asyncio.to_thread(
+                        history_source_extends, cached_source, source)
                 ):
                     views = cached_views
                     self._codex_history_image_views.move_to_end(cache_key)
@@ -15788,6 +15907,7 @@ class WrapperMachine:
                             event=view.event,
                             previous_item_id=view.previous_item_id,
                             next_item_id=view.next_item_id,
+                            source_complete=view.source_complete,
                         )
                         for view in views
                     ),
@@ -16612,7 +16732,8 @@ class WrapperMachine:
                 if official_rows is not None:
                     official_image = history_image_from_events(
                         official_rows, cmd.turn_id, cmd.image_id)
-                    if official_image is not None:
+                    if (official_image is not None
+                            and isinstance(official_image.get("data"), str)):
                         media_type, width, height, data = await asyncio.to_thread(
                             _render_history_image,
                             official_image,
@@ -16639,15 +16760,10 @@ class WrapperMachine:
 
             rows = None
             if is_codex:
+                official_rows = None
                 try:
                     official_rows = await self._codex_history.turn_events(
                         sid, cmd.turn_id)
-                    rows = await self._supplement_codex_history_image_views(
-                        sid,
-                        cmd.turn_id,
-                        official_rows,
-                        required_image_id=cmd.image_id,
-                    )
                 except (
                     CodexHistoryCursorError,
                     CodexHistoryInvalidResponse,
@@ -16657,7 +16773,19 @@ class WrapperMachine:
                     OSError,
                     RuntimeError,
                 ):
-                    rows = None
+                    pass
+                # Public user/item ids can change after a new turn. An issued
+                # locator still binds the exact native task and steer segment;
+                # use that source witness even if the old public detail id no
+                # longer materializes. Never search neighbouring turns.
+                supplemented = await self._supplement_codex_history_image_views(
+                    sid,
+                    cmd.turn_id,
+                    official_rows or [],
+                    required_image_id=cmd.image_id,
+                )
+                if official_rows is not None or supplemented:
+                    rows = supplemented
             if rows is None:
                 rows = await asyncio.to_thread(
                     self._history_index.get_turn_detail,

@@ -418,6 +418,8 @@ export function BtwPanel(p: Props) {
                 imageAssets={p.imageAssets}
                 onLoadImage={p.onLoadImage}
                 onAuthorizeImage={p.onAuthorizeImage}
+                asyncReplyMode={runtimeState === "running" ? "steer"
+                  : runtimeState === "idle" ? "query" : undefined}
                 onReplyAsyncQuestion={p.engine !== "codex" || !p.sid
                   || acceptancePending
                   || (p.rt?.control ? sessionControlLocksInput(p.rt.control) : p.rt?.external)

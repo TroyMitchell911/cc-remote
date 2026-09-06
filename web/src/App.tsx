@@ -5582,6 +5582,8 @@ export default function App() {
                 ? undefined : loadHistoryTurnDetail}
               onEdit={historyView.recovering
                 ? undefined : (prompt) => setEditPrompt(prompt)}
+              asyncReplyMode={rt.state === "running" ? "steer"
+                : rt.state === "idle" ? "query" : undefined}
               onReplyAsyncQuestion={focusedEngine !== "codex"
                 || historyView.recovering || !state.wrapperOnline
                 || state.connState !== "connected"

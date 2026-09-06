@@ -219,6 +219,7 @@ export class RelayWs {
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
   private readonly knownBtwSids = new Set<string>();
+  private readonly previewReadAttempts = new Map<string, { authorizationId: string; commandId: string }>();
 
   constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
@@ -928,7 +929,15 @@ export class RelayWs {
     decision: "allow" | "deny",
     targetSid?: string | null,
   ): string | null {
-    return this.sendTracked({
+    const key = JSON.stringify([this.sidObj(targetSid).sid ?? null, requestId]);
+    const previous = this.previewReadAttempts.get(key);
+    // Automatic read handshakes must not loop if a producer keeps atomically
+    // replacing the file. Same challenge is idempotent; a changed challenge
+    // requires a fresh read request (e.g. the existing Refresh action).
+    if (decision === "allow" && previous) {
+      return previous.authorizationId === authorizationId ? previous.commandId : null;
+    }
+    const commandId = this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "authorize_preview",
       authorization_id: authorizationId,
@@ -937,6 +946,13 @@ export class RelayWs {
       ts: nowTs(),
       ...this.sidObj(targetSid),
     });
+    if (commandId && decision === "allow") {
+      this.previewReadAttempts.set(key, { authorizationId, commandId });
+      if (this.previewReadAttempts.size > 256) {
+        this.previewReadAttempts.delete(this.previewReadAttempts.keys().next().value!);
+      }
+    }
+    return commandId;
   }
 
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains

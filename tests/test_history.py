@@ -41,6 +41,7 @@ from cc_remote.protocol import (
     is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.codex_history import (
     CodexHistoryCursorError,
@@ -2878,7 +2879,7 @@ def test_requested_codex_summary_restores_process_beyond_recent_hydration(
     asyncio.run(run())
 
 
-def test_requested_codex_summary_never_scans_beyond_tail_budget(
+def test_requested_codex_summary_keeps_completeness_witness_bounded(
     monkeypatch, tmp_path,
 ):
     rollout = tmp_path / "adaptive-process-summary.jsonl"
@@ -2903,6 +2904,13 @@ def test_requested_codex_summary_never_scans_beyond_tail_budget(
         )
 
     monkeypatch.setattr(mm, "codex_history_native_witness", witness)
+    metadata_calls = []
+
+    def missing_metadata(_path, **kwargs):
+        metadata_calls.append(kwargs)
+        return CodexHistoryProcessPageWitness()
+
+    monkeypatch.setattr(mm, "codex_history_process_witnesses", missing_metadata)
 
     class Official:
         async def summary_page(self, *_args, **_kwargs):
@@ -2954,6 +2962,176 @@ def test_requested_codex_summary_never_scans_beyond_tail_budget(
         assert len(calls) == 1
         assert calls[0][1] is not None
         assert calls[0][2] == ()
+        # Missing metadata is not negative evidence. Retry on a changed source,
+        # but do not repeatedly rescan an unchanged rollout on passive refresh.
+        assert len(metadata_calls) == 1
+        assert set(metadata_calls[0]["native_turn_ids"]) == {
+            "native-0", "native-1", "native-2", "native-3",
+        }
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stable", [False, True])
+def test_requested_process_metadata_retries_flushes_and_invalidates_rewrites(
+    monkeypatch, tmp_path, stable,
+):
+    rollout = tmp_path / "process-cache.jsonl"
+    rollout.write_text("initial\n")
+    scans = []
+
+    def witness(_path, **_kwargs):
+        scans.append(rollout.read_text())
+        if "flushed" not in scans[-1]:
+            return CodexHistoryProcessPageWitness()
+        return CodexHistoryProcessPageWitness(
+            process_by_native_segment={
+                ("native-old", 0): CodexHistoryProcessWitness(
+                    started_ms=1000, done_ms=4000, generated_images=True),
+            },
+            offset_by_native_segment={("native-old", 0): 1},
+        )
+
+    monkeypatch.setattr(mm, "codex_history_process_witnesses", witness)
+
+    async def run():
+        machine, _ = _mk_machine()
+        sid = "process-cache"
+
+        async def read():
+            page = CodexHistoryPage(
+                events=(), turns=(_empty_summary_turn("item-old"),),
+                has_more=False, oldest_id="item-old", newest_id="item-old",
+                native_turn_ids=("native-old",),
+                native_segment_by_visible_id={"item-old": ("native-old", 0)},
+            )
+            images = await machine._refine_codex_page_process(
+                sid, page, HistorySourceFingerprint.capture(str(rollout)),
+                revision=machine._history_revision(sid), before="item-opaque",
+                before_offset=None, max_turns=1,
+                native_turn_ids=("native-old",), stable=stable,
+            )
+            return images, page.turns[0]
+
+        assert (await read())[0] == set()
+        assert (await read())[0] == set()
+        assert len(scans) == 1
+        with rollout.open("a") as output:
+            output.write("flushed\n")
+        images, turn = await read()
+        assert images == {"item-old"}
+        assert turn["processDoneTs"] - turn["processStartedTs"] == 3000
+        assert len(scans) == 2
+        with rollout.open("a") as output:
+            output.write("newer append\n")
+        assert (await read())[0] == {"item-old"}
+        assert len(scans) == (2 if stable else 3)
+        # A rewrite is not an append; cached proof may never cross it.
+        rollout.write_text("replacement without old process\n")
+        assert (await read())[0] == set()
+        assert len(scans) == (3 if stable else 4)
+
+    asyncio.run(run())
+
+
+def test_large_head_process_metadata_reads_only_appends(monkeypatch, tmp_path):
+    rollout = tmp_path / "large-process-head.jsonl"
+
+    def row(kind, *, second=0, **payload):
+        return (json.dumps({
+            "timestamp": f"2026-09-06T00:00:{second:02d}Z",
+            "type": "event_msg",
+            "payload": {"type": kind, **payload},
+        }) + "\n").encode()
+
+    prefix = (
+        row("task_started", turn_id="native-head")
+        + row("user_message", turn_id="native-head", message="test")
+        + row("exec_command_end", second=1, call_id="cmd", exit_code=0)
+    )
+    with rollout.open("wb") as output:
+        output.write(prefix)
+        # More than the normal head budget, without retaining tool payloads in
+        # either the metadata cache or this test's Python objects.
+        filler = b'{"type":"response_item","payload":{"type":"reasoning","text":"' \
+            + b"x" * (1024 * 1024) + b'"}}\n'
+        for _ in range(16):
+            output.write(filler)
+
+    original_open = open
+    reads = []
+
+    class CountedFile:
+        def __init__(self, source):
+            self.source = source
+
+        def __enter__(self):
+            self.source.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.source.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.source, name)
+
+        def read(self, *args):
+            data = self.source.read(*args)
+            reads.append(len(data))
+            return data
+
+    monkeypatch.setattr(codex_stream_module, "open", lambda *args, **kwargs:
+                        CountedFile(original_open(*args, **kwargs)), raising=False)
+
+    async def run():
+        machine, _ = _mk_machine()
+
+        async def read():
+            page = CodexHistoryPage(
+                events=(), turns=(_empty_summary_turn("item-head"),),
+                has_more=False, oldest_id="item-head", newest_id="item-head",
+                native_turn_ids=("native-head",),
+                native_segment_by_visible_id={"item-head": ("native-head", 0)},
+            )
+            images = await machine._refine_codex_page_process(
+                "large-head", page, HistorySourceFingerprint.capture(rollout),
+                revision=machine._history_revision("large-head"),
+                before="item-head", before_offset=None, max_turns=1,
+                native_turn_ids=("native-head",), stable=False,
+            )
+            return images, page.turns[0]
+
+        await read()
+        assert sum(reads) >= rollout.stat().st_size
+        reads.clear()
+        await read()
+        assert sum(reads) == 0
+        for second in (5, 9):
+            # A single appended record also exercises the reverse-reader seam:
+            # the first suffix row must not be discarded as a partial line.
+            appended = row("exec_command_end", second=second,
+                           call_id="cmd", exit_code=0)
+            with rollout.open("ab") as output:
+                output.write(appended)
+            reads.clear()
+            _, turn = await read()
+            assert sum(reads) <= len(appended) + 3
+            assert turn["processDoneTs"] - turn["processStartedTs"] == (second - 1) * 1000
+        appended = row("image_generation_end", second=10, call_id="image")
+        with rollout.open("ab") as output:
+            output.write(appended)
+        reads.clear()
+        images, _ = await read()
+        assert images == {"item-head"}
+        assert sum(reads) <= len(appended) + 3
+        # Rewrites invalidate the prefix rather than carrying old image/time
+        # evidence into a different source occupying the same path.
+        rollout.write_bytes(
+            row("task_started", turn_id="native-head")
+            + row("user_message", turn_id="native-head", message="test"))
+        images, turn = await read()
+        assert not images
+        assert turn["processDetailState"] == "none"
 
     asyncio.run(run())
 
@@ -2978,9 +3156,11 @@ def test_requested_codex_older_process_pages_continue_from_cached_offset(
     older_calls = []
 
     def older_witness(
-        _path, *, before, before_offset, max_turns,
+        _path, *, before, before_offset, max_turns, native_turn_ids,
+        source_end_offset,
     ):
         older_calls.append((before, before_offset, max_turns))
+        assert native_turn_ids == ("native-old",)
         return CodexHistoryProcessPageWitness(
             process_by_visible_id={
                 "msg-old": CodexHistoryProcessWitness(

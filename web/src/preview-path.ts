@@ -26,8 +26,8 @@ function resolveLocalPath(markdownPath: string, target: string): string | null {
         return null;
       } else {
         // Preserve a relative escape for the authenticated wrapper to resolve.
-        // If it leaves cwd, the wrapper returns an exact-file confirmation
-        // challenge instead of reading it.
+        // If it leaves cwd, the wrapper uses an exact-file read capability;
+        // the browser completes that scoped handshake without a second prompt.
         resolved.push("..");
       }
       continue;
@@ -42,7 +42,7 @@ function resolveLocalPath(markdownPath: string, target: string): string | null {
 
 /** Resolve a Markdown link/image without ever assigning a local path to an
  * HTML URL. Paths outside cwd remain local targets and are subject to the
- * wrapper's exact-file confirmation flow. */
+ * wrapper's exact-file read capability flow. */
 export function classifyPreviewTarget(markdownPath: string, rawTarget: string): PreviewTarget {
   const target = rawTarget.trim();
   if (!target || target.length > 4096) return { kind: "blocked", value: "" };
