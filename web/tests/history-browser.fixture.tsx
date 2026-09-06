@@ -63,6 +63,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { MARKDOWN_HTML_GITHUB_README, MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README } from "./fixtures/markdown-html";
 import { SessionsSidebar } from "../src/components/SessionsSidebar";
 import { useMobileViewport } from "../src/use-mobile-viewport";
 import {
@@ -1071,6 +1072,7 @@ function HistoryConversationBrowserFixture() {
   const detailErrorOnce = params.has("detail-error-once");
   const detailOlderErrorOnce = params.has("detail-older-error-once");
   const detailRetainedPreview = params.has("detail-retained-preview");
+  const detailRestoredPage = params.get("detail-restored-page");
   const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
   const actualMermaid = params.has("actual-mermaid");
@@ -1105,8 +1107,25 @@ function HistoryConversationBrowserFixture() {
       return [compactToolsTurn()];
     }
     if (detailPaging) {
+      let detailTurn = detailPagingTurn("deferred", false, detailRetainedPreview);
+      if (detailRestoredPage === "process") {
+        detailTurn = {
+          ...detailPagingTurn("latest"),
+          detailLoaded: false, detailRestoreIncomplete: true,
+          processStartedTs: 10_000, processDoneTs: 10_000 + 129 * 60_000,
+        };
+      } else if (detailRestoredPage === "older" || detailRestoredPage === "newer") {
+        detailTurn = {
+          ...detailTurn,
+          processDetailState: "unknown", detailReasons: [], detailEventCount: 0,
+          detailHasMore: detailRestoredPage === "older",
+          detailOldestCursor: detailRestoredPage === "older" ? "detail-older" : undefined,
+          detailHasNewer: detailRestoredPage === "newer",
+          detailNewerCursor: detailRestoredPage === "newer" ? "detail-newer" : undefined,
+        };
+      }
       return [
-        detailPagingTurn("deferred", false, detailRetainedPreview),
+        detailTurn,
         ...(detailScrollCancel
           ? Array.from({ length: 6 }, (_, index) =>
             finalTurn(`detail-after-${index + 1}`, 3))
@@ -1165,7 +1184,7 @@ function HistoryConversationBrowserFixture() {
     }
     return INITIAL;
   }, [
-    actualMermaid, compactTools, detailPaging, detailRetainedPreview,
+    actualMermaid, compactTools, detailPaging, detailRetainedPreview, detailRestoredPage,
     detailScrollCancel, dualImage,
     interactiveTimeline, math, streamingMath,
     deepBrowse, invalidMermaid, large, largeCount, paragraphs, mermaid, mermaidHistory,
@@ -1455,7 +1474,8 @@ function HistoryConversationBrowserFixture() {
     detailRequestCountRef.current += 1;
     document.documentElement.dataset.detailRequests =
       String(detailRequestCountRef.current);
-    const page: DetailFixturePage = before === "detail-older"
+    // Either explicit cursor returns the terminal combined process window.
+    const page: DetailFixturePage = before === "detail-older" || before === "detail-newer"
       ? "older" : "latest";
     document.documentElement.dataset.detailLastBefore = before ?? "initial";
     const failThisRequest = (
@@ -1475,7 +1495,8 @@ function HistoryConversationBrowserFixture() {
             detailLoading: true,
             detailError: undefined,
             detailRetryBefore: before ?? null,
-            detailRetryDirection: before == null ? "initial" : "older",
+            detailRetryDirection: before == null ? "initial"
+              : before === "detail-newer" ? "newer" : "older",
           } : turn),
       },
     }));
@@ -2562,9 +2583,12 @@ function buildAnimatedGifFixture(): string {
 
 function ArtifactPreviewFixture({ kind }: {
   kind: "gif" | "invalid-gif" | "html" | "pdf" | "svg"
-    | "markdown-svg" | "markdown-source";
+    | "markdown-svg" | "markdown-source" | "markdown-html" | "markdown-github-html";
 }) {
+  const [openedFile, setOpenedFile] = useState("");
   const svgData = window.btoa(UNSAFE_SVG);
+  const htmlReadme = kind === "markdown-github-html"
+    ? MARKDOWN_HTML_GITHUB_README : MARKDOWN_HTML_LOCAL_README;
   const artifact = kind === "pdf"
     ? {
       file: "report.pdf",
@@ -2628,6 +2652,23 @@ function ArtifactPreviewFixture({ kind }: {
       size: UNSAFE_SVG.length,
       mtimeNs: "1",
     }
+    : kind === "markdown-html" || kind === "markdown-github-html"
+    ? {
+      file: "readme_zh.md", sid: "artifact-preview-session",
+      requestId: "artifact-preview-request", kind: "md" as const,
+      content: htmlReadme, size: htmlReadme.length,
+      mtimeNs: "1", revision: "c".repeat(64),
+      assets: {
+        "header.svg": {
+          mediaType: "image/svg+xml",
+          data: window.btoa(MARKDOWN_HTML_HEADER_SVG),
+        },
+        "local-logo.png": {
+          mediaType: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3x8AAAAASUVORK5CYII=",
+        },
+      },
+    }
     : kind === "markdown-source"
     ? {
       file: "LONG_REPORT.md",
@@ -2659,8 +2700,10 @@ function ArtifactPreviewFixture({ kind }: {
       },
     };
   return <main style={{ height: "100dvh" }}>
+    <output hidden data-testid="artifact-opened-file">{openedFile}</output>
     <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
       theme={kind === "html" ? "dark" : "light"}
+      onOpenFile={(path, line) => setOpenedFile(`${path}:${line || ""}`)}
       onTab={() => {}} onClose={() => {}} />
   </main>;
 }
@@ -2777,6 +2820,10 @@ createRoot(document.getElementById("root")!).render(
     ? <ArtifactPreviewFixture kind="markdown-svg" />
     : rootParams.has("artifact-markdown-source")
     ? <ArtifactPreviewFixture kind="markdown-source" />
+    : rootParams.has("artifact-markdown-github-html")
+    ? <ArtifactPreviewFixture kind="markdown-github-html" />
+    : rootParams.has("artifact-markdown-html")
+    ? <ArtifactPreviewFixture kind="markdown-html" />
     : rootParams.has("code-copy-theme")
     ? <CodeCopyThemeFixture
         theme={rootParams.get("theme") === "light" ? "light" : "dark"} />

@@ -820,6 +820,43 @@ try {
   assert.match(pagedUnknownMarkup, /查看更多内容/,
     "an actual unread detail page remains reachable without an empty placeholder");
 
+  const cursorlessMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "cursorless-detail-session", turns: [{
+      ...opaqueDirectSummary, detailHasMore: true, detailHasNewer: true,
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.doesNotMatch(cursorlessMarkup, /查看更多内容|turn-detail-entry/,
+    "stale pagination flags without a cursor cannot offer a repeating initial read");
+
+  const partiallyRestoredProcess: Turn = {
+    ...sourceTimedProcess,
+    blocks: [generated, ...exactDirectDetail.blocks],
+    detailLoaded: false, detailRestoreIncomplete: true,
+    detailHasMore: true, detailOldestCursor: "older-process-page",
+    detailEventCount: 433,
+    processDoneTs: sourceTimedProcess.processStartedTs! + 129 * 60_000,
+  };
+  const partiallyRestoredMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "partially-restored-session", turns: [partiallyRestoredProcess],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(partiallyRestoredMarkup, /已处理 2h 9m/);
+  assert.match(partiallyRestoredMarkup, /generated-image-gallery/,
+    "output images stay outside the collapsed process disclosure");
+  assert.doesNotMatch(partiallyRestoredMarkup, /查看更多内容|turn-detail-entry/,
+    "a known process owns its pagination without a second inert entry below the answer");
+
+  const processWithTruncatedAnswerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "process-with-truncated-answer", turns: [{
+      ...partiallyRestoredProcess, detailReasons: ["process", "answer_truncated"],
+    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(processWithTruncatedAnswerMarkup, /查看完整内容/,
+    "real deferred answer content retains its own entry even beside a process disclosure");
+
   const restoredProcessMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "restored-process-session", turns: [restoredUnknownProcess],
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},

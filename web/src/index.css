@@ -839,6 +839,10 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .source-line.focused{ background:var(--accent-weak); box-shadow:inset 3px 0 var(--accent); }
 .source-line.focused .source-line-no{ color:var(--accent-ink); background:var(--accent-weak); }
 .markdown-preview{ max-width:780px; margin:0 auto; overflow-wrap:anywhere; }
+.markdown-preview [align="center"]{ text-align:center; }
+.markdown-preview [align="left"]{ text-align:left; }
+.markdown-preview [align="right"]{ text-align:right; }
+.markdown-preview [align="justify"]{ text-align:justify; }
 .markdown-preview img{ display:block; max-height:min(66vh,720px); margin:14px auto; border-radius:9px; object-fit:contain; }
 .markdown-preview pre{ white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; overflow-x:hidden; }
 .markdown-preview table{ display:table; width:100%; max-width:100%; table-layout:fixed; }

@@ -228,7 +228,8 @@ def test_insecure_caddy_template_is_explicit_http_without_tls_headers():
     assert "ws://cc-remote.example.com" in source
     assert "reverse_proxy 127.0.0.1:8765" in source
     assert "Strict-Transport-Security" not in source
-    assert "https://" not in source
+    # HTTPS-only remote images do not make the application site use TLS.
+    assert "https://cc-remote.example.com" not in source
 
 
 def test_deploy_examples_configure_insecure_flag_on_both_sides():
@@ -1063,3 +1064,39 @@ def test_caddy_image_policy_allows_only_image_blob_urls(template):
         for name, sources in directives.items()
         if name != "img-src"
     )
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_caddy_github_image_allowlist_does_not_relax_other_capabilities(template):
+    source = (ROOT / "deploy" / template).read_text()
+    policies = re.findall(r'Content-Security-Policy "([^"]+)"', source)
+    assert len(policies) == 2
+    application, preview = (
+        {
+            parts[0]: set(parts[1:])
+            for directive in policy.split(";")
+            if (parts := directive.strip().split())
+        }
+        for policy in policies
+    )
+    github_images = {
+        "https://github.com/user-attachments/assets/",
+        "https://raw.githubusercontent.com",
+        "https://user-images.githubusercontent.com",
+        "https://private-user-images.githubusercontent.com",
+        "https://camo.githubusercontent.com",
+        "https://avatars.githubusercontent.com",
+        "https://github-production-user-asset-6210df.s3.amazonaws.com",
+    }
+    assert application["img-src"] == {"'self'", "data:", "blob:"} | github_images
+    for directive, sources in application.items():
+        if directive != "img-src":
+            assert sources.isdisjoint(github_images)
+    assert application["script-src"] == {"'self'"}
+    ws_scheme = "ws" if template.endswith(".insecure") else "wss"
+    assert application["connect-src"] == {
+        "'self'", f"{ws_scheme}://cc-remote.example.com",
+    }
+    assert application["frame-src"] == {"'self'"}
+    assert preview["img-src"] == {"data:", "blob:"}
+    assert preview["connect-src"] == {"'none'"}

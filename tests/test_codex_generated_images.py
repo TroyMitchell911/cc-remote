@@ -44,7 +44,7 @@ def _row(payload, *, timestamp="2026-09-05T13:00:00Z"):
     return {"type": "event_msg", "timestamp": timestamp, "payload": payload}
 
 
-def _rows(encoded, *, complete=True):
+def _rows(encoded, *, complete=True, storage="legacy"):
     rows = [
         _row({"type": "task_started", "turn_id": "native-1"}),
         _row({"type": "user_message", "message": "draw"}),
@@ -52,6 +52,13 @@ def _rows(encoded, *, complete=True):
               "status": "completed", "result": encoded,
               "saved_path": "/missing/generated.png"}),
     ]
+    if storage == "extension":
+        rows[2] = _row({
+            "type": "item_completed", "turn_id": "native-1",
+            "item": {"type": "Extension", "kind": "image_gen.generation",
+                     "id": "raw-image-call", "status": "completed",
+                     "result": encoded, "savedPath": "/missing/generated.png"},
+        })
     if complete:
         rows.append(_row({"type": "task_complete", "turn_id": "native-1"}))
     return rows
@@ -124,9 +131,10 @@ def test_image_supplement_completion_requires_its_own_native_terminal(tmp_path):
         assert len(views) == 1 and views[0].source_complete is complete
 
 
-def test_generated_image_rollout_ref_matches_official_and_is_exact_segment_scoped(tmp_path):
+@pytest.mark.parametrize("storage", ["legacy", "extension"])
+def test_generated_image_rollout_ref_matches_official_and_is_exact_segment_scoped(tmp_path, storage):
     raw, encoded = _image()
-    rows = _rows(encoded, complete=False)
+    rows = _rows(encoded, complete=False, storage=storage)
     rows.append(rows[-1])  # Duplicate native completion must not duplicate output.
     rows.extend([
         _row({"type": "user_message", "message": "steer the same task"}),
@@ -156,10 +164,11 @@ def test_generated_image_rollout_ref_matches_official_and_is_exact_segment_scope
     assert encoded not in "".join(e.model_dump_json() for e in translated)
 
 
-def test_generated_image_history_is_lazy_and_survives_missing_saved_file(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage", ["legacy", "extension"])
+def test_generated_image_history_is_lazy_and_survives_missing_saved_file(monkeypatch, tmp_path, storage):
     raw, encoded = _image()
     path = tmp_path / "rollout.jsonl"
-    path.write_text("".join(json.dumps(row) + "\n" for row in _rows(encoded)))
+    path.write_text("".join(json.dumps(row) + "\n" for row in _rows(encoded, storage=storage)))
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(path))
     image_event = _event(_item(encoded)).model_dump(mode="json")
     official = [
@@ -173,7 +182,7 @@ def test_generated_image_history_is_lazy_and_survives_missing_saved_file(monkeyp
             return official
 
         async def turn_events(self, _sid, _turn_id):
-            return official
+            raise AssertionError("an exact local image must not fetch all native tool pages")
 
         def rollout_fallback(self, _sid, _turn_id):
             return SimpleNamespace(native_turn_id="native-1", segment_index=0)
@@ -223,11 +232,12 @@ def test_active_image_supplement_cache_does_not_hide_later_generated_output(monk
     asyncio.run(run())
 
 
-def test_generated_image_old_public_id_uses_exact_native_locator(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage", ["legacy", "extension"])
+def test_generated_image_old_public_id_uses_exact_native_locator(monkeypatch, tmp_path, storage):
     """Sending a new turn must not break an already-issued image reference."""
     raw, encoded = _image()
     path = tmp_path / "rollout.jsonl"
-    rows = _rows(encoded)
+    rows = _rows(encoded, storage=storage)
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(path))
 
@@ -312,14 +322,15 @@ def test_generated_image_capture_uses_existing_scoped_snapshot_only_after_succes
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("storage", ["legacy", "extension"])
 @pytest.mark.parametrize("before,head_budget", [
     (None, 8 * 1024 * 1024),
     (None, 1024 * 1024),
     ("item-opaque-cold-page", 8 * 1024 * 1024),
 ])
-def test_official_summary_omitting_image_items_recovers_only_witnessed_output(monkeypatch, tmp_path, before, head_budget):
+def test_official_summary_omitting_image_items_recovers_only_witnessed_output(monkeypatch, tmp_path, before, head_budget, storage):
     _, encoded = _image()
-    rows = _rows(encoded)
+    rows = _rows(encoded, storage=storage)
     rows[2]["timestamp"] = "2026-09-05T13:00:03Z"
     rows[2:2] = [{"type": "response_item", "timestamp": "2026-09-05T13:00:01Z",
                   "payload": {"type": "function_call", "name": "exec_command",
@@ -376,3 +387,24 @@ def test_official_summary_omitting_image_items_recovers_only_witnessed_output(mo
         assert len(history.model_dump_json()) < 8000
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("mutation", [
+    {"turn_id": "another-native"},
+    {"kind": "unrelated.extension"},
+    {"status": "failed"},
+    {"status": "inProgress"},
+    {"result": "not-an-image"},
+    {"id": "../invalid"},
+])
+def test_generated_extension_recovery_rejects_wrong_owner_and_invalid_output(tmp_path, mutation):
+    _, encoded = _image()
+    rows = _rows(encoded, storage="extension")
+    payload = rows[2]["payload"]
+    if "turn_id" in mutation:
+        payload.update(mutation)
+    else:
+        payload["item"].update(mutation)
+    path = tmp_path / "rollout.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert codex_history_image_views(str(path), "native-1") == ()

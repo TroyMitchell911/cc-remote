@@ -2,6 +2,10 @@ import { expect, test } from "@playwright/test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol";
+import {
+  GITHUB_README_ATTACHMENT_URL, GITHUB_README_IMAGE_URL,
+  MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README,
+} from "./fixtures/markdown-html";
 
 type PanelRelayEvent<T = ServerEvent> = T extends ServerEvent
   ? Omit<T, "v" | "ts"> : never;
@@ -1658,6 +1662,149 @@ test("artifact-invalid-gif reports a decode error instead of a broken image", as
   await expect(page.getByRole("img", { name: "animation.gif" })).toHaveCount(0);
 });
 
+test("Markdown HTML preview renders README layout without executing active HTML", async ({
+  page,
+}, testInfo) => {
+  const requested: string[] = [];
+  page.on("request", (request) => {
+    if (/preview\.example|header\.svg|local-logo\.png|\/private\/local\.png/.test(request.url())) {
+      requested.push(request.url());
+    }
+  });
+  await page.route("https://preview.example/**", (route) => route.abort());
+  await gotoWithProductionCsp(page, "/tests/history-browser.html?artifact-markdown-html=1");
+  const preview = page.locator(".markdown-preview");
+  const heading = preview.getByRole("heading", { name: "Microduck", exact: true });
+  await expect(heading).toBeVisible();
+  await expect(heading).toHaveCSS("text-align", "center");
+  await expect(preview).not.toContainText('<p align="center">');
+  const hero = preview.getByRole("img", { name: "Robot overview" });
+  await expect(hero).toBeVisible();
+  await expect(hero).toHaveAttribute("width", "820");
+  await expect(hero).toHaveAttribute("height", "320");
+  await expect.poll(() => hero.evaluate((node) =>
+    (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  const geometry = await hero.evaluate((node) => {
+    const image = node.getBoundingClientRect();
+    const container = node.closest(".markdown-preview")!.getBoundingClientRect();
+    return { image: image.width, container: container.width };
+  });
+  expect(geometry.image).toBeLessThanOrEqual(geometry.container + 1);
+  await preview.screenshot({ path: testInfo.outputPath("markdown-html-preview.png") });
+
+  const local = preview.getByRole("img", { name: "Local logo" });
+  await expect(local).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await expect(local).toHaveAttribute("width", "64");
+  await expect.poll(() => local.evaluate((node) =>
+    (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await preview.getByRole("link", { name: "English", exact: true }).click();
+  await expect(page.getByTestId("artifact-opened-file")).toHaveText("README.md:");
+  await preview.getByRole("link", { name: "安装指南", exact: true }).click();
+  await expect(page.getByTestId("artifact-opened-file")).toHaveText("docs/install.md:12");
+  await expect(preview.getByRole("link", { name: "官方项目" })).toHaveAttribute("target", "_blank");
+  await preview.locator("summary").click();
+  await expect(preview.locator("details")).toHaveAttribute("open", "");
+  await expect(preview.locator("details strong")).toHaveText("Markdown");
+  await preview.getByRole("link", { name: "跳转到安装" }).click();
+  await expect(page).toHaveURL(/#cc-preview-installation$/);
+  await expect(preview.locator("#cc-preview-installation")).toBeVisible();
+
+  await expect(preview.locator("script,style,iframe,object,embed,form,source,svg,math")).toHaveCount(0);
+  // Screenshot capture can restore an empty style attribute on checkboxes.
+  await expect(preview.locator('[style]:not([style=""]),[onclick],[onerror],[srcset]')).toHaveCount(0);
+  await expect(page.locator("body")).not.toHaveAttribute("data-md-unsafe", /.+/);
+  await expect(preview.getByRole("checkbox")).toBeChecked();
+  await expect(preview.getByRole("checkbox")).toBeDisabled();
+  expect(requested).toEqual([]);
+  await page.getByRole("button", { name: "源码", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "Markdown 源码编辑器" }))
+    .toHaveValue(MARKDOWN_HTML_LOCAL_README);
+  await page.getByRole("button", { name: "预览", exact: true }).click();
+  await expect(heading).toBeVisible();
+  await expect(page.locator("body")).not.toHaveAttribute("data-md-unsafe", /.+/);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => hero.evaluate((node) => {
+    const bounds = node.getBoundingClientRect();
+    return bounds.width > 0 && bounds.right <= window.innerWidth + 1;
+  })).toBe(true);
+});
+
+test("Markdown HTML preview allows GitHub images without opening other network capabilities", async ({
+  page,
+}) => {
+  const requested: { url: string; referer?: string }[] = [];
+  // Fulfill every external request locally. The CSP, not a mock abort, must
+  // prevent unlisted images, remote scripts, and fetches from reaching here.
+  await page.route(/^https?:\/\/(?!127\.0\.0\.1(?::|\/))/, (route) => {
+    const request = route.request();
+    const url = request.url();
+    requested.push({ url, referer: request.headers().referer });
+    if (request.resourceType() === "script") {
+      return route.fulfill({ contentType: "application/javascript",
+        body: 'document.body.dataset.unexpectedGithubScript = "yes";' });
+    }
+    return route.fulfill({ contentType: "image/svg+xml", body: MARKDOWN_HTML_HEADER_SVG });
+  });
+  await gotoWithProductionCsp(page, "/tests/history-browser.html?artifact-markdown-github-html=1");
+  const hero = page.getByRole("img", { name: "Robot overview" });
+  await expect(hero).toHaveAttribute("src", GITHUB_README_ATTACHMENT_URL);
+  await expect(hero).toHaveAttribute("referrerpolicy", "no-referrer");
+  await expect.poll(() => hero.evaluate((node) =>
+    (node as HTMLImageElement).naturalWidth)).toBe(820);
+  expect(requested).toEqual([
+    { url: GITHUB_README_ATTACHMENT_URL, referer: undefined },
+  ]);
+
+  // Exercise the attachment destination separately: Playwright's WebKit
+  // route.fulfill cannot synthesize 3xx responses. Both real redirect origins
+  // must be admitted by the production policy, not only github.com.
+  const allowed = [
+    GITHUB_README_IMAGE_URL,
+    "https://raw.githubusercontent.com/test/readme.svg",
+    "https://user-images.githubusercontent.com/test/readme.svg",
+    "https://private-user-images.githubusercontent.com/test/readme.svg",
+    "https://camo.githubusercontent.com/test/readme.svg",
+    "https://avatars.githubusercontent.com/test/readme.svg",
+  ];
+  const blocked = [
+    "https://preview.example/image.svg",
+    "https://raw.githubusercontent.com.evil.example/image.svg",
+    "https://github.com/not-an-attachment/image.svg",
+    "https://other-bucket.s3.amazonaws.com/image.svg",
+    "http://raw.githubusercontent.com/test/insecure.svg",
+  ];
+  const imageResults = await page.evaluate(async ({ allowed, blocked }) => {
+    return Promise.all([...allowed, ...blocked].map((src) => new Promise<boolean>((resolve) => {
+      const image = document.createElement("img");
+      image.referrerPolicy = "no-referrer";
+      image.onload = () => { image.remove(); resolve(true); };
+      image.onerror = () => { image.remove(); resolve(false); };
+      image.src = src;
+      document.body.append(image);
+    })));
+  }, { allowed, blocked });
+  expect(imageResults).toEqual([...allowed.map(() => true), ...blocked.map(() => false)]);
+  const remoteScript = "https://raw.githubusercontent.com/test/blocked.js";
+  const remoteFetch = "https://raw.githubusercontent.com/test/blocked.json";
+  const otherCapabilities = await page.evaluate(async ({ remoteScript, remoteFetch }) => {
+    const scriptLoaded = new Promise<boolean>((resolve) => {
+      const script = document.createElement("script");
+      script.onload = () => { script.remove(); resolve(true); };
+      script.onerror = () => { script.remove(); resolve(false); };
+      script.src = remoteScript;
+      document.head.append(script);
+    });
+    const fetched = fetch(remoteFetch).then(() => true, () => false);
+    return Promise.all([scriptLoaded, fetched]);
+  }, { remoteScript, remoteFetch });
+  expect(otherCapabilities).toEqual([false, false]);
+  await expect(page.locator("body")).not.toHaveAttribute("data-unexpected-github-script", /.+/);
+  expect(requested.map(({ url }) => url).sort()).toEqual([
+    GITHUB_README_ATTACHMENT_URL, ...allowed,
+  ].sort());
+  expect(requested.every(({ referer }) => referer === undefined)).toBe(true);
+});
+
 test("mobile Markdown source editor fills the available artifact body", async ({
   page,
 }) => {
@@ -2825,6 +2972,51 @@ test("older history becoming available under touch waits for release", async ({
   await page.waitForTimeout(250);
   await expect(page.getByTestId("load-count")).toHaveText("1");
 });
+
+test("restored turn detail uses one process disclosure and preserves its duration", async ({ page }) => {
+  await page.goto(
+    "/tests/history-browser.html?detail-paging=1&detail-restored-page=process",
+  );
+  const header = page.locator(".turn-process-head");
+  await expect(header).toContainText("已处理 2h 9m");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".turn-detail-entry")).toHaveCount(0);
+  await header.click();
+  await expect(page.getByRole("button", { name: "加载更早过程" })).toBeVisible();
+  await page.getByRole("button", { name: "加载更早过程" }).click();
+  await expect(page.getByText("较早命令 1")).toBeVisible();
+  await expect(page.locator(".turn-detail-entry")).toHaveCount(0);
+});
+
+for (const direction of ["older", "newer"]) {
+  for (const failOnce of [false, true]) {
+    test(`standalone turn detail follows its ${direction} cursor${failOnce ? " after retry" : ""}`, async ({ page }) => {
+      await page.goto(
+        "/tests/history-browser.html?detail-paging=1&delay=100"
+          + `&detail-restored-page=${direction}`
+          + (failOnce ? "&detail-error-once=1" : ""),
+      );
+      await expect(page.locator(".turn-process-head")).toHaveCount(0);
+      const more = page.getByRole("button", { name: "查看更多内容" });
+      await more.click();
+      await expect(page.locator("html"))
+        .toHaveAttribute("data-detail-last-before", `detail-${direction}`);
+      if (failOnce) {
+        await expect(page.locator(".turn-detail-entry-error")).toContainText("详细过程暂时不可用");
+        await more.click();
+      }
+      await expect(page.locator(".turn-detail-entry")).toHaveCount(0);
+      await expect(page.locator("html"))
+        .toHaveAttribute("data-detail-requests", failOnce ? "2" : "1");
+      await expect(page.locator("html"))
+        .toHaveAttribute("data-detail-last-before", `detail-${direction}`);
+      const header = page.locator(".turn-process-head");
+      if (await header.getAttribute("aria-expanded") === "false") await header.click();
+      await expect(page.getByText("较早命令 1")).toBeVisible();
+      await expect(page.getByText("较新命令 1")).toBeVisible();
+    });
+  }
+}
 
 test("turn detail stays bounded and older pages load explicitly without jumping", async ({
   page,

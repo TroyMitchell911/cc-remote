@@ -53,7 +53,10 @@ Success requires all of the following: the expected immutable releases are
 active, Python and served Web build metadata report the same protocol/product,
 services have stable PIDs without restart loops, the public health endpoint is
 healthy, expected Wrappers reconnect, and recent logs contain no new fatal
-errors. On failure, use the installer-owned rollback or the retained previous
+errors. Installations using Codex Code must also verify the
+[shared CLI control plane](#codex-code-shared-control-plane-acceptance);
+an online Wrapper alone does not prove bidirectional CLI access.
+On failure, use the installer-owned rollback or the retained previous
 release and matching state snapshot; do not delete old releases during the
 deployment.
 
@@ -102,7 +105,13 @@ deployment.
   `/opt/cc-remote/current/web/dist`.
 - `Caddyfile` — reverse proxy + auto Let's Encrypt TLS (`wss://domain/ws` →
   `127.0.0.1:8765`) plus an early 4 KiB login-body limit. Replace
-  `cc-remote.example.com` with your domain.
+  `cc-remote.example.com` with your domain. The application CSP allows HTTPS
+  images from the exact GitHub hosts listed in the template, including the
+  dedicated attachment redirect bucket, but not arbitrary external images,
+  scripts, or fetch connections. The HTML preview runner remains isolated.
+  Image-policy changes require the managed Caddy configuration to be updated
+  through the VPS activation transaction; replacing the Web bundle alone is
+  insufficient. Do not replace the host allowlist with `https:` or wildcards.
 - `Caddyfile.insecure` — explicit plain-HTTP public-IP template selected only
   when `ALLOW_INSECURE_HTTP=1`, the setup target is a public IPv4 address, and
   `PUBLIC_ORIGIN` exactly matches `http://that-address`. It omits HSTS and
@@ -214,6 +223,69 @@ docker build -f deploy/Dockerfile \
   of the Code settings. Codex Work sessions and schedules may select any
   configured profile; the local registry freezes that ownership across retries
   and default-profile changes.
+
+### Codex Code shared control plane acceptance
+
+The required topology is **CLI → the same official app-server ← Wrapper**,
+not merely two processes reading the same rollout. Check every enabled Code
+account separately; never merge accounts into one `CODEX_HOME` to get sharing.
+This does not apply to Work's deliberately private app-server.
+
+1. Resolve the actual daily CLI (including shell aliases/launchers), the
+   Wrapper's selected executable (`CODEX_BIN` if set), service user, and each
+   account's effective `CODEX_HOME`. Compare real paths, not command names.
+   A Codex CLI `--profile` is a configuration profile, not cc-remote's account
+   home selection. Do not read or copy auth files. Both selected CLIs must
+   support `app-server daemon` and `app-server proxy`; an npm installation
+   alone neither proves nor disproves that capability.
+2. Keep `CC_REMOTE_CODEX_DAEMON=auto` for sharing. Wrapper startup already
+   prepares each account's daemon and enables remote control before connecting
+   to Relay; do not add a second daemon or another startup service. Check the
+   current startup's `Codex profile shared daemon ready` log and
+   `remote_control=true`. A prewarm failure, `using stdio`, or an unverified
+   existing-server candidate is not proof of shared readiness.
+3. As the same OS user, compare the following **read-only** probes using the
+   resolved account home and both executable paths (replace placeholders):
+
+   ```bash
+   CODEX_HOME="<account-home>" "<daily-codex-bin>" app-server daemon version
+   CODEX_HOME="<account-home>" "<wrapper-codex-bin>" app-server daemon version
+   ```
+
+   Require a running daemon, compatible CLI/app-server versions, and the same
+   resolved `socketPath`/managed server identity. For an already connected Code
+   session, also check the Wrapper's actual `app-server proxy --sock …` target
+   and successful connection, not just that a socket file exists. With npm,
+   Node and its native Codex child are one launch chain, not two independent
+   clients. Do not expose complete process environments or user prompts in logs.
+4. Verify the operator's normal `codex resume <session-id>` workflow actually
+   connects to that same endpoint. Use an operator-approved idle test session
+   or an already connected terminal; do not resume a busy production session
+   for testing. Current Unix-socket connection evidence or structured app-server
+   connection records tied to that CLI's lifetime can establish the route;
+   old log rows, matching home paths and `active writer` errors alone cannot.
+   Confirm a shared session does not become read-only solely because its CLI is
+   open. A live two-direction prompt test spends model tokens and requires
+   explicit authorization; otherwise report transport verification separately
+   from an untested live-message round trip.
+
+The official CLI supports explicit endpoint selection with
+`codex resume --remote unix:// <session-id>` for the selected home's default
+socket, or `--remote unix://<absolute-socket-path>` for a specific endpoint.
+See [the official connection documentation](https://learn.chatgpt.com/docs/app-server#connect-the-cli-terminal-ui).
+This is a diagnostic/explicit connection option, **not a mandatory suffix for
+all resumes**. If explicit connection works but plain resume does not, sharing
+via automatic discovery has not passed acceptance: compare the actual CLI
+build, home, endpoint and startup/connection errors. Do not assume all builds
+auto-attach simply because a daemon is running, or mask the difference by
+silently changing the user's shell alias.
+
+An existing private CLI writer is not migrated into the daemon by starting it
+later. Let the operator finish and exit that CLI normally, then reconnect to
+the verified shared endpoint. Never kill an active CLI, delete locks/rollouts,
+disable ownership checks, or force takeover to make this check pass. Report any
+unverified account or stdio fallback as a remaining coordination issue, even
+when Relay/Web health is green; do not claim bidirectional deployment complete.
 
 ## Security (short version)
 

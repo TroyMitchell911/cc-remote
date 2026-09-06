@@ -769,6 +769,23 @@ _HISTORY_VISIBLE_PROCESS_MARKERS = tuple(
 )
 
 
+def _history_generated_image_record(line: bytes) -> bool:
+    """Cheap positive hint; the exact image reader validates the full record.
+
+    Native image payloads exceed the ordinary process-record budget. Inspect
+    only their envelope, never decode the base64 while counting process rows.
+    """
+    header = line[:1024]
+    return bool(
+        re.search(rb'"type"\s*:\s*"image_generation_end"', header)
+        or (
+            re.search(rb'"type"\s*:\s*"item_completed"', header)
+            and re.search(rb'"type"\s*:\s*"Extension"', header)
+            and re.search(rb'"kind"\s*:\s*"image_gen\.generation"', header)
+        )
+    )
+
+
 def _history_visible_process_stamp(line: bytes) -> tuple[bool, int | None]:
     """Return bounded public-process evidence from one persisted record.
 
@@ -1183,7 +1200,7 @@ def _history_boundary_records(
                           else _MAX_HISTORY_REVERSE_RECORD_BYTES),
     ):
         if include_process:
-            if re.search(rb'"type"\s*:\s*"image_generation_end"', line[:1024]):
+            if _history_generated_image_record(line):
                 process.observe(None)
                 process.generated_images = True
             visible_process, process_stamp = _history_visible_process_stamp(line)
@@ -1573,7 +1590,7 @@ def codex_history_process_append(
             b'"thread_goal_updated"', b'"thread_goal_cleared"',
         )) or re.search(rb'"usermessage"|"role"\s*:\s*"user"', line, re.I)):
             return None
-        if re.search(rb'"type"\s*:\s*"image_generation_end"', line[:1024]):
+        if _history_generated_image_record(line):
             process.observe(None)
             process.generated_images = True
         visible, stamp = _history_visible_process_stamp(line)
@@ -4682,6 +4699,25 @@ def codex_translate_history(
                         status="failed" if is_error else "succeeded",
                         duration_ms=_legacy_duration_ms(p.get("duration")),
                     ))
+            elif (t == "event_msg"
+                  and (generated_item := _rollout_generated_image_item(p)) is not None):
+                open_assistant_only_turn()
+                native_turn = active_turn_id or pending_turn_id
+                if (p.get("turn_id") is not None
+                        and p.get("turn_id") != native_turn):
+                    continue
+                item_id = _history_id(generated_item.get("id"), "image", line_no, raw_ts)
+                if item_id not in seen_process_items:
+                    seen_process_items.add(item_id)
+                    image_event = CodexStreamTranslator(tool_result_max)._process_item(
+                        {**generated_item, "id": item_id},
+                        {"turnId": _history_optional_turn_id(native_turn)},
+                        completed=True,
+                    )
+                    if image_event is not None:
+                        image_event.ts = ts if ts is not None else 0
+                        events.append(image_event)
+                        turn_visible = True
             elif t == "event_msg" and payload_type == "item_completed":
                 item = p.get("item") if isinstance(p.get("item"), dict) else {}
                 if str(item.get("type") or "").lower() == "plan":
@@ -4813,24 +4849,6 @@ def codex_translate_history(
                         is_error=False,
                         status="succeeded",
                     ))
-            elif t == "event_msg" and payload_type == "image_generation_end":
-                open_assistant_only_turn()
-                item_id = _history_id(p.get("call_id"), "image", line_no, raw_ts)
-                if item_id not in seen_process_items:
-                    seen_process_items.add(item_id)
-                    image_event = CodexStreamTranslator(tool_result_max)._process_item(
-                        {"id": item_id, "type": "imageGeneration",
-                         "status": p.get("status"), "result": p.get("result"),
-                         "savedPath": p.get("saved_path"),
-                         "revisedPrompt": p.get("revised_prompt")},
-                        {"turnId": _history_optional_turn_id(
-                            active_turn_id or pending_turn_id)},
-                        completed=True,
-                    )
-                    if image_event is not None:
-                        image_event.ts = ts if ts is not None else 0
-                        events.append(image_event)
-                        turn_visible = True
             elif t == "event_msg" and payload_type == "sub_agent_activity":
                 open_assistant_only_turn()
                 item = {
@@ -5306,6 +5324,24 @@ def _history_image_payload(
     return normalized, width, height, data
 
 
+def _rollout_generated_image_item(payload: dict) -> dict | None:
+    """Normalize the two native persisted image-generation envelopes only."""
+    if payload.get("type") == "image_generation_end":
+        return {
+            "type": "imageGeneration", "id": payload.get("call_id"),
+            "status": payload.get("status"), "result": payload.get("result"),
+            "savedPath": payload.get("saved_path"),
+            "revisedPrompt": payload.get("revised_prompt"),
+        }
+    item = payload.get("item")
+    if (payload.get("type") == "item_completed"
+            and isinstance(item, dict)
+            and item.get("type") == "Extension"
+            and item.get("kind") == "image_gen.generation"):
+        return {**item, "type": "imageGeneration"}
+    return None
+
+
 def _generated_image_payload(result: object) -> tuple[str, int, int, bytes] | None:
     # Native imageGeneration.result is PNG base64 (or an image data URL).
     # Reject oversize bodies before decoding/copying; use the same image limits
@@ -5416,24 +5452,29 @@ def codex_history_image_views(
                     saw_visible_user = True
                 continue
 
-            if row_type == "event_msg" and payload_type == "image_generation_end":
+            generated_item = (_rollout_generated_image_item(payload)
+                              if row_type == "event_msg" else None)
+            if generated_item is not None:
                 if (current_segment != segment_index
                         or len(calls) >= _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT):
                     continue
-                raw_call_id = payload.get("call_id")
+                if (payload.get("turn_id") is not None
+                        and payload.get("turn_id") != native_turn_id):
+                    continue
+                raw_call_id = generated_item.get("id")
                 if (not isinstance(raw_call_id, str)
                         or not _SAFE_WIRE_ID.fullmatch(raw_call_id)
                         or raw_call_id in by_call_id):
                     continue
-                status = _process_status(payload.get("status"))
+                status = _process_status(generated_item.get("status"))
                 if status != "succeeded":
                     continue
-                image = _generated_image_payload(payload.get("result"))
+                image = _generated_image_payload(generated_item.get("result"))
                 if image is None or image_bytes + len(image[3]) > (
                         _MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT):
                     continue
                 image_bytes += len(image[3])
-                image_path, _ = bounded_text(payload.get("saved_path"), 16 * 1024)
+                image_path, _ = bounded_text(generated_item.get("savedPath"), 16 * 1024)
                 record = {
                     "call_id": raw_call_id, "item_id": raw_call_id,
                     "path": image_path, "timestamp": row.get("timestamp"),

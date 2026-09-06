@@ -47,12 +47,14 @@ def _event(kind: str, turn_id: str) -> bytes:
 
 
 def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
-                  cmdline: tuple[str, ...] = (), cwd: Path | None = None) -> Path:
+                  cmdline: tuple[str, ...] = (), cwd: Path | None = None,
+                  ppid: int = 0) -> Path:
     proc = root / str(pid)
     (proc / "fd").mkdir(parents=True)
     (proc / "fdinfo").mkdir()
     # /proc/<pid>/stat fields after comm start at field 3; starttime is field 22.
     fields = ["S"] + ["0"] * 18 + [str(start)] + ["0"] * 4
+    fields[1] = str(ppid)
     fields[4] = str(tty)
     (proc / "stat").write_text(f"{pid} (codex) " + " ".join(fields))
     if cmdline:
@@ -835,7 +837,8 @@ def test_codex_resume_logical_holder_clears_when_process_exits(tmp_path):
     assert second.passive_holders[sid] == set()
 
 
-def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path):
+@pytest.mark.parametrize("npm_launcher", [False, True])
+def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path, npm_launcher):
     target = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     sibling = "019f49bc-f146-70b3-bfcb-1b7f2a50901e"
     cwd = tmp_path / "repo"
@@ -851,9 +854,16 @@ def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path):
     sibling_rollout.write_bytes(meta(sibling))
     proc_root = tmp_path / "proc"
     identity = ProcessIdentity(227, 2207)
+    if npm_launcher:
+        _fake_process(
+            proc_root, 226, 2206, tty=34823,
+            cmdline=("/usr/bin/node", "/opt/npm/bin/codex.js", "--no-alt-screen"),
+            cwd=cwd,
+        )
     _fake_process(
         proc_root, identity.pid, identity.start_ticks, tty=34823,
         cmdline=("/opt/codex", "--no-alt-screen"), cwd=cwd,
+        ppid=226 if npm_launcher else 0,
     )
     snapshots = tmp_path / "shell_snapshots"
     snapshots.mkdir()
@@ -868,6 +878,7 @@ def test_plain_codex_tui_uses_exact_startup_shell_snapshot(tmp_path):
     assert scan.holders[target] == {identity}
     assert scan.holders[sibling] == set()
     assert scan.passive_holders[target] == set()
+    assert set(scan.client_proxies) == {identity}
 
 
 def test_plain_codex_tui_snapshot_binding_fails_closed_when_ambiguous(tmp_path):

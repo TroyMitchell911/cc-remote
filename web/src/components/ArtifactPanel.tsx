@@ -27,6 +27,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { PanelResizer } from "./PanelResizer";
 import { PdfArtifactPreview } from "./PdfArtifactPreview";
+import { previewImageDimension, rehypePreviewHtml } from "../markdown-preview-html";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -244,12 +245,14 @@ function SourceFile({ content, targetLine, artifactKey }: {
   </>;
 }
 
-function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
+function PreviewImage({ markdownPath, src, alt, title, width, height, asset, requestAsset,
   onAuthorizePreview }: {
   markdownPath: string;
   src: string;
   alt?: string;
   title?: string;
+  width?: string | number;
+  height?: string | number;
   asset?: PreviewAssetState;
   requestAsset: (path: string) => boolean;
   onAuthorizePreview?: (
@@ -276,6 +279,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
 
   if (target.kind === "external") {
     return <img src={target.value} alt={alt || ""} title={title}
+      width={width} height={height}
       loading="lazy" referrerPolicy="no-referrer" />;
   }
   if (target.kind !== "local") {
@@ -297,7 +301,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
     return <img src={asset.mediaType === "image/svg+xml"
       ? svg.url!
       : `data:${asset.mediaType};base64,${asset.data}`}
-      alt={alt || ""} title={title} loading="lazy" />;
+      alt={alt || ""} title={title} width={width} height={height} loading="lazy" />;
   }
   if (asset?.error) {
     return <span className="preview-image-error" title={asset.error}>图片不可用：{alt || src}</span>;
@@ -364,6 +368,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     editor.draft,
     artifact.kind === "md" && mode === "preview",
   );
+  const markdownRehypePlugins = useMemo(() => [
+    rehypePreviewHtml, ...(math.plugins?.rehypePlugins ?? []),
+  ], [math.plugins?.rehypePlugins]);
   const dirty = artifact.kind === "md" && editor.draft !== editor.baseline;
   const sections = artifact.kind === "gitdiff"
     ? (artifact.sections || EMPTY_GIT_DIFF_SECTIONS) : EMPTY_GIT_DIFF_SECTIONS;
@@ -485,29 +492,30 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   const markdownComponents = useMemo<Components>(() => ({
     pre: MarkdownPreviewPre,
     code: MarkdownPreviewCode,
-    img: ({ src, alt, title }) => {
+    img: ({ src, alt, title, width, height }) => {
       const source = typeof src === "string" ? src : "";
       const target = classifyPreviewTarget(artifact.file, source);
       const asset = target.kind === "local" ? artifact.assets?.[target.value] : undefined;
       return <PreviewImage markdownPath={artifact.file} src={source} alt={alt}
-        title={title} asset={asset} requestAsset={requestAsset}
+        title={title} width={previewImageDimension(width)} height={previewImageDimension(height)}
+        asset={asset} requestAsset={requestAsset}
         onAuthorizePreview={onAuthorizePreview} />;
     },
-    a: ({ href, children, title }) => {
+    a: ({ href, children, title, id }) => {
       const target = classifyPreviewTarget(artifact.file, href || "");
       if (target.kind === "external") {
         return <a href={target.value} target="_blank" rel="noopener noreferrer"
-          title={title}>{children}</a>;
+          title={title} id={id}>{children}</a>;
       }
-      if (target.kind === "anchor") return <a href={target.value} title={title}>{children}</a>;
+      if (target.kind === "anchor") return <a href={target.value} title={title} id={id}>{children}</a>;
       if (target.kind === "local" && onOpenFile) {
         const source = parseLocalFileTarget(href || "");
-        return <a href="#" title={target.value} onClick={(event) => {
+        return <a href="#" title={target.value} id={id} onClick={(event) => {
           event.preventDefault();
           onOpenFile(target.value, source?.line);
         }}>{children}</a>;
       }
-      return <span className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
+      return <span id={id} className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
     },
   }), [
     artifact.assets,
@@ -653,7 +661,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
               : <div className="prose markdown-preview"><ReactMarkdown
                   remarkPlugins={
                     math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
-                  rehypePlugins={math.plugins?.rehypePlugins}
+                  rehypePlugins={markdownRehypePlugins}
                   components={markdownComponents}>
                   {math.normalizedSource}
                 </ReactMarkdown></div>}

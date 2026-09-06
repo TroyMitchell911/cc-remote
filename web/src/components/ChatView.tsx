@@ -2777,9 +2777,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             // expand. Keep that uncertainty in the projection, not as a button
             // which disappears after an empty read. Real deferred content,
             // unread detail pages and explicit failures retain their controls.
-            const hasUnreadDetailPages = !!t.detailHasMore || !!t.detailHasNewer;
+            const canReadOlderDetail = !!t.detailHasMore && !!t.detailOldestCursor;
+            const canReadNewerDetail = !!t.detailHasNewer && !!t.detailNewerCursor;
+            const hasUnreadDetailPages = canReadOlderDetail || canReadNewerDetail;
+            // The process disclosure already owns its paging controls. A second
+            // entry below the answer would load invisible, collapsed process
+            // rows. Keep a separate entry only for genuinely deferred content
+            // or pages which don't yet have a process disclosure.
             const showStandaloneDetail = t.done && !t.detailLoaded
-              && (hasDeferredContent || hasUnreadDetailPages);
+              && (hasDeferredContent || (!showProcessTimeline && hasUnreadDetailPages));
             const standaloneDetailLabel = hasDeferredContent
               ? "查看完整内容" : hasUnreadDetailPages ? "查看更多内容" : "重试加载详情";
             // Keep the live affordance at the physical tail of the turn. The
@@ -2817,6 +2823,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 ? externalPlanProgress.itemId : null;
             const detailRetryBefore = t.detailRetryBefore;
             const detailRetryDirection = t.detailRetryDirection;
+            const standaloneDetailPage = detailRetryDirection
+              ? [detailRetryBefore, detailRetryDirection] as const
+              : !hasDeferredContent && canReadOlderDetail
+                ? [t.detailOldestCursor, "older"] as const
+                : !hasDeferredContent && canReadNewerDetail
+                  ? [t.detailNewerCursor, "newer"] as const
+                  : [undefined, "initial"] as const;
             const deferredProcessCount = (!t.detailLoaded || !!t.detailLoading)
                 && processDetailState === "present"
               ? processItems.length === 0
@@ -2945,17 +2958,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                       detailRetryDirection,
                       false)
                   : undefined}
-                canLoadEarlier={
-                  !!t.detailHasMore && !!t.detailOldestCursor
-                }
-                canLoadNewer={
-                  !!t.detailHasNewer && !!t.detailNewerCursor
-                }
-                onLoadEarlier={onLoadDetail && t.detailOldestCursor
+                canLoadEarlier={canReadOlderDetail}
+                canLoadNewer={canReadNewerDetail}
+                onLoadEarlier={onLoadDetail && canReadOlderDetail
                   ? () => requestProcessDetail(
                       t.id, t.detailOldestCursor, "older")
                   : undefined}
-                onLoadNewer={onLoadDetail && t.detailNewerCursor
+                onLoadNewer={onLoadDetail && canReadNewerDetail
                   ? () => requestProcessDetail(
                       t.id, t.detailNewerCursor, "newer")
                   : undefined}
@@ -3071,8 +3080,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                     aria-busy={!!t.detailLoading}
                     onClick={() => requestProcessDetail(
                       t.id,
-                      detailRetryDirection ? detailRetryBefore : undefined,
-                      detailRetryDirection ?? "initial",
+                      ...standaloneDetailPage,
                       false,
                     )}>
                     {t.detailLoading

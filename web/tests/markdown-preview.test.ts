@@ -26,6 +26,17 @@ import {
 import type { ServerEvent } from "../src/protocol.ts";
 import type { Turn } from "../src/domain/conversation.ts";
 import { asyncQuestionKey, presentAsyncQuestionReplies, supplementalAnswerPrompt } from "../src/async-question-presentation.ts";
+import { MARKDOWN_HTML_README } from "./fixtures/markdown-html.ts";
+import { previewImageDimension } from "../src/markdown-preview-html.ts";
+
+for (const [input, expected] of [[820, 820], ["64", 64], ["100%", "100%"],
+  ["40%", "40%"], [4096, 4096]] as const) {
+  assert.equal(previewImageDimension(input), expected);
+}
+for (const input of [undefined, null, "", 0, -1, "-10px", "99px", "100.1%",
+  "101%", "0%", 4097, "99999999", "calc(100vh)", "1;position:fixed"]) {
+  assert.equal(previewImageDimension(input), undefined);
+}
 
 const nativeQuestion: Turn = { id: "question-turn", prompt: "检查日志", done: true,
   blocks: [{ kind: "text", message_id: "question-message", text: "native question", done: true,
@@ -1238,8 +1249,66 @@ $$`,
   assert.match(markup, />预览</);
   assert.match(markup, />源码</);
   assert.match(markup, />保存</);
-  assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(markup, /alert\(1\)/);
   assert.doesNotMatch(markup, /<script>/);
+
+  const renderHtmlMarkdown = (content: string) => renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: {
+      file: "docs/readme_zh.md", sid: "html-readme", requestId: "html-readme-r1",
+      kind: "md", content, assets: {},
+    },
+    active: "diff", hasBtw: false, onTab: () => {}, onClose: () => {},
+    onOpenFile: () => {},
+  })).split('<div class="prose markdown-preview">')[1];
+  const htmlMarkdown = renderHtmlMarkdown(MARKDOWN_HTML_README);
+  assert.match(htmlMarkdown, /<h1 align="center">Microduck<\/h1>/);
+  assert.match(htmlMarkdown, /<img[^>]*src="https:\/\/preview\.example\/header\.png"/);
+  assert.match(htmlMarkdown, /<img[^>]*width="820"[^>]*height="320"/);
+  assert.match(htmlMarkdown, /referrerPolicy="no-referrer"/);
+  assert.match(htmlMarkdown, /<a href="#" title="docs\/README.md">English<\/a>/);
+  assert.match(htmlMarkdown, /<a href="https:\/\/preview\.example\/project" target="_blank" rel="noopener noreferrer"/);
+  assert.match(htmlMarkdown, /<em>通过强化学习/);
+  assert.match(htmlMarkdown, /<strong>这个仓库/);
+  assert.match(htmlMarkdown, /<details class="message-disclosure"><summary>安装说明<\/summary>/);
+  assert.match(htmlMarkdown, /<strong>Markdown<\/strong>/);
+  assert.match(htmlMarkdown, /<table>/);
+  assert.match(htmlMarkdown, /<input[^>]*disabled=""/);
+  assert.match(htmlMarkdown, /<h2 id="cc-preview-installation">安装<\/h2>/);
+  assert.match(htmlMarkdown, /href="#cc-preview-installation"/);
+  assert.doesNotMatch(htmlMarkdown, /<script|<style|<iframe|<form|<button>不可提交|<source/);
+  assert.doesNotMatch(htmlMarkdown, /mdUnsafe|javascript:|onerror=|onclick=|position:fixed|srcset=/i);
+  assert.doesNotMatch(htmlMarkdown, /<img[^>]*src="(?:\.\/|\/private\/|docs\/)/,
+    "raw HTML images must use the existing local asset loader, never a browser-local URL");
+  assert.match(renderHtmlMarkdown('```html\n<p align="center">example</p>\n```'),
+    /&lt;p align=&quot;center&quot;&gt;example&lt;\/p&gt;/,
+    "code examples remain literal HTML source");
+  assert.match(renderHtmlMarkdown('<p>Formula: $x^2$</p>\n\n$$y = 2$$'), /class="katex"/,
+    "HTML sanitation must run before the trusted math renderer");
+  assert.match(renderHtmlMarkdown('<a name="旧章节"></a>\n\n[跳转](#%E6%97%A7%E7%AB%A0%E8%8A%82)'),
+    /href="#cc-preview-旧章节"/);
+  const footnotes = renderHtmlMarkdown('Note[^one]\n\n[^one]: Kept footnote');
+  assert.match(footnotes, /id="cc-preview-user-content-fn-one"/);
+  assert.match(footnotes, /href="#cc-preview-user-content-fn-one"/);
+  const chatStillLiteral = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '<h1 align="center">Literal chat HTML</h1>', done: true,
+  }));
+  assert.doesNotMatch(chatStillLiteral, /<h1/);
+  assert.match(chatStillLiteral, /&lt;h1/);
+
+  for (const unsafe of [
+    '<a href="jav&#x61;script:alert(1)">x</a>',
+    '<a href="java&#10;script:alert(1)">x</a>',
+    '<svg><a href="javascript:alert(1)">x</a><script>alert(1)</script></svg>',
+    '<math><mi xlink:href="data:text/html,bad">x</mi></math>',
+    '<img src="data:image/svg+xml,bad" style="width:999999px" onerror="alert(1)">',
+    '<div id="__proto__" name="location" class="preview-injected"><p>content</p></div>',
+    '<object data="https://preview.example/private"></object>',
+  ]) {
+    const safe = renderHtmlMarkdown(unsafe);
+    assert.doesNotMatch(safe, /<svg|<math|<script|<object|javascript:|xlink:href|onerror=/i);
+    assert.doesNotMatch(safe, /id="__proto__"|name="location"|class="preview-injected"/);
+    assert.doesNotMatch(safe, /<img[^>]*(?:style=|src="data:)/);
+  }
   const readOnlyMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
     artifact: authorizationState.artifact!,
     active: "diff",

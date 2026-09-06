@@ -16760,6 +16760,15 @@ class WrapperMachine:
 
             rows = None
             if is_codex:
+                # Resolve an issued native locator locally before asking for
+                # every tool page of a potentially multi-hour turn. Start with
+                # no summary rows: only a current source-witnessed image may
+                # authorize the cached bytes on this fast path.
+                recovered = await self._supplement_codex_history_image_views(
+                    sid, cmd.turn_id, [], required_image_id=cmd.image_id)
+                if history_image_from_events(recovered, cmd.turn_id, cmd.image_id) is not None:
+                    rows = recovered
+            if is_codex and rows is None:
                 official_rows = None
                 try:
                     official_rows = await self._codex_history.turn_events(
