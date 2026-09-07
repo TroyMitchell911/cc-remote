@@ -212,6 +212,8 @@ CLI to satisfy deployment checks.
   explicitly accepts that exception. Every command must exit zero. Expected
   platform-defined test skips are allowed, but failures or missing tools must
   be reported rather than silently bypassed.
+- Run the Web gate with Node 24 (see `.nvmrc`), matching CI. Newer Node
+  browser-like globals must not mask missing browser-environment guards.
 
 ```bash
 .venv/bin/python -m pytest

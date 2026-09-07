@@ -10764,6 +10764,23 @@ try {
     onDelete: () => {},
     onForkWorktree: () => {},
   };
+  const nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  try {
+    // Node 25 exposes Web Storage by default, while CI's Node 24 does not.
+    // Do not let that host global mask a browser-only initialization dependency.
+    Reflect.deleteProperty(globalThis, "localStorage");
+    assert.doesNotThrow(() => renderToStaticMarkup(createElement(
+      SessionsSidebar, sidebarProps)), "the sidebar renders without Web Storage");
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      get() { throw new DOMException("blocked", "SecurityError"); },
+    });
+    assert.doesNotThrow(() => renderToStaticMarkup(createElement(
+      SessionsSidebar, sidebarProps)), "SSR must not read the host's Web Storage");
+  } finally {
+    if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
   const completionSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar, sidebarProps));
   assert.match(completionSidebarMarkup, />已完成</);

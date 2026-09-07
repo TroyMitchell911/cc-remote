@@ -7586,6 +7586,80 @@ test("profile session card manual unread survives refresh until explicit opening
   await expect(active.locator(".pill.completed")).toHaveCount(0);
 });
 
+test("profile session card manual unread stays usable when storage is unavailable", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.addInitScript(() => {
+    const mode = new URLSearchParams(location.search).get("unread-storage");
+    if (mode === "missing" || mode === "access-denied") {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        get() {
+          if (mode === "access-denied") throw new DOMException("blocked", "SecurityError");
+          return undefined;
+        },
+      });
+    } else {
+      const getItem = Storage.prototype.getItem;
+      const setItem = Storage.prototype.setItem;
+      Storage.prototype.getItem = function (key) {
+        if (mode === "read-denied" && key === "cc-remote:manual-unread-v1")
+          throw new DOMException("blocked", "SecurityError");
+        return getItem.call(this, key);
+      };
+      Storage.prototype.setItem = function (key, value) {
+        if (mode === "write-denied" && key === "cc-remote:manual-unread-v1")
+          throw new DOMException("full", "QuotaExceededError");
+        return setItem.call(this, key, value);
+      };
+    }
+  });
+  for (const mode of ["missing", "access-denied", "read-denied", "write-denied"]) {
+    await page.goto(`/tests/history-browser.html?profile-sidebar=code&unread-storage=${mode}&machine=storage-${mode}`);
+    const active = page.locator(".scard").filter({ hasText: "看看当前仓库" });
+    await active.getByRole("button", { name: "更多操作" }).click();
+    await active.getByRole("button", { name: "标记为未读" }).click();
+    await expect(active.locator(".pill.completed")).toHaveText("未读");
+    await page.evaluate(() => {
+      // A storage event must not crash or erase local state if access is denied;
+      // unrelated/sessionStorage events must never replace these local marks.
+      window.dispatchEvent(new StorageEvent("storage", { key: "cc-remote:manual-unread-v1" }));
+      window.dispatchEvent(new StorageEvent("storage", { storageArea: sessionStorage }));
+    });
+    await expect(active.locator(".pill.completed")).toHaveText("未读");
+    await active.click();
+    await expect(active.locator(".pill.completed")).toHaveCount(0);
+    await active.getByRole("button", { name: "更多操作" }).click();
+    await active.getByRole("button", { name: "标记为未读" }).click();
+    await expect(active.locator(".pill.completed")).toHaveText("未读");
+    await page.reload();
+    await expect(active.locator(".pill.completed")).toHaveCount(0);
+  }
+  expect(errors).toEqual([]);
+});
+
+test("profile session card manual unread still synchronizes across tabs", async ({ page, context }) => {
+  await page.goto("/tests/history-browser.html?profile-sidebar=code");
+  const other = await context.newPage();
+  try {
+    await other.goto("/tests/history-browser.html?profile-sidebar=code");
+    const active = page.locator(".scard").filter({ hasText: "看看当前仓库" });
+    const otherActive = other.locator(".scard").filter({ hasText: "看看当前仓库" });
+    await active.getByRole("button", { name: "更多操作" }).click();
+    await active.getByRole("button", { name: "标记为未读" }).click();
+    await expect(otherActive.locator(".pill.completed")).toHaveText("未读");
+    await otherActive.click();
+    await expect(active.locator(".pill.completed")).toHaveCount(0);
+    await active.getByRole("button", { name: "更多操作" }).click();
+    await active.getByRole("button", { name: "标记为未读" }).click();
+    await expect(otherActive.locator(".pill.completed")).toHaveText("未读");
+    await other.evaluate(() => localStorage.clear());
+    await expect(active.locator(".pill.completed")).toHaveCount(0);
+  } finally {
+    await other.close();
+  }
+});
+
 test("profile session card edges remain visible in dark theme", async ({
   page,
 }) => {
