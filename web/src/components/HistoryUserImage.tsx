@@ -161,6 +161,7 @@ export function HistoryUserImage({
   const imageButton = (
     <button ref={triggerRef} type="button"
       className="ubub-image-trigger history-image-trigger"
+      title={asset?.status === "error" ? asset.error : undefined}
       style={{ aspectRatio: `${width} / ${height}` }}
       aria-label={src
         ? `预览${label}`
@@ -177,7 +178,7 @@ export function HistoryUserImage({
         : <span className={`history-image-placeholder${
           canRetry ? " retryable" : ""
         }`} aria-hidden="true">
-          {canRetry ? "点击重试" : ""}
+          {canRetry ? <><span>{asset?.error ?? "图片加载未完成"}</span><span>点击重试</span></> : ""}
         </span>}
     </button>
   );

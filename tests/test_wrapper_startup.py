@@ -88,6 +88,7 @@ def test_wrapper_entrypoint_prepares_codex_before_run(monkeypatch) -> None:
             events.append("transport")
 
     class FakeMachine:
+        viewer_pages = None
         def __init__(self, _cfg, _transport) -> None:
             events.append("machine")
 
@@ -96,6 +97,18 @@ def test_wrapper_entrypoint_prepares_codex_before_run(monkeypatch) -> None:
 
         async def run(self) -> None:
             events.append("run")
+            await asyncio.sleep(0)
+
+    class FakeViewerTransport:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def run(self):
+            events.append("viewer-start")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("viewer-stop")
 
     monkeypatch.setattr(wrapper_main, "wrapper_config", lambda: cfg)
     monkeypatch.setattr(wrapper_main, "validate_wrapper_config", lambda _cfg: None)
@@ -103,7 +116,8 @@ def test_wrapper_entrypoint_prepares_codex_before_run(monkeypatch) -> None:
         wrapper_main, "scrub_parent_control_secrets", lambda: events.append("scrub"))
     monkeypatch.setattr(wrapper_main, "WrapperTransport", FakeTransport)
     monkeypatch.setattr(wrapper_main, "WrapperMachine", FakeMachine)
+    monkeypatch.setattr(wrapper_main, "ViewerTransport", FakeViewerTransport)
 
     asyncio.run(wrapper_main.main())
 
-    assert events == ["scrub", "transport", "machine", "prepare", "run"]
+    assert events == ["scrub", "transport", "machine", "prepare", "run", "viewer-start", "viewer-stop"]

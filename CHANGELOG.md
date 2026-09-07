@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+- Fix home-directory page discovery (protocol v55): explicitly referenced HTML
+  and verified, user-owned Python static-server links become private session
+  previews without per-project registration. Preserve manual publications,
+  cloud links, no-follow file checks and the separate binary channel. Never
+  crawl home or populate the global catalog with automatic pages. Support
+  exact/longest-prefix import maps used by local Three.js addons.
+- Add session-scoped page associations (protocol v54), persisted on the parent
+  Wrapper. Confirm explicitly referenced/written HTML against existing source
+  publications, surface compact "View page" actions outside process details,
+  and make the global catalog an explicit secondary association picker. Keep
+  cloud links native, preserve source-device identity, and never widen paths.
+- Add registered static remote Viewer previews (protocol v53): default opaque
+  Bridge frames reuse HTTPS or explicitly allowed HTTP/IP origins without extra
+  DNS/TLS; optional Isolated mode keeps per-preview origins. Explicit device-local
+  resource publications and separate pull-driven
+  binary channel, desktop side panels and mobile full-screen viewing. Directory
+  traversal, symlinks and unregistered resources fail closed. No browser engine,
+  model call or arbitrary LAN HTTP proxy is introduced. See `docs/remote-viewer.md`.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v52. Codex native
   async questions retain their bounded structured metadata in live events and
   history, and render as nonblocking inline forms. Replies use the existing

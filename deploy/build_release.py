@@ -33,6 +33,7 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _RELAY_DEPLOY = (
     "Caddyfile",
     "Caddyfile.insecure",
+    "Caddyfile.viewer.example",
     "caddy_managed_block.py",
     "cc-remote-relay.service",
     "env.relay.example",
@@ -219,6 +220,8 @@ def build_bundle(
             raise BuildError(str(exc)) from exc
         if not (root / "web" / "dist" / "index.html").is_file():
             raise BuildError("web/dist is missing; build the web client first")
+        if not (root / "web" / "dist" / "cc-remote-viewer-runner.js").is_file():
+            raise BuildError("Viewer runner is missing; run the complete web build first")
 
     prefix = f"cc-remote-{role}-v{product_version}"
     name = f"{prefix}-{system}-{machine}.tar.gz"

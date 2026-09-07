@@ -780,7 +780,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v52_layout():
+def test_release_docs_and_examples_describe_one_atomic_v55_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -793,11 +793,11 @@ def test_release_docs_and_examples_describe_one_atomic_v52_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v52" in deploy_readme
+    assert "Protocol v55" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v52" in document
+        assert "v55" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -841,7 +841,7 @@ def test_release_docs_and_examples_describe_one_atomic_v52_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.151" in claude
-    assert "protocol v52" in claude
+    assert "protocol v55" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 
@@ -1023,6 +1023,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
         "not path /html-preview-runner.html /html-preview-runner.js"
         in source
     )
+    assert "not path /html-preview-runner.html /html-preview-runner.js /__cc_viewer/bridge/*" in source
     assert (
         "@html_preview path /html-preview-runner.html /html-preview-runner.js"
         in source

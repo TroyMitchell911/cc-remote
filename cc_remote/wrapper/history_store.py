@@ -2374,6 +2374,8 @@ class HistoryIndexStore:
         turn_id: str,
         image_id: str,
         variant: str,
+        *,
+        exact_source: bool = False,
     ) -> tuple[str, int, int, bytes] | None:
         now = time.time()
         with self._connect() as connection:
@@ -2383,11 +2385,12 @@ class HistoryIndexStore:
                 FROM history_image_assets
                 WHERE session_id=? AND engine=? AND source_path=?
                   AND turn_id=? AND image_id=? AND variant=?
+                  AND (? = 0 OR source_token = ?)
                 ORDER BY (source_token = ?) DESC, created_at DESC
                 LIMIT 1
                 """,
                 (session_id, engine, source.path, turn_id, image_id,
-                 variant, source.token),
+                 variant, int(exact_source), source.token, source.token),
             ).fetchone()
             if row is None:
                 return None

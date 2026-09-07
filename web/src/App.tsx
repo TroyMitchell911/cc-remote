@@ -9,6 +9,12 @@ import {
   type TouchEvent,
 } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
+import { RemoteViewerContext, useRemoteViewerLinks } from "./remote-viewer-context";
+import { ViewerPagesProvider } from "./components/ViewerPagesProvider";
+import { MANUAL_UNREAD_STORAGE } from "./manual-unread-storage";
+import type { ViewerPage } from "./remote-viewer";
+import { readViewerSelections, writeViewerSelections, viewerScopeKey, setViewerSelection,
+  type ViewerSelection } from "./remote-viewer";
 import {
   createRuntime,
   deferredQueueCapacity,
@@ -258,6 +264,9 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
 ));
+const RemoteViewerPanel = lazy(() => import("./components/RemoteViewerPanel").then(
+  ({ RemoteViewerPanel: Panel }) => ({ default: Panel }),
+));
 const StatusSheet = lazy(() => import("./components/StatusSheet").then(
   ({ StatusSheet: Sheet }) => ({ default: Sheet }),
 ));
@@ -337,6 +346,9 @@ export default function App() {
   const [rightView, setRightView] = useState<RightPanelView>(
     btwPanelScopes.length ? "btw" : "diff");
   const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
+  const [viewerSelections, setViewerSelections] = useState(() => readViewerSelections(sessionStorage));
+  const [viewerUrl, setViewerUrl] = useState<{ key: string; href: string; openId: string } | null>(null);
+  useEffect(() => writeViewerSelections(sessionStorage, viewerSelections), [viewerSelections]);
   const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
   const setAgentDetailListener = useCallback(
     (listener: ((message: AgentDetail) => void) | null) => {
@@ -847,7 +859,37 @@ export default function App() {
   // The rendered slot owns desktop split space, never retained chat data.
   // A hidden BTW can keep running; an empty/opening visible BTW still needs room.
   const btwShowing = btwPanelVisible && !!visibleParentSid;
-  const visibleRightPanel = agentPanel ? "agent"
+  const viewerKey = visibleParentSid
+    ? viewerScopeKey({ machineId, space, engine, sid: visibleParentSid }) : null;
+  const viewerShowing = !!viewerKey && Object.hasOwn(viewerSelections, viewerKey);
+  const closeViewer = useCallback(() => {
+    if (!viewerKey) return;
+    setViewerSelections((current) => {
+      const next = { ...current };
+      delete next[viewerKey];
+      return next;
+    });
+    setViewerUrl(null);
+  }, [viewerKey]);
+  const openViewer = useCallback((href?: string) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey, href ? null : current[viewerKey] ?? null));
+    setViewerUrl(href ? { key: viewerKey, href, openId: uuid() } : null);
+  }, [viewerKey, confirmArtifactDiscard]);
+  const openViewerLink = useRemoteViewerLinks(
+    authed && state.connState === "connected" ? viewerKey : null, openViewer);
+  const openViewerPage = useCallback((page: ViewerPage) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerUrl(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey,
+      { machine_id: page.machine_id, site_id: page.site_id, entry: page.entry }));
+  }, [viewerKey, confirmArtifactDiscard]);
+  const selectViewer = (selection: ViewerSelection | null) => {
+    if (viewerKey) setViewerSelections((current) => setViewerSelection(current, viewerKey, selection));
+  };
+  const visibleRightPanel = viewerShowing ? "viewer" : agentPanel ? "agent"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
   // Questions, hydration and completion receipts must agree with the rendered
@@ -2373,6 +2415,10 @@ export default function App() {
           if (msg.type === "history_image"
               && historyImageAssetsRef.current.accept(msg)) {
             bumpHistoryImageRevision();
+            if (msg.error && msg.session_id === stateRef.current.focusedSid
+                && msg.revision !== stateRef.current.runtimes[msg.session_id]?.historyRevision) {
+              requestHistory(msg.session_id, undefined, HISTORY_INITIAL_PAGE);
+            }
           }
           if (msg.type === "queued_query_detail") {
             setQueuedQueryEditor((current) => (
@@ -3228,6 +3274,14 @@ export default function App() {
               // not discard either side chat.
             }
             if (ownership) {
+              setViewerSelections((current) => {
+                const old = viewerScopeKey({ ...ownership, sid: msg.old_key });
+                if (!Object.hasOwn(current, old)) return current;
+                const key = viewerScopeKey({ ...ownership, sid: msg.session_id });
+                const next = { ...current, [key]: current[key] ?? current[old] };
+                delete next[old];
+                return next;
+              });
               setBtwPanelScopes((current) => rekeyBtwPanelScope(
                 current,
                 btwPanelScopeKey(ownership.machineId, ownership.space,
@@ -4984,6 +5038,7 @@ export default function App() {
   };
   const getDiff = (file: string) => {
     if (!confirmArtifactDiscard()) return;
+    closeViewer();
     const requestId = wsRef.current?.sendGetDiff(file, theme) ?? null;
     if (!requestId) return;
     setRightView("diff");
@@ -4991,6 +5046,7 @@ export default function App() {
   };
   const openTurnDiff = (files: string[], diff: string) => {
     if (!diff || !confirmArtifactDiscard()) return;
+    closeViewer();
     setRightView("diff");
     dispatch({ type: "set_artifact", artifact: {
       file: files.length === 1 ? files[0] : `本轮改动 · ${files.length} 个文件`,
@@ -5006,6 +5062,7 @@ export default function App() {
   ): boolean => {
     if (!targetSid) return false;
     if (!confirmArtifactDiscard()) return false;
+    closeViewer();
     const requestId = uuid();
     if (!wsRef.current?.sendGetFilePreview(
       file, requestId, targetSid)) return false;
@@ -5028,6 +5085,7 @@ export default function App() {
   const openAgentDetail = (runId: string, title?: string) => {
     if (!focusedSid || focusedEngine !== "claude" || space !== "code"
         || !rt.historyRevision) return;
+    closeViewer();
     setAgentPanel({ sid: focusedSid, revision: rt.historyRevision,
       runId, title: title || "协作代理" });
   };
@@ -5121,6 +5179,7 @@ export default function App() {
   const openBtw = () => {
     if (!confirmArtifactDiscard()) return;
     if (!btwPanelKey) return;
+    closeViewer();
     setRightView("btw");
     setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
     if (!activeBtwGroup && !btwOpening) createBtw();
@@ -5254,6 +5313,7 @@ export default function App() {
         method: "POST", credentials: "same-origin", cache: "no-store",
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      try { localStorage.removeItem(MANUAL_UNREAD_STORAGE); } catch { /* Private browsing. */ }
       await import("./cache").then((module) => module.clearCache());
       await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
@@ -5343,6 +5403,9 @@ export default function App() {
     ? activeTurnCandidates : [];
 
   return (
+    <ViewerPagesProvider scope={visibleParentSid && authed
+      ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
+    <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
     <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + (visibleRightPanel !== null ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
@@ -5365,11 +5428,14 @@ export default function App() {
         }))}
         completionBadges={completionBadges}
         activeSessionId={focusedSid}
+        machineId={machineId}
         onSelect={(id) => {
-          if (!confirmArtifactDiscard()) return;
+          if (!confirmArtifactDiscard()) return false;
           cancelPendingNotificationTarget();
           const selected = state.sessions.find((s) => s.session_id === id);
-          if (selected) focusListedSession(selected);
+          if (!selected) return false;
+          focusListedSession(selected);
+          return true;
         }}
         onNew={(profileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", claudeProfileId: engine === "claude" ? profileId ?? newChatClaudeProfileId : null, codexProfileId: engine === "codex" ? profileId ?? newChatCodexProfileId : null }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", claudeProfileId: newChatClaudeProfileId, codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
@@ -5491,6 +5557,7 @@ export default function App() {
             notificationAvailable={typeof Notification !== "undefined"}
             onNotificationMode={updateNotificationMode}
             onOpenUsageActivity={openUsageActivity}
+            onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onToggleTheme={toggleTheme}
             onLogout={() => void logout()}
           />
@@ -5818,6 +5885,15 @@ export default function App() {
       </section>
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
       {(() => {
+        if (visibleRightPanel === "viewer" && visibleParentSid && viewerKey) {
+          return <Suspense fallback={<div className="artifact-panel empty" role="status"><p>加载预览…</p></div>}>
+            <RemoteViewerPanel key={`${viewerKey}:${viewerUrl?.key === viewerKey ? viewerUrl.openId : ""}`}
+              scope={{ machineId, sid: visibleParentSid, space, engine }}
+              selection={viewerSelections[viewerKey] ?? null}
+              requestedUrl={viewerUrl?.key === viewerKey ? viewerUrl.href : undefined}
+              devices={remoteDevices} onSelect={selectViewer} onClose={closeViewer} />
+          </Suspense>;
+        }
         if (visibleRightPanel === "agent" && agentPanel) {
           return <Suspense fallback={null}>
             <AgentDetailController
@@ -6139,5 +6215,7 @@ export default function App() {
         }}
         onClose={() => setDeviceSheetOpen(false)} />
     </div>
+    </RemoteViewerContext.Provider>
+    </ViewerPagesProvider>
   );
 }

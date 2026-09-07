@@ -669,7 +669,7 @@ export type ServerEvent =
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 52;
+export const PROTOCOL_VERSION = 55;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

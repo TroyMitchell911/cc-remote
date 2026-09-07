@@ -2086,6 +2086,7 @@ function ProfileSidebarFixture() {
     params.get("profile-sidebar") === "work" ? "work" : "code",
   );
   const [newProfileId, setNewProfileId] = useState("none");
+  const [activeSessionId, setActiveSessionId] = useState("profile-sidebar-active");
   useEffect(() => {
     const root = document.documentElement;
     const previousEngine = root.dataset.engine;
@@ -2135,9 +2136,10 @@ function ProfileSidebarFixture() {
         codexProfiles={profiles}
         defaultCodexProfileId="primary"
         sessions={sessions}
-        activeSessionId="profile-sidebar-active"
+        machineId={params.get("machine") ?? "fixture-device"}
+        activeSessionId={activeSessionId}
         onSpaceChange={setSpace}
-        onSelect={noop}
+        onSelect={setActiveSessionId}
         onNew={(profileId) => setNewProfileId(profileId ?? "none")}
         onNewInDir={noop}
         onClose={noop}

@@ -81,7 +81,7 @@ CLI to satisfy deployment checks.
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v52 is declared by
+- **Protocol version gate**: current wire protocol v55 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -92,6 +92,19 @@ CLI to satisfy deployment checks.
   is scoped by `machine_id`; a credential for one enrolled device must never be
   accepted for another. Keep `cc_remote/device.py`, `relay/devices.py`, relay
   routing, and the Web device selector aligned when this contract changes.
+- **Remote Viewer serves static pages, not arbitrary LAN services**: read
+  `docs/remote-viewer.md` before changing its resource or origin boundary. Keep
+  Bridge pages in opaque HTTP-sandboxed frames (never `allow-same-origin`),
+  secrets out of URLs/JSON, and binary transfers on `/ws/viewer` (Wrapper) /
+  `/ws/viewer-client` (browser Cookie + exact Origin), never on chat/replay.
+  Optional Isolated mode uses per-preview origins and a `__Host-` main HTTPS
+  cookie; default Bridge preserves the existing cookie. Home-page discovery is
+  enabled by default (`CC_REMOTE_VIEWER_HOME_PREVIEW=0` opts out): only explicit
+  HTML references or device-verified Python static listeners create private,
+  session-associated publications. Never crawl home, add automatic entries to
+  the global catalog, infer ownership from a private IP alone, follow symlinks,
+  start an engine/service, or fetch an arbitrary private URL. Preserve manual
+  publications and FD-based project/resource boundaries.
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
@@ -206,6 +219,7 @@ uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
 npm --prefix web run build
 npm --prefix web run test:reliability
 npm --prefix web run test:history-browser
+npm --prefix web run test:viewer
 npm --prefix web run lint
 bash -n \
   deploy/install.sh \
@@ -232,6 +246,7 @@ python -m cc_remote.relay        # terminal 1 (set WEB_STATIC_DIR=web/dist to se
 python -m cc_remote.wrapper      # terminal 2 (on each machine running Claude/Codex)
 pytest                           # zero-token unit tests
 npm --prefix web run test:reliability
+npm --prefix web run test:viewer
 npm --prefix web run lint
 npm --prefix web run build
 ```

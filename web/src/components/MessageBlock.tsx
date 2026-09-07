@@ -5,6 +5,9 @@ import { createContext, isValidElement, useContext, useEffect, useId,
 import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { parseLocalFileTarget } from "../file-link";
+import { RemoteViewerContext } from "../remote-viewer-context";
+import { ViewerPagesContext } from "../viewer-pages-context";
+import { isLocalViewerUrl } from "../remote-viewer";
 import { Icon } from "../icons";
 import {
   classifyMessageImageTarget,
@@ -439,6 +442,8 @@ function MarkdownLink({
   href = "", children, title,
 }: ComponentPropsWithoutRef<"a">) {
   const { onOpenFile } = useContext(MessageMarkdownContext);
+  const openViewer = useContext(RemoteViewerContext);
+  const openPage = useContext(ViewerPagesContext)?.openLink;
   const file = parseLocalFileTarget(href);
   if (file && onOpenFile) {
     const location = file.line ? `${file.path}:${file.line}` : file.path;
@@ -447,6 +452,11 @@ function MarkdownLink({
   }
   if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) {
     return <a href={href} target="_blank" rel="noopener noreferrer"
+      onClick={isLocalViewerUrl(href) ? (event) => {
+        if (event.defaultPrevented || event.button !== 0
+            || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (openPage?.(href) || openViewer?.(href)) event.preventDefault();
+      } : undefined}
       title={title}>{children}</a>;
   }
   if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;

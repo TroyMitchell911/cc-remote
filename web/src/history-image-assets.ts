@@ -8,6 +8,7 @@ export interface HistoryImageAsset {
   data?: string;
   width?: number;
   height?: number;
+  error?: string;
   /** Wall-clock start of the active request. Present while loading so a
    * virtualized remount can keep the original timeout boundary. */
   startedAt?: number;
@@ -266,7 +267,9 @@ export class HistoryImageAssetCache {
         || event.turn_id !== request.turnId
         || event.image_id !== request.imageId
         || event.variant !== request.variant
-        || (request.revision != null && event.revision !== request.revision)) {
+        // A correlated error can report the current revision precisely because
+        // the request was stale. Consume it instead of leaving an endless spinner.
+        || (request.revision != null && event.revision !== request.revision && !event.error)) {
       return false;
     }
     const current = this.entries.get(request.key);
@@ -288,6 +291,7 @@ export class HistoryImageAssetCache {
       data: ready ? event.data ?? undefined : undefined,
       width: event.width ?? undefined,
       height: event.height ?? undefined,
+      error: ready ? undefined : event.error ?? "图片数据暂不可用，请重试",
       lastUsed: ++this.tick,
       requestGeneration: request.requestGeneration,
     });
@@ -306,6 +310,7 @@ export class HistoryImageAssetCache {
         data: entry.data,
         width: entry.width,
         height: entry.height,
+        error: entry.error,
         ...(entry.status === "loading"
           ? {
               startedAt: entry.startedAt,

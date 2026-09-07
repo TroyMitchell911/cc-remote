@@ -61,6 +61,7 @@ import {
   rekeyCompletionReceipts,
 } from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
+import "./presentation-state.test.ts";
 import {
   historyImageDisplaySource,
   TurnImagePreviewCache,

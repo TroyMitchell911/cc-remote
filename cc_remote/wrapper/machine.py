@@ -296,6 +296,7 @@ from cc_remote.wrapper.codex_stream import (
     codex_generated_image_ref,
     codex_history_boundary_process_start, codex_history_boundary_user,
     codex_history_turn_user,
+    codex_history_user_images,
     codex_history_turn_users,
     codex_history_native_witness, codex_history_process_witnesses,
     codex_history_process_append,
@@ -2182,6 +2183,9 @@ class WrapperMachine:
         self._preview_capability_store = PreviewCapabilityStore(
             Path(cfg.state_dir))
         self._preview_capability_mutation_lock = asyncio.Lock()
+        from cc_remote.wrapper.viewer_pages import SessionPages
+        self.viewer_pages = SessionPages(
+            Path(cfg.state_dir) / "viewer-pages.json", self._viewer_page_scope)
         self._preview_challenges: OrderedDict[
             str, _PreviewChallenge
         ] = OrderedDict()
@@ -9475,6 +9479,7 @@ class WrapperMachine:
         session_key = self._ctx_wire_sid(ctx)
         if not session_key:
             return
+        await self._observe_viewer_page_paths(ctx, raw_paths)
         for raw_path in raw_paths:
             candidate = os.path.realpath(
                 raw_path if os.path.isabs(raw_path)
@@ -9500,6 +9505,33 @@ class WrapperMachine:
                     "structured preview capability not granted",
                     error=str(exc),
                 )
+
+    async def _observe_viewer_page_paths(self, ctx, raw_paths):
+        # A successful structured write is an exact discovery hint. Home page
+        # policy and FD checks still run; this never enumerates project files.
+        paths = [path if os.path.isabs(path) else os.path.join(ctx.cwd, path)
+                 for path in raw_paths if path.lower().endswith((".html", ".htm"))]
+        if not paths or ctx.btw:
+            return
+        try:
+            from cc_remote.viewer import registry_path
+            from cc_remote.viewer_home import HomePages
+            from cc_remote.viewer_pages import PageRef
+            home_pages = HomePages(Path(self.cfg.state_dir) / "viewer-home-pages.json")
+            values = await asyncio.to_thread(home_pages.locate, registry_path(), paths[:8])
+            values = [value for value in values if sum(
+                item["reference"] == value["reference"] for item in values) == 1]
+            pages = [PageRef(
+                machine_id=self.cfg.machine_id, site_id=value["site_id"],
+                entry=value["entry"], label=value["label"], references=[value["reference"]],
+                turn_ids=[ctx.active_msg_id] if ctx.active_msg_id else [],
+            ).model_dump() for value in values]
+            if pages:
+                await self.viewer_pages({"operation": "associate", "scope": {
+                    "engine": ctx.engine, "space": ctx.space, "sid": self._ctx_wire_sid(ctx)},
+                    "pages": pages, "automatic": True})
+        except Exception as exc:
+            log.debug("page discovery deferred", error_type=type(exc).__name__)
 
     @staticmethod
     def _preview_image_read_path(msg: ToolUse) -> Optional[str]:
@@ -16708,6 +16740,8 @@ class WrapperMachine:
                 variant=cmd.variant,
                 bytes=len(data or b""),
                 authoritative=error is None,
+                error=error,
+                request_id=cmd.request_id,
                 client_id=client_id,
                 elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             )
@@ -16800,10 +16834,53 @@ class WrapperMachine:
                     self._history_index.get_turn_detail,
                     sid, engine, source, cmd.turn_id,
                 )
-            if rows is None:
-                return await send(error="历史图片已过期，请刷新会话")
             image = history_image_from_events(
-                rows, cmd.turn_id, cmd.image_id)
+                rows or [], cmd.turn_id, cmd.image_id)
+            if is_codex and image is None:
+                # Exact native upload lookup also works after metadata/detail
+                # eviction. Already-resolved generated/tool image references
+                # keep their existing fast path; never scan uploads for them.
+                # Check the source again before accepting any bytes.
+                cached = await asyncio.to_thread(
+                    self._history_index.get_image_asset,
+                    sid, engine, source, cmd.turn_id, cmd.image_id, cmd.variant,
+                    exact_source=True,
+                )
+                if cached is not None:
+                    current_source = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source.path,
+                    )
+                    if (current_source != source and not await asyncio.to_thread(
+                        history_source_extends, source, current_source,
+                    )) or self._history_revision(sid) != revision:
+                        return await send(error="会话历史已更新，请重新加载图片")
+                    media_type, width, height, data = cached
+                    return await send(media_type=media_type, width=width, height=height, data=data)
+                uploads = await asyncio.to_thread(
+                    codex_history_user_images, source.path, cmd.turn_id,
+                )
+                recovered = history_image_from_events([
+                    {"type": "user_msg", "msg_id": cmd.turn_id, "images": uploads},
+                ], cmd.turn_id, cmd.image_id)
+                if recovered is not None:
+                    current_source = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source.path,
+                    )
+                    if (current_source != source and not await asyncio.to_thread(
+                        history_source_extends, source, current_source,
+                    )) or self._history_revision(sid) != revision:
+                        return await send(error="会话历史已更新，请重新加载图片")
+                    media_type, width, height, data = await asyncio.to_thread(
+                        _render_history_image, recovered, cmd.variant,
+                    )
+                    await asyncio.to_thread(
+                        self._history_index.put_image_asset,
+                        sid, engine, current_source, cmd.turn_id, cmd.image_id,
+                        cmd.variant, media_type, width, height, data,
+                    )
+                    return await send(media_type=media_type, width=width, height=height, data=data)
+            if rows is None and image is None:
+                return await send(error="历史图片已过期，请刷新会话")
             if image is None:
                 return await send(error="未找到这张历史图片")
 
@@ -22972,6 +23049,10 @@ class WrapperMachine:
     async def _drop_preview_session(
         self, engine: str, session_id: str,
     ) -> None:
+        try:
+            await self.viewer_pages.drop(engine, session_id)
+        except (OSError, ValueError):
+            log.warning("page associations could not be removed")
         await self._run_preview_capability_mutation(
             self._preview_capability_store.remove_session,
             engine,
@@ -22991,6 +23072,10 @@ class WrapperMachine:
         old_key: str,
         session_id: str,
     ) -> None:
+        try:
+            await self.viewer_pages.rekey(ctx.engine, ctx.space, old_key, session_id)
+        except (OSError, ValueError):
+            log.warning("page associations could not be rekeyed")
         await self._run_preview_capability_mutation(
             self._preview_capability_store.rekey,
             ctx.engine,
@@ -23020,6 +23105,28 @@ class WrapperMachine:
                 preview_id=challenge.preview_id,
                 created_at=challenge.created_at,
             )
+
+    async def _viewer_page_scope(self, scope):
+        """Resolve metadata against this account's session, never focus/spawn."""
+        sid = self._resolve_session_alias(scope.sid) or scope.sid
+        ctx = self._ctx_for(sid)
+        if ctx is not None:
+            if ctx.engine != scope.engine or ctx.space != scope.space:
+                raise ValueError("session scope mismatch")
+            return scope.model_copy(update={"sid": self._ctx_wire_sid(ctx)}), ctx.cwd
+        # History-only/cold sessions remain browsable without creating an engine.
+        if scope.engine == "codex":
+            path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
+            cwd = await asyncio.to_thread(self._codex_cwd_for_wire, sid) if path else None
+            if path and self._codex_controls is not None:
+                controls = await self._load_codex_session_controls(sid)
+                cwd = controls.cwd_override or cwd
+        else:
+            path = await asyncio.to_thread(self._claude_transcript_path_for_wire, sid)
+            cwd = None
+        if not path:
+            raise ValueError("unknown session")
+        return scope.model_copy(update={"sid": sid}), cwd
 
     async def _require_preview_authorization(
         self,

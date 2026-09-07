@@ -84,6 +84,7 @@ import { asyncQuestionKey, presentAsyncQuestionReplies } from "../async-question
 
 const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
 const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
+const PagePreviewLinks = lazy(() => import("./PagePreviewLinks").then((module) => ({ default: module.PagePreviewLinks })));
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -3046,30 +3047,29 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                       onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />}
                   </div>
                 ))}
-                {showCompletionFooter && (
-                  <>
-                    <div className="ubub-meta ai-meta">
-                      {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
-                      {finalBlocks.length > 0 && <button
-                        className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
-                        onClick={() => copyText(t.id + "-ai", aiText(t))}
-                        aria-label="复制">
-                        <Icon name="copy" size={13} />
-                      </button>}
-                      {onFork && canForkTurn(engine, t) && (
-                        <button className="ubub-act" aria-label="派生"
-                          data-tooltip="从此回复派生新会话"
-                          aria-busy={forkingPointId === t.forkPointId}
-                          disabled={!!forkingPointId}
-                          onClick={() => onFork(t.forkPointId)}>
-                          <Icon name="branch" size={13} />
-                        </button>
-                      )}
-                    </div>
-                    {ti === turns.length - 1
-                      && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
-                  </>
-                )}
+                {/* Late page metadata shares a stable slot; completion metadata
+                    still requires a real terminal, including after compaction. */}
+                <div className={`ubub-meta ${showCompletionFooter ? "ai-meta" : "page-meta"}`}>
+                  {showCompletionFooter && t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
+                  {showCompletionFooter && finalBlocks.length > 0 && <button
+                    className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
+                    onClick={() => copyText(t.id + "-ai", aiText(t))}
+                    aria-label="复制">
+                    <Icon name="copy" size={13} />
+                  </button>}
+                  {showCompletionFooter && onFork && canForkTurn(engine, t) && (
+                    <button className="ubub-act" aria-label="派生"
+                      data-tooltip="从此回复派生新会话"
+                      aria-busy={forkingPointId === t.forkPointId}
+                      disabled={!!forkingPointId}
+                      onClick={() => onFork(t.forkPointId)}>
+                      <Icon name="branch" size={13} />
+                    </button>
+                  )}
+                  <Suspense fallback={null}><PagePreviewLinks turn={t} sid={sid} /></Suspense>
+                </div>
+                {showCompletionFooter && ti === turns.length - 1
+                  && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
               </>
             )}
               {(showStandaloneDetail

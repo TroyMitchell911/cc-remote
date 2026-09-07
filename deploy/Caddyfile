@@ -15,9 +15,11 @@ cc-remote.example.com {
 	}
 	header @entry Cache-Control "no-store"
 	@application {
-		not path /html-preview-runner.html /html-preview-runner.js
+		not path /html-preview-runner.html /html-preview-runner.js /__cc_viewer/bridge/*
 	}
 	@html_preview path /html-preview-runner.html /html-preview-runner.js
+	# The relay supplies the Bridge runner's HTTP sandbox + per-publication CSP.
+	# Do not overwrite it with the main app's CSP / X-Frame-Options: DENY.
 	header @application {
 		Strict-Transport-Security "max-age=31536000"
 		# Only GitHub image hosts and its attachment redirect bucket are external.

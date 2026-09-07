@@ -230,6 +230,11 @@ class RelayConfig:
         "DEVICE_DB_PATH", _default_device_db_path()))
     device_pairing_ttl_seconds: int = field(
         default_factory=lambda: _int("DEVICE_PAIRING_TTL_SECONDS", 600))
+    # Empty mode preserves an explicitly configured legacy isolated host;
+    # otherwise the default bridge needs no extra DNS, port or certificate.
+    viewer_mode: str = field(default_factory=lambda: _env("VIEWER_MODE", "").strip())
+    viewer_origin_template: str = field(default_factory=lambda: _env(
+        "VIEWER_ORIGIN_TEMPLATE", "").strip())
 
 
 @dataclass
@@ -528,6 +533,18 @@ def validate_relay_config(cfg: RelayConfig) -> None:
                 and not cfg.allow_insecure_http
             ):
                 errors.append("PUBLIC_ORIGIN must use https except on loopback")
+
+    from cc_remote.relay.viewer import effective_viewer_mode, validate_origin_template
+    try:
+        mode = effective_viewer_mode(cfg)
+        if mode not in {"off", "bridge", "isolated"}:
+            raise ValueError("VIEWER_MODE must be off, bridge or isolated")
+        if mode == "isolated":
+            if not cfg.viewer_origin_template:
+                raise ValueError("isolated Viewer mode needs VIEWER_ORIGIN_TEMPLATE")
+            validate_origin_template(cfg.viewer_origin_template, cfg.public_origin)
+    except ValueError as exc:
+        errors.append(str(exc))
 
     if errors:
         raise ValueError("invalid relay configuration: " + "; ".join(errors))

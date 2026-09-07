@@ -46,6 +46,7 @@ async function mockRightPanelRelay(
   }, { visible, engine });
   await page.route("**/api/**", (route) => route.fulfill({ status: 404 }));
   await page.route("**/api/session", (route) => route.fulfill({ json: {} }));
+  await page.route("**/api/viewers/pages", (route) => route.fulfill({ json: { pages: [] } }));
   await page.route("**/api/devices", (route) => route.fulfill({ json: {
     devices: [{ machine_id: "layout-machine", label: "Layout", online: true }],
   } }));
@@ -985,6 +986,247 @@ async function expectRightPanelSpace(
   await expect(page.locator(".pane")).toHaveCSS(
     "padding-right", open && desktop ? "548px" : "0px");
 }
+
+const VIEWER_LINK_SITE = { id: "robot", label: "机器人结构", machine_id: "layout-machine",
+  revision: "a".repeat(32), entry: "/viewer/index.html", urls: ["http://localhost:9000/viewer/index.html"] };
+
+test("remote Viewer menu and registered links use a session-scoped panel without engine queries", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 881 });
+  const relay = await mockRightPanelRelay(page, { secondParent: true, seedTurns: [{
+    id: "viewer-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "viewer-message", done: true, channel: "final",
+      text: "[结构预览](http://localhost:9000/viewer/index.html)" }],
+  }] });
+  let registered = false;
+  await page.route("**/api/viewers", (route) => route.fulfill({ json: { enabled: true,
+    sites: registered ? [VIEWER_LINK_SITE, { ...VIEWER_LINK_SITE, machine_id: "another-device" }] : [] } }));
+  await page.goto("/");
+  await expect(page.getByText("session layout-p", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "更多设置", exact: true }).click();
+  await page.getByRole("button", { name: /远程预览.*交互页面/ }).click();
+  await expect(page.locator(".remote-viewer-panel")).toContainText("本会话还没有页面");
+  await expectRightPanelSpace(page, true);
+  await page.keyboard.press("Control+b");
+  await page.getByText("Second parent", { exact: true }).click();
+  await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+  await expectRightPanelSpace(page, false);
+  await page.getByText("Layout parent", { exact: true }).click();
+  await expect(page.locator(".remote-viewer-panel")).toBeVisible();
+  await page.locator(".remote-viewer-panel .viewer-desktop-close").click();
+  await expectRightPanelSpace(page, false);
+  registered = true;
+  const refreshed = page.waitForResponse("**/api/viewers");
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await (await refreshed).finished();
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  await expect(page.locator(".remote-viewer-panel")).toContainText("选择生成该页面的设备与预览");
+  await expect(page.locator(".viewer-site")).toHaveCount(2);
+  const previousPanel = await page.locator(".remote-viewer-panel").elementHandle();
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  await expect.poll(() => previousPanel!.evaluate((element) => element.isConnected)).toBe(false);
+  await expect(page.locator(".remote-viewer-panel")).toContainText("选择生成该页面的设备与预览");
+  expect(relay.commands.some((command) => ["query", "fork_btw", "get_file_preview"].includes(String(command.type))))
+    .toBe(false);
+});
+
+for (const mode of ["disabled", "unregistered", "unrelated", "unavailable", "malformed"] as const) {
+  test(`remote Viewer preserves native link navigation when the catalog is ${mode}`, async ({ page, context }) => {
+    const href = "http://192.168.56.1/admin";
+    const relay = await mockRightPanelRelay(page, { seedTurns: [{
+      id: "ordinary-link", prompt: "查看页面", done: true, detailLoaded: true,
+      blocks: [{ kind: "text", message_id: "ordinary-link-message", done: true, channel: "final",
+        text: `[管理页面](${href})` }],
+    }] });
+    await context.route(href, (route) => route.fulfill({ contentType: "text/html", body: "native-link-target" }));
+    await page.route("**/api/viewers", (route) => route.fulfill(mode === "unavailable"
+      ? { status: 503, json: { error: "device_offline" } }
+      : { json: mode === "malformed" ? null : { enabled: mode !== "disabled",
+        sites: mode === "unregistered" ? [] : [{ ...VIEWER_LINK_SITE,
+          urls: mode === "unrelated" ? VIEWER_LINK_SITE.urls : [href] }] } }));
+    const catalog = page.waitForResponse("**/api/viewers");
+    await page.goto("/");
+    await (await catalog).finished();
+    const popup = page.waitForEvent("popup");
+    await page.getByRole("link", { name: "管理页面", exact: true }).click();
+    const original = await popup;
+    await expect(original).toHaveURL(href);
+    await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+    expect(relay.commands.some((command) => ["query", "fork_btw", "get_file_preview"].includes(String(command.type))))
+      .toBe(false);
+    await original.close();
+  });
+}
+
+test("remote Viewer preserves a first click while its catalog is still loading", async ({ page, context }) => {
+  const href = VIEWER_LINK_SITE.urls[0];
+  await mockRightPanelRelay(page, { seedTurns: [{
+    id: "pending-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "pending-link-message", done: true, channel: "final",
+      text: `[结构预览](${href})` }],
+  }] });
+  await context.route(href, (route) => route.fulfill({ contentType: "text/html", body: "native-link-target" }));
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/viewers", (route) => { pending = route; });
+  await page.goto("/");
+  await expect.poll(() => !!pending).toBe(true);
+  const popup = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  const original = await popup;
+  await expect(original).toHaveURL(href);
+  await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+  await pending!.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } });
+  await original.close();
+});
+
+test("remote Viewer registered link waits for its deferred session controller", async ({ page }) => {
+  const href = VIEWER_LINK_SITE.urls[0];
+  const relay = await mockRightPanelRelay(page, { seedTurns: [{
+    id: "deferred-viewer-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "deferred-viewer-message", done: true, channel: "final",
+      text: `[结构预览](${href})` }],
+  }] });
+  let controller: import("@playwright/test").Route | undefined;
+  await page.route("**/src/viewer-pages-controller.tsx*", (route) => { controller = route; });
+  await page.route("**/api/viewers", (route) => route.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } }));
+  let associations = 0;
+  await page.route("**/api/viewers/pages", (route) => {
+    const body = route.request().postDataJSON();
+    if (body.action === "associate") associations++;
+    return route.fulfill({ json: { pages: body.action === "associate" ? [{
+      id: "deferred-page", ...body.page, label: VIEWER_LINK_SITE.label,
+      references: [], turn_ids: [], available: true,
+    }] : [] } });
+  });
+  await page.route("**/api/viewers/open", (route) => route.fulfill({ status: 503, json: { error: "device_offline" } }));
+  const catalog = page.waitForResponse("**/api/viewers");
+  await page.goto("/");
+  await (await catalog).finished();
+  await expect.poll(() => !!controller).toBe(true);
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  await expect(page.locator(".remote-viewer-panel")).toBeVisible();
+  await expect(page.locator(".remote-viewer-panel [role=alert]")).toHaveCount(0);
+  expect(associations).toBe(0);
+  await controller!.continue();
+  await expect(page.locator(".remote-viewer-panel [role=alert]")).toContainText("设备已离线");
+  expect(associations).toBe(1);
+  expect(relay.commands.some((command) => command.type === "query")).toBe(false);
+});
+
+test("remote Viewer registered link keeps an original-link fallback after a failed preview", async ({ page, context }) => {
+  const href = VIEWER_LINK_SITE.urls[0] + "?camera=front#part";
+  await mockRightPanelRelay(page, { seedTurns: [{
+    id: "registered-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "registered-link-message", done: true, channel: "final",
+      text: `[结构预览](${href})` }],
+  }] });
+  await context.route("http://localhost:9000/**", (route) => route.fulfill({ contentType: "text/html", body: "native-link-target" }));
+  let catalogReads = 0;
+  await page.route("**/api/viewers", (route) => {
+    catalogReads++;
+    return route.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } });
+  });
+  await page.route("**/api/viewers/open", (route) => route.fulfill({ status: 503, json: { error: "device_offline" } }));
+  await page.route("**/api/viewers/pages", (route) => {
+    const body = route.request().postDataJSON();
+    return route.fulfill({ json: { pages: body.action === "associate" ? [{
+      id: "registered-page", ...body.page, label: VIEWER_LINK_SITE.label,
+      references: [], turn_ids: [], available: true,
+    }] : [] } });
+  });
+  const catalog = page.waitForResponse("**/api/viewers");
+  await page.goto("/");
+  await (await catalog).finished();
+  const link = page.getByRole("link", { name: "结构预览", exact: true });
+  await link.waitFor();
+  // Refocusing the parent from an iframe must not drop a freshly resolved link.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  // Modifier and non-primary clicks must never call the Viewer handler.
+  const modifiers = await link.evaluate((node) => {
+    return [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]
+      .map((options) => {
+        const click = new MouseEvent("click", { bubbles: true, cancelable: true, ...options });
+        // Block native test navigation only after React has had a chance to
+        // consume it, and record whether the application did so.
+        let allowed = false;
+        const capture = (event: Event) => { allowed = !event.defaultPrevented; event.preventDefault(); };
+        document.addEventListener("click", capture, { once: true });
+        node.dispatchEvent(click);
+        return allowed;
+      });
+  });
+  expect(modifiers).toEqual([true, true, true, true, true]);
+  await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+  expect(catalogReads).toBe(1);
+  await link.click();
+  await expect(page.locator(".remote-viewer-panel [role=alert]")).toContainText("设备已离线");
+  const fallback = page.getByRole("link", { name: "打开原链接", exact: true });
+  await expect(fallback).toHaveAttribute("href", href);
+  await expect(fallback).toHaveAttribute("rel", "noopener noreferrer");
+  const popup = page.waitForEvent("popup");
+  await fallback.click();
+  const original = await popup;
+  await expect(original).toHaveURL(href);
+  await original.close();
+});
+
+test("remote Viewer drops a cached match as soon as catalog revalidation begins", async ({ page, context }) => {
+  const href = VIEWER_LINK_SITE.urls[0];
+  await mockRightPanelRelay(page, { seedTurns: [{
+    id: "refresh-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "refresh-link-message", done: true, channel: "final",
+      text: `[结构预览](${href})` }],
+  }] });
+  await context.route(href, (route) => route.fulfill({ contentType: "text/html", body: "native-link-target" }));
+  let hold = false;
+  let pending: import("@playwright/test").Route | undefined;
+  await page.route("**/api/viewers", (route) => {
+    if (hold) { pending = route; return; }
+    return route.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } });
+  });
+  const catalog = page.waitForResponse("**/api/viewers");
+  await page.goto("/");
+  await (await catalog).finished();
+  hold = true;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => !!pending).toBe(true);
+  const popup = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  const original = await popup;
+  await expect(original).toHaveURL(href);
+  await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+  await pending!.fulfill({ status: 503, json: { error: "device_offline" } });
+  await original.close();
+});
+
+test("remote Viewer ignores a late catalog from the previous session", async ({ page, context }) => {
+  const href = VIEWER_LINK_SITE.urls[0];
+  await page.setViewportSize({ width: 1568, height: 881 });
+  await mockRightPanelRelay(page, { secondParent: true, seedTurns: [{
+    id: "scoped-link", prompt: "查看结构", done: true, detailLoaded: true,
+    blocks: [{ kind: "text", message_id: "scoped-link-message", done: true, channel: "final",
+      text: `[结构预览](${href})` }],
+  }] });
+  await context.route(href, (route) => route.fulfill({ contentType: "text/html", body: "native-link-target" }));
+  let first: import("@playwright/test").Route | undefined;
+  await page.route("**/api/viewers", (route) => {
+    if (!first) { first = route; return; }
+    return route.fulfill({ json: { enabled: false, sites: [] } });
+  });
+  await page.goto("/");
+  await expect.poll(() => !!first).toBe(true);
+  await page.keyboard.press("Control+b");
+  const catalog = page.waitForResponse("**/api/viewers");
+  await page.getByText("Second parent", { exact: true }).click();
+  await (await catalog).finished();
+  await first!.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } });
+  await expect(page.getByText("session layout-o", { exact: true })).toBeVisible();
+  const popup = page.waitForEvent("popup");
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  const original = await popup;
+  await expect(original).toHaveURL(href);
+  await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
+  await original.close();
+});
 
 test("side chat scope follows its parent through navigation and refresh without creating forks", async ({ page }) => {
   await page.setViewportSize({ width: 1568, height: 881 });
@@ -5853,8 +6095,19 @@ test(`extending a released native selection yields the retained viewport anchor 
   const viewport = page.locator(".thread");
   // Selection handles do not produce a new mouse pointerdown on the thread.
   // Exercise the browser's Range/selectionchange path directly, not a wheel.
-  await viewport.evaluate((node) => { node.scrollTop -= 1800; });
   await waitForScrollIdle(page);
+  // Initial virtual measurements can reassert the mounted tail after goto.
+  // Establish room for the native scroll before testing selection retention;
+  // a clamped write at the bottom cannot exercise the behavior under test.
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await viewport.evaluate((node) => {
+      node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - 1800);
+    });
+    await waitForScrollIdle(page);
+    if (await viewport.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop >= 1200)) break;
+  }
+  expect(await viewport.evaluate((node) => node.scrollHeight - node.clientHeight - node.scrollTop))
+    .toBeGreaterThanOrEqual(1200);
   const start = (await readingAnchor(page)).id;
   const text = page.locator(`[data-turn-id="${start}"] p`).first();
   await text.evaluate((node) => {
@@ -7311,6 +7564,26 @@ test("profile keycaps hang from session cards without shifting titles", async ({
   expect(ordinaryGeometry.borderColor).not.toBe("transparent");
   expect(ordinaryGeometry.borderColor).not.toBe("rgba(0, 0, 0, 0)");
   expect(ordinaryGeometry.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+});
+
+test("profile session card manual unread survives refresh until explicit opening", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?profile-sidebar=code");
+  const active = page.locator(".scard").filter({ hasText: "看看当前仓库" });
+  await active.getByRole("button", { name: "更多操作" }).click();
+  await active.getByRole("button", { name: "标记为未读" }).click();
+  await expect(active).toHaveClass(/active/);
+  await expect(active.locator(".pill.completed")).toHaveText("未读");
+  await page.reload();
+  await expect(active.locator(".pill.completed")).toHaveText("未读");
+  await page.goto("/tests/history-browser.html?profile-sidebar=code&machine=another-device");
+  await expect(active.locator(".pill.completed")).toHaveCount(0);
+  await page.goto("/tests/history-browser.html?profile-sidebar=code");
+  await expect(active.locator(".pill.completed")).toHaveText("未读");
+  await page.locator(".scard").filter({ hasText: "cc-remote 派生" }).click();
+  await active.click();
+  await expect(active.locator(".pill.completed")).toHaveCount(0);
+  await page.reload();
+  await expect(active.locator(".pill.completed")).toHaveCount(0);
 });
 
 test("profile session card edges remain visible in dark theme", async ({

@@ -1,4 +1,4 @@
-const CACHE = "cc-remote-shell-v3";
+const CACHE = "cc-remote-shell-v4";
 const SHELL = [
   "/", "/manifest.webmanifest", "/favicon.svg", "/apple-touch-icon.png",
   "/icon-192.png", "/icon-512.png", "/icon-maskable-512.png",
@@ -26,7 +26,10 @@ self.addEventListener("fetch", (event) => {
       || url.pathname === "/healthz"
       || url.pathname === "/cc-remote-build.json") return;
   if (url.pathname === "/html-preview-runner.html"
-      || url.pathname === "/html-preview-runner.js") return;
+      || url.pathname === "/html-preview-runner.js"
+      || url.pathname.startsWith("/__cc_viewer/")
+      || url.pathname.startsWith("/ws/")
+      || url.pathname === "/cc-remote-viewer-runner.js") return;
   if (request.mode === "navigate") {
     event.respondWith(fetch(request).then((response) => {
       const copy = response.clone();

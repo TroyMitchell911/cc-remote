@@ -7,12 +7,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/check-bundle-budget.mjs",
+    "build": "tsc -b && vite build && npm run build:viewer-runner && node scripts/check-bundle-budget.mjs",
+    "build:viewer-runner": "vite build --config vite.viewer-runner.config.ts",
     "lint": "oxlint",
     "test:compile": "tsc -p tsconfig.tests.json",
     "test:outbox": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/outbox.test.js",
     "test:scroll": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/scroll-follow.test.js",
     "test:history-browser": "playwright test -c playwright.config.ts",
+    "test:viewer-resources": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/viewer-resources.test.js",
+    "test:viewer": "npm run test:viewer-resources && node node_modules/.tmp/cc-remote-tests/tests/viewer-discovery.test.js && npm run build:viewer-runner && playwright test -c playwright.viewer.config.ts",
     "test:jitter": "playwright test -c playwright.jitter.config.ts --project=webkit",
     "test:diff": "npm run test:compile --silent && node --expose-gc node_modules/.tmp/cc-remote-tests/tests/diff-performance.test.js",
     "test:preview": "npm run test:compile --silent && node node_modules/.tmp/cc-remote-tests/tests/markdown-preview.test.js",
@@ -20,6 +23,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "acorn": "8.18.0",
+    "css-tree": "3.2.1",
+    "parse-srcset": "1.0.2",
     "@tanstack/react-virtual": "3.14.8",
     "dompurify": "^3.4.12",
     "katex": "0.16.47",
@@ -36,6 +42,7 @@
     "shiki": "^4.3.1"
   },
   "devDependencies": {
+    "@types/css-tree": "3.2.0",
     "@playwright/test": "1.61.1",
     "@types/node": "^24.13.2",
     "@types/react": "^19.2.17",

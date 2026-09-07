@@ -164,6 +164,7 @@ def test_release_bundles_are_deterministic_and_role_scoped(
 
     if role == "relay":
         assert f"{prefix}/web/dist/index.html" in members
+        assert f"{prefix}/web/dist/cc-remote-viewer-runner.js" in members
         assert f"{prefix}/requirements-relay.lock" in members
         assert f"{prefix}/deploy/install-relay.sh" in members
         assert f"{prefix}/deploy/setup-vps.sh" in members
@@ -451,12 +452,13 @@ def test_role_locks_and_release_workflow_are_versioned_inputs():
     assert "uses: ./.github/workflows/ci.yml" in workflow
     assert "pytest" in source_workflow
     assert "test:reliability" in source_workflow
+    assert "test:viewer" in source_workflow
     assert "actions/attest" in workflow
     assert "gh release upload" in workflow
     uv_version = (ROOT / "deploy" / "uv-version.txt").read_text().strip()
     assert (
         workflow + source_workflow
-    ).count(f'version: "{uv_version}"') == 2
+    ).count(f'version: "{uv_version}"') == 3
     python_version = (
         ROOT / "deploy" / "python-version.txt"
     ).read_text().strip()

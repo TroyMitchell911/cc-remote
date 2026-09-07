@@ -9,8 +9,15 @@ const DIST = resolve(import.meta.dirname, "../dist");
 // their presentation and accessible labels add <2 KiB, no new dependencies.
 // Exact supplemental-answer presentation, full-width image actions and bounded
 // automatic preview reads add <3 KiB; keep the gzip/dependency-count gates fixed.
-const MAX_ENTRY_BYTES = 523 * 1024;
-const MAX_INITIAL_BYTES = 917 * 1024;
+// Remote Viewer adds scoped descriptors, a menu/link entry and panel dispatch
+// (~4 KiB initial JS). The iframe UI/styles are lazy; no browser/CAD dependency
+// is added to startup. Keep compressed-size and request-count limits unchanged.
+// Verified session-page links add <0.2 KiB of click dispatch; discovery and
+// import-map compilation remain lazy. Keep gzip and request-count gates fixed.
+// First-paint page metadata restoration and correlated image errors add <2 KiB.
+// Manual unread stays in the lazy sidebar; no new startup dependency/request.
+const MAX_ENTRY_BYTES = 528 * 1024;
+const MAX_INITIAL_BYTES = 926 * 1024;
 const MAX_INITIAL_GZIP_BYTES = 280 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 

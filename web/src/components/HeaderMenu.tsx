@@ -12,6 +12,7 @@ interface Props {
   notificationAvailable: boolean;
   onNotificationMode: (mode: NotificationMode) => Promise<boolean>;
   onOpenUsageActivity: () => void;
+  onOpenViewer?: () => void;
   onToggleTheme: () => void;
   onLogout: () => void;
 }
@@ -35,6 +36,7 @@ export function HeaderMenu({
   notificationAvailable,
   onNotificationMode,
   onOpenUsageActivity,
+  onOpenViewer,
   onToggleTheme,
   onLogout,
 }: Props) {
@@ -146,7 +148,15 @@ export function HeaderMenu({
                   <b>设置</b>
                 </header>
                 <div className="header-menu-items">
-                  {engine === "codex" && <button ref={firstRef} type="button"
+                  {onOpenViewer && <button ref={firstRef} type="button" className="header-menu-item" onClick={() => {
+                    close();
+                    onOpenViewer();
+                  }}>
+                    <Icon name="globe" size={18} />
+                    <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
+                    <Icon name="chevron-right" size={16} />
+                  </button>}
+                  {engine === "codex" && <button ref={onOpenViewer ? undefined : firstRef} type="button"
                     className="header-menu-item" onClick={() => {
                       close();
                       onOpenUsageActivity();
@@ -155,7 +165,7 @@ export function HeaderMenu({
                     <span><b>使用活动</b><small>每日 Token、峰值与连续使用记录</small></span>
                     <Icon name="chevron-right" size={16} />
                   </button>}
-                  <button ref={engine === "codex" ? undefined : firstRef}
+                  <button ref={engine === "codex" || onOpenViewer ? undefined : firstRef}
                     type="button" className="header-menu-item"
                     onClick={() => setPage("notifications")}>
                     <Icon name="notify" size={18} />

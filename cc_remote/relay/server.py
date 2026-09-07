@@ -25,7 +25,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from cc_remote.config import (
     RelayConfig, relay_config, valid_machine_id, validate_relay_config,
@@ -33,10 +33,11 @@ from cc_remote.config import (
 from cc_remote.log import logger
 from cc_remote.protocol import PROTOCOL_VERSION
 from cc_remote.relay.auth import (
-    SESSION_COOKIE_NAME, SessionClaims, authenticate_login,
+    SessionClaims, authenticate_login,
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.viewer import ViewerError, ViewerRelay, main_cookie_name
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.push import (
     PushDispatcher, PushOutcome, PushSubscription, PushSubscriptionStore,
@@ -374,11 +375,11 @@ async def _read_json_limited(req: Request, max_bytes: int):
 
 
 async def _active_claims(
-    req: Request,
+    req: Request | WebSocket,
     cfg: RelayConfig,
     sessions: SessionRegistry,
 ) -> SessionClaims | None:
-    token = req.cookies.get(SESSION_COOKIE_NAME, "")
+    token = req.cookies.get(main_cookie_name(cfg, req), "")
     claims = session_token_claims(token, cfg.session_secret)
     if (
         claims is None
@@ -586,13 +587,50 @@ def create_app(
     app.state.push_store = push_store
     app.state.push_dispatcher = push_dispatcher
     app.state.device_store = devices
+    viewers = ViewerRelay(
+        cfg, lambda req: _active_claims(req, cfg, sessions), sessions.active,
+        lambda claims, machine: _claims_allow_machine(claims, machine, devices),
+        lambda req: _request_origin_allowed(req, cfg),
+    )
+    app.state.viewers = viewers
 
     @app.middleware("http")
     async def static_shell_cache_policy(req: Request, call_next):
         """Never let a protocol upgrade reload into a stale application shell."""
+        grant_id = viewers.host_grant(req)
+        if grant_id is None and req.url.path.startswith("/__cc_viewer/bridge/"):
+            from cc_remote.relay.viewer_bridge import bridge_runner
+            return await bridge_runner(req, viewers)
+        viewer_api = req.url.path == "/api/viewers" or req.url.path.startswith("/api/viewers/")
+        if grant_id is not None or viewer_api:
+            try:
+                response = (await viewers.host(req, grant_id) if grant_id is not None
+                            else await viewers.api(req))
+            except (ViewerError, ValueError, asyncio.TimeoutError) as exc:
+                status = exc.status if isinstance(exc, ViewerError) else 400
+                code = exc.code if isinstance(exc, ViewerError) else "invalid_request"
+                if grant_id is not None:
+                    messages = {
+                        "device_offline": "设备已离线，请连接后重新打开预览。",
+                        "resource_unavailable": "资源不存在、已更改或未包含在预览范围内。",
+                        "publication_changed": "预览配置已更新，请重新打开。",
+                        "preview_expired": "预览已过期，请从 cc-remote 重新打开。",
+                    }
+                    response = HTMLResponse(
+                        '<meta charset="utf-8"><p style="font:15px system-ui;padding:24px">'
+                        + messages.get(code, "当前无法打开预览，请返回 cc-remote 重试。") + "</p>",
+                        status_code=status,
+                    )
+                else:
+                    response = JSONResponse({"error": code}, status_code=status)
+            if grant_id is not None:
+                response.headers.update(viewers.headers(grant_id))
+            if viewer_api or req.url.path.startswith("/__cc_viewer/") or response.status_code >= 400:
+                response.headers["Cache-Control"] = "no-store"
+            return response
         response = await call_next(req)
         path = req.url.path
-        if path in {"/", "/index.html", "/sw.js", "/cc-remote-build.json"}:
+        if path in {"/", "/index.html", "/sw.js", "/cc-remote-build.json", "/cc-remote-viewer-runner.js"}:
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
         elif (
             path.startswith("/assets/")
@@ -756,7 +794,7 @@ def create_app(
             {"ok": True, "exp": exp}, headers={"Cache-Control": "no-store"}
         )
         response.set_cookie(
-            SESSION_COOKIE_NAME,
+            main_cookie_name(cfg, req),
             token,
             max_age=cfg.session_ttl_seconds,
             path="/",
@@ -768,7 +806,7 @@ def create_app(
 
     @app.get("/api/session")
     async def session_status(req: Request) -> JSONResponse:
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
+        token = req.cookies.get(main_cookie_name(cfg, req), "")
         claims = session_token_claims(token, cfg.session_secret)
         if (
             claims is None
@@ -792,7 +830,7 @@ def create_app(
                 status_code=403,
                 headers={"Cache-Control": "no-store"},
             )
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
+        token = req.cookies.get(main_cookie_name(cfg, req), "")
         claims = session_token_claims(token, cfg.session_secret)
         if claims is not None:
             if push_store is not None:
@@ -800,7 +838,7 @@ def create_app(
             await sessions.revoke(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(
-            SESSION_COOKIE_NAME,
+            main_cookie_name(cfg, req),
             path="/",
             secure=_request_cookie_secure(req),
             httponly=True,
@@ -969,6 +1007,7 @@ def create_app(
         if not revoked:
             return JSONResponse({"error": "not_found"}, status_code=404)
         await hub.disconnect_wrapper(machine_id, reason="device revoked")
+        await viewers.disconnect_machine(machine_id)
         return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/machines")
@@ -992,6 +1031,34 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.websocket("/ws/viewer")
+    async def viewer_ws(websocket: WebSocket) -> None:
+        authorization = websocket.headers.get("authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        scope = wrapper_machine_scope(token, cfg)
+        dynamic = scope is None
+        if dynamic:
+            scope = await devices.machine_for_token(token)
+        if scope is None or websocket.headers.get("origin"):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        async def authorized(machine_id: str) -> bool:
+            return (await devices.machine_for_token(token) == machine_id) if dynamic else True
+        await viewers.serve_wrapper(websocket, scope, authorized)
+
+    @app.websocket("/ws/viewer-client")
+    async def viewer_client_ws(websocket: WebSocket) -> None:
+        # This is a browser-only resource connection, never a wrapper role or
+        # chat connection. A public grant ID is not authentication.
+        from cc_remote.relay.viewer_bridge import serve_bridge
+        claims = await _active_claims(websocket, cfg, sessions)
+        if (claims is None or websocket.headers.get("authorization")
+                or not _request_origin_allowed(websocket, cfg, allow_missing=False)):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        await serve_bridge(websocket, viewers, claims)
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         authorization = websocket.headers.get("authorization", "")
@@ -1009,7 +1076,7 @@ def create_app(
                 role = "wrapper"
         claims: Optional[SessionClaims] = None
         if role is None:
-            token = websocket.cookies.get(SESSION_COOKIE_NAME, "")
+            token = websocket.cookies.get(main_cookie_name(cfg, websocket), "")
             origin = websocket.headers.get("origin", "")
             origin_ok = _request_origin_allowed(
                 websocket, cfg, allow_missing=False,

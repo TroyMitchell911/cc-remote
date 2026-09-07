@@ -140,11 +140,11 @@ deployment.
   restores the matching pre-release data before an older wrapper is restarted,
   and verifies the v34 Codex ownership backfill.
 
-Protocol v52 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v55 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v52 relay/web release; then start the v52 wrapper.
+activate the v55 relay/web release; then start the v55 wrapper.
 
 The wrapper installer treats local Work data and versioned private control state
 as part of the release
@@ -156,8 +156,8 @@ restores and starts the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v52, and retain that snapshot with the previous release. To roll back,
-stop v52, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v55, and retain that snapshot with the previous release. To roll back,
+stop v55, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state
@@ -166,6 +166,21 @@ not deleted). Use this for immediate failed activation; after normal use,
 prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
 
 ## Container deploy (Docker) and the nginx alternative
+
+For the optional static remote Viewer feature, also read
+[`docs/remote-viewer.md`](../docs/remote-viewer.md). Default Bridge mode reuses
+the existing origin, including explicitly allowed HTTP/IP access; no extra DNS/TLS
+is needed. Include the runner asset and both Viewer WebSocket routes; preserve
+the relay's HTTP sandbox/CSP on `/__cc_viewer/bridge/*` using the updated proxy
+template. Home-directory page discovery is enabled by default; opt out with
+`CC_REMOTE_VIEWER_HOME_PREVIEW=0` in the Wrapper environment. It verifies explicit
+HTML references or owned Python static listeners, not arbitrary URL proxies;
+automatic pages stay in their session lists. Existing manual publications are
+preserved. Check one actual page on each resource device, not just the catalog.
+Optional Isolated mode
+still requires wildcard TLS and a narrow frame-src addition. Never serve raw
+Viewer scripts on the main application origin. Verify real mobile access before
+reporting this optional feature as deployed.
 
 The official relay install is a systemd venv staged by `setup-vps.sh` behind a
 managed Caddy. Two alternative topologies are supported for hosts that already

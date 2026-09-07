@@ -170,6 +170,11 @@ def test_generated_image_history_is_lazy_and_survives_missing_saved_file(monkeyp
     path = tmp_path / "rollout.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in _rows(encoded, storage=storage)))
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(path))
+
+    def no_upload_scan(*_):
+        raise AssertionError("a resolved generated image must not scan unrelated uploads")
+
+    monkeypatch.setattr(mm, "codex_history_user_images", no_upload_scan)
     image_event = _event(_item(encoded)).model_dump(mode="json")
     official = [
         {"type": "user_msg", "msg_id": "user-1", "prompt": "draw"},

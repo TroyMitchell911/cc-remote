@@ -17,12 +17,15 @@ import {
 import { useImeSubmit } from "../use-ime-submit";
 import { codexProfilePresentation } from "../codex-profile-presentation";
 import { newWorkProfileForSidebarFilter } from "../work-profile-selection";
+import { manualUnreadKey } from "../manual-unread";
+import { useManualUnread } from "../use-manual-unread";
 
 interface Props {
   open: boolean;
   engine: Engine;
   space: Space;
   profileScopeKey: string;
+  machineId?: string;
   claudeProfiles?: ClaudeProfileInfo[];
   defaultClaudeProfileId?: string | null;
   codexProfiles?: CodexProfileInfo[];
@@ -34,7 +37,7 @@ interface Props {
   liveStates?: Record<string, State>;
   completionBadges?: Record<string, CompletionBadgeKind>;
   activeSessionId: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (id: string) => void | boolean;
   onNew: (profileId?: string) => void;
   onNewInDir: (cwd: string) => void;
   onClose: () => void;
@@ -69,11 +72,12 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 }
 
 export function SessionsSidebar({ open, engine, space,
-  profileScopeKey, claudeProfiles = [], defaultClaudeProfileId,
+  profileScopeKey, machineId, claudeProfiles = [], defaultClaudeProfileId,
   codexProfiles = [], defaultCodexProfileId,
   onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
+  const manualUnread = useManualUnread();
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
@@ -281,12 +285,16 @@ export function SessionsSidebar({ open, engine, space,
     }
     const onTitleClick = () => {
       if (lifting) { closeMenu(); return; }
-      onSelect(s.session_id);
+      if (onSelect(s.session_id) !== false && machineId) {
+        manualUnread.update({ machineId, engine: s.engine ?? engine, space: s.space ?? space }, s.session_id, false);
+      }
     };
     // Prefer live runtime state (resident session) over the list snapshot.
     const st = liveStates?.[s.session_id] ?? s.state;
-    const completion = completionBadges?.[s.session_id];
-    const completionLabel = completion === "btw" ? "BTW 完成"
+    const unreadScope = machineId ? { machineId, engine: s.engine ?? engine, space: s.space ?? space } : null;
+    const completion = unreadScope && manualUnread.marks[manualUnreadKey(unreadScope, s.session_id)]
+      ? "unread" : completionBadges?.[s.session_id];
+    const completionLabel = completion === "unread" ? "未读" : completion === "btw" ? "BTW 完成"
       : completion === "both" ? "2 项完成"
       : completion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
@@ -320,7 +328,7 @@ export function SessionsSidebar({ open, engine, space,
           {(st === "running" || st === "interrupting") && (
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
           )}
-          {completionLabel && st !== "running" && st !== "interrupting" && (
+          {completionLabel && (completion === "unread" || (st !== "running" && st !== "interrupting")) && (
             <span className="pill completed"><span className="sd" />{completionLabel}</span>
           )}
         </div>
@@ -345,6 +353,9 @@ export function SessionsSidebar({ open, engine, space,
             <button onClick={() => doPin(s)}>
               <Icon name="pin" size={15} />{s.pinned ? "取消置顶" : "置顶"}
             </button>
+            {unreadScope && <button onClick={() => {
+              manualUnread.update(unreadScope, s.session_id, true); setMenuCardId(null); setLifting(false);
+            }}><Icon name="message" size={15} />标记为未读</button>}
             {space === "code" && capabilities.forkWorktree && (
               <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
                 title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>

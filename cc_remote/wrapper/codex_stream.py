@@ -17,6 +17,7 @@ import shlex
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import islice
+from typing import Callable
 
 from pydantic import ValidationError
 
@@ -5194,9 +5195,10 @@ def _record_containing_offset(
     *,
     file_size: int,
     offset: int,
+    max_record_bytes: int = _MAX_HISTORY_BOUNDARY_RECORD_BYTES,
 ) -> tuple[int, bytes] | None:
     """Read one bounded JSONL record around a byte match."""
-    prefix_start = max(0, offset - _MAX_HISTORY_BOUNDARY_RECORD_BYTES)
+    prefix_start = max(0, offset - max_record_bytes)
     source.seek(prefix_start)
     prefix = source.read(offset - prefix_start)
     newline = prefix.rfind(b"\n")
@@ -5209,9 +5211,9 @@ def _record_containing_offset(
     if record_start is None:
         return None
     source.seek(record_start)
-    line = source.readline(_MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1)
+    line = source.readline(max_record_bytes + 1)
     if (
-        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        len(line) > max_record_bytes
         or (
             not line.endswith(b"\n")
             and record_start + len(line) < file_size
@@ -5221,13 +5223,18 @@ def _record_containing_offset(
     return record_start, line.rstrip(b"\r\n")
 
 
-def _codex_native_turn_window(
+def _codex_history_record_window(
     path: str,
-    native_turn_id: str,
+    identity: str,
+    accept: Callable[[bytes], bool],
+    *,
+    max_record_bytes: int = _MAX_HISTORY_BOUNDARY_RECORD_BYTES,
 ) -> tuple[int, int] | None:
-    """Locate a native task by exact id without walking every JSONL record."""
-    needle = native_turn_id.encode("ascii")
+    """Locate one structurally verified record using bounded byte searches."""
+    if not isinstance(identity, str) or not _SAFE_WIRE_ID.fullmatch(identity):
+        return None
     try:
+        needle = identity.encode("ascii")
         with open(path, "rb") as source:
             file_size = os.fstat(source.fileno()).st_size
             left = 0
@@ -5249,6 +5256,7 @@ def _codex_native_turn_window(
                         source,
                         file_size=file_size,
                         offset=absolute_match,
+                        max_record_bytes=max_record_bytes,
                     )
                     if record is not None:
                         record_start, line = record
@@ -5256,7 +5264,7 @@ def _codex_native_turn_window(
                             checked_records.add(record_start)
                             if len(checked_records) > _MAX_HISTORY_TURN_MATCHES:
                                 return None
-                            if _history_turn_cursor(line) == native_turn_id:
+                            if accept(line):
                                 return record_start, file_size
                     cursor = match if reverse else match + len(needle)
 
@@ -5286,6 +5294,51 @@ def _codex_native_turn_window(
     except (OSError, UnicodeEncodeError):
         return None
     return None
+
+
+def _codex_native_turn_window(
+    path: str,
+    native_turn_id: str,
+) -> tuple[int, int] | None:
+    return _codex_history_record_window(
+        path, native_turn_id,
+        lambda line: _history_turn_cursor(line) == native_turn_id,
+    )
+
+
+def codex_history_user_images(path: str, message_id: str) -> list[dict]:
+    """Recover inline uploads by exact native user-item id, never a nearby turn.
+
+    Browser history can outlive both the official reader's locator LRU and the
+    rebuildable detail index. The original response item is still authoritative;
+    no app-server resume, full-history translation or localImage path is needed.
+    """
+    images: list[dict] = []
+
+    def accept(line: bytes) -> bool:
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            return False
+        payload = row.get("payload")
+        if _legacy_response_user_item_id(payload) != message_id:
+            return False
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return False
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_image":
+                image = _data_uri_to_img(item.get("image_url"))
+                if image is not None:
+                    images.append(image)
+        return True
+
+    _codex_history_record_window(
+        path, message_id, accept, max_record_bytes=_MAX_HISTORY_RECORD_CHARS,
+    )
+    return images
 
 
 def _history_image_payload(
