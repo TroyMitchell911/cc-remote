@@ -144,6 +144,24 @@ test("Bridge explains unsupported modules and failed CDN dependencies without we
   await expect(page.locator(".viewer-stage iframe")).toHaveAttribute("sandbox", "allow-scripts");
 });
 
+for (const api of ["WebSocket", "XMLHttpRequest", "EventSource", "Worker", "SharedWorker"]) {
+  test(`Bridge rejects ${api} without suggesting a mode switch will connect a backend`, async ({ page }) => {
+    test.skip(process.env.VIEWER_TEST_MODE === "isolated", "Bridge compiler diagnostics.");
+    await page.getByRole("button", { name: "打开远程预览" }).click();
+    await page.getByRole("button", { name: new RegExp(`^${api} 限制测试`) }).click();
+    const error = page.locator(".viewer-error-banner");
+    await expect(error).toContainText(`此页面使用 ${api}，Bridge 暂不支持。`, { timeout: 20000 });
+    if (["Worker", "SharedWorker"].includes(api)) {
+      await expect(error).toContainText("请使用不依赖 Worker 的静态页面。");
+      await expect(error).not.toContainText("后台连接");
+    } else {
+      await expect(error).toContainText("当前预览不代理后台连接，切换 Isolated 模式也无法接通后台服务。");
+    }
+    await expect(error).not.toContainText("请使用 Isolated 模式");
+    await expect(page.locator(".viewer-stage iframe")).toHaveAttribute("sandbox", "allow-scripts");
+  });
+}
+
 test("an unrelated opaque frame cannot steal the Bridge initialization port", async ({ page }) => {
   test.skip(process.env.VIEWER_TEST_MODE === "isolated", "Bridge handshake coverage.");
   let releaseRunner!: () => void;

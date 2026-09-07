@@ -84,6 +84,11 @@ document.getElementById('rotate').onclick=()=>{
             for name, label, script in [
                 ("dynamic", "动态模块限制测试", "const path='./app.js'; await import(path)"),
                 ("cdn", "依赖断网测试", "import 'https://esm.sh/cc-remote-fixture-dependency';"),
+                ("websocket", "WebSocket 限制测试", "new WebSocket('wss://backend.invalid/socket');"),
+                ("xhr", "XMLHttpRequest 限制测试", "new XMLHttpRequest();"),
+                ("eventsource", "EventSource 限制测试", "new EventSource('https://backend.invalid/events');"),
+                ("worker", "Worker 限制测试", "new Worker('./app.js');"),
+                ("sharedworker", "SharedWorker 限制测试", "new SharedWorker('./app.js');"),
             ]:
                 (root / f"viewer/{name}.html").write_text(
                     f'<!doctype html><body><script type="module">{script}</script></body>')

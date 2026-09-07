@@ -88,8 +88,13 @@ export class Compiler {
             && ((!node.computed && property.type === "Identifier" && property.name === "url") || property.value === "url"))
           edits.push({ start: node.start, end: node.end, value: JSON.stringify(url) });
       }
-      if (node.type === "NewExpression" && ["Worker", "SharedWorker", "WebSocket", "XMLHttpRequest", "EventSource"].includes(String((node.callee as Node).name)))
-        throw new Error("此预览依赖后台连接或 Worker，Bridge 暂不支持；请使用 Isolated 模式。");
+      if (node.type === "NewExpression") {
+        const api = String((node.callee as Node).name);
+        if (["Worker", "SharedWorker"].includes(api))
+          throw new Error(`此页面使用 ${api}，Bridge 暂不支持。请使用不依赖 Worker 的静态页面。`);
+        if (["WebSocket", "XMLHttpRequest", "EventSource"].includes(api))
+          throw new Error(`此页面使用 ${api}，Bridge 暂不支持。当前预览不代理后台连接，切换 Isolated 模式也无法接通后台服务。`);
+      }
       if (node.type === "CallExpression") {
         const target = node.callee as Node;
         if (target.type === "MemberExpression" && (target.object as Node).name === "document"
