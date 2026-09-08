@@ -12,6 +12,13 @@ class SessionPages:
         self.store = ViewerPageStore(path)
         self.resolve_scope = resolve_scope
         self.lock = asyncio.Lock()
+        # A failed optional profile migration disables only this metadata
+        # surface until restart/recovery, not the engine's chat operations.
+        self.blocked_engines: set[str] = set()
+
+    def _require_ready(self, engine):
+        if engine in self.blocked_engines:
+            raise ValueError("page profile migration is incomplete")
 
     @staticmethod
     async def _io(method, *args, **kwargs):
@@ -39,7 +46,9 @@ class SessionPages:
         if operation not in fields or set(payload) != {"scope", "operation"} | fields[operation]:
             raise ValueError("invalid page operation")
         async with self.lock:
-            scope, cwd = await self.resolve_scope(PageScope.model_validate(payload["scope"]))
+            requested = PageScope.model_validate(payload["scope"])
+            self._require_ready(requested.engine)
+            scope, cwd = await self.resolve_scope(requested)
             if operation == "associate":
                 values = payload["pages"]
                 if not isinstance(values, list) or len(values) > 8 or type(payload["automatic"]) is not bool:
@@ -56,8 +65,10 @@ class SessionPages:
 
     async def rekey(self, engine, space, old_sid, sid):
         async with self.lock:
+            self._require_ready(engine)
             await self._io(self.store.rekey, engine, space, old_sid, sid)
 
     async def drop(self, engine, sid):
         async with self.lock:
+            self._require_ready(engine)
             await self._io(self.store.drop, engine, sid)

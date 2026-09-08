@@ -2575,10 +2575,13 @@ class WrapperMachine:
             # migrates or is quarantined. Code and Work stay available, but a
             # later restart must retain the old-id -> new-id transform.
             self._claude_presentation_profile_migration_ok = False
+        claude_viewer_migration_ok = self._migrate_viewer_profile_state(
+            "claude", claude_transition, ready=self._claude_profile_migration_ok)
         if (
             self._claude_profile_migration_ok
             and self._claude_work_profile_migration_ok
             and self._claude_presentation_profile_migration_ok
+            and claude_viewer_migration_ok
             and claude_transition is not None
         ):
             try:
@@ -2647,10 +2650,13 @@ class WrapperMachine:
                     "Codex Work profile ownership migration is incomplete",
                     error_type=type(exc).__name__,
                 )
+        codex_viewer_migration_ok = self._migrate_viewer_profile_state(
+            "codex", transition, ready=self._codex_profile_migration_ok)
         if (
             self._codex_profile_migration_ok
             and self._codex_work_profile_migration_ok
             and self._codex_presentation_profile_migration_ok
+            and codex_viewer_migration_ok
             and transition is not None
         ):
             try:
@@ -2665,6 +2671,24 @@ class WrapperMachine:
                     "Codex profile topology could not be persisted",
                     error_type=type(exc).__name__,
                 )
+
+    def _migrate_viewer_profile_state(self, engine, transition, *, ready):
+        # Startup runs before metadata serving. Keep the topology replay marker
+        # on failure, and block old-scope reads/writes without disabling chat.
+        self.viewer_pages.blocked_engines.add(engine)
+        if not ready:
+            return False
+        if transition is not None:
+            try:
+                self.viewer_pages.store.migrate_profile_sessions(
+                    engine, transition.wire_session_id,
+                    profile_revision=transition.revision)
+            except Exception as exc:
+                log.warning("Viewer profile migration is incomplete",
+                            engine=engine, error_type=type(exc).__name__)
+                return False
+        self.viewer_pages.blocked_engines.discard(engine)
+        return True
 
     def _migrate_claude_core_profile_state(
         self, transition: ClaudeProfileTopologyTransition,
@@ -23123,7 +23147,11 @@ class WrapperMachine:
                 cwd = controls.cwd_override or cwd
         else:
             path = await asyncio.to_thread(self._claude_transcript_path_for_wire, sid)
-            cwd = None
+            profile, native_sid = self._claude_target(sid)
+            info = await asyncio.to_thread(
+                self._claude_catalog_session_info, profile, native_sid,
+            ) if path else None
+            cwd = getattr(info, "cwd", None)
         if not path:
             raise ValueError("unknown session")
         return scope.model_copy(update={"sid": sid}), cwd

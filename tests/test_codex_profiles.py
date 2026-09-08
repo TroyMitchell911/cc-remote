@@ -37,6 +37,7 @@ from cc_remote.wrapper.machine import WrapperMachine, _CodexHistoryProfiles
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.workspaces import WorkRegistry
+from cc_remote.viewer_pages import PageScope, PageRef
 
 
 def _profiles(primary: Path, stack: Path) -> str:
@@ -2576,6 +2577,9 @@ def test_same_home_profile_id_rename_migrates_persisted_identity(
     assert initial._session_pins is not None
     initial._session_pins.set_pinned(
         "codex", "stack@same-native-id", True)
+    page_scope = PageScope(engine="codex", space="code", sid="stack@same-native-id")
+    page = PageRef(machine_id="device", site_id="demo", entry="/index.html", label="Demo")
+    initial.viewer_pages.store.associate(page_scope, [page], automatic=False)
     work = initial._work.for_engine("codex")
     record = work.create_session(codex_profile_id="stack")
     work.bind_session(
@@ -2604,6 +2608,9 @@ def test_same_home_profile_id_rename_migrates_persisted_identity(
         "luna@same-native-id").turn_id == "turn-stack"
     assert renamed._session_pins is not None
     assert "luna@same-native-id" in renamed._session_pins.ids("codex")
+    assert renamed.viewer_pages.store.list(page_scope) == []
+    assert renamed.viewer_pages.store.list(
+        page_scope.model_copy(update={"sid": "luna@same-native-id"})) == [page.public()]
     migrated_work = renamed._work.for_engine("codex").get_by_session(
         "same-native-id", codex_profile_id="luna")
     assert migrated_work is not None

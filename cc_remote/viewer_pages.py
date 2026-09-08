@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import Literal
+from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -22,6 +22,7 @@ from cc_remote.viewer import ViewerSite, clean_path, load_sites, open_resource
 MAX_PAGES = 32
 MAX_SCOPES = 512
 MAX_STORE_BYTES = 4 * 1024 * 1024
+_PROFILE_REVISIONS = "_profile_revisions"
 
 
 class PageScope(BaseModel):
@@ -127,9 +128,15 @@ class ViewerPageStore:
                     or info.st_size > MAX_STORE_BYTES):
                 raise ValueError("invalid page store")
             data = json.loads(stream.read(MAX_STORE_BYTES + 1))
-        if not isinstance(data, dict) or len(data) > MAX_SCOPES:
+        if (not isinstance(data, dict)
+                or len(data) - (_PROFILE_REVISIONS in data) > MAX_SCOPES):
             raise ValueError("invalid page store")
         for key, rows in data.items():
+            if key == _PROFILE_REVISIONS:
+                if (not isinstance(rows, dict) or set(rows) - {"claude", "codex"}
+                        or any(type(v) is not int or v < 0 for v in rows.values())):
+                    raise ValueError("invalid page profile revisions")
+                continue
             engine, space, sid = json.loads(key)
             if PageScope(engine=engine, space=space, sid=sid).key != key:
                 raise ValueError("invalid scope")
@@ -152,7 +159,8 @@ class ViewerPageStore:
             before = json.dumps(data, ensure_ascii=False)
             yield data
             encoded = json.dumps(data, ensure_ascii=False).encode()
-            if len(data) > MAX_SCOPES or len(encoded) > MAX_STORE_BYTES:
+            if (len(data) - (_PROFILE_REVISIONS in data) > MAX_SCOPES
+                    or len(encoded) > MAX_STORE_BYTES):
                 raise ValueError("page store full")
             if encoded == before.encode():
                 return
@@ -200,6 +208,56 @@ class ViewerPageStore:
                     row["removed"] = True
         return self.list(scope)
 
+    @staticmethod
+    def _merge_rows(rows: list[dict]) -> list[dict]:
+        merged = {}
+        for page in map(PageRef.model_validate, rows):
+            previous = merged.get(page.id)
+            if previous:
+                page = page.model_copy(update={
+                    "references": list(dict.fromkeys(previous.references + page.references))[-16:],
+                    "turn_ids": list(dict.fromkeys(previous.turn_ids + page.turn_ids))[-16:],
+                    "removed": previous.removed or page.removed,
+                })
+            merged[page.id] = page
+        if len(merged) > MAX_PAGES:
+            raise ValueError("session page list full")
+        result = [p.model_dump() for p in merged.values()]
+        if len(json.dumps(result, ensure_ascii=False).encode()) > 48 * 1024:
+            raise ValueError("session page metadata full")
+        return result
+
+    def migrate_profile_sessions(
+        self, engine: Literal["claude", "codex"], transform: Callable[[str], str],
+        *, profile_revision: int,
+    ) -> None:
+        """Rewrite one engine's scopes atomically, once per topology revision.
+
+        Revisions live in the same transaction as the rows: a crash between
+        independent store migrations must not replay an account-ID swap. Old
+        stores without this private metadata remain readable.
+        """
+        if (engine not in {"claude", "codex"}
+                or type(profile_revision) is not int or profile_revision < 1):
+            raise ValueError("invalid page profile migration")
+        with self._edit() as data:
+            revisions = data.get(_PROFILE_REVISIONS, {})
+            if revisions.get(engine, 0) >= profile_revision:
+                return
+            updated = {}
+            for key, rows in data.items():
+                if key == _PROFILE_REVISIONS:
+                    continue
+                row_engine, space, sid = json.loads(key)
+                if row_engine != engine:
+                    updated[key] = rows
+                    continue
+                key = PageScope(engine=engine, space=space, sid=transform(sid)).key
+                updated[key] = self._merge_rows(updated.get(key, []) + rows)
+            data.clear()
+            data.update(updated)
+            data[_PROFILE_REVISIONS] = {**revisions, engine: profile_revision}
+
     def rekey(self, engine: str, space: str, old_sid: str, sid: str):
         old, new = (PageScope(engine=engine, space=space, sid=s) for s in (old_sid, sid))
         if old == new:
@@ -207,21 +265,7 @@ class ViewerPageStore:
         with self._edit() as data:
             rows = data.pop(old.key, [])
             if rows:
-                merged = {}
-                for page in map(PageRef.model_validate, rows + data.get(new.key, [])):
-                    previous = merged.get(page.id)
-                    if previous:
-                        page = page.model_copy(update={
-                            "references": list(dict.fromkeys(previous.references + page.references))[-16:],
-                            "turn_ids": list(dict.fromkeys(previous.turn_ids + page.turn_ids))[-16:],
-                            "removed": previous.removed or page.removed,
-                        })
-                    merged[page.id] = page
-                if len(merged) > MAX_PAGES:
-                    raise ValueError("session page list full")
-                data[new.key] = [p.model_dump() for p in merged.values()]
-                if len(json.dumps(data[new.key], ensure_ascii=False).encode()) > 48 * 1024:
-                    raise ValueError("session page metadata full")
+                data[new.key] = self._merge_rows(rows + data.get(new.key, []))
 
     def drop(self, engine: str, sid: str):
         with self._edit() as data:

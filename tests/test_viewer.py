@@ -279,6 +279,140 @@ def test_page_store_rejects_insecure_and_oversized_state(tmp_path):
     assert store.list(scope) == []  # failed transaction is atomic
 
 
+def test_page_profile_migration_merges_tombstones_and_keeps_engine_revisions(tmp_path):
+    store = ViewerPageStore(tmp_path / "pages.json")
+    old = PageScope(engine="claude", space="code", sid="session")
+    qualified = old.model_copy(update={"sid": "personal@session"})
+    codex = old.model_copy(update={"engine": "codex"})
+    page = PageRef(machine_id="device", site_id="demo", entry="/index.html", label="Demo",
+                   references=["old.html"], turn_ids=["old-turn"])
+    store.associate(old, [page], automatic=True)
+    store.associate(qualified, [page.model_copy(update={"references": ["new.html"],
+                                                       "turn_ids": ["new-turn"]})], automatic=True)
+    store.remove(qualified, page.id)
+    store.associate(codex, [page], automatic=False)
+    store.migrate_profile_sessions("claude", lambda sid: "personal@session", profile_revision=1)
+    assert store.list(old) == []
+    assert store.associate(qualified, [page], automatic=True) == []
+    assert store.list(codex) == [page.public()]
+    assert store.associate(qualified, [page], automatic=False)[0]["turn_ids"] == ["old-turn", "new-turn"]
+    store.migrate_profile_sessions("codex", lambda sid: "stack@" + sid, profile_revision=1)
+    assert store.list(codex) == []
+    assert store.list(codex.model_copy(update={"sid": "stack@session"})) == [page.public()]
+    before = store.path.read_bytes()
+    reloaded = ViewerPageStore(store.path)
+    reloaded.migrate_profile_sessions("codex", lambda sid: "wrong@" + sid, profile_revision=1)
+    reloaded.migrate_profile_sessions("claude", lambda sid: "wrong@" + sid, profile_revision=1)
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["invalid_sid", "too_many_pages", "too_many_bytes"])
+def test_page_profile_migration_failure_preserves_rows_and_revision(tmp_path, failure):
+    store = ViewerPageStore(tmp_path / "pages.json")
+    scopes = [PageScope(engine="claude", space="code", sid=sid) for sid in ("a", "b")]
+    for i, scope in enumerate(scopes):
+        if failure == "too_many_pages":
+            pages = [PageRef(machine_id="device", site_id=f"page-{i}-{j}", entry="/index.html",
+                             label="Demo") for j in range(17)]
+        elif failure == "too_many_bytes":
+            pages = [PageRef(machine_id="device", site_id=f"page-{i}", entry="/index.html", label="Demo",
+                             references=[str(j) * 4000 for j in range(8)])]
+        else:
+            pages = [PageRef(machine_id="device", site_id="demo", entry="/index.html", label="Demo")]
+        store.associate(scope, pages, automatic=False)
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError):
+        store.migrate_profile_sessions("claude", lambda sid: "" if failure == "invalid_sid" else "merged",
+                                       profile_revision=1)
+    assert store.path.read_bytes() == before
+    store.migrate_profile_sessions("claude", lambda sid: "profile@" + sid, profile_revision=1)
+    assert all(store.list(scope.model_copy(update={"sid": "profile@" + scope.sid})) for scope in scopes)
+
+
+@pytest.mark.parametrize("revisions", [{"claude": True}, {"codex": -1}, {"other": 1}, []])
+def test_page_store_rejects_invalid_profile_revision_metadata(tmp_path, revisions):
+    path = tmp_path / "pages.json"
+    path.write_text(json.dumps({"_profile_revisions": revisions}))
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="profile revisions"):
+        ViewerPageStore(path).list(PageScope(engine="claude", space="code", sid="session"))
+
+
+def test_page_profile_metadata_does_not_consume_a_session_slot(tmp_path, monkeypatch):
+    monkeypatch.setattr("cc_remote.viewer_pages.MAX_SCOPES", 1)
+    store = ViewerPageStore(tmp_path / "pages.json")
+    store.migrate_profile_sessions("claude", lambda sid: sid, profile_revision=1)
+    scope = PageScope(engine="claude", space="code", sid="session")
+    page = PageRef(machine_id="device", site_id="demo", entry="/index.html", label="Demo")
+    assert store.associate(scope, [page], automatic=False) == [page.public()]
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match="page store full"):
+        store.associate(scope.model_copy(update={"sid": "another"}), [page], automatic=False)
+    assert store.path.read_bytes() == before
+    store.rekey("claude", "code", scope.sid, "real-session")
+    assert store.list(scope.model_copy(update={"sid": "real-session"})) == [page.public()]
+    store.drop("claude", "real-session")
+    assert store.list(scope.model_copy(update={"sid": "real-session"})) == []
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_viewer_migration_failure_preserves_chat_and_replay_marker(tmp_path, monkeypatch, engine):
+    from cc_remote.config import WrapperConfig
+    from cc_remote.wrapper.machine import WrapperMachine
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-a"))
+    cfg = WrapperConfig()
+    cfg.state_dir = tmp_path / "state"
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.claude_profiles_json = json.dumps({
+        "a": {"label": "A", "config_dir": str(tmp_path / "claude-a"), "default": True},
+        "b": {"label": "B", "config_dir": str(tmp_path / "claude-b")},
+    })
+    cfg.codex_profiles_json = json.dumps({
+        "a": {"label": "A", "home": str(tmp_path / "codex-a"), "default": True},
+        "b": {"label": "B", "home": str(tmp_path / "codex-b")},
+    })
+    original = ViewerPageStore.migrate_profile_sessions
+
+    def fail_one(self, row_engine, *args, **kwargs):
+        if row_engine == engine:
+            raise OSError("temporary write failure")
+        return original(self, row_engine, *args, **kwargs)
+
+    monkeypatch.setattr(ViewerPageStore, "migrate_profile_sessions", fail_one)
+    machine = WrapperMachine(cfg, SimpleNamespace(on_connected=None))
+    assert machine._claude_profile_migration_ok
+    assert machine._codex_profile_migration_ok
+    assert machine._claude_work_profile_migration_ok
+    assert machine._codex_work_profile_migration_ok
+    assert machine.viewer_pages.blocked_engines == {engine}
+    marker = cfg.state_dir / f"{engine}-profile-transition.json"
+    assert marker.exists()
+    scope = PageScope(engine=engine, space="code", sid="a@session")
+
+    async def blocked_operations():
+        # No old-key operation may race current-topology writes while recovery
+        # is pending, including lifecycle mutations that bypass resolve_scope.
+        for payload in (
+            {"operation": "list"},
+            {"operation": "associate", "pages": [], "automatic": True},
+            {"operation": "remove", "page_id": "0" * 32},
+        ):
+            with pytest.raises(ValueError, match="profile migration is incomplete"):
+                await machine.viewer_pages({"scope": scope.model_dump(), **payload})
+        with pytest.raises(ValueError, match="profile migration is incomplete"):
+            await machine.viewer_pages.rekey(engine, "code", scope.sid, "new-session")
+        with pytest.raises(ValueError, match="profile migration is incomplete"):
+            await machine.viewer_pages.drop(engine, scope.sid)
+
+    asyncio.run(blocked_operations())
+    monkeypatch.setattr(ViewerPageStore, "migrate_profile_sessions", original)
+    recovered = WrapperMachine(cfg, SimpleNamespace(on_connected=None))
+    assert recovered.viewer_pages.blocked_engines == set()
+    assert not marker.exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lifecycle", ["rekey", "drop"])
 async def test_cancelled_page_write_finishes_before_session_lifecycle(tmp_path, monkeypatch, lifecycle):

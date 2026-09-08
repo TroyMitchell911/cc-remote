@@ -32,6 +32,7 @@ from cc_remote.protocol import (
 from cc_remote.wrapper import claude_catalog, machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.session_presentation import SessionPresentationStore
+from cc_remote.viewer_pages import PageRef, PageScope, ViewerPageStore
 
 
 NATIVE_ID = "11111111-1111-4111-8111-111111111111"
@@ -752,6 +753,96 @@ def test_machine_lists_duplicate_native_ids_in_both_claude_accounts(
             "company", "company prompt",
         ),
     }
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_cold_viewer_scope_reads_the_owning_claude_catalog_without_resuming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, multi: bool,
+) -> None:
+    personal, company = tmp_path / "personal", tmp_path / "company"
+    _write_transcript(personal, "personal", cwd="/personal-project")
+    _write_transcript(company, "company", cwd="/company-project")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(personal))
+    cfg = WrapperConfig()
+    cfg.state_dir = tmp_path / "state"
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.claude_profiles_json = _profiles(personal, company) if multi else ""
+    machine = WrapperMachine(cfg, _StubTransport())
+    expected = [(f"personal@{NATIVE_ID}", "/personal-project"),
+                (f"company@{NATIVE_ID}", "/company-project")] if multi else [
+                    (NATIVE_ID, "/personal-project")]
+
+    for sid, cwd in expected:
+        scope = PageScope(engine="claude", space="code", sid=sid)
+        resolved, actual_cwd = asyncio.run(machine._viewer_page_scope(scope))
+        assert resolved == scope
+        assert actual_cwd == cwd
+    assert machine.sessions == {}
+    assert machine.focused_sid is None
+    assert machine.transport.sent == []
+
+    unknown = PageScope(engine="claude", space="code", sid=expected[0][0] + "-missing")
+    with pytest.raises(ValueError, match="unknown session"):
+        asyncio.run(machine._viewer_page_scope(unknown))
+
+
+def test_claude_profile_transitions_migrate_viewer_scopes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    personal, company = tmp_path / "personal", tmp_path / "company"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(personal))
+    cfg = WrapperConfig()
+    cfg.state_dir = tmp_path / "state"
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.claude_profiles_json = ""
+    initial = WrapperMachine(cfg, _StubTransport())
+    store = initial.viewer_pages.store
+    scope = PageScope(engine="claude", space="code", sid=NATIVE_ID)
+    page = PageRef(machine_id="device", site_id="demo", entry="/index.html", label="Personal")
+    store.associate(scope, [page], automatic=False)
+    # Code and Work are separate lists even for the same native session.
+    work_scope = scope.model_copy(update={"space": "work"})
+    store.associate(work_scope, [page], automatic=True)
+    store.remove(work_scope, page.id)
+    codex_scope = scope.model_copy(update={"engine": "codex"})
+    store.associate(codex_scope, [page], automatic=False)
+
+    cfg.claude_profiles_json = _profiles(personal, company)
+    multi = WrapperMachine(cfg, _StubTransport())
+    personal_scope = scope.model_copy(update={"sid": f"personal@{NATIVE_ID}"})
+    company_scope = scope.model_copy(update={"sid": f"company@{NATIVE_ID}"})
+    assert store.list(scope) == []
+    assert store.list(personal_scope)[0]["label"] == "Personal"
+    store.associate(company_scope, [page.model_copy(update={"label": "Company"})], automatic=False)
+
+    # Swap both IDs and simulate a crash after store migration but before the
+    # topology commit. A new Wrapper must not replay the non-idempotent swap.
+    cfg.claude_profiles_json = _profiles(company, personal)
+    complete = ClaudeProfileTopologyStore.complete
+    monkeypatch.setattr(ClaudeProfileTopologyStore, "complete",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash")))
+    failed = WrapperMachine(cfg, _StubTransport())
+    assert not failed._claude_profile_migration_ok
+    assert store.list(company_scope)[0]["label"] == "Personal"
+    assert store.list(personal_scope)[0]["label"] == "Company"
+    monkeypatch.setattr(ClaudeProfileTopologyStore, "complete", complete)
+    recovered = WrapperMachine(cfg, _StubTransport())
+    assert recovered._claude_profile_migration_ok
+    assert store.list(company_scope)[0]["label"] == "Personal"
+    assert store.list(personal_scope)[0]["label"] == "Company"
+
+    # Back to one account: the other account's qualified key must stay private.
+    cfg.claude_profiles_json = ""
+    single = WrapperMachine(cfg, _StubTransport())
+    assert single._claude_profile_migration_ok
+    assert store.list(scope)[0]["label"] == "Personal"
+    assert store.list(personal_scope)[0]["label"] == "Company"
+    assert store.associate(work_scope, [page], automatic=True) == []
+    assert store.list(codex_scope)[0]["label"] == "Personal"
+    assert ViewerPageStore(store.path).list(scope) == store.list(scope)
+    assert multi.sessions == recovered.sessions == single.sessions == {}
 
 
 def test_claude_session_list_fails_closed_during_profile_migration() -> None:
