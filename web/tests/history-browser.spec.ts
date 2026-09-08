@@ -6210,7 +6210,13 @@ test("desktop wheel scrolling remains available after text selection", async ({
   await waitForScrollIdle(page);
   const startTurnId = (await readingAnchor(page)).id;
   const text = page.locator(`[data-turn-id="${startTurnId}"] p`).first();
+  // A reading anchor may be clipped above the thread. In the CI trace the
+  // drag hit the fixture toolbar instead of text, so no selection existed.
+  await text.scrollIntoViewIfNeeded();
+  await waitForScrollIdle(page);
   const point = await textSelectionPoint(text);
+  expect(await text.evaluate((node, at) =>
+    node.contains(document.elementFromPoint(at.x, at.y)), point)).toBe(true);
 
   await page.mouse.move(point.x, point.y);
   await page.mouse.down();
