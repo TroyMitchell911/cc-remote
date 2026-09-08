@@ -86,14 +86,19 @@ export interface BoundCompactionOrphanReconciliation {
 export function reconcileBoundCompactionOrphanDetailed(
   turns: readonly Turn[],
   ownerAliases: readonly string[],
-  nativeId: string,
+  nativeId: string | readonly string[],
 ): BoundCompactionOrphanReconciliation {
   const aliases = new Set(ownerAliases.filter(Boolean));
+  const nativeIds = new Set(
+    typeof nativeId === "string" ? [nativeId] : nativeId,
+  );
   const owners = turns.flatMap((turn, index) =>
     exactAliases(turn).some((alias) => aliases.has(alias)) ? [index] : []);
-  const orphans = turns.flatMap((turn, index) =>
-    orphanNativeId(turn, false) === nativeId && turn.blocks.length === 1
-      ? [index] : []);
+  const orphans = turns.flatMap((turn, index) => {
+    const orphanId = orphanNativeId(turn, false);
+    return orphanId && nativeIds.has(orphanId) && turn.blocks.length === 1
+      ? [index] : [];
+  });
   if (owners.length !== 1 || orphans.length !== 1
       || owners[0] === orphans[0]) {
     return { turns: [...turns], owner: null, orphan: null };
@@ -110,7 +115,7 @@ export function reconcileBoundCompactionOrphanDetailed(
 export function reconcileBoundCompactionOrphan(
   turns: readonly Turn[],
   ownerAliases: readonly string[],
-  nativeId: string,
+  nativeId: string | readonly string[],
 ): Turn[] {
   return reconcileBoundCompactionOrphanDetailed(
     turns, ownerAliases, nativeId).turns;

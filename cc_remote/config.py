@@ -12,11 +12,13 @@ import json
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from cc_remote.claude_broker.paths import default_socket_path
+from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
 
 try:
@@ -111,6 +113,40 @@ def _codex_profiles_json() -> str:
     return payload.strip()
 
 
+def _claude_profiles_json() -> str:
+    inline = _env("CC_REMOTE_CLAUDE_PROFILES_JSON", "").strip()
+    if inline:
+        return inline
+    configured = _env("CC_REMOTE_CLAUDE_PROFILES_FILE", "").strip()
+    # Older installed macOS LaunchAgents predate the explicit profile-file key.
+    # launchd injects the exact XPC service name, so keep only those permanent
+    # managed jobs forward compatible without making an ordinary source/test
+    # process implicitly read a real user's registry on macOS.
+    if (not configured
+            and sys.platform == "darwin"
+            and _env("XPC_SERVICE_NAME", "").strip() in {
+                "com.muggle.cc-remote.wrapper",
+                "com.mugglepro.cc-remote-wrapper",
+            }):
+        configured = str(
+            Path.home() / ".cc-remote" / "claude-profiles.json")
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("profile file is not a bounded regular file")
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        raise ValueError(f"invalid Claude profile file: {path}") from exc
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise ValueError(f"invalid Claude profile file: {path}")
+    return payload.strip()
+
+
 def _default_device_db_path() -> str:
     push_path = _env("PUSH_DB_PATH", "").strip()
     if push_path:
@@ -194,6 +230,11 @@ class RelayConfig:
         "DEVICE_DB_PATH", _default_device_db_path()))
     device_pairing_ttl_seconds: int = field(
         default_factory=lambda: _int("DEVICE_PAIRING_TTL_SECONDS", 600))
+    # Empty mode preserves an explicitly configured legacy isolated host;
+    # otherwise the default bridge needs no extra DNS, port or certificate.
+    viewer_mode: str = field(default_factory=lambda: _env("VIEWER_MODE", "").strip())
+    viewer_origin_template: str = field(default_factory=lambda: _env(
+        "VIEWER_ORIGIN_TEMPLATE", "").strip())
 
 
 @dataclass
@@ -217,6 +258,10 @@ class WrapperConfig:
     # shell. An explicit absolute CLAUDE_BIN may override this standard path,
     # but an empty value must never silently select the SDK-bundled executable.
     claude_bin: str = field(default_factory=_claude_bin)
+    # Optional account registry. Each entry owns one complete
+    # CLAUDE_CONFIG_DIR. Empty preserves the historical single-account path.
+    claude_profiles_json: str = field(
+        default_factory=_claude_profiles_json)
     # Optional proxy inherited only by Codex subprocesses launched by this
     # wrapper.  It deliberately does not mutate the wrapper process or the
     # user's shell/CLI environment.
@@ -489,6 +534,18 @@ def validate_relay_config(cfg: RelayConfig) -> None:
             ):
                 errors.append("PUBLIC_ORIGIN must use https except on loopback")
 
+    from cc_remote.relay.viewer import effective_viewer_mode, validate_origin_template
+    try:
+        mode = effective_viewer_mode(cfg)
+        if mode not in {"off", "bridge", "isolated"}:
+            raise ValueError("VIEWER_MODE must be off, bridge or isolated")
+        if mode == "isolated":
+            if not cfg.viewer_origin_template:
+                raise ValueError("isolated Viewer mode needs VIEWER_ORIGIN_TEMPLATE")
+            validate_origin_template(cfg.viewer_origin_template, cfg.public_origin)
+    except ValueError as exc:
+        errors.append(str(exc))
+
     if errors:
         raise ValueError("invalid relay configuration: " + "; ".join(errors))
 
@@ -501,9 +558,23 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
     """Reject credentials or relay URLs that could expose wrapper authority."""
     errors: list[str] = []
     try:
+        claude_profiles = ClaudeProfileRegistry.from_json(
+            cfg.claude_profiles_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+        claude_profiles = None
+    try:
         CodexProfileRegistry.from_json(cfg.codex_profiles_json)
     except ValueError as exc:
         errors.append(str(exc))
+    if (
+        claude_profiles is not None
+        and claude_profiles.is_multi_profile
+        and cfg.experimental_claude_broker
+    ):
+        errors.append(
+            "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER is not supported with "
+            "multiple Claude profiles")
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if not valid_machine_id(cfg.machine_id):
@@ -604,6 +675,5 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
     if cfg.codex_daemon_mode not in {"auto", "off"}:
         errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
-
     if errors:
         raise ValueError("invalid wrapper configuration: " + "; ".join(errors))

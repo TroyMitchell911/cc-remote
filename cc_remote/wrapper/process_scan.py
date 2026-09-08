@@ -383,11 +383,11 @@ def process_command_environment_value(
 ) -> tuple[bool, tuple[bytes, ...] | None, str | None]:
     """Read argv and one env value from the same exact process snapshot.
 
-    Ownership routing needs only ``CODEX_HOME``. Returning one named value keeps
-    credentials and unrelated environment data out of callers and logs. The
-    boolean distinguishes a successfully inspected environment where the key
-    is absent from a failed/racy read; account attribution must fail closed on
-    the latter.
+    Account routing needs only one named root such as ``CODEX_HOME`` or
+    ``CLAUDE_CONFIG_DIR``. Returning that one value keeps credentials and
+    unrelated environment data out of callers and logs. The boolean
+    distinguishes a successfully inspected environment where the key is absent
+    from a failed/racy read; account attribution must fail closed on the latter.
     """
     if (
         not key

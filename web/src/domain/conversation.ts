@@ -1,5 +1,6 @@
 import type {
   AssistantChannel,
+  AsyncQuestionSpec,
   ConversationImageRef,
   PlanEntry,
   ProcessKind,
@@ -23,6 +24,12 @@ export interface TextBlock {
   text: string;
   done: boolean;
   channel?: AssistantChannel;
+  delivery?: "async";
+  questions?: AsyncQuestionSpec[];
+  /** Source event time and detached-follow-up scope, preserved for chronology. */
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -51,6 +58,9 @@ export interface ToolBlock {
     duration_ms?: number | null;
   };
   done: boolean;
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -77,9 +87,17 @@ export interface ProcessBlock {
   exit_code?: number | null;
   duration_ms?: number | null;
   truncated?: boolean | null;
+  /** Background Claude Agent work stays visible in its card without reopening
+   * the enclosing session after the parent ResultMessage. */
+  background?: boolean | null;
   explanation?: string | null;
   plan?: PlanEntry[];
   done: boolean;
+  startedTs?: number;
+  updatedTs?: number;
+  /** Completion is a later chronological boundary than a detached start. */
+  terminalOrder?: number;
+  terminalTs?: number;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -138,6 +156,16 @@ export interface Turn {
   ts?: number;
   doneTs?: number;
   durationMs?: number;
+  /** Exact visible-process evidence, or `unknown` when a bounded native
+   * summary proves only that more detail exists. */
+  processDetailState?: "none" | "present" | "unknown";
+  detailReasons?: Array<
+    "process" | "prompt_truncated" | "answer_truncated" | "image_deferred"
+  >;
+  /** First/last trustworthy visible-process event, never the user-message
+   * timestamp. These drive the process timer without inheriting prompt wait. */
+  processStartedTs?: number;
+  processDoneTs?: number;
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;
@@ -146,6 +174,8 @@ export interface Turn {
   /** Exact failed page request retained only long enough for an in-place retry. */
   detailRetryBefore?: string | null;
   detailRetryDirection?: "initial" | "older" | "newer";
+  /** A stale cursor is being replaced from the authoritative newest page. */
+  detailResetPending?: boolean;
   detailHasMore?: boolean;
   detailOldestCursor?: string | null;
   detailHasNewer?: boolean;

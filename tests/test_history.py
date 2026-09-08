@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from cc_remote.protocol import (
     CodexTerminalFence, GetHistory, GetHistoryImage, GetTurnDetail, History,
     HistoryImage,
     TurnDetail, HistoryInvalidated,
+    BackgroundProcessSync,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
     ToolUse, ToolResult,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
@@ -39,6 +41,7 @@ from cc_remote.protocol import (
     is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.codex_history import (
     CodexHistoryCursorError,
@@ -48,7 +51,11 @@ from cc_remote.wrapper.codex_history import (
 from cc_remote.wrapper.codex_rpc import CodexRpcRejected
 from cc_remote.wrapper.codex_stream import (
     CodexAutomaticUserRecovery,
+    CodexHistoryWindow,
     CodexHistoryImageView,
+    CodexHistoryNativeWitness,
+    CodexHistoryProcessPageWitness,
+    CodexHistoryProcessWitness,
 )
 from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
@@ -57,8 +64,10 @@ from cc_remote.wrapper.history_store import (
     history_image_id,
     materialize_history_turns,
 )
+from cc_remote.wrapper.session_ctx import ActiveTurnBinding
 from cc_remote.wrapper.stream import (
     StreamTranslator,
+    public_agent_run_id,
     transcript_compact_history_page,
     transcript_compact_snapshot,
     last_assistant_model,
@@ -68,6 +77,387 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def _empty_summary_turn(
+    turn_id: str,
+    *,
+    client_message_id: str | None = None,
+    native_turn_id: str | None = None,
+) -> dict:
+    turn = {
+        "id": turn_id,
+        "prompt": "question",
+        "blocks": [],
+        "done": True,
+        "processDetailState": "none",
+        "detailReasons": [],
+        "detailEventCount": 0,
+        "detailLoaded": False,
+    }
+    if client_message_id is not None:
+        turn["clientMsgId"] = client_message_id
+    if native_turn_id is not None:
+        turn["forkPointId"] = native_turn_id
+    return turn
+
+
+def test_codex_process_clock_overlay_requires_exact_logical_and_native_owner(
+    tmp_path,
+):
+    rollout = tmp_path / "process-clock-overlay.jsonl"
+    rollout.write_text('{"type":"session_meta"}\n')
+    machine, _transport = _mk_machine()
+    machine._codex_process_clocks.observe_start(
+        rollout, "browser-message", "native-turn", 12_345)
+    clocks = machine._codex_process_clocks.get(rollout)
+    turns = [
+        _empty_summary_turn(
+            "visible", client_message_id="browser-message",
+            native_turn_id="native-turn",
+        ),
+        _empty_summary_turn(
+            "wrong-message", client_message_id="other-message",
+            native_turn_id="native-turn",
+        ),
+        _empty_summary_turn(
+            "wrong-native", client_message_id="browser-message",
+            native_turn_id="other-native-turn",
+        ),
+    ]
+
+    mm._apply_codex_process_clocks(turns, clocks)
+
+    assert turns[0]["processStartedTs"] == 12_345
+    assert turns[0]["processDetailState"] == "present"
+    assert turns[0]["detailReasons"] == ["process"]
+    assert turns[0]["detailEventCount"] == 1
+    assert "processStartedTs" not in turns[1]
+    assert "processStartedTs" not in turns[2]
+
+
+def test_live_codex_process_clock_starts_only_on_first_visible_process(
+    tmp_path,
+):
+    rollout = tmp_path / "live-process-clock.jsonl"
+    rollout.write_text('{"type":"session_meta"}\n')
+
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        machine._history_index = HistoryIndexStore(tmp_path / "history-state")
+        ctx = _mk_ctx("live-clock", "live-clock")
+        ctx.engine = "codex"
+        ctx.active_turn_binding = ActiveTurnBinding(
+            msg_id="browser-one",
+            turn_id="native-one",
+            seq=1,
+            generation=machine.instance_id,
+        )
+        machine.sessions[ctx.key] = ctx
+        initial_revision = machine._history_revision("live-clock")
+        source = HistorySourceFingerprint.capture(rollout)
+        cached_events = ({
+            "type": "user_msg",
+            "msg_id": "cached-turn",
+            "prompt": "cached",
+        },)
+        cached_page = MaterializedHistoryPage(
+            events=cached_events,
+            has_more=False,
+            oldest_id="cached-turn",
+            newest_id="cached-turn",
+            turns=materialize_history_turns(cached_events),
+        )
+        assert machine._history_index.put_page(
+            "live-clock", "codex", source,
+            before=None, limit=4, page=cached_page,
+        )
+        machine._history_index.put_image_asset(
+            "live-clock", "codex", source,
+            "cached-turn", "cached-image", "thumbnail",
+            "image/png", 1, 1, b"image",
+        )
+
+        # Waiting/reasoning/final-only replies do not create an empty process
+        # disclosure or start its clock.
+        await machine._emit(ctx, Delta(
+            message_id="final", channel="final", text="direct", ts=10.0))
+        await machine._emit(ctx, ProcessEvent(
+            item_id="reasoning", kind="reasoning", phase="update",
+            status="running", title="Thinking", ts=11.0,
+        ))
+        await machine._emit(ctx, ProcessEvent(
+            item_id="hook", kind="hook", phase="end",
+            status="succeeded", title="Hook", ts=12.0,
+        ))
+        assert machine._codex_process_clocks.get(rollout).has_clocks is False
+        assert machine._history_revision("live-clock") == initial_revision
+
+        await machine._emit(ctx, Delta(
+            message_id="commentary", channel="commentary",
+            text="working", ts=13.25,
+        ))
+        clocks = machine._codex_process_clocks.get(rollout)
+        assert clocks.resolve("browser-one", "native-one") == 13_250
+        assert machine._history_revision("live-clock") == initial_revision
+        assert machine._history_index.get_page(
+            "live-clock", "codex", source, before=None, limit=4,
+        ) == cached_page
+        assert machine._history_index.get_turn_detail(
+            "live-clock", "codex", source, "cached-turn",
+        ) == cached_events
+        assert machine._history_index.get_image_asset(
+            "live-clock", "codex", source,
+            "cached-turn", "cached-image", "thumbnail",
+        ) == ("image/png", 1, 1, b"image")
+
+        # Further visible deltas for the same binding neither move the earliest
+        # start nor invalidate a source-identical history projection again.
+        await machine._emit(ctx, Delta(
+            message_id="commentary", channel="commentary",
+            text="more", ts=14.0,
+        ))
+        assert machine._codex_process_clocks.get(rollout).resolve(
+            "browser-one", "native-one") == 13_250
+        assert machine._history_revision("live-clock") == initial_revision
+
+        # A steer is a separate logical message even while Codex retains the
+        # same native task owner.
+        ctx.active_turn_binding = ActiveTurnBinding(
+            msg_id="browser-two",
+            turn_id="native-one",
+            seq=2,
+            generation=machine.instance_id,
+        )
+        await machine._emit(ctx, ToolUse(
+            message_id="tool-message", tool_use_id="tool-one",
+            tool="exec_command", input={}, ts=15.0,
+        ))
+        clocks = machine._codex_process_clocks.get(rollout)
+        assert clocks.resolve("browser-two", "native-one") == 15_000
+        assert len(transport.sent) == 6
+
+    asyncio.run(run())
+
+
+def test_codex_process_clock_failure_is_logged_once_and_keeps_live_transport(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "broken-live-process-clock.jsonl"
+    rollout.write_text('{"type":"session_meta"}\n')
+
+    async def run():
+        machine, transport = _mk_machine()
+        lookups = 0
+        warnings = []
+
+        def broken_rollout(_sid):
+            nonlocal lookups
+            lookups += 1
+            raise RuntimeError("unexpected lookup failure")
+
+        machine._codex_rollout_for_wire = broken_rollout
+        monkeypatch.setattr(
+            mm.log,
+            "warning",
+            lambda event, **fields: warnings.append((event, fields)),
+        )
+        ctx = _mk_ctx("broken-live-clock", "broken-live-clock")
+        ctx.engine = "codex"
+        ctx.active_turn_binding = ActiveTurnBinding(
+            msg_id="browser-message",
+            turn_id="native-turn",
+            seq=1,
+            generation=machine.instance_id,
+        )
+        machine.sessions[ctx.key] = ctx
+        for index in range(3):
+            await machine._emit(ctx, Delta(
+                message_id=f"commentary-{index}", channel="commentary",
+                text=f"still authoritative {index}", ts=20.0 + index,
+            ))
+
+        assert lookups == 1
+        assert [message.text for message in transport.sent] == [
+            "still authoritative 0",
+            "still authoritative 1",
+            "still authoritative 2",
+        ]
+        assert [event for event, _fields in warnings] == [
+            "Codex process-clock rollout lookup failed open",
+        ]
+
+    asyncio.run(run())
+
+
+def test_live_codex_process_clock_rejects_mismatched_native_owner(tmp_path):
+    rollout = tmp_path / "mismatched-live-process-clock.jsonl"
+    rollout.write_text('{"type":"session_meta"}\n')
+
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("mismatched-live-clock", "mismatched-live-clock")
+        ctx.engine = "codex"
+        ctx.active_turn_binding = ActiveTurnBinding(
+            msg_id="browser-message",
+            turn_id="native-active",
+            seq=1,
+            generation=machine.instance_id,
+        )
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit(ctx, ProcessEvent(
+            item_id="foreign-tool",
+            kind="command",
+            phase="start",
+            status="running",
+            turn_id="native-foreign",
+            title="Foreign tool",
+            ts=30.0,
+        ))
+
+        assert machine._codex_process_clocks.get(rollout).has_clocks is False
+        assert transport.sent[-1].turn_id == "native-foreign"
+
+    asyncio.run(run())
+
+
+def test_official_codex_summary_uses_only_positive_rollout_process_witness():
+    page = CodexHistoryPage(
+        events=(),
+        turns=(
+            {
+                "id": "direct", "prompt": "hello", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "processed", "prompt": "inspect", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+                "processStartedTs": 30_000,
+                "processDoneTs": 30_001,
+            },
+            {
+                "id": "omitted-full", "prompt": "inspect full", "blocks": [],
+                "done": True, "processDetailState": "none",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "exact", "prompt": "already hydrated", "blocks": [],
+                "done": True, "processDetailState": "present",
+                "detailReasons": ["process"], "detailEventCount": 2,
+                "detailLoaded": False,
+                "processStartedTs": 50_000,
+                "processDoneTs": 51_000,
+            },
+            {
+                "id": "untimed", "prompt": "hydrated without time", "blocks": [],
+                "done": True, "processDetailState": "present",
+                "detailReasons": ["process"], "detailEventCount": 2,
+                "detailLoaded": False,
+            },
+        ),
+        has_more=False,
+        oldest_id="direct",
+        newest_id="processed",
+    )
+    witness = CodexHistoryNativeWitness(
+        process_by_visible_id={
+            "processed": CodexHistoryProcessWitness(
+                started_ms=40_000,
+                done_ms=44_000,
+            ),
+            "omitted-full": CodexHistoryProcessWitness(
+                started_ms=45_000,
+                done_ms=47_000,
+            ),
+            "exact": CodexHistoryProcessWitness(
+                started_ms=60_000,
+                done_ms=70_000,
+            ),
+            "untimed": CodexHistoryProcessWitness(
+                started_ms=80_000,
+                done_ms=82_000,
+            ),
+        },
+    )
+
+    mm._apply_codex_process_witness(page, witness)
+
+    direct, processed, omitted_full, exact, untimed = page.turns
+    assert direct["processDetailState"] == "unknown"
+    assert direct["detailEventCount"] == 0
+    assert processed["processDetailState"] == "present"
+    assert processed["detailReasons"] == ["process"]
+    assert processed["detailEventCount"] == 1
+    assert processed["processStartedTs"] == 40_000
+    assert processed["processDoneTs"] == 44_000
+    assert omitted_full["processDetailState"] == "present"
+    assert omitted_full["detailReasons"] == ["process"]
+    assert omitted_full["detailEventCount"] == 1
+    assert omitted_full["processStartedTs"] == 45_000
+    assert omitted_full["processDoneTs"] == 47_000
+    assert exact["processStartedTs"] == 50_000
+    assert exact["processDoneTs"] == 51_000
+    assert untimed["processStartedTs"] == 80_000
+    assert untimed["processDoneTs"] == 82_000
+
+
+def test_official_codex_process_witness_joins_unrelated_visible_ids_by_segment():
+    page = CodexHistoryPage(
+        events=(),
+        turns=(
+            {
+                "id": "item-first", "prompt": "first", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+            {
+                "id": "item-steer", "prompt": "continue", "blocks": [],
+                "done": True, "processDetailState": "unknown",
+                "detailReasons": [], "detailEventCount": 0,
+                "detailLoaded": False,
+            },
+        ),
+        has_more=False,
+        oldest_id="item-first",
+        newest_id="item-steer",
+        native_turn_ids=("native-multi",),
+        native_segment_by_visible_id={
+            "item-first": ("native-multi", 0),
+            "item-steer": ("native-multi", 1),
+        },
+    )
+    witness = CodexHistoryNativeWitness(
+        # These are real rollout ids and deliberately cannot match item-*.
+        process_by_visible_id={
+            "msg-first": CodexHistoryProcessWitness(
+                started_ms=10_000, done_ms=11_000),
+            "msg-steer": CodexHistoryProcessWitness(
+                started_ms=20_000, done_ms=22_000),
+        },
+        process_by_native_segment={
+            ("native-multi", 0): CodexHistoryProcessWitness(
+                started_ms=10_000, done_ms=11_000),
+            ("native-multi", 1): CodexHistoryProcessWitness(
+                started_ms=20_000, done_ms=22_000),
+        },
+    )
+
+    mm._apply_codex_process_witness(page, witness)
+
+    assert [turn["processDetailState"] for turn in page.turns] == [
+        "present", "present",
+    ]
+    assert page.turns[0]["processStartedTs"] == 10_000
+    assert page.turns[1]["processStartedTs"] == 20_000
 
 
 def test_live_codex_terminal_is_available_to_stale_history_immediately(
@@ -1941,6 +2331,919 @@ def test_requested_codex_summary_passes_source_bound_client_aliases(
     asyncio.run(run())
 
 
+def test_official_codex_summary_overlays_source_bound_process_clock(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-process-clock.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"official-clock"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Official:
+        async def summary_page(self, _sid, **kwargs):
+            client_message_id = kwargs["segment_client_message_ids"][
+                ("native-turn", 0)
+            ]
+            turn = _empty_summary_turn(
+                "official-user",
+                client_message_id=client_message_id,
+                native_turn_id="native-turn",
+            )
+            return CodexHistoryPage(
+                events=(),
+                turns=(turn,),
+                has_more=False,
+                oldest_id="official-user",
+                newest_id="official-user",
+                native_turn_ids=("native-turn",),
+                native_segment_by_visible_id={
+                    "official-user": ("native-turn", 0),
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        machine._codex_client_messages.put(
+            rollout,
+            "native-turn",
+            "browser-message",
+            segment_index=0,
+        )
+        machine._codex_process_clocks.observe_start(
+            rollout,
+            "browser-message",
+            "native-turn",
+            123_456,
+        )
+        ctx = _mk_ctx("official-clock", "official-clock")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_official_codex_history(
+            "official-clock", before=None, limit=4)
+
+        assert len(history.turns) == 1
+        assert history.turns[0].clientMsgId == "browser-message"
+        assert history.turns[0].forkPointId == "native-turn"
+        assert history.turns[0].processDetailState == "present"
+        assert history.turns[0].processStartedTs == 123_456
+
+    asyncio.run(run())
+
+
+def test_official_codex_summary_backfills_oversized_pre_sidecar_turn(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-oversized-process-clock.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-long"},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user", "id": "native-user",
+                "content": [{"type": "input_text", "text": "inspect"}],
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message", "message": "inspect",
+                "client_id": "browser-long",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "commentary",
+                "message": "early work",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:04Z",
+            "type": "compacted",
+            "payload": {"replacement_history": ["x" * (1100 * 1024)]},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:09Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "commentary",
+                "message": "late work",
+            },
+        },
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            turn = _empty_summary_turn(
+                "official-user",
+                client_message_id="browser-long",
+                native_turn_id="native-long",
+            )
+            turn.update({
+                "done": False,
+                "processDetailState": "present",
+                "detailReasons": ["process"],
+                "detailEventCount": 1,
+                "processStartedTs": 1_767_225_609_000,
+            })
+            return CodexHistoryPage(
+                events=(),
+                turns=(turn,),
+                has_more=False,
+                oldest_id="official-user",
+                newest_id="official-user",
+                native_turn_ids=("native-long",),
+                native_segment_by_visible_id={
+                    "official-user": ("native-long", 0),
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine.cfg.codex_history_window_max_bytes = 1024 * 1024
+        machine._codex_history = Official()
+        ctx = _mk_ctx("official-long", "official-long")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_official_codex_history(
+            "official-long", before=None, limit=4)
+
+        assert history.turns[0].processStartedTs == 1_767_225_603_000
+        assert machine._codex_process_clocks.get(rollout).resolve(
+            "browser-long", "native-long",
+        ) == 1_767_225_603_000
+
+    asyncio.run(run())
+
+
+def test_official_codex_summary_backfills_oversized_second_steer_clock(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-oversized-steer-clock.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-multi"},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user", "id": "native-first",
+                "content": [{"type": "input_text", "text": "first"}],
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message", "message": "first",
+                "client_id": "browser-first",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "commentary",
+                "message": "first work",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:10Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user", "id": "native-steer",
+                "content": [{"type": "input_text", "text": "continue"}],
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:10Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message", "message": "continue",
+                "client_id": "browser-steer",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:13Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "commentary",
+                "message": "steer work",
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:14Z",
+            "type": "compacted",
+            "payload": {"replacement_history": ["x" * (1100 * 1024)]},
+        },
+        {
+            "timestamp": "2026-01-01T00:00:19Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "commentary",
+                "message": "late steer work",
+            },
+        },
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            first = _empty_summary_turn(
+                "official-first",
+                client_message_id="browser-first",
+                native_turn_id="native-multi",
+            )
+            steer = _empty_summary_turn(
+                "official-steer",
+                client_message_id="browser-steer",
+                native_turn_id="native-multi",
+            )
+            steer.update({
+                "done": False,
+                "processDetailState": "present",
+                "detailReasons": ["process"],
+                "detailEventCount": 1,
+                "processStartedTs": 1_767_225_619_000,
+            })
+            return CodexHistoryPage(
+                events=(),
+                turns=(first, steer),
+                has_more=False,
+                oldest_id="official-first",
+                newest_id="official-steer",
+                native_turn_ids=("native-multi",),
+                native_segment_by_visible_id={
+                    "official-first": ("native-multi", 0),
+                    "official-steer": ("native-multi", 1),
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine.cfg.codex_history_window_max_bytes = 1024 * 1024
+        machine._codex_history = Official()
+        machine._codex_process_clocks.observe_start(
+            rollout,
+            "browser-first",
+            "native-multi",
+            1_767_225_603_000,
+        )
+        ctx = _mk_ctx("official-steer", "official-steer")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_official_codex_history(
+            "official-steer", before=None, limit=4)
+
+        assert history.turns[0].processStartedTs == 1_767_225_603_000
+        assert history.turns[1].processStartedTs == 1_767_225_613_000
+        clocks = machine._codex_process_clocks.get(rollout)
+        assert clocks.resolve(
+            "browser-first", "native-multi",
+        ) == 1_767_225_603_000
+        assert clocks.resolve(
+            "browser-steer", "native-multi",
+        ) == 1_767_225_613_000
+
+    asyncio.run(run())
+
+
+def test_official_process_clock_scan_memo_tracks_growth_and_new_segments(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "process-clock-growth-memo.jsonl"
+    rollout.write_bytes(b"x" * (1024 * 1024 + 128))
+    scans = []
+    scanned_segment = 0
+
+    def window_info(path, **_kwargs):
+        scans.append(os.path.getsize(path))
+        size = os.path.getsize(path)
+        return CodexHistoryWindow(
+            start_offset=max(0, size - 1024 * 1024),
+            end_offset=size,
+            has_older=True,
+            newest_boundary_offset=size - 512,
+            newest_cursor=f"visible-{scanned_segment}",
+            newest_native_turn_id="native-multi",
+            newest_segment_index=scanned_segment,
+        )
+
+    monkeypatch.setattr(mm, "codex_history_window_info", window_info)
+
+    def page(segment_index):
+        visible_id = f"visible-{segment_index}"
+        return CodexHistoryPage(
+            events=(),
+            turns=(_empty_summary_turn(
+                visible_id,
+                client_message_id=f"browser-{segment_index}",
+                native_turn_id="native-multi",
+            ),),
+            has_more=False,
+            oldest_id=visible_id,
+            newest_id=visible_id,
+            native_turn_ids=("native-multi",),
+            native_segment_by_visible_id={
+                visible_id: ("native-multi", segment_index),
+            },
+        )
+
+    async def run():
+        nonlocal scanned_segment
+        machine, _transport = _mk_machine()
+        machine.cfg.codex_history_window_max_bytes = 1024 * 1024
+        empty_clocks = machine._codex_process_clocks_for_source(None)
+
+        source = HistorySourceFingerprint.capture(rollout)
+        await machine._backfill_official_codex_process_clock(
+            str(rollout), source,
+            machine._codex_history_client_message_ids(str(rollout)),
+            page(0), limit=4, in_progress=True, clocks=empty_clocks,
+        )
+        assert len(scans) == 1
+
+        # Growth well below the exact boundary + byte budget cannot make this
+        # same segment oversized, so it reuses the memoized negative result.
+        with rollout.open("ab") as stream:
+            stream.write(b"y" * 128)
+        source = HistorySourceFingerprint.capture(rollout)
+        await machine._backfill_official_codex_process_clock(
+            str(rollout), source,
+            machine._codex_history_client_message_ids(str(rollout)),
+            page(0), limit=4, in_progress=True, clocks=empty_clocks,
+        )
+        assert len(scans) == 1
+
+        # A later steer under the same native turn is a new segment coordinate,
+        # so the old memo cannot suppress its independent boundary check.
+        scanned_segment = 1
+        await machine._backfill_official_codex_process_clock(
+            str(rollout), source,
+            machine._codex_history_client_message_ids(str(rollout)),
+            page(1), limit=4, in_progress=True, clocks=empty_clocks,
+        )
+        assert len(scans) == 2
+
+    asyncio.run(run())
+
+
+def test_cached_codex_summary_observes_new_process_clock_without_source_change(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "cached-process-clock.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"cached-clock"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_history_window_info",
+        lambda path, **_kwargs: CodexHistoryWindow(
+            0, os.path.getsize(path), False,
+        ),
+    )
+    canned = [
+        UserMsg(
+            msg_id="native-user",
+            client_msg_id="browser-message",
+            prompt="direct question",
+        ),
+        Delta(
+            message_id="final", channel="final", text="direct answer",
+        ),
+        TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ),
+    ]
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (
+            [event.model_copy(deep=True) for event in canned], None,
+        ),
+    )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-cache")
+        ctx = _mk_ctx("cached-clock", "cached-clock")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        first = await machine._build_history(
+            "cached-clock", limit=4, detail="summary")
+        assert first.turns[0].processDetailState == "none"
+        assert first.turns[0].processStartedTs is None
+
+        # The sidecar changes while rollout bytes and the cached SQLite source
+        # fingerprint stay identical. The cache-hit path must overlay it rather
+        # than returning the old compact-derived clock.
+        machine._codex_process_clocks.observe_start(
+            rollout,
+            "browser-message",
+            "native-turn",
+            77_000,
+        )
+        cached = await machine._build_history(
+            "cached-clock", limit=4, detail="summary")
+        assert cached.turns[0].processDetailState == "present"
+        assert cached.turns[0].processStartedTs == 77_000
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_restores_process_beyond_recent_hydration(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "process-summary.jsonl"
+    rows = []
+    for index in range(4):
+        turn_id = f"native-{index}"
+        minute = index * 2
+        rows.extend((
+            {
+                "timestamp": f"2026-08-21T01:{minute:02d}:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            },
+            {
+                "timestamp": f"2026-08-21T01:{minute:02d}:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message", "turn_id": turn_id,
+                    "message": f"prompt {index}",
+                },
+            },
+        ))
+        if index != 3:
+            rows.extend((
+                {
+                    "timestamp": f"2026-08-21T01:{minute:02d}:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call", "id": f"call-{index}",
+                        "call_id": f"call-{index}", "name": "exec_command",
+                        "input": {},
+                    },
+                },
+                {
+                    "timestamp": f"2026-08-21T01:{minute:02d}:08Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": f"call-{index}", "output": "ok",
+                    },
+                },
+            ))
+        rows.append({
+            "timestamp": f"2026-08-21T01:{minute:02d}:10Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": turn_id},
+        })
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class Official:
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=tuple({
+                    "id": f"native-{index}",
+                    "prompt": f"prompt {index}",
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                } for index in range(4)),
+                has_more=False,
+                oldest_id="native-0",
+                newest_id="native-3",
+                native_turn_ids=tuple(
+                    f"native-{index}" for index in reversed(range(4))
+                ),
+                native_segment_by_visible_id={
+                    f"native-{index}": (f"native-{index}", 0)
+                    for index in range(4)
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("process-summary", "process-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+
+        assert [turn.processDetailState for turn in history.turns] == [
+            "present", "present", "present", "unknown",
+        ]
+        assert history.turns[0].processStartedTs is not None
+        assert history.turns[0].processDoneTs is not None
+        assert (
+            history.turns[0].processDoneTs
+            - history.turns[0].processStartedTs
+        ) == 3000
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_keeps_completeness_witness_bounded(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "adaptive-process-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"adaptive-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    calls = []
+
+    def witness(_path, *, max_turns, max_scan_bytes, required_turn_ids=()):
+        calls.append((max_turns, max_scan_bytes, required_turn_ids))
+        assert max_scan_bytes is not None
+        return CodexHistoryNativeWitness(
+            turn_ids=("native-3", "native-2"),
+            process_by_visible_id={
+                "native-3": CodexHistoryProcessWitness(
+                    started_ms=10_000, done_ms=11_000),
+            },
+            offset_by_visible_id={
+                "native-3": 10,
+            },
+        )
+
+    monkeypatch.setattr(mm, "codex_history_native_witness", witness)
+    metadata_calls = []
+
+    def missing_metadata(_path, **kwargs):
+        metadata_calls.append(kwargs)
+        return CodexHistoryProcessPageWitness()
+
+    monkeypatch.setattr(mm, "codex_history_process_witnesses", missing_metadata)
+
+    class Official:
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=tuple({
+                    "id": f"native-{index}",
+                    "prompt": f"prompt {index}",
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                } for index in range(4)),
+                has_more=False,
+                oldest_id="native-0",
+                newest_id="native-3",
+                native_turn_ids=(
+                    "native-3", "native-2", "native-1", "native-0"),
+                native_segment_by_visible_id={
+                    f"native-{index}": (f"native-{index}", 0)
+                    for index in range(4)
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("adaptive-summary", "adaptive-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        first = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+        second = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary",
+        )
+
+        assert [turn.processDetailState for turn in first.turns] == [
+            "unknown", "unknown", "unknown", "present",
+        ]
+        assert [turn.processDetailState for turn in second.turns] == [
+            "unknown", "unknown", "unknown", "present",
+        ]
+        assert first.authoritative is True
+        assert second.authoritative is True
+        assert len(calls) == 1
+        assert calls[0][1] is not None
+        assert calls[0][2] == ()
+        # Missing metadata is not negative evidence. Retry on a changed source,
+        # but do not repeatedly rescan an unchanged rollout on passive refresh.
+        assert len(metadata_calls) == 1
+        assert set(metadata_calls[0]["native_turn_ids"]) == {
+            "native-0", "native-1", "native-2", "native-3",
+        }
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stable", [False, True])
+def test_requested_process_metadata_retries_flushes_and_invalidates_rewrites(
+    monkeypatch, tmp_path, stable,
+):
+    rollout = tmp_path / "process-cache.jsonl"
+    rollout.write_text("initial\n")
+    scans = []
+
+    def witness(_path, **_kwargs):
+        scans.append(rollout.read_text())
+        if "flushed" not in scans[-1]:
+            return CodexHistoryProcessPageWitness()
+        return CodexHistoryProcessPageWitness(
+            process_by_native_segment={
+                ("native-old", 0): CodexHistoryProcessWitness(
+                    started_ms=1000, done_ms=4000, generated_images=True),
+            },
+            offset_by_native_segment={("native-old", 0): 1},
+        )
+
+    monkeypatch.setattr(mm, "codex_history_process_witnesses", witness)
+
+    async def run():
+        machine, _ = _mk_machine()
+        sid = "process-cache"
+
+        async def read():
+            page = CodexHistoryPage(
+                events=(), turns=(_empty_summary_turn("item-old"),),
+                has_more=False, oldest_id="item-old", newest_id="item-old",
+                native_turn_ids=("native-old",),
+                native_segment_by_visible_id={"item-old": ("native-old", 0)},
+            )
+            images = await machine._refine_codex_page_process(
+                sid, page, HistorySourceFingerprint.capture(str(rollout)),
+                revision=machine._history_revision(sid), before="item-opaque",
+                before_offset=None, max_turns=1,
+                native_turn_ids=("native-old",), stable=stable,
+            )
+            return images, page.turns[0]
+
+        assert (await read())[0] == set()
+        assert (await read())[0] == set()
+        assert len(scans) == 1
+        with rollout.open("a") as output:
+            output.write("flushed\n")
+        images, turn = await read()
+        assert images == {"item-old"}
+        assert turn["processDoneTs"] - turn["processStartedTs"] == 3000
+        assert len(scans) == 2
+        with rollout.open("a") as output:
+            output.write("newer append\n")
+        assert (await read())[0] == {"item-old"}
+        assert len(scans) == (2 if stable else 3)
+        # A rewrite is not an append; cached proof may never cross it.
+        rollout.write_text("replacement without old process\n")
+        assert (await read())[0] == set()
+        assert len(scans) == (3 if stable else 4)
+
+    asyncio.run(run())
+
+
+def test_large_head_process_metadata_reads_only_appends(monkeypatch, tmp_path):
+    rollout = tmp_path / "large-process-head.jsonl"
+
+    def row(kind, *, second=0, **payload):
+        return (json.dumps({
+            "timestamp": f"2026-09-06T00:00:{second:02d}Z",
+            "type": "event_msg",
+            "payload": {"type": kind, **payload},
+        }) + "\n").encode()
+
+    prefix = (
+        row("task_started", turn_id="native-head")
+        + row("user_message", turn_id="native-head", message="test")
+        + row("exec_command_end", second=1, call_id="cmd", exit_code=0)
+    )
+    with rollout.open("wb") as output:
+        output.write(prefix)
+        # More than the normal head budget, without retaining tool payloads in
+        # either the metadata cache or this test's Python objects.
+        filler = b'{"type":"response_item","payload":{"type":"reasoning","text":"' \
+            + b"x" * (1024 * 1024) + b'"}}\n'
+        for _ in range(16):
+            output.write(filler)
+
+    original_open = open
+    reads = []
+
+    class CountedFile:
+        def __init__(self, source):
+            self.source = source
+
+        def __enter__(self):
+            self.source.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.source.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.source, name)
+
+        def read(self, *args):
+            data = self.source.read(*args)
+            reads.append(len(data))
+            return data
+
+    monkeypatch.setattr(codex_stream_module, "open", lambda *args, **kwargs:
+                        CountedFile(original_open(*args, **kwargs)), raising=False)
+
+    async def run():
+        machine, _ = _mk_machine()
+
+        async def read():
+            page = CodexHistoryPage(
+                events=(), turns=(_empty_summary_turn("item-head"),),
+                has_more=False, oldest_id="item-head", newest_id="item-head",
+                native_turn_ids=("native-head",),
+                native_segment_by_visible_id={"item-head": ("native-head", 0)},
+            )
+            images = await machine._refine_codex_page_process(
+                "large-head", page, HistorySourceFingerprint.capture(rollout),
+                revision=machine._history_revision("large-head"),
+                before="item-head", before_offset=None, max_turns=1,
+                native_turn_ids=("native-head",), stable=False,
+            )
+            return images, page.turns[0]
+
+        await read()
+        assert sum(reads) >= rollout.stat().st_size
+        reads.clear()
+        await read()
+        assert sum(reads) == 0
+        for second in (5, 9):
+            # A single appended record also exercises the reverse-reader seam:
+            # the first suffix row must not be discarded as a partial line.
+            appended = row("exec_command_end", second=second,
+                           call_id="cmd", exit_code=0)
+            with rollout.open("ab") as output:
+                output.write(appended)
+            reads.clear()
+            _, turn = await read()
+            assert sum(reads) <= len(appended) + 3
+            assert turn["processDoneTs"] - turn["processStartedTs"] == (second - 1) * 1000
+        appended = row("image_generation_end", second=10, call_id="image")
+        with rollout.open("ab") as output:
+            output.write(appended)
+        reads.clear()
+        images, _ = await read()
+        assert images == {"item-head"}
+        assert sum(reads) <= len(appended) + 3
+        # Rewrites invalidate the prefix rather than carrying old image/time
+        # evidence into a different source occupying the same path.
+        rollout.write_bytes(
+            row("task_started", turn_id="native-head")
+            + row("user_message", turn_id="native-head", message="test"))
+        images, turn = await read()
+        assert not images
+        assert turn["processDetailState"] == "none"
+
+    asyncio.run(run())
+
+
+def test_requested_codex_older_process_pages_continue_from_cached_offset(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "offset-process-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"offset-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(
+        mm,
+        "codex_history_native_witness",
+        lambda *_args, **_kwargs: CodexHistoryNativeWitness(
+            turn_ids=("native-new",),
+            offset_by_visible_id={"msg-new": 123},
+            offset_by_native_segment={("native-new", 0): 123},
+        ),
+    )
+    older_calls = []
+
+    def older_witness(
+        _path, *, before, before_offset, max_turns, native_turn_ids,
+        source_end_offset,
+    ):
+        older_calls.append((before, before_offset, max_turns))
+        assert native_turn_ids == ("native-old",)
+        return CodexHistoryProcessPageWitness(
+            process_by_visible_id={
+                "msg-old": CodexHistoryProcessWitness(
+                    started_ms=30_000, done_ms=31_000),
+            },
+            offset_by_visible_id={"msg-old": 45},
+            process_by_native_segment={
+                ("native-old", 0): CodexHistoryProcessWitness(
+                    started_ms=30_000, done_ms=31_000),
+            },
+            offset_by_native_segment={("native-old", 0): 45},
+        )
+
+    monkeypatch.setattr(
+        mm, "codex_history_process_witnesses", older_witness)
+
+    class Official:
+        async def summary_page(self, _sid, *, before, **_kwargs):
+            native_id = "native-new" if before is None else "native-old"
+            visible_id = "item-new" if before is None else "item-old"
+            return CodexHistoryPage(
+                events=(),
+                turns=({
+                    "id": visible_id,
+                    "prompt": native_id,
+                    "blocks": [],
+                    "done": True,
+                    "processDetailState": "unknown",
+                    "detailReasons": [],
+                    "detailEventCount": 0,
+                    "detailLoaded": False,
+                },),
+                has_more=before is None,
+                oldest_id=visible_id,
+                newest_id=visible_id,
+                native_turn_ids=(native_id,),
+                native_segment_by_visible_id={
+                    visible_id: (native_id, 0),
+                },
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("offset-summary", "offset-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._build_requested_history(
+            ctx.key, before=None, limit=1, cwd=ctx.cwd, detail="summary",
+        )
+        first = await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=2,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        second = await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=2,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        await machine._build_requested_history(
+            ctx.key,
+            before="item-new",
+            limit=3,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert first.turns[0].processDetailState == "present"
+        assert second.turns[0].processDetailState == "present"
+        assert older_calls == [
+            ("item-new", 123, 2),
+            ("item-new", 123, 3),
+        ]
+
+    asyncio.run(run())
+
+
 def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
     monkeypatch, tmp_path,
 ):
@@ -2856,6 +4159,15 @@ def test_materialized_summary_never_exposes_untrusted_error_text():
         events=[{"type": "user_msg", "msg_id": "u1", "prompt": "hello"}],
     )
     assert deserialize(serialize(detail)) == detail
+    reset = TurnDetail(
+        session_id="s1",
+        turn_id="u1",
+        revision="test-revision",
+        authoritative=False,
+        error="详细过程已更新，请重新加载该轮",
+        reset_required=True,
+    )
+    assert deserialize(serialize(reset)) == reset
 
 
 def test_history_revision_is_boot_scoped_and_monotonic():
@@ -3040,6 +4352,314 @@ def test_get_turn_detail_is_routed_and_revision_bound(monkeypatch, tmp_path):
         assert stale.authoritative is False and stale.events == []
 
         assert transport.sent[-2:] == [response, stale]
+
+    asyncio.run(go())
+
+
+def test_codex_turn_detail_snapshot_cursor_survives_rollout_append(
+    tmp_path,
+):
+    rollout = tmp_path / "snapshot-detail.jsonl"
+    rollout.write_text('{"type":"first"}\n')
+    original_events = (
+        {"type": "user_msg", "sid": "snapshot-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        *(
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": f"old-step-{index}", "kind": "command",
+             "phase": "end", "status": "succeeded"}
+            for index in range(5)
+        ),
+        {"type": "turn_end", "sid": "snapshot-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+
+    class MissingLocator:
+        async def turn_events(self, *_args, **_kwargs):
+            raise CodexHistoryCursorError("rollout locator expired")
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-snapshot")
+        machine._codex_history = MissingLocator()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("snapshot-detail", "snapshot-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        original = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", original, original_events)
+        revision = machine._history_revision(ctx.key)
+
+        newest = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=2,
+        ))
+        assert newest.authoritative is True
+        assert newest.has_more is True
+        assert newest.oldest_cursor is not None
+        assert newest.oldest_cursor.startswith("td1.")
+        snapshot_cursor = newest.oldest_cursor
+        numeric_boundary = snapshot_cursor.rsplit(".", 1)[-1]
+
+        with rollout.open("a") as stream:
+            stream.write('{"type":"second"}\n')
+        appended = HistorySourceFingerprint.capture(rollout)
+        appended_events = (
+            *original_events[:-1],
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": "new-after-append", "kind": "command",
+             "phase": "end", "status": "succeeded"},
+            original_events[-1],
+        )
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", appended, appended_events)
+
+        older = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        expected = mm._turn_detail_page(
+            list(original_events), before=numeric_boundary, limit=2)[0]
+        assert older.authoritative is True
+        assert older.events == expected
+        assert all(
+            row.get("item_id") != "new-after-append"
+            for row in older.events
+        )
+
+        malformed_parts = snapshot_cursor.split(".")
+        malformed_parts[2] = "0" * 16
+        malformed = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=".".join(malformed_parts),
+            limit=2,
+        ))
+        assert malformed.authoritative is False
+        assert malformed.reset_required is True
+
+        snapshot_reader = (
+            machine._history_index.get_turn_detail_by_snapshot)
+
+        def locked_snapshot(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        machine._history_index.get_turn_detail_by_snapshot = locked_snapshot
+        transient = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        assert transient.authoritative is False
+        assert transient.reset_required is False
+        assert transient.error == "详细过程暂时不可用，请稍后重试"
+        machine._history_index.get_turn_detail_by_snapshot = snapshot_reader
+
+        with sqlite3.connect(machine._history_index.path) as connection:
+            connection.execute(
+                "DELETE FROM history_turn_details WHERE source_token=?",
+                (original.token,),
+            )
+        expired = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        assert expired.authoritative is False
+        assert expired.reset_required is True
+        assert expired.events == []
+
+    asyncio.run(go())
+
+
+def test_claude_turn_detail_snapshot_cursor_survives_transcript_append(
+    tmp_path,
+    monkeypatch,
+):
+    transcript = tmp_path / "snapshot-detail.jsonl"
+    transcript.write_text('{"type":"first"}\n')
+    original_events = (
+        {"type": "user_msg", "sid": "snapshot-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        *(
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": f"old-step-{index}", "kind": "command",
+             "phase": "end", "status": "succeeded"}
+            for index in range(5)
+        ),
+        {"type": "turn_end", "sid": "snapshot-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(
+            tmp_path / "state-claude-snapshot")
+        monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+        ctx = _mk_ctx("snapshot-detail", "snapshot-detail")
+        ctx.engine = "claude"
+        machine.sessions[ctx.key] = ctx
+        original = HistorySourceFingerprint.capture(transcript)
+        machine._history_index.put_turn_details(
+            ctx.key, "claude", original, original_events)
+        revision = machine._history_revision(ctx.key)
+
+        newest = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=2,
+        ))
+        assert newest.authoritative is True
+        assert newest.has_more is True
+        assert newest.oldest_cursor is not None
+        assert newest.oldest_cursor.startswith("td1.")
+        snapshot_cursor = newest.oldest_cursor
+        numeric_boundary = snapshot_cursor.rsplit(".", 1)[-1]
+
+        with transcript.open("a") as stream:
+            stream.write('{"type":"second"}\n')
+        appended = HistorySourceFingerprint.capture(transcript)
+        appended_events = (
+            *original_events[:-1],
+            {"type": "process", "sid": "snapshot-detail",
+             "item_id": "new-after-append", "kind": "command",
+             "phase": "end", "status": "succeeded"},
+            original_events[-1],
+        )
+        machine._history_index.put_turn_details(
+            ctx.key, "claude", appended, appended_events)
+
+        older = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=snapshot_cursor,
+            limit=2,
+        ))
+        expected = mm._turn_detail_page(
+            list(original_events), before=numeric_boundary, limit=2)[0]
+        assert older.authoritative is True
+        assert older.events == expected
+        assert all(
+            row.get("item_id") != "new-after-append"
+            for row in older.events
+        )
+
+    asyncio.run(go())
+
+
+def test_codex_turn_detail_prefers_visible_index_and_resets_invalid_legacy_page(
+    tmp_path,
+):
+    rollout = tmp_path / "visible-index-detail.jsonl"
+    rollout.write_text('{"type":"first"}\n')
+    indexed_events = (
+        {"type": "user_msg", "sid": "visible-index-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "tool_use", "sid": "visible-index-detail",
+         "tool_use_id": "indexed-tool", "tool": "Read", "input": {}},
+        {"type": "tool_result", "sid": "visible-index-detail",
+         "tool_use_id": "indexed-tool", "content": "indexed result",
+         "is_error": False},
+        {"type": "turn_end", "sid": "visible-index-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    )
+    official_events = [
+        {"type": "user_msg", "sid": "visible-index-detail",
+         "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "turn_end", "sid": "visible-index-detail",
+         "turn_id": "native-1", "result": {
+             "subtype": "success", "duration_ms": 1, "is_error": False,
+         }},
+    ]
+
+    class LostSupplementLocator:
+        async def turn_events(self, *_args, **_kwargs):
+            return list(official_events)
+
+        @staticmethod
+        def turn_detail_source(*_args, **_kwargs):
+            return "full"
+
+        @staticmethod
+        def rollout_fallback(*_args, **_kwargs):
+            return SimpleNamespace(
+                before=None,
+                limit=4,
+                native_turn_id="native-1",
+                segment_count=1,
+                segment_index=0,
+            )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-visible")
+        machine._codex_history = LostSupplementLocator()
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("visible-index-detail", "visible-index-detail")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_turn_details(
+            ctx.key, "codex", source, indexed_events)
+
+        async def unavailable_history(*_args, **_kwargs):
+            raise CodexHistoryCursorError("segment locator disappeared")
+
+        machine._build_history = unavailable_history
+        revision = machine._history_revision(ctx.key)
+        detail = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before=None,
+            limit=192,
+        ))
+        assert detail.authoritative is True
+        assert any(
+            row.get("tool_use_id") == "indexed-tool"
+            for row in detail.events
+        )
+
+        invalid_page = await machine._handle_get_turn_detail(SimpleNamespace(
+            session_id=ctx.key,
+            turn_id="message-1",
+            client_id="client-1",
+            revision=revision,
+            before="999",
+            limit=192,
+        ))
+        assert invalid_page.authoritative is False
+        assert invalid_page.reset_required is True
+        assert invalid_page.events == []
 
     asyncio.run(go())
 
@@ -3274,6 +4894,123 @@ def test_history_image_tool_asset_is_served_only_from_current_turn_reference(
         ))
         assert missing.data is None
         assert missing.error == "未找到这张历史图片"
+
+    asyncio.run(go())
+
+
+def test_claude_tool_image_rehydrates_from_transcript_after_asset_eviction(
+    tmp_path,
+):
+    raw, encoded = _test_png()
+    prompt_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    rows = [
+        {
+            "uuid": prompt_id,
+            "type": "user",
+            "message": {"role": "user", "content": "draw it"},
+        },
+        {
+            "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image",
+                "name": "Read",
+                "input": {"file_path": "/tmp/chart.png"},
+            }]},
+        },
+        {
+            "uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded,
+                    },
+                }],
+            }]},
+        },
+        {
+            "uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "type": "assistant",
+            "message": {"role": "assistant", "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "done"}]},
+        },
+    ]
+    transcript = tmp_path / "claude-tool-image.jsonl"
+    transcript.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    messages = [SimpleNamespace(**row) for row in rows]
+    events = translate_history(messages, 65_536)
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image"})
+    materialized = mm._attach_claude_history_image_refs([events], assets)
+    assert len(materialized) == 1
+    event_rows = tuple(event.model_dump(mode="json") for event in events)
+    assert encoded not in json.dumps(event_rows)
+    image_ref = next(
+        event["input"]["history_image"]
+        for event in event_rows
+        if event.get("type") == "process"
+        and event.get("item_id") == "tool-image"
+        and event.get("phase") == "end"
+    )
+
+    async def go():
+        machine, _transport = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state-claude-image")
+        machine._watch_session = lambda _sid: None
+        machine._claude_transcript_path_for_wire = (
+            lambda _sid: str(transcript)
+        )
+        ctx = _mk_ctx("session-claude-image", "session-claude-image")
+        ctx.engine = "claude"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(transcript)
+        page = MaterializedHistoryPage(
+            events=event_rows,
+            has_more=False,
+            oldest_id=prompt_id,
+            newest_id=prompt_id,
+            turns=materialize_history_turns(event_rows),
+        )
+        machine._history_index.put_page(
+            "session-claude-image", "claude", source,
+            before=None, limit=4, page=page, detail_events=event_rows,
+        )
+        revision = machine._history_revision("session-claude-image")
+
+        thumbnail = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-claude-image",
+            turn_id=prompt_id,
+            image_id=image_ref["image_id"],
+            variant="thumbnail",
+            request_id="thumbnail-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert thumbnail.error is None
+        assert thumbnail.media_type == "image/webp"
+        assert thumbnail.width == 48 and thumbnail.height == 24
+
+        full = await machine._handle_get_history_image(SimpleNamespace(
+            session_id="session-claude-image",
+            turn_id=prompt_id,
+            image_id=image_ref["image_id"],
+            variant="full",
+            request_id="full-request",
+            client_id="client-1",
+            revision=revision,
+        ))
+        assert full.error is None and full.media_type == "image/png"
+        assert base64.b64decode(full.data) == raw
 
     asyncio.run(go())
 
@@ -3805,9 +5542,9 @@ def test_codex_history_growth_during_scan_is_provisional_without_index(
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
     monkeypatch.setattr(
         mm,
-        "codex_history_window",
-        lambda path, **_kwargs: (
-            0, os.path.getsize(path), False, None, None,
+        "codex_history_window_info",
+        lambda path, **_kwargs: CodexHistoryWindow(
+            0, os.path.getsize(path), False,
         ),
     )
 
@@ -3885,9 +5622,9 @@ def test_history_index_write_failure_keeps_coherent_source_authoritative(
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
     monkeypatch.setattr(
         mm,
-        "codex_history_window",
-        lambda path, **_kwargs: (
-            0, os.path.getsize(path), False, None, None,
+        "codex_history_window_info",
+        lambda path, **_kwargs: CodexHistoryWindow(
+            0, os.path.getsize(path), False,
         ),
     )
     monkeypatch.setattr(
@@ -4063,7 +5800,7 @@ def test_compacted_claude_main_chain_recovers_precompact_history(
     assert recovered is not None
     messages, timestamps = recovered
     assert [message.uuid for message in messages] == [
-        "user-before", "assistant-before", "compact-summary",
+        "user-before", "assistant-before", "compact-boundary", "compact-summary",
         "compact-command", "user-after", "assistant-after",
     ]
     events = translate_history(messages, 10_000, timestamps=timestamps)
@@ -4337,6 +6074,7 @@ def test_compact_index_loads_large_active_record_and_task_notification(tmp_path)
                     if message.uuid == "answer-large").message["content"][0][
                         "text"]) == 20 * 1024 * 1024
     assert internal_events["task-notification"].kind == "task"
+    assert internal_events["compact-boundary"].kind == "compaction"
 
 
 def test_compacted_claude_page_loads_only_requested_main_chain_turns(
@@ -4406,7 +6144,8 @@ def test_compacted_claude_page_loads_only_requested_main_chain_turns(
         "claude-compact", path=str(transcript), before="user-4", limit=2)
     assert older is not None
     assert [message.uuid for message in older.messages] == [
-        "user-2", "answer-2", "compact-summary", "compact-command",
+        "user-2", "answer-2", "compact-boundary",
+        "compact-summary", "compact-command",
         "user-3", "answer-3",
     ]
     assert older.has_more is True
@@ -4462,7 +6201,7 @@ def test_compacted_claude_page_uses_only_visible_human_boundaries(tmp_path):
     assert older.oldest_cursor == "user-old"
     assert older.has_more is False
     assert [message.uuid for message in older.messages] == [
-        "user-old", "answer-old", "compact-summary",
+        "user-old", "answer-old", "compact-boundary", "compact-summary",
         "task-notification", "blank-user",
     ]
     exhausted = transcript_compact_history_page(
@@ -5377,11 +7116,60 @@ def test_hello_sends_snapshots_and_control_state_without_replay_flood():
         await m._handle_client_hello(SimpleNamespace(client_id="c1"))
         types = [msg.type for msg in tr.sent]
         assert types == [
-            "snapshot", "query_queue", "completion_state", "perm",
-            "snapshot", "query_queue", "completion_state", "perm",
+            "btw_sync",
+            "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
+            "completion_state", "perm", "auto_compact",
+            "snapshot", "ask_user_sync", "background_process_sync", "query_queue",
+            "completion_state", "perm", "auto_compact",
         ]
         assert "replay_start" not in types and "user_msg" not in types
         assert all(msg.to == "c1" for msg in tr.sent)     # routed to the requesting client
+    asyncio.run(go())
+
+
+def test_background_process_membership_replays_and_clears_authoritatively():
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s1", "s1")
+        machine.sessions["s1"] = ctx
+
+        await machine._emit(ctx, ProcessEvent(
+            item_id="bash-task", kind="task", phase="start",
+            status="running", turn_id="turn-1", parent_id="bash-tool",
+            title="Run verification", command="make verify",
+            background=True,
+        ))
+        assert [message.type for message in transport.sent] == [
+            "process", "background_process_sync",
+        ]
+        assert is_downstream(transport.sent[-1]) is False
+        assert ctx.seq == 1
+        assert ctx.claude_background_processes["bash-task"].command \
+            == "make verify"
+
+        transport.sent.clear()
+        await machine._handle_client_hello(SimpleNamespace(client_id="phone"))
+        snapshot = next(
+            message for message in transport.sent
+            if isinstance(message, BackgroundProcessSync)
+        )
+        assert snapshot.to == "phone" and snapshot.seq is None
+        assert [item.item_id for item in snapshot.items] == ["bash-task"]
+
+        transport.sent.clear()
+        await machine._emit(ctx, ProcessEvent(
+            item_id="bash-task", kind="task", phase="end",
+            status="succeeded", turn_id="turn-1", parent_id="bash-tool",
+            title="Run verification", background=True,
+        ))
+        assert [message.type for message in transport.sent] == [
+            "process", "background_process_sync",
+        ]
+        assert is_downstream(transport.sent[-1]) is False
+        assert ctx.seq == 2
+        assert transport.sent[-1].items == []
+        assert ctx.claude_background_processes == {}
+
     asyncio.run(go())
 
 
@@ -5402,9 +7190,12 @@ def test_hello_with_cursor_replays_only_missing_tail():
             generations={"s1": m.instance_id}, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
-            "replay_start", "user_msg", "replay_end", "session_control",
-            "query_queue", "completion_state", "perm"]
-        assert tr.sent[1].msg_id == "m3"
+            "btw_sync",
+            "replay_start", "user_msg", "replay_end", "ask_user_sync",
+            "background_process_sync", "session_control", "query_queue",
+            "completion_state", "perm",
+            "auto_compact"]
+        assert tr.sent[2].msg_id == "m3"
         assert all(msg.to == "c1" for msg in tr.sent)
 
     asyncio.run(go())
@@ -5428,9 +7219,12 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
             client_id="c1", cursors=None, generations=None, last_seq=None))
 
         assert [msg.type for msg in tr.sent] == [
+            "btw_sync",
             "snapshot", "replay_start", "user_msg", "delta", "replay_end",
-            "query_queue", "completion_state", "perm"]
-        assert tr.sent[2].prompt == "current"
+            "ask_user_sync", "background_process_sync", "query_queue",
+            "completion_state", "perm",
+            "auto_compact"]
+        assert tr.sent[3].prompt == "current"
         assert all(msg.to == "c1" for msg in tr.sent)
 
     asyncio.run(go())
@@ -5691,9 +7485,9 @@ def test_codex_summary_sizes_final_projection_before_dropping_old_turns(
     )
     monkeypatch.setattr(
         mm,
-        "codex_history_window",
-        lambda path, **_kwargs: (
-            0, os.path.getsize(path), False, None, None,
+        "codex_history_window_info",
+        lambda path, **_kwargs: CodexHistoryWindow(
+            0, os.path.getsize(path), False,
         ),
     )
 
@@ -6029,8 +7823,24 @@ def test_oversized_active_codex_steer_keeps_live_user_item_id(
             {"timestamp": "2026-01-01T00:10:00Z", "type": "event_msg",
              "payload": {"type": "user_message",
                          "message": "latest steer"}},
+            {"timestamp": "2026-01-01T00:10:01Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "commentary",
+                         "message": "steer work before compact"}},
         ):
             rollout.write((json.dumps(row) + "\n").encode())
+        # Make the latest steer itself exceed the bounded window. Its forced
+        # recovery boundary is the response_item above, which has no turn_id;
+        # ownership and segment identity must come from the reverse scan.
+        rollout.seek(2 * 1024 * 1024, os.SEEK_CUR)
+        rollout.write(b"\n")
+        rollout.write((json.dumps({
+            "timestamp": "2026-01-01T00:10:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message", "phase": "final_answer",
+                "message": "late answer",
+            },
+        }) + "\n").encode())
 
     monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(source))
 
@@ -6040,15 +7850,38 @@ def test_oversized_active_codex_steer_keeps_live_user_item_id(
         ctx = _mk_ctx("codex-active-steer", "codex-active-steer")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
+        machine._codex_client_messages.put(
+            source, "turn-long", "browser-first", segment_index=0,
+        )
+        machine._codex_client_messages.put(
+            source, "turn-long", "browser-steer", segment_index=1,
+        )
+        machine._codex_process_clocks.observe_start(
+            source, "browser-first", "turn-long", 1_000,
+        )
 
         newest = await machine._build_history("codex-active-steer", limit=60)
         users = [
-            (row["msg_id"], row["prompt"])
+            (row["msg_id"], row.get("client_msg_id"), row["prompt"])
             for row in newest.events if row["type"] == "user_msg"
         ]
-        assert users == [("msg-native-steer", "latest steer")]
+        assert users == [(
+            "msg-native-steer", "browser-steer", "latest steer",
+        )]
         assert newest.oldest_id == "msg-native-steer"
         assert newest.has_more is True
+        clocks = machine._codex_process_clocks.get(source)
+        assert clocks.resolve("browser-first", "turn-long") == 1_000
+        assert clocks.resolve(
+            "browser-steer", "turn-long",
+        ) == 1_767_226_201_000
+
+        summary = await machine._build_history(
+            "codex-active-steer", limit=60, detail="summary",
+        )
+        assert len(summary.turns) == 1
+        assert summary.turns[0].clientMsgId == "browser-steer"
+        assert summary.turns[0].processStartedTs == 1_767_226_201_000
 
     asyncio.run(go())
 
@@ -6090,6 +7923,12 @@ def test_compacted_codex_tail_recovers_omitted_current_prompt(
         ctx = _mk_ctx("codex-compacted", "codex-compacted")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
+        machine._codex_client_messages.put(
+            source,
+            "turn-long",
+            "browser-long",
+            segment_index=0,
+        )
 
         newest = await machine._build_history("codex-compacted", limit=60)
         assert [row["prompt"] for row in newest.events
@@ -6101,6 +7940,27 @@ def test_compacted_codex_tail_recovers_omitted_current_prompt(
                    for row in newest.events)
         assert newest.oldest_id == "turn-long"
         assert newest.has_more is True
+        assert machine._codex_process_clocks.get(source).resolve(
+            "browser-long", "turn-long",
+        ) == 1_767_225_603_000
+
+        summary = await machine._build_history(
+            "codex-compacted", limit=60, detail="summary",
+        )
+        assert summary.turns[0].processStartedTs == 1_767_225_603_000
+
+        # Simulate a later restart whose bounded boundary scan cannot revisit
+        # the omitted prefix. Rebuild SQLite from the unchanged source: the
+        # source-bound sidecar remains the earliest presentation truth.
+        machine._history_index.invalidate_session("codex-compacted")
+        monkeypatch.setattr(
+            mm, "codex_history_boundary_process_start",
+            lambda *_args, **_kwargs: None,
+        )
+        restarted = await machine._build_history(
+            "codex-compacted", limit=60, detail="summary",
+        )
+        assert restarted.turns[0].processStartedTs == 1_767_225_603_000
 
     asyncio.run(go())
 
@@ -6689,9 +8549,11 @@ def test_task_notification_history_is_structured_only_with_raw_origin_evidence(
     assert not any(
         isinstance(event, UserMsg) and "task-notification" in event.prompt
         for event in events)
-    process = next(
+    process = [
         event for event in events
-        if event.type == "process" and event.item_id == "agent:call-agent-1")
+        if event.type == "process"
+        and event.item_id == public_agent_run_id("call-agent-1")
+    ][-1]
     assert process.kind == "agent" and process.phase == "end"
     assert process.status == "succeeded"
     assert process.parent_id == "call-agent-1"
@@ -6709,6 +8571,128 @@ def test_task_notification_history_is_structured_only_with_raw_origin_evidence(
     )], 10_000, internal_user_events=metadata)
     assert next(event for event in visible if isinstance(event, UserMsg)).prompt \
         == notification
+
+
+def test_background_bash_notification_stays_an_ordinary_background_task(
+        monkeypatch, tmp_path):
+    notification = """<task-notification>
+<task-id>bash-task-1</task-id>
+<tool-use-id>call-bash-1</tool-use-id>
+<status>completed</status>
+<summary>Background command completed</summary>
+</task-notification>"""
+    path = tmp_path / "session.jsonl"
+    rows = [
+        {"type": "queue-operation", "operation": "enqueue",
+         "content": notification},
+        {"type": "assistant", "uuid": "assistant-row",
+         "message": {"role": "assistant", "content": [{
+             "type": "tool_use", "id": "call-bash-1", "name": "Bash",
+             "input": {"command": "make check", "run_in_background": True},
+         }]}},
+        {"type": "user", "uuid": "notification-row",
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": notification}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path", lambda _sid: str(path))
+
+    metadata = transcript_internal_user_events("session")
+    assert metadata["notification-row"].kind == "task"
+    messages = [
+        SimpleNamespace(
+            uuid="human-turn", type="user",
+            message={"role": "user", "content": "run checks"}),
+        SimpleNamespace(
+            uuid="assistant-row", type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use", "id": "call-bash-1", "name": "Bash",
+                "input": {"command": "make check", "run_in_background": True},
+            }]}),
+        SimpleNamespace(
+            uuid="notification-row", type="user",
+            message={"role": "user", "content": notification}),
+    ]
+    events = translate_history(
+        messages, 10_000, internal_user_events=metadata)
+    process = next(
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "bash-task-1")
+    assert process.kind == "task"
+    assert process.parent_id == "call-bash-1"
+    assert process.title == "后台任务"
+    assert process.summary == "Background command completed"
+    assert process.background is True
+    assert not any(
+        isinstance(event, ProcessEvent) and event.kind == "agent"
+        for event in events)
+
+
+def test_late_internal_task_notification_does_not_extend_completed_answer():
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    answer_id = "22222222-2222-4222-8222-222222222222"
+    notification_id = "33333333-3333-4333-8333-333333333333"
+    notification = """<task-notification>
+<task-id>stale-background-command</task-id>
+<status>stopped</status>
+<summary>No completion record was found after resume</summary>
+</task-notification>"""
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "finish the task"},
+        ),
+        SimpleNamespace(
+            uuid=answer_id,
+            type="assistant",
+            parent_tool_use_id=None,
+            message={
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ),
+        SimpleNamespace(
+            uuid=notification_id,
+            type="user",
+            message={"role": "user", "content": notification},
+        ),
+    ]
+    internal = {
+        notification_id: ProcessEvent(
+            item_id="stale-background-command",
+            kind="task",
+            phase="end",
+            status="cancelled",
+            title="后台任务",
+            summary="No completion record was found after resume",
+            background=True,
+        ),
+    }
+
+    events = translate_history(
+        messages,
+        10_000,
+        timestamps={
+            prompt_id: 1_000.0,
+            answer_id: 1_010.0,
+            notification_id: 40_000.0,
+        },
+        internal_user_events=internal,
+    )
+
+    process = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "stale-background-command"
+    )
+    assert process.ts == 40_000.0
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.turn_id == answer_id
+    assert terminal.ts == 1_010.0
+    assert terminal.result.duration_ms == 10_000
 
 
 def test_history_hides_cancelled_command_placeholders_without_hiding_real_text():
@@ -6814,6 +8798,145 @@ def test_claude_history_marks_sdk_interrupt_without_a_fake_user_turn():
     assert terminal.ts == 1005.0
 
 
+def test_claude_history_repairs_replacement_alias_bound_to_interrupt_marker():
+    previous_id = "11111111-1111-4111-8111-111111111111"
+    previous_reply_id = "22222222-2222-4222-8222-222222222222"
+    marker_id = "33333333-3333-4333-8333-333333333333"
+    replacement_id = "44444444-4444-4444-8444-444444444444"
+    replacement_reply_id = "55555555-5555-4555-8555-555555555555"
+    browser_id = "66666666-6666-4666-8666-666666666666"
+    messages = [
+        SimpleNamespace(
+            uuid=previous_id,
+            type="user",
+            message={"role": "user", "content": "old prompt"},
+        ),
+        SimpleNamespace(
+            uuid=previous_reply_id,
+            type="assistant",
+            parent_tool_use_id=None,
+            message={
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [{"type": "text", "text": "old partial"}],
+            },
+        ),
+        SimpleNamespace(
+            uuid=marker_id,
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "text",
+                "text": "[Request interrupted by user]",
+            }]},
+        ),
+        SimpleNamespace(
+            uuid=replacement_id,
+            type="user",
+            message={"role": "user", "content": "stop for now"},
+        ),
+        SimpleNamespace(
+            uuid=replacement_reply_id,
+            type="assistant",
+            parent_tool_use_id=None,
+            message={
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "stopped"}],
+            },
+        ),
+    ]
+
+    events = translate_history(
+        messages,
+        10_000,
+        client_message_ids={marker_id: browser_id},
+    )
+
+    users = [event for event in events if isinstance(event, UserMsg)]
+    assert [(event.prompt, event.client_msg_id) for event in users] == [
+        ("old prompt", None),
+        ("stop for now", browser_id),
+    ]
+    assert [
+        event.result.subtype
+        for event in events
+        if isinstance(event, TurnEnd)
+    ] == ["interrupted", "success"]
+
+
+@pytest.mark.parametrize(
+    "intervening",
+    [
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222221",
+            type="user",
+            message={"role": "user", "content": "<command-name>/status</command-name>"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="user",
+            message={
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "late tool result",
+                }],
+            },
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222223",
+            type="assistant",
+            parent_tool_use_id=None,
+            message={"role": "assistant", "content": "malformed late output"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222224",
+            type="assistant",
+            parent_tool_use_id=None,
+            message={
+                "role": "assistant",
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "No response requested."}],
+            },
+        ),
+    ],
+    ids=("meta-user", "tool-result", "malformed-assistant", "synthetic-assistant"),
+)
+def test_claude_history_interrupt_alias_repair_requires_adjacent_user(
+    intervening,
+):
+    marker_id = "11111111-1111-4111-8111-111111111111"
+    later_user_id = "33333333-3333-4333-8333-333333333333"
+    browser_id = "44444444-4444-4444-8444-444444444444"
+    messages = [
+        SimpleNamespace(
+            uuid=marker_id,
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "text",
+                "text": "[Request interrupted by user]",
+            }]},
+        ),
+        intervening,
+        SimpleNamespace(
+            uuid=later_user_id,
+            type="user",
+            message={"role": "user", "content": "unrelated later prompt"},
+        ),
+    ]
+
+    events = translate_history(
+        messages,
+        10_000,
+        client_message_ids={marker_id: browser_id},
+    )
+
+    user = next(event for event in events if isinstance(event, UserMsg))
+    assert user.prompt == "unrelated later prompt"
+    assert user.client_msg_id is None
+
+
 def test_claude_history_keeps_synthetic_api_error_but_marks_turn_failed():
     prompt_id = "33333333-3333-4333-8333-333333333333"
     error_id = "44444444-4444-4444-8444-444444444444"
@@ -6850,6 +8973,380 @@ def test_claude_history_keeps_synthetic_api_error_but_marks_turn_failed():
     assert terminal.result.subtype == "error"
     assert terminal.result.is_error is True
     assert last_assistant_model(messages) is None
+
+
+def _test_png() -> tuple[bytes, str]:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (48, 24), (34, 92, 150)).save(buffer, "PNG")
+    raw = buffer.getvalue()
+    return raw, base64.b64encode(raw).decode("ascii")
+
+
+def test_live_claude_image_read_reuses_view_image_process_without_base64():
+    _raw, encoded = _test_png()
+    translator = StreamTranslator(65_536, turn_id="turn-image")
+
+    started = translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image", name="Read",
+            input={"file_path": "/tmp/chart.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image",
+    ))
+    process_start = next(
+        event for event in started
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    )
+    assert process_start.kind == "server_tool"
+    assert process_start.phase == "start"
+    assert process_start.tool == "view_image"
+    assert process_start.input == {"file_path": "/tmp/chart.png"}
+    assert not any(isinstance(event, ToolUse) for event in started)
+
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image",
+        content=[{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": encoded,
+            },
+        }],
+    )]))
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    )
+    assert process_end.phase == "end"
+    assert process_end.status == "succeeded"
+    assert process_end.tool == "view_image"
+    assert not any(isinstance(event, ToolResult) for event in finished)
+    assert encoded not in "".join(
+        event.model_dump_json() for event in [*started, *finished]
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "is_error", "status"),
+    [
+        ("file is not a supported image", False, "succeeded"),
+        ("permission denied", True, "failed"),
+    ],
+)
+def test_live_claude_image_suffix_without_image_preserves_result(
+    content, is_error, status,
+):
+    translator = StreamTranslator(65_536, turn_id="turn-image-fallback")
+    translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image-fallback", name="Read",
+            input={"file_path": "/tmp/not-an-image.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image-fallback",
+    ))
+
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image-fallback",
+        content=content,
+        is_error=is_error,
+    )]))
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-fallback"
+    )
+    assert process_end.phase == "end"
+    assert process_end.status == status
+    assert process_end.tool == "Read"
+    assert process_end.output == content
+    assert "preview_id" not in (process_end.input or {})
+
+
+def test_failed_claude_image_read_never_projects_base64_as_output():
+    _raw, encoded = _test_png()
+    translator = StreamTranslator(65_536, turn_id="turn-image-error")
+    translator.feed(AssistantMessage(
+        content=[ToolUseBlock(
+            id="tool-image-error", name="Read",
+            input={"file_path": "/tmp/error.png"},
+        )],
+        model="claude-test",
+        message_id="assistant-image-error",
+    ))
+    finished = translator.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="tool-image-error",
+        content=[{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": encoded,
+            },
+        }],
+        is_error=True,
+    )]))
+
+    process_end = next(
+        event for event in finished
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-error"
+    )
+    assert process_end.status == "failed"
+    assert process_end.tool == "Read"
+    assert process_end.output == "图片读取结果不可用"
+    assert encoded not in process_end.model_dump_json()
+
+
+def test_image_read_fallback_clears_provisional_preview_candidate():
+    async def go():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("image-fallback", "image-fallback")
+        start = ProcessEvent(
+            item_id="tool-image-fallback",
+            kind="server_tool",
+            phase="start",
+            status="running",
+            title="查看图片",
+            input={"file_path": "/tmp/not-an-image.png"},
+            tool="view_image",
+        )
+        await machine._observe_preview_image_event(ctx, start)
+        assert set(ctx.preview_image_candidates) == {"tool-image-fallback"}
+        assert ctx.preview_image_candidates["tool-image-fallback"].endswith(
+            "/tmp/not-an-image.png")
+
+        fallback = ProcessEvent(
+            item_id="tool-image-fallback",
+            kind="server_tool",
+            phase="end",
+            status="failed",
+            title="读取 · /tmp/not-an-image.png",
+            input={"file_path": "/tmp/not-an-image.png"},
+            output="permission denied",
+            tool="Read",
+        )
+        await machine._observe_preview_image_event(ctx, fallback)
+        assert ctx.preview_image_candidates == {}
+
+    asyncio.run(go())
+
+
+def test_claude_history_image_read_uses_lazy_ref_not_tool_output():
+    raw, encoded = _test_png()
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "draw it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image",
+                "name": "Read",
+                "input": {"file_path": "/tmp/chart.png"},
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="33333333-3333-4333-8333-333333333333",
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": encoded,
+                    },
+                }],
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="44444444-4444-4444-8444-444444444444",
+            type="assistant",
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "done"}]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    image_rows = [
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "tool-image"
+    ]
+    assert [event.phase for event in image_rows] == ["start", "end"]
+    assert all(event.tool == "view_image" for event in image_rows)
+    assert not any(
+        isinstance(event, (ToolUse, ToolResult))
+        and getattr(event, "tool_use_id", None) == "tool-image"
+        for event in events
+    )
+    assert encoded not in "".join(event.model_dump_json() for event in events)
+
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image"})
+    materialized = mm._attach_claude_history_image_refs([events], assets)
+    assert len(materialized) == 1
+    assert materialized[0].data == raw
+    image_ref = image_rows[-1].input["history_image"]
+    assert image_ref["width"] == 48 and image_ref["height"] == 24
+    assert image_ref["byte_size"] == len(raw)
+    assert encoded not in "".join(event.model_dump_json() for event in events)
+
+
+def test_claude_history_image_materialization_bounds_retained_bodies():
+    raw, encoded = _test_png()
+    groups = []
+    assets = []
+    for index in range(2):
+        turn_id = f"11111111-1111-4111-8111-11111111111{index}"
+        item_id = f"tool-image-{index}"
+        groups.append([
+            UserMsg(msg_id=turn_id, prompt="draw it"),
+            ProcessEvent(
+                item_id=item_id,
+                kind="server_tool",
+                phase="end",
+                status="succeeded",
+                title="查看图片",
+                input={"file_path": f"/tmp/chart-{index}.png"},
+                tool="view_image",
+            ),
+        ])
+        assets.append(stream_module.ClaudeHistoryImageAsset(
+            item_id=item_id,
+            image_id=stream_module.claude_history_image_id(item_id),
+            media_type="image/png",
+            data=encoded,
+        ))
+
+    materialized = mm._attach_claude_history_image_refs(
+        groups,
+        tuple(assets),
+        max_cached_bytes=len(raw),
+    )
+    assert len(materialized) == 2
+    assert sum(image.data is not None for image in materialized) == 1
+    assert all(
+        group[-1].input.get("history_image") is not None
+        for group in groups
+    )
+
+
+def test_claude_history_non_image_read_result_stays_visible():
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "open it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "tool-image-fallback",
+                "name": "Read",
+                "input": {"file_path": "/tmp/not-an-image.png"},
+            }]},
+        ),
+        SimpleNamespace(
+            uuid="33333333-3333-4333-8333-333333333333",
+            type="user",
+            message={"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "tool-image-fallback",
+                "is_error": True,
+                "content": "permission denied",
+            }]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    process_end = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-fallback"
+        and event.phase == "end"
+    )
+    assert process_end.status == "failed"
+    assert process_end.tool == "Read"
+    assert process_end.output == "permission denied"
+    assert stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image-fallback"},
+    ) == ()
+
+
+def test_claude_history_assistant_result_uses_same_image_shapes(tmp_path):
+    raw, encoded = _test_png()
+    prompt_id = "11111111-1111-4111-8111-111111111111"
+    messages = [
+        SimpleNamespace(
+            uuid=prompt_id,
+            type="user",
+            message={"role": "user", "content": "draw it"},
+        ),
+        SimpleNamespace(
+            uuid="22222222-2222-4222-8222-222222222222",
+            type="assistant",
+            message={"role": "assistant", "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "tool-image-server",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/server-chart.png"},
+                },
+                {
+                    "type": "server_tool_result",
+                    "tool_use_id": "tool-image-server",
+                    "content": [{
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": encoded,
+                        },
+                    }],
+                },
+            ]},
+        ),
+    ]
+
+    events = translate_history(messages, 65_536)
+    image_end = next(
+        event for event in events
+        if isinstance(event, ProcessEvent)
+        and event.item_id == "tool-image-server"
+        and event.phase == "end"
+    )
+    assert image_end.tool == "view_image"
+    assets = stream_module.extract_claude_history_image_assets(
+        messages, item_ids={"tool-image-server"},
+    )
+    assert len(assets) == 1 and base64.b64decode(assets[0].data) == raw
+    transcript = tmp_path / "assistant-image-result.jsonl"
+    transcript.write_text("".join(
+        json.dumps({
+            "uuid": message.uuid,
+            "type": message.type,
+            "message": message.message,
+        }) + "\n"
+        for message in messages
+    ))
+    assert stream_module.read_claude_history_image_asset(
+        str(transcript), assets[0].image_id,
+    ) is not None
 
 
 def test_live_claude_turn_end_uses_last_assistant_transcript_uuid():

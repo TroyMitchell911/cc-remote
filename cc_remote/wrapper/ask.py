@@ -1,8 +1,9 @@
 """In-process MCP server exposing cc-remote's agent-facing tools.
 
 Tools:
-- `ask_user(question, options)`: ask the user a multiple-choice clarifying
-  question. Blocks until the user answers (client renders a question card).
+- `ask_user(question, options)`: ask the user a clarifying question with
+  suggested choices and a custom-text fallback. Blocks until the user answers
+  (client renders a question card).
 - `set_mode(mode)`: switch cc's permission mode yourself (e.g. "plan" when the
   user wants to plan, "bypassPermissions" to go back to normal). The mode
   change takes effect immediately for the rest of the turn.
@@ -30,7 +31,7 @@ ASK_USER_TOOL = "ask_user"
 SET_MODE_TOOL = "set_mode"
 MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
-# async (question, options) -> answer string
+# async (question, options) -> selected label or custom answer string
 AskCallback = Callable[[str, list[dict[str, str]]], Awaitable[str]]
 # async (mode) -> None  (machine: sdk.set_permission_mode + emit Perm)
 SetModeCallback = Callable[[str], Awaitable[None]]
@@ -82,10 +83,12 @@ def make_ask_server(ask: AskCallback, set_mode: SetModeCallback) -> Server:
             types.Tool(
                 name=ASK_USER_TOOL,
                 description=(
-                    "Ask the user a clarifying question with multiple-choice options. "
+                    "Ask the user a clarifying question with suggested options and a "
+                    "custom-text fallback. "
                     "Use this in plan mode or whenever you need the user to pick between "
                     "approaches before proceeding. The call blocks until the user answers; "
-                    "their selected option's label is returned as the tool result. Do NOT "
+                    "their selected option label or custom answer is returned as the tool "
+                    "result. Do NOT "
                     "ask via plain text when you could use this tool."
                 ),
                 inputSchema={

@@ -75,6 +75,41 @@ def test_claude_capability_listing_uses_effective_configured_cli(
     asyncio.run(run())
 
 
+def test_claude_isolated_plugin_listing_uses_only_profile_settings(
+    monkeypatch, tmp_path
+):
+    async def run():
+        config = tmp_path / "claude-stack"
+        config.mkdir()
+        spawned = []
+
+        async def spawn(*args, **kwargs):
+            spawned.append((args, kwargs))
+            return _ClaudeProcess()
+
+        monkeypatch.setattr(
+            capabilities_module.asyncio, "create_subprocess_exec", spawn
+        )
+
+        assert await capabilities_module._claude_plugins(
+            "/sdk/runtime/claude",
+            config,
+            isolate_account_env=True,
+        ) == []
+
+        assert spawned[0][0] == (
+            "/sdk/runtime/claude",
+            "--setting-sources=user",
+            "plugin",
+            "list",
+            "--json",
+        )
+        child_env = spawned[0][1]["env"]
+        assert child_env["CLAUDE_CONFIG_DIR"] == str(config)
+
+    asyncio.run(run())
+
+
 def test_claude_skill_create_and_remove_uses_scoped_recoverable_trash(
     monkeypatch, tmp_path
 ):
@@ -267,6 +302,12 @@ def test_claude_user_hooks_follow_config_dir_outside_home(
             ("PreToolUse", "user"),
             ("PostToolUse", "project-local"),
         }
+        isolated_hooks = capabilities_module._claude_hooks(
+            str(project), config, True,
+        )
+        assert {(hook["name"], hook["scope"]) for hook in isolated_hooks} == {
+            ("PreToolUse", "user"),
+        }
 
         await capabilities_module.manage_engine_hook(
             "claude", "create", str(project), event="SessionStart",
@@ -280,6 +321,18 @@ def test_claude_user_hooks_follow_config_dir_outside_home(
         assert "SessionStart" in json.loads(active_settings.read_text())["hooks"]
         assert "SessionEnd" in json.loads(project_settings.read_text())["hooks"]
         assert "SessionStart" not in json.loads(legacy_settings.read_text())["hooks"]
+
+        with pytest.raises(ValueError, match="只加载账号级 Hook"):
+            await capabilities_module.manage_engine_hook(
+                "claude",
+                "create",
+                str(project),
+                event="SessionEnd",
+                command="inactive-project-hook",
+                scope="project",
+                claude_config_root=config,
+                isolate_claude_account_env=True,
+            )
 
         created = next(
             hook for hook in capabilities_module._claude_hooks(str(project))
@@ -545,6 +598,47 @@ def test_claude_plugin_mutation_uses_effective_configured_cli(
             verb,
             "example",
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("action", "verb"),
+    (("install", "install"), ("uninstall", "uninstall")),
+)
+def test_claude_isolated_plugin_mutation_uses_only_profile_settings(
+    monkeypatch, tmp_path, action, verb
+):
+    async def run():
+        config = tmp_path / "claude-stack"
+        config.mkdir()
+        spawned = []
+
+        async def spawn(*args, **kwargs):
+            spawned.append((args, kwargs))
+            return _ClaudeProcess()
+
+        monkeypatch.setattr(
+            capabilities_module.asyncio, "create_subprocess_exec", spawn
+        )
+
+        await capabilities_module._manage_claude_plugin(
+            "example",
+            action,
+            "/sdk/runtime/claude",
+            config,
+            isolate_account_env=True,
+        )
+
+        assert spawned[0][0] == (
+            "/sdk/runtime/claude",
+            "--setting-sources=user",
+            "plugin",
+            verb,
+            "example",
+        )
+        child_env = spawned[0][1]["env"]
+        assert child_env["CLAUDE_CONFIG_DIR"] == str(config)
 
     asyncio.run(run())
 

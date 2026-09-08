@@ -71,7 +71,7 @@ class ControlStore:
                 continue
             controls = {
                 key: value for key, value in raw_controls.items()
-                if key in {"model", "effort", "permission_mode"}
+                if key in {"model", "effort", "permission_mode", "auto_compact"}
                 and isinstance(value, str)
             }
             if controls:
@@ -87,7 +87,7 @@ class ControlStore:
         session_id = self._session_id(session_id)
         current = dict(self._sessions.get(session_id, {}))
         for key, value in controls.items():
-            if key not in {"model", "effort", "permission_mode"}:
+            if key not in {"model", "effort", "permission_mode", "auto_compact"}:
                 continue
             if value is None:
                 current.pop(key, None)

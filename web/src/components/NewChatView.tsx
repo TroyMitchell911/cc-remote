@@ -2,13 +2,15 @@
 // with a working directory, optional model/effort overrides, and attachments.
 // A null override is intentional: the wrapper/engine keeps its own local default.
 /* oxlint-disable react/only-export-components */
-import { useEffect, useRef, useState, type ClipboardEvent } from "react";
+import {
+  lazy, Suspense, useEffect, useRef, useState, type ClipboardEvent,
+} from "react";
 import { Icon } from "../icons";
 import {
-  effortsFor, modelsFor, type Catalog, type Effort, type Model,
+  effortsFor, modelsFor, parseSlash, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
@@ -22,12 +24,20 @@ import {
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
+import {
+  autoCompactSelectionLabel,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+
+const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
 
 type Engine = "claude" | "codex";
 
 export interface NewChatCatalogRequest {
   engine: Engine;
   cwd?: string;
+  claudeProfileId?: string;
   codexProfileId?: string;
 }
 
@@ -36,6 +46,7 @@ export interface NewChatCatalogRequest {
 export function newChatCatalogRequest(
   engine: Engine, space: Space, cwd: string,
   codexProfileId?: string | null,
+  claudeProfileId?: string | null,
 ): NewChatCatalogRequest | null {
   if (engine === "codex") {
     return {
@@ -43,7 +54,11 @@ export function newChatCatalogRequest(
       ...(codexProfileId ? { codexProfileId } : {}),
     };
   }
-  return space === "code" ? { engine, cwd } : null;
+  return space === "code" ? {
+    engine,
+    cwd,
+    ...(claudeProfileId ? { claudeProfileId } : {}),
+  } : null;
 }
 
 export interface NewChatLocalDefaults {
@@ -136,8 +151,12 @@ interface Props {
   catalog?: Catalog;
   model?: string | null;
   effort?: string | null;
+  autoCompact?: AutoCompactSelection;
   defaultModel?: string | null;
   defaultEffort?: string | null;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
+  claudeProfileId?: string | null;
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   codexProfileId?: string | null;
@@ -150,6 +169,8 @@ interface Props {
   onPickCwd: () => void;  // open the directory picker
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
+  onPickAutoCompact?: (selection: AutoCompactSelection) => void;
+  onPickClaudeProfile?: (profileId: string) => void;
   onPickCodexProfile?: (profileId: string) => void;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onGetPermissionProfiles?: (cwd: string) => void;
@@ -173,6 +194,7 @@ interface NewChatExecutionControls {
   permissionMode: CodexPermissionMode;
   permissionProfile: string | null;
   webSearch: CodexWebSearchMode | null;
+  serviceTier: CodexServiceTier;
 }
 
 const defaultExecutionControls = (
@@ -182,6 +204,7 @@ const defaultExecutionControls = (
   permissionMode: "never",
   permissionProfile: null,
   webSearch: null,
+  serviceTier: "default",
 });
 
 function NewChatSelectorSheet({
@@ -240,10 +263,13 @@ function displayEffort(
 export function NewChatView({ cwd, controlScopeKey,
   space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
+  autoCompact = { mode: "inherit", thresholdTokens: null },
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
+  claudeProfiles = [], defaultClaudeProfileId = null, claudeProfileId = null,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, onPickCodexProfile,
+  onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile,
+  onPickCodexProfile,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -254,6 +280,8 @@ export function NewChatView({ cwd, controlScopeKey,
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] =
     useState<"models" | "efforts" | null>(null);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
+  const [autoCompactNotice, setAutoCompactNotice] = useState<string | null>(null);
   const [executionControls, setExecutionControls] =
     useState<NewChatExecutionControls>(
       () => defaultExecutionControls(controlScopeKey));
@@ -275,6 +303,8 @@ export function NewChatView({ cwd, controlScopeKey,
         : defaultExecutionControls(controlScopeKey)
     ));
     setPermissionsOpen(false);
+    setAutoCompactOpen(false);
+    setAutoCompactNotice(null);
   }, [controlScopeKey]);
 
   useEffect(() => {
@@ -306,7 +336,9 @@ export function NewChatView({ cwd, controlScopeKey,
     permissionMode,
     permissionProfile,
     webSearch,
+    serviceTier,
   } = scopedExecutionControls;
+  const fastSelected = serviceTier === "fast";
   const updateExecutionControls = (
     patch: Partial<Omit<NewChatExecutionControls, "scopeKey">>,
   ) => {
@@ -317,16 +349,20 @@ export function NewChatView({ cwd, controlScopeKey,
       ...patch,
     }));
   };
-  const selectedCodexProfile = engine === "codex"
-    ? codexProfiles.find((profile) => profile.id === codexProfileId) ?? null
-    : null;
-  const selectedProfileMissing = engine === "codex" && !!codexProfileId
-    && selectedCodexProfile === null;
+  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = engine === "codex"
+    ? defaultCodexProfileId : defaultClaudeProfileId;
+  const accountProfileId = engine === "codex"
+    ? codexProfileId : claudeProfileId;
+  const selectedAccountProfile = accountProfiles.find(
+    (profile) => profile.id === accountProfileId) ?? null;
+  const selectedProfileMissing = !!accountProfileId
+    && selectedAccountProfile === null;
   // A catalog read can fail while direct app-server startup still succeeds.
   // Warn without treating that transient read as an authentication verdict.
   const selectedProfileWarning = selectedProfileMissing
-    ? "所选 Codex 账号已移除，请重新选择。"
-    : selectedCodexProfile?.error ?? null;
+    ? `所选 ${engine === "codex" ? "Codex" : "Claude"} 账号已移除，请重新选择。`
+    : selectedAccountProfile?.error ?? null;
   const canSend = (text.trim().length > 0 || hasAttachments || pastes.length > 0)
     && !creating && !importing && !selectedProfileMissing;
   const modelList = modelsFor(engine, catalog);
@@ -401,6 +437,35 @@ export function NewChatView({ cwd, controlScopeKey,
   };
 
   const send = (value = taRef.current?.value ?? text) => {
+    const command = parseSlash(value.trim());
+    if (command?.slash === "autocompact") {
+      if (engine !== "claude") {
+        setAutoCompactNotice("自动压缩阈值仅适用于 Claude 会话。");
+        setText("");
+        return;
+      }
+      if (!command.args) {
+        setAutoCompactOpen(true);
+        setAutoCompactNotice(null);
+        setText("");
+        return;
+      }
+      const parsed = parseAutoCompactArgument(command.args);
+      if (!parsed.ok) {
+        setAutoCompactNotice(parsed.error);
+        return;
+      }
+      if (!onPickAutoCompact) {
+        setAutoCompactNotice("自动压缩设置当前不可用。");
+        return;
+      }
+      onPickAutoCompact(parsed.selection);
+      setAutoCompactNotice(
+        `已设置自动压缩：${autoCompactSelectionLabel(parsed.selection)}`,
+      );
+      setText("");
+      return;
+    }
     const composed = composePastePrompt(pastes, value.trim());
     if (!composed.ok) {
       window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
@@ -422,7 +487,7 @@ export function NewChatView({ cwd, controlScopeKey,
       engine === "codex" && space === "code"
         ? (webSearch ?? undefined)
         : undefined,
-      engine === "codex" ? "default" : undefined);
+      engine === "codex" ? serviceTier : undefined);
     if (!queued) setCreating(false);
   };
 
@@ -443,24 +508,25 @@ export function NewChatView({ cwd, controlScopeKey,
       <Icon name="edit" size={13} />
     </button>
   );
-  const showCodexProfileSelector =
-    engine === "codex"
-    && (codexProfiles.length > 1 || selectedProfileMissing);
-  const profileSelector = showCodexProfileSelector ? (
+  const showProfileSelector = accountProfiles.length > 1
+    || selectedProfileMissing;
+  const pickAccountProfile = engine === "codex"
+    ? onPickCodexProfile : onPickClaudeProfile;
+  const profileSelector = showProfileSelector ? (
     <label className="newchat-profile">
       <span>账号</span>
-      <select value={codexProfileId ?? ""}
-        onChange={(event) => onPickCodexProfile?.(event.target.value)}
-        disabled={creating || importing || !onPickCodexProfile}
-        aria-label="选择 Codex 账号">
-        {selectedProfileMissing && codexProfileId && (
-          <option value={codexProfileId} disabled>已移除账号</option>
+      <select value={accountProfileId ?? ""}
+        onChange={(event) => pickAccountProfile?.(event.target.value)}
+        disabled={creating || importing || !pickAccountProfile}
+        aria-label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
+        {selectedProfileMissing && accountProfileId && (
+          <option value={accountProfileId} disabled>已移除账号</option>
         )}
-        {codexProfiles.map((profile) => (
+        {accountProfiles.map((profile) => (
           <option key={profile.id} value={profile.id}>
             {codexProfilePresentation(
-              codexProfiles,
-              defaultCodexProfileId,
+              accountProfiles,
+              defaultAccountProfileId,
               profile.id,
             )?.fullLabel ?? profile.label}
             {profile.error ? " · 目录暂不可用" : ""}
@@ -558,7 +624,10 @@ export function NewChatView({ cwd, controlScopeKey,
 
         <textarea className="newchat-input"
           placeholder={space === "work" ? "描述要完成的工作，或上传文档、表格、演示…" : "发条消息开始…"} ref={taRef}
-          value={text} onChange={(e) => setText(e.target.value)} onPaste={onPaste}
+          value={text} onChange={(e) => {
+            setText(e.target.value);
+            setAutoCompactNotice(null);
+          }} onPaste={onPaste}
           autoFocus={autoFocus} rows={3}
           disabled={creating || importing}
           onCompositionStart={() => imeSubmitRef.current.startComposition()}
@@ -601,6 +670,19 @@ export function NewChatView({ cwd, controlScopeKey,
               disabled={creating || importing || !onPickEffort}>
               {effortLabel}
             </button>
+            {engine === "codex" && space === "work" && (
+              <button type="button"
+                className={"hint-ctl fast-chip" + (fastSelected ? " on" : "")}
+                aria-label="新工作 Fast 服务档位"
+                aria-pressed={fastSelected}
+                onClick={() => updateExecutionControls({
+                  serviceTier: fastSelected ? "default" : "fast",
+                })}
+                title="Fast：快速 / 标准（首条消息生效）"
+                disabled={creating || importing}>
+                {fastSelected ? "快速" : "标准"}
+              </button>
+            )}
             {engine === "codex" && space === "code" && (
               <button type="button" className="newchat-access"
                 onClick={() => {
@@ -618,7 +700,9 @@ export function NewChatView({ cwd, controlScopeKey,
           <div className="newchat-foot-right">
             <span className="newchat-hint">{createError
               ? `创建失败：${createError}`
-              : importing ? "正在导入附件…" : creating ? "正在创建会话…" : "Enter 发送"}</span>
+              : importing ? "正在导入附件…"
+                : creating ? "正在创建会话…"
+                  : autoCompactNotice ?? "Enter 发送"}</span>
             <button className="newchat-send"
               onPointerDown={() => {
                 if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
@@ -643,6 +727,30 @@ export function NewChatView({ cwd, controlScopeKey,
           setSheetKind(null);
         }}
       />
+      <>
+        <div className={"scrim" + (autoCompactOpen ? " show" : "")}
+          onClick={() => setAutoCompactOpen(false)} />
+        <div className={"sheet auto-compact-sheet"
+          + (autoCompactOpen ? " show" : "")}
+          role="dialog" aria-label="新会话自动压缩">
+          <div className="sheet-grip" />
+          <div className="sheet-title">新会话自动压缩</div>
+          <div className="sheet-scroll">
+            <Suspense fallback={
+              <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
+              <AutoCompactControl value={autoCompact}
+                newSession
+                disabled={creating || importing}
+                onChange={(selection) => {
+                  onPickAutoCompact?.(selection);
+                  setAutoCompactNotice(
+                    `已设置自动压缩：${autoCompactSelectionLabel(selection)}`,
+                  );
+                }} />
+            </Suspense>
+          </div>
+        </div>
+      </>
       <CommandSheet
         open={permissionsOpen}
         kind="perms"

@@ -49,6 +49,7 @@ def test_new_session_query_and_turn_binding_roundtrip():
         NewSession(engine="claude", service_tier="fast")
     work = NewSession(
         engine="codex", space="work", codex_profile_id="stack",
+        service_tier="fast",
     )
     assert deserialize(serialize(work)) == work
     with pytest.raises(ValidationError):
@@ -137,6 +138,8 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "engine": "claude",
             "model": "claude-test",
             "effort": "high",
+            "auto_compact_mode": None,
+            "auto_compact_threshold_tokens": None,
             "collaboration_mode": None,
             "permission_mode": None,
             "permission_profile": None,
@@ -369,8 +372,9 @@ def test_blank_new_session_does_not_start_a_turn():
 
         assert ctx.turn_task is None
         assert [msg.type for msg in transport.sent] == [
-            "snapshot", "session_focus", "perm"]
+            "snapshot", "session_focus", "auto_compact", "perm"]
         assert transport.sent[1].request_id == "req-blank"
-        assert transport.sent[2].mode == "bypassPermissions"
+        assert transport.sent[2].mode == "inherit"
+        assert transport.sent[3].mode == "bypassPermissions"
 
     asyncio.run(run())

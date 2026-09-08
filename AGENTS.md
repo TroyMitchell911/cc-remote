@@ -10,6 +10,27 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **control link** (this repo) — client ⇄ relay ⇄ wrapper ⇄ Claude Agent SDK /
   Codex app-server. Native CLI ownership is detected and mirrored separately.
 
+## Deployment
+
+The repository-owned deployment procedure is [`deploy/README.md`](deploy/README.md).
+Read its automation contract and the relevant installation path completely
+before any deploy, redeploy, recovery, verification, or rollback. Do not depend
+on out-of-tree instructions, and do not add an operator's host aliases,
+usernames, IPs, domains, home directories, or credentials to this repository.
+Resolve that inventory from the environment the operator placed in scope.
+
+Use one tested source snapshot or one set of release artifacts for all protocol
+tiers, stage and validate before touching live services, preserve external
+configuration and private state, and use the repository's immutable activation
+transactions. A dropped SSH/control connection is an unknown result: inspect
+the original transaction and live state before deciding whether a retry is
+safe. Deployment is complete only after protocol/build identity, service
+stability, public health, and expected Wrapper connectivity are verified.
+For Codex Code, also follow `deploy/README.md`'s shared-control-plane acceptance:
+verify each account's daily CLI and Wrapper connect to the same official
+app-server, not a private stdio fallback. Do not force takeover or kill a live
+CLI to satisfy deployment checks.
+
 ## Critical constraints / traps
 - **Drain footgun**: after `ClaudeSDKClient.interrupt()`, the SDK does NOT kill
   the session — the current turn's stream still emits a terminal
@@ -23,28 +44,34 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.128`**: message-type shapes and the
-  interrupt/drain contract can shift between minor versions. Re-run the
+- **SDK pinned to `claude-agent-sdk==0.2.151`**: message-type shapes and the
+  interrupt/drain contract can shift between patch versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
-  the major/minor at startup).
-- **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
+  the exact verified patch at startup).
+- **Claude Code is the user's daily CLI, not the SDK bundle**: Claude Code
+  `>=2.1.258` is required and checked before a Claude session starts. The wrapper
   defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
   to the SDK. An empty value keeps this default; only another absolute path may
   override it. Keep that CLI updated and signed in before starting the wrapper.
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.128). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.151). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
   Text deltas still stream live via `StreamEvent`.
-- **Claude only — don't set `setting_sources=[]`**: we WANT
-  `~/.claude/settings.json` loaded so Claude inherits the model link
-  (`ANTHROPIC_BASE_URL`), model id, and
-  `bypassPermissions`. Note: settings.json's `env` block overrides the process
-  env, so redirecting the model backend from cc-remote is not possible — it's
-  the user's `settings.json` that decides.
+- **Claude only — don't set `setting_sources=[]` for Code**: legacy single-account
+  Code intentionally loads `~/.claude/settings.json`. Explicit account profiles
+  keep the real HOME, select their native storage boundary with
+  `CLAUDE_CONFIG_DIR`, clear ambient provider variables, and use
+  `setting_sources=["user"]`. Project/local settings may contain provider env or
+  auth helpers and must not participate in an account-isolated child. Never pass
+  the selected profile's complete settings file through `--settings`: that
+  promotes every user setting above project/local precedence. Never parse or
+  copy account credentials into cc-remote state. Single-account behavior stays
+  native; Work is the deliberate exception with one wrapper-owned policy file,
+  `setting_sources=[]`, and safe mode.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -54,7 +81,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v35 is declared by
+- **Protocol version gate**: current wire protocol v55 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -65,6 +92,19 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   is scoped by `machine_id`; a credential for one enrolled device must never be
   accepted for another. Keep `cc_remote/device.py`, `relay/devices.py`, relay
   routing, and the Web device selector aligned when this contract changes.
+- **Remote Viewer serves static pages, not arbitrary LAN services**: read
+  `docs/remote-viewer.md` before changing its resource or origin boundary. Keep
+  Bridge pages in opaque HTTP-sandboxed frames (never `allow-same-origin`),
+  secrets out of URLs/JSON, and binary transfers on `/ws/viewer` (Wrapper) /
+  `/ws/viewer-client` (browser Cookie + exact Origin), never on chat/replay.
+  Optional Isolated mode uses per-preview origins and a `__Host-` main HTTPS
+  cookie; default Bridge preserves the existing cookie. Home-page discovery is
+  enabled by default (`CC_REMOTE_VIEWER_HOME_PREVIEW=0` opts out): only explicit
+  HTML references or device-verified Python static listeners create private,
+  session-associated publications. Never crawl home, add automatic entries to
+  the global catalog, infer ownership from a private IP alone, follow symlinks,
+  start an engine/service, or fetch an arbitrary private URL. Preserve manual
+  publications and FD-based project/resource boundaries.
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
@@ -139,7 +179,8 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `codex_lifecycle.py` owns the
   source-bound exact-terminal ledger; `history_store.py` owns the rebuildable
-  SQLite projection; `machine.py`, `command_router.py`,
+  SQLite projection;
+  `machine.py`, `command_router.py`,
   `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
   the shared session pool, command dispatch, live replay, relay transport, and
   persistence.
@@ -171,6 +212,8 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   explicitly accepts that exception. Every command must exit zero. Expected
   platform-defined test skips are allowed, but failures or missing tools must
   be reported rather than silently bypassed.
+- Run the Web gate with Node 24 (see `.nvmrc`), matching CI. Newer Node
+  browser-like globals must not mask missing browser-environment guards.
 
 ```bash
 .venv/bin/python -m pytest
@@ -178,6 +221,7 @@ uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
 npm --prefix web run build
 npm --prefix web run test:reliability
 npm --prefix web run test:history-browser
+npm --prefix web run test:viewer
 npm --prefix web run lint
 bash -n \
   deploy/install.sh \
@@ -204,6 +248,7 @@ python -m cc_remote.relay        # terminal 1 (set WEB_STATIC_DIR=web/dist to se
 python -m cc_remote.wrapper      # terminal 2 (on each machine running Claude/Codex)
 pytest                           # zero-token unit tests
 npm --prefix web run test:reliability
+npm --prefix web run test:viewer
 npm --prefix web run lint
 npm --prefix web run build
 ```

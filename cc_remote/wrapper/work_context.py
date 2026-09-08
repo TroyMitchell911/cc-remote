@@ -22,6 +22,115 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
+def _bounded_context_tail(path: str) -> list[bytes] | None:
+    """Read one source-stable JSONL tail used by context recovery.
+
+    Appends after the captured size are harmless: the returned records describe
+    a slightly older, internally complete snapshot.  Replacement or truncation
+    invalidates the sample because those bytes no longer identify the same
+    native conversation.
+    """
+    try:
+        with open(path, "rb") as history:
+            before = os.fstat(history.fileno())
+            size = before.st_size
+            start = max(0, size - _CONTEXT_TAIL_SCAN_BYTES)
+            read_start = max(0, start - 1)
+            history.seek(read_start)
+            data = history.read(size - read_start)
+            after = os.fstat(history.fileno())
+        current = os.stat(path)
+    except OSError:
+        return None
+
+    if (before.st_dev != after.st_dev or before.st_ino != after.st_ino
+            or after.st_size < size
+            or current.st_dev != before.st_dev
+            or current.st_ino != before.st_ino
+            or current.st_size < size):
+        return None
+
+    starts_at_record_boundary = start == 0
+    if start > 0:
+        starts_at_record_boundary = data[:1] == b"\n"
+        data = data[1:]
+    lines = data.splitlines()
+    if not starts_at_record_boundary and lines:
+        lines = lines[1:]
+    return lines
+
+
+def claude_recent_context_usage(
+    usage: object,
+) -> dict[str, Any] | None:
+    """Project one top-level Claude assistant response into current depth.
+
+    Anthropic prompt-cache counters partition the input depth.  The completed
+    assistant output will join that depth on the next model call, so include it
+    exactly once.  This is intentionally a labelled recent-turn fallback, not
+    a replacement for the richer native ``get_context_usage`` breakdown.
+    """
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    observed = False
+    for key in (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ):
+        if key not in usage:
+            continue
+        value = _nonnegative_int(usage.get(key))
+        if value is None:
+            return None
+        observed = True
+        total += value
+        if total > MAX_SAFE_WIRE_INTEGER:
+            return None
+    if not observed or total <= 0:
+        return None
+    # AssistantMessage/transcript model ids can be the proxy's upstream model
+    # rather than the Claude alias selected by the user. Model presentation is
+    # therefore added later from the session's authoritative control state.
+    return {"totalTokens": total}
+
+
+def recover_claude_context_usage(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, Any] | None:
+    """Recover the newest main-chain Claude context depth from its JSONL tail."""
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return None
+    lines = _bounded_context_tail(source_path)
+    if lines is None:
+        return None
+    for raw in reversed(lines):
+        if not raw or len(raw) > _CONTEXT_RECORD_MAX_BYTES:
+            continue
+        try:
+            record = json.loads(raw)
+        except (UnicodeError, ValueError):
+            continue
+        if (not isinstance(record, dict)
+                or record.get("type") != "assistant"
+                or record.get("isSidechain") is True
+                or record.get("parentToolUseID") is not None
+                or record.get("parent_tool_use_id") is not None):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        recovered = claude_recent_context_usage(message.get("usage"))
+        if recovered is not None:
+            return recovered
+    return None
+
+
 def recover_codex_context_usage(
     session_id: str,
     *,
@@ -40,44 +149,9 @@ def recover_codex_context_usage(
     )
     if not path:
         return None
-    try:
-        with open(path, "rb") as history:
-            before = os.fstat(history.fileno())
-            size = before.st_size
-            start = max(0, size - _CONTEXT_TAIL_SCAN_BYTES)
-            # Inspect the byte immediately before the bounded window. Without
-            # it, a window which happens to start exactly after ``\n`` is
-            # indistinguishable from one starting halfway through a record and
-            # we would discard a complete first line.
-            read_start = max(0, start - 1)
-            history.seek(read_start)
-            data = history.read(size - read_start)
-            after = os.fstat(history.fileno())
-        current = os.stat(path)
-    except OSError:
+    lines = _bounded_context_tail(path)
+    if lines is None:
         return None
-
-    # A rollout can append while this bounded read is in flight. That makes the
-    # captured sample merely older, not corrupt, because we read exactly the
-    # pre-open snapshot length. Replacement or truncation is different: bytes
-    # may now belong to another source/offset, so fail closed and retry after
-    # the next process generation instead of painting a fabricated context.
-    if (before.st_dev != after.st_dev or before.st_ino != after.st_ino
-            or after.st_size < size
-            or current.st_dev != before.st_dev
-            or current.st_ino != before.st_ino
-            or current.st_size < size):
-        return None
-
-    # A partial first record is never trustworthy. The final record may be
-    # complete without a trailing newline, which is normal for a closed file.
-    starts_at_record_boundary = start == 0
-    if start > 0:
-        starts_at_record_boundary = data[:1] == b"\n"
-        data = data[1:]
-    lines = data.splitlines()
-    if not starts_at_record_boundary and lines:
-        lines = lines[1:]
     for raw in reversed(lines):
         if not raw or len(raw) > _CONTEXT_RECORD_MAX_BYTES:
             continue
@@ -152,6 +226,7 @@ def recover_work_context_baseline(
     session_id: str,
     *,
     codex_home: str | None = None,
+    claude_path: str | None = None,
 ) -> int | None:
     """Recover a migrated Work session's first authoritative input depth.
 
@@ -166,7 +241,7 @@ def recover_work_context_baseline(
             else codex_rollout_path(session_id, codex_home=codex_home)
         )
     else:
-        path = transcript_path(session_id)
+        path = claude_path or transcript_path(session_id)
     if not path:
         return None
     try:

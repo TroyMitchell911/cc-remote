@@ -22,9 +22,14 @@ from cc_remote.protocol import (
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
-def _success(turn_id: str) -> TurnEnd:
+def _success(
+    turn_id: str,
+    *,
+    checkpoint_id: str | None = None,
+) -> TurnEnd:
     return TurnEnd(
         turn_id=turn_id,
+        checkpoint_id=checkpoint_id,
         result=TurnResult(
             subtype="success", duration_ms=10, is_error=False
         ),
@@ -122,6 +127,55 @@ def test_main_completion_acknowledgement_broadcasts_and_seeds_reconnect():
         assert seeded.unread is False
         assert seeded.to == "phone"
         assert seeded.route_id == "phone-route"
+
+    asyncio.run(run())
+
+
+def test_claude_completion_receipt_prefers_stable_checkpoint_identity():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit(ctx, _success(
+            "main-assistant-before-background",
+            checkpoint_id="top-level-user-checkpoint",
+        ))
+
+        unread = transport.sent[-1]
+        assert isinstance(unread, CompletionState)
+        assert unread.completion_id == "top-level-user-checkpoint"
+        assert machine._session_presentation.get(
+            "claude", "session-1"
+        ).completion_id == "top-level-user-checkpoint"
+
+    asyncio.run(run())
+
+
+def test_codex_steer_segment_does_not_publish_completion_receipt():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", "session-1")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit(ctx, TurnEnd(
+            turn_id="shared-native-task",
+            result=TurnResult(
+                subtype="steered", duration_ms=0, is_error=False,
+            ),
+        ))
+
+        assert [message.type for message in transport.sent] == ["turn_end"]
+        snapshot = machine._session_presentation.get(
+            "codex", "session-1"
+        )
+        assert snapshot.completion_id is None
+        assert snapshot.completion_revision == 0
+
+        await machine._emit(ctx, _success("shared-native-task"))
+        assert isinstance(transport.sent[-1], CompletionState)
+        assert transport.sent[-1].completion_id == "shared-native-task"
 
     asyncio.run(run())
 
@@ -459,7 +513,10 @@ def test_failed_and_private_btw_turns_do_not_create_shared_receipts():
         btw.owner_client_id = "owner"
         await machine._emit(btw, _success("btw-turn"))
         assert [message.type for message in transport.sent] == ["turn_end"]
-        assert transport.sent[0].to == "owner"
+        # Account ownership is broader than an individual page connection:
+        # every tab/device signed in as this owner sees the side-chat terminal.
+        assert transport.sent[0].to is None
+        assert transport.sent[0].owner_id == "owner"
 
     asyncio.run(run())
 

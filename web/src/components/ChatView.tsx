@@ -1,7 +1,10 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -13,16 +16,24 @@ import {
   defaultRangeExtractor,
   useVirtualizer,
 } from "@tanstack/react-virtual";
-import type { Turn } from "../domain/conversation";
+import type {
+  Block, ProcessBlock, TextBlock, Turn,
+} from "../domain/conversation";
 import type { Space } from "../protocol";
 import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
-import { ProcessTimeline } from "./ProcessTimeline";
+import {
+  BackgroundProcessDock,
+  GeneratedImagePreview,
+  ProcessTimeline,
+} from "./ProcessTimeline";
 import {
   finalTextBlocks,
+  generatedImageIdentity,
+  generatedOutputImages,
   hasActiveProcess,
-  processBlocks,
+  presentableProcessBlocks,
 } from "../process-blocks";
 import { isMarkdownPath } from "../preview-path";
 import { collectTurnFileChanges } from "../file-changes";
@@ -69,6 +80,11 @@ import {
   HISTORY_REQUEST_TIMEOUT_MS,
 } from "../history-requests";
 import { mergeDetailWithLiveTail } from "../history-merge";
+import { asyncQuestionKey, presentAsyncQuestionReplies } from "../async-question-presentation";
+
+const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
+const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
+const PagePreviewLinks = lazy(() => import("./PagePreviewLinks").then((module) => ({ default: module.PagePreviewLinks })));
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -80,6 +96,10 @@ const THREAD_CONTENT_BOTTOM_PX = 8;
 const WORK_THREAD_CONTENT_TOP_PX = 26;
 const WORK_THREAD_CONTENT_BOTTOM_PX = 20;
 const USER_SCROLL_INTENT_IDLE_MS = 260;
+// Overlay scrollbars do not subtract their painted width from clientWidth.
+// Keep a small right-edge hit region for the native thumb while still
+// requiring the event target to be the scroll container itself.
+const SCROLLBAR_POINTER_GUTTER_PX = 14;
 // HistoryRequestCoordinator allows replacement after 15 seconds. Release the
 // local anchor just after that boundary so an unanswered command cannot lock
 // pagination forever.
@@ -178,7 +198,7 @@ interface TextSelectionRetention {
   scope: string;
   anchorTurnId: string;
   focusTurnId: string;
-  pointerId: number;
+  pointerId: number | null;
   interactionToken: number | null;
   dragging: boolean;
   releaseAnchorTurnId: string | null;
@@ -188,6 +208,13 @@ interface TextSelectionRetention {
 interface TextSelectionCandidate {
   scope: string;
   pointerId: number;
+}
+
+function nativeSelectionBoundary(selection: Selection) {
+  return {
+    anchor: selection.anchorNode, anchorOffset: selection.anchorOffset,
+    focus: selection.focusNode, focusOffset: selection.focusOffset,
+  };
 }
 
 const TEXT_SELECTION_EXCLUDED_SELECTOR = [
@@ -209,6 +236,7 @@ function selectionTurnId(
 ): string | null {
   if (!root || !node || !root.contains(node)) return null;
   const element = node instanceof Element ? node : node.parentElement;
+  if (element?.closest("input, textarea, select, [contenteditable='true']")) return null;
   return element?.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId ?? null;
 }
 
@@ -258,6 +286,48 @@ function formatTime(ts: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+const BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS = 160;
+
+function backgroundFollowupLabel(process?: ProcessBlock): string {
+  const raw = process?.summary || process?.title || "后台任务完成";
+  return raw.length <= BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS
+    ? raw
+    : `${raw.slice(0, BACKGROUND_FOLLOWUP_LABEL_MAX_CHARS - 1)}…`;
+}
+
+function backgroundFollowupBoundaries(
+  finalBlocks: TextBlock[], timelineBlocks: Block[],
+): Map<string, ProcessBlock | null> {
+  const completions = timelineBlocks.filter(
+    (block): block is ProcessBlock => block.kind === "process"
+      && block.background === true && block.done
+      && (block.processKind === "task" || block.processKind === "agent"),
+  );
+  const used = new Set<string>();
+  const boundaries = new Map<string, ProcessBlock | null>();
+  let emittedFallback = false;
+  for (const block of finalBlocks) {
+    if (block.background !== true) continue;
+    const candidate = block.startedTs == null ? undefined : completions
+      .filter((process) => !used.has(process.item_id)
+        && process.terminalTs != null
+        && process.terminalTs <= block.startedTs!)
+      .sort((left, right) => (right.terminalTs ?? 0) - (left.terminalTs ?? 0))[0];
+    if (candidate) {
+      used.add(candidate.item_id);
+      boundaries.set(block.message_id, candidate);
+      continue;
+    }
+    // Legacy history can lack source clocks. Mark the first detached reply once
+    // without manufacturing a relationship for every text fragment.
+    if (boundaries.size === 0 && !emittedFallback) {
+      boundaries.set(block.message_id, null);
+      emittedFallback = true;
+    }
+  }
+  return boundaries;
+}
+
 function detailTurnFingerprint(turn: Turn): string {
   return [
     turn.detailLoaded ? "1" : "0",
@@ -284,13 +354,16 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
-  onLoadDetail, onEdit, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onReplyAsyncQuestion, asyncReplyMode, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   externalPlanProgress,
+  backgroundProcesses = [],
+  onOpenAgent,
   activeTurnId = null,
+  ambiguousActiveTurnIds = [],
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -320,6 +393,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     autoLoad?: boolean,
   ) => boolean;
   onEdit?: (prompt: string) => void;
+  onReplyAsyncQuestion?: (prompt: string) => boolean;
+  asyncReplyMode?: "query" | "steer";
   onGetDiff?: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
   onPreviewMarkdown?: (file: string) => void;
@@ -338,13 +413,18 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string, imageId: string, variant: HistoryImageVariant,
   ) => boolean;
   onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
   externalPlanProgress?: {
     turnId: string;
     itemId: string;
   } | null;
+  backgroundProcesses?: ProcessBlock[];
   /** Exact displayed row owned by the still-running native task. Runtime-only:
    * never infer this from array position, final text, or historical activity. */
   activeTurnId?: string | null;
+  /** More than one displayed row exactly aliases the active native owner.
+   * Empty for idle/browse/missing-owner states, which must stay fail-closed. */
+  ambiguousActiveTurnIds?: readonly string[];
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
@@ -379,6 +459,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
   const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
   const textSelectionRef = useRef<TextSelectionRetention | null>(null);
+  const nativeSelectionBoundaryRef = useRef<ReturnType<typeof nativeSelectionBoundary> | null>(null);
+  const textSelectionReleaseFrameRef = useRef<number | null>(null);
+  const selectionScrollIntentFnRef = useRef<(() => void) | null>(null);
   const [textSelection, setTextSelection] =
     useState<TextSelectionRetention | null>(null);
   const detailAnchorRef = useRef<DetailAnchorTransaction | null>(null);
@@ -407,6 +490,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const userScrollIntentRef = useRef(false);
   const userScrollDirectionRef = useRef<UserScrollDirection | null>(null);
   const userScrollIntentTimerRef = useRef<number | null>(null);
+  const scrollbarDragIntentRef = useRef<{
+    scope: string;
+    pointerId: number;
+  } | null>(null);
+  // A real downward gesture may finish while the final cached-newer page is
+  // still installing. Remember only that exact viewport scope so the settled
+  // page can hand back to the live runtime without requiring a second scroll.
+  const manualLatestIntentRef = useRef<string | null>(null);
   const turnKeySnapshotRef = useRef<TurnKeySnapshot | null>(null);
   const turnImagePreviewCacheRef = useRef(new TurnImagePreviewCache());
   // `historyViewRevision` is kept as a compatibility scope for the
@@ -473,6 +564,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     hasNewer,
     windowEpoch: historyWindowEpoch,
   } = scopedPresentedHistory;
+  const supplemental = useMemo(() => presentAsyncQuestionReplies(turns), [turns]);
+  const asyncQuestionScope = JSON.stringify([historyScopeKey ?? "", sid]);
+  const [openAsyncQuestion, setOpenAsyncQuestion] = useState<{
+    scope: string; messageId: string | null;
+  } | null>(null);
+  useLayoutEffect(() => { setOpenAsyncQuestion(null); }, [asyncQuestionScope]);
   turnImagePreviewCacheRef.current.update(sid, turns);
 
   useLayoutEffect(() => {
@@ -972,21 +1069,34 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!active || !active.dragging
         || (pointerId != null && active.pointerId !== pointerId)) return;
-    const releaseBoundary = captureHistoryBoundary();
-    if (active.interactionToken !== null) {
-      // Finishing a text drag must never replay a bottom command queued while
-      // the browser owned native selection auto-scroll.
-      scrollCoordinatorRef.current.endInteraction(
-        active.interactionToken, false,
-      );
-      setScrollPolicyEpoch((value) => value + 1);
-    }
-    commitTextSelection({
-      ...active,
-      dragging: false,
-      interactionToken: null,
-      releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
-      releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+    if (textSelectionReleaseFrameRef.current !== null) return;
+    // Mouseup's native default action can finish one last auto-scroll / range
+    // update. Keep ownership until that action has settled, then snapshot both
+    // the selection and viewport together; its queued selectionchange is not
+    // a new gesture and must not disable stationary resize protection.
+    textSelectionReleaseFrameRef.current = window.requestAnimationFrame(() => {
+      textSelectionReleaseFrameRef.current = null;
+      const current = textSelectionRef.current;
+      if (!current || current.interactionToken !== active.interactionToken) return;
+      const releaseBoundary = captureHistoryBoundary();
+      const native = window.getSelection();
+      const valid = !!native && !native.isCollapsed && native.rangeCount > 0;
+      nativeSelectionBoundaryRef.current = valid ? nativeSelectionBoundary(native) : null;
+      if (current.interactionToken !== null) {
+        // Finishing a text drag must never replay a bottom command queued while
+        // the browser owned native selection auto-scroll.
+        scrollCoordinatorRef.current.endInteraction(
+          current.interactionToken, false,
+        );
+        setScrollPolicyEpoch((value) => value + 1);
+      }
+      commitTextSelection(valid ? {
+        ...current,
+        dragging: false,
+        interactionToken: null,
+        releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
+        releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+      } : null);
     });
   }, [captureHistoryBoundary, commitTextSelection]);
 
@@ -1006,7 +1116,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection]);
 
   const clearTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     const active = textSelectionRef.current;
     if (active?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -1022,6 +1137,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection, publishTextSelection]);
 
   const disposeTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     const selection = textSelectionRef.current;
     if (selection?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -1030,6 +1149,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
     textSelectionRef.current = null;
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     onTextSelectionGuardChange?.(null);
   }, [onTextSelectionGuardChange]);
 
@@ -1039,11 +1159,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!nativeSelection || nativeSelection.isCollapsed
         || nativeSelection.rangeCount === 0) {
-      if (active) clearTextSelection();
+      // Native edge selection can transiently expose an empty range while
+      // the mouse remains held. Release on the real pointer boundary instead.
+      if (active && !active.dragging) clearTextSelection();
       return;
     }
-    if (!candidate && !active) return;
-    const expectedScope = active?.scope ?? candidate?.scope;
+    const expectedScope = active?.scope ?? candidate?.scope ?? scrollScope;
     if (expectedScope !== scrollScope) {
       clearTextSelection();
       return;
@@ -1058,29 +1179,42 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       if (!active || !active.dragging) clearTextSelection();
       return;
     }
+    const previous = nativeSelectionBoundaryRef.current;
+    const boundary = nativeSelectionBoundary(nativeSelection);
+    nativeSelectionBoundaryRef.current = boundary;
     if (active) {
-      if (active.anchorTurnId === anchorTurnId
-          && active.focusTurnId === focusTurnId) return;
+      if (previous && previous.anchor === boundary.anchor
+          && previous.anchorOffset === boundary.anchorOffset
+          && previous.focus === boundary.focus
+          && previous.focusOffset === boundary.focusOffset) return;
+      // Native selection handles and keyboard extension can move without a
+      // pointerdown/wheel reaching this element, including within ONE turn.
+      // Yield the old stationary viewport anchor before native auto-scroll.
+      if (!active.dragging) selectionScrollIntentFnRef.current?.();
+      if (active.anchorTurnId === anchorTurnId && active.focusTurnId === focusTurnId) return;
       commitTextSelection({
-        ...active,
+        ...textSelectionRef.current!,
         anchorTurnId,
         focusTurnId,
       });
       return;
     }
-    if (!candidate || !sid) return;
+    if (!sid) return;
     cancelDetailAnchorFnRef.current?.();
     setMeasurementBoundary(null);
     pauseOutputFollow();
-    const interactionToken =
-      scrollCoordinatorRef.current.beginInteraction(false);
+    // Touch handles / a selectionchange delivered after mouseup have no
+    // pressed mouse candidate. Retain their DOM without a never-ending lock.
+    const interactionToken = candidate
+      ? scrollCoordinatorRef.current.beginInteraction(false) : null;
+    if (!candidate) selectionScrollIntentFnRef.current?.();
     const selection: TextSelectionRetention = {
       scope: scrollScope,
       anchorTurnId,
       focusTurnId,
-      pointerId: candidate.pointerId,
+      pointerId: candidate?.pointerId ?? null,
       interactionToken,
-      dragging: true,
+      dragging: !!candidate,
       releaseAnchorTurnId: null,
       releaseAnchorOffset: null,
     };
@@ -1093,6 +1227,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   useEffect(() => {
     const handlePointerEnd = (event: globalThis.PointerEvent) => {
+      if (scrollbarDragIntentRef.current?.pointerId === event.pointerId) {
+        scrollbarDragIntentRef.current = null;
+      }
       const candidate = textSelectionCandidateRef.current;
       if (candidate?.pointerId === event.pointerId) {
         textSelectionCandidateRef.current = null;
@@ -1572,6 +1709,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       touchEventClockOffsetRef.current = null;
       userScrollIntentRef.current = false;
       userScrollDirectionRef.current = null;
+      scrollbarDragIntentRef.current = null;
+      manualLatestIntentRef.current = null;
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
         userScrollIntentTimerRef.current = null;
@@ -1707,11 +1846,50 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       USER_SCROLL_INTENT_IDLE_MS,
     );
   };
+  selectionScrollIntentFnRef.current = () => markUserScrollIntent("unknown");
+
+  const leaveHistoryBrowse = useCallback((): boolean => {
+    if (!browseMode || !onReturnLatest) return false;
+    const requestActivityKey = historyRequestRef.current?.activityKey;
+    scrollbarDragIntentRef.current = null;
+    manualLatestIntentRef.current = null;
+    cancelDetailAnchorFnRef.current?.();
+    cancelHistoryAnchor();
+    historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
+    completeHistoryLoadGates();
+    setMeasurementBoundary(null);
+    onReturnLatest();
+    return true;
+  }, [
+    browseMode, cancelHistoryAnchor, clearHistoryRequestTimeout,
+    completeHistoryLoadGates, completeHistoryPageActivity, onReturnLatest,
+  ]);
 
   const onThreadPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     markUserScrollIntent("unknown");
+    scrollbarDragIntentRef.current = null;
     if (event.pointerType !== "mouse" || event.button !== 0
         || !event.isPrimary) {
+      textSelectionCandidateRef.current = null;
+      return;
+    }
+    const thread = event.currentTarget;
+    const rect = thread.getBoundingClientRect();
+    const paintedScrollbarWidth = Math.max(
+      thread.offsetWidth - thread.clientWidth,
+      SCROLLBAR_POINTER_GUTTER_PX,
+    );
+    const ownsVerticalScrollbar = event.target === thread
+      && thread.scrollHeight > thread.clientHeight + 0.5
+      && event.clientX >= rect.right - paintedScrollbarWidth
+      && event.clientX <= rect.right;
+    if (ownsVerticalScrollbar) {
+      scrollbarDragIntentRef.current = {
+        scope: scrollScope,
+        pointerId: event.pointerId,
+      };
       textSelectionCandidateRef.current = null;
       return;
     }
@@ -1818,6 +1996,35 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
         }
       }
     }
+    if (userDrivenScroll && movingTowardHistory) {
+      manualLatestIntentRef.current = null;
+    }
+    const scrollbarReachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && scrollbarDragIntentRef.current?.scope === scrollScope
+      && movingTowardLatest
+      && isAtLatestEdge(metrics);
+    if (scrollbarReachedBrowseTail) {
+      lastScrollTopRef.current = metrics.scrollTop;
+      leaveHistoryBrowse();
+      return;
+    }
+    const reachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && movingTowardLatest
+      && !textSelectionDragging
+      && isAtLatestEdge(metrics)
+      && userDrivenScroll;
+    if (reachedBrowseTail) {
+      if (userDrivenScroll) manualLatestIntentRef.current = scrollScope;
+      if (!hasNewer
+          && !historyRequestRef.current
+          && !historyAnchorRef.current.current()) {
+        lastScrollTopRef.current = metrics.scrollTop;
+        leaveHistoryBrowse();
+        return;
+      }
+    }
     lastScrollTopRef.current = metrics.scrollTop;
     const nextScrollState = userDrivenScroll
       ? controller.observeScroll(
@@ -1842,6 +2049,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       );
     }
   };
+
+  useEffect(() => {
+    const intentScope = manualLatestIntentRef.current;
+    if (!browseMode || intentScope !== scrollScope) {
+      manualLatestIntentRef.current = null;
+      return;
+    }
+    // The final cached-newer response clears its keyed request/anchor in the
+    // preceding layout effects. If the user's gesture already left the DOM at
+    // the real bottom, complete the same action as the explicit button.
+    if (hasNewer || historyRequestRef.current
+        || historyAnchorRef.current.current()) return;
+    const el = scrollRef.current;
+    if (!el || !isAtLatestEdge(readScrollMetrics(el))
+        || textSelectionRef.current?.dragging) return;
+    leaveHistoryBrowse();
+  }, [
+    activeHistoryGeneration, browseMode, hasNewer, historyWindowEpoch,
+    leaveHistoryBrowse, scrollScope, turns,
+  ]);
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (Math.abs(event.deltaY) <= 0.5) return;
@@ -2033,19 +2260,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const returnToLatest = () => {
-    if (!browseMode || !onReturnLatest) {
-      scrollToBottom();
-      return;
-    }
-    const requestActivityKey = historyRequestRef.current?.activityKey;
-    cancelDetailAnchorFnRef.current?.();
-    cancelHistoryAnchor();
-    historyRequestRef.current = null;
-    clearHistoryRequestTimeout();
-    completeHistoryPageActivity(requestActivityKey);
-    setMeasurementBoundary(null);
-    completeHistoryLoadGates();
-    onReturnLatest();
+    if (leaveHistoryBrowse()) return;
+    scrollToBottom();
   };
 
   const beginProcessInteraction = useCallback((): number => {
@@ -2368,6 +2584,37 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           + index * (HISTORY_VIRTUAL_ESTIMATE_PX + HISTORY_TURN_GAP_PX),
       };
     });
+  // A shared native Codex task can make two steer segments match the same
+  // history alias. App passes those exact active candidates separately so an
+  // idle, browsed, missing, or stale owner can never revive an arbitrary row.
+  const ambiguousActiveTurnIdSet = new Set(ambiguousActiveTurnIds);
+  const fallbackWorkingTurnId = activeTurnId == null
+      && ambiguousActiveTurnIdSet.size > 1
+    ? [...turns].reverse().find((turn) => {
+        if (!ambiguousActiveTurnIdSet.has(turn.id)) return false;
+        if (turn.done && (turn.interrupted || turn.error)) return false;
+        const archived = mergeDetailWithLiveTail(
+          turn.detailProjection?.blocks ?? [],
+          turn.liveSpillBlocks ?? [],
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const timeline = mergeDetailWithLiveTail(
+          archived,
+          turn.blocks,
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const processItems = presentableProcessBlocks(timeline, engine);
+        const foreground = turn.done
+          ? processItems.filter((block) => !(
+              block.kind === "process" && block.background === true
+            ))
+          : processItems;
+        return !turn.done || hasActiveProcess(foreground)
+          || foreground.some((block) => !block.done);
+      })?.id ?? null
+    : null;
   const activityRequest = historyRequestRef.current;
   const visibleHistoryPageActivity = historyPageActivity && (
     activityRequest?.activityKey === historyPageActivity.key
@@ -2377,19 +2624,29 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   if (turns.length === 0) {
     if (loading) {
       return (
-        <div className="empty">
-          <div className="spinner" aria-label="加载中" />
-          <p className="loading-tx">加载会话历史…</p>
+        <div className={surface === "work"
+          ? "thread-shell work-thread-shell" : "thread-shell"}>
+          <div className="empty">
+            <div className="spinner" aria-label="加载中" />
+            <p className="loading-tx">加载会话历史…</p>
+          </div>
+          <BackgroundProcessDock processes={backgroundProcesses}
+            onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
         </div>
       );
     }
     return (
-      <div className="empty">
-        <div className="glyph"><ClaudeMark size={30} /></div>
-        <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
-        <p>{surface === "work"
-          ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
-          : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+      <div className={surface === "work"
+        ? "thread-shell work-thread-shell" : "thread-shell"}>
+        <div className="empty">
+          <div className="glyph"><ClaudeMark size={30} /></div>
+          <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
+          <p>{surface === "work"
+            ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
+            : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+        </div>
+        <BackgroundProcessDock processes={backgroundProcesses}
+          onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
       </div>
     );
   }
@@ -2404,7 +2661,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             ? "正在加载更早历史…" : "正在加载更新历史…"}</span>
         </div>
       )}
-      <div className="thread" ref={scrollRef}
+      <div className="thread-frame">
+        <div className="thread" ref={scrollRef}
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         data-text-selection-dragging={
           activeTextSelection?.dragging ? "true" : "false"
@@ -2466,34 +2724,86 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               t.done && !t.detailRestorePending
                 && !t.detailRestoreIncomplete,
             );
-            const activeProcess = hasActiveProcess(timelineBlocks);
-            const processItems = processBlocks(timelineBlocks);
+            const processItems = presentableProcessBlocks(
+              timelineBlocks, engine);
+            const foregroundProcessItems = t.done
+              ? processItems.filter((block) => !(
+                  block.kind === "process" && block.background === true
+                ))
+              : processItems;
+            const activeProcess = hasActiveProcess(foregroundProcessItems);
             const activeTimeline = activeProcess
-              || processItems.some((block) => !block.done);
+              || foregroundProcessItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
+            const generatedImages = generatedOutputImages(timelineBlocks);
+            const followupBoundaries = backgroundFollowupBoundaries(
+              finalBlocks, timelineBlocks);
             const enclosingTaskActive = activeTurnId === t.id;
+            const processDetailState = processItems.length > 0
+              ? "present"
+              : t.processDetailState
+                ?? ((t.detailEventCount ?? 0) > 0 ? "unknown" : "none");
+            const hasDeferredContent = t.detailReasons?.some(
+              (reason) => reason !== "process") ?? false;
             // A failed/interrupted enclosing terminal is authoritative. A
             // successful answer may still own genuine background agent work,
             // but a stale child flag must never animate beside "已打断".
             const terminalProblem = t.done && (!!t.interrupted || !!t.error);
             const working = !terminalProblem && (
               enclosingTaskActive || !t.done || activeTimeline);
+            // A source can positively report process presence while an
+            // incomplete detail response contains only the final answer. Do
+            // not turn that contradiction into an endless loading row: keep
+            // the disclosure and expose a retryable error instead.
+            const missingLoadedProcess = t.done && !!t.detailLoaded
+              && !t.detailLoading
+              && !t.detailHasMore && !t.detailHasNewer
+              && processItems.length === 0
+              && processDetailState === "present";
+            const processDetailError = t.detailError
+              ?? (missingLoadedProcess
+                ? "详细过程未完整返回，请重试" : undefined);
             const hasProcessTimeline = processItems.length > 0
-              || (!!t.detailEventCount && !t.detailLoaded)
-              || !!t.detailError;
+              || processDetailState === "present";
             const activePhase = !working
               ? "complete"
               : hasProcessTimeline
-                  && (enclosingTaskActive
-                    || activeTimeline || finalBlocks.length === 0)
+                  && (activeTimeline
+                    || (enclosingTaskActive
+                      && (finalBlocks.length === 0 || t.done)))
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
             const showProcessTimeline = hasProcessTimeline;
+            // Unknown native summaries don't prove that there is anything to
+            // expand. Keep that uncertainty in the projection, not as a button
+            // which disappears after an empty read. Real deferred content,
+            // unread detail pages and explicit failures retain their controls.
+            const canReadOlderDetail = !!t.detailHasMore && !!t.detailOldestCursor;
+            const canReadNewerDetail = !!t.detailHasNewer && !!t.detailNewerCursor;
+            const hasUnreadDetailPages = canReadOlderDetail || canReadNewerDetail;
+            // The process disclosure already owns its paging controls. A second
+            // entry below the answer would load invisible, collapsed process
+            // rows. Keep a separate entry only for genuinely deferred content
+            // or pages which don't yet have a process disclosure.
+            const showStandaloneDetail = t.done && !t.detailLoaded
+              && (hasDeferredContent || (!showProcessTimeline && hasUnreadDetailPages));
+            const standaloneDetailLabel = hasDeferredContent
+              ? "查看完整内容" : hasUnreadDetailPages ? "查看更多内容" : "重试加载详情";
             // Keep the live affordance at the physical tail of the turn. The
             // process disclosure can be far above the viewport once a long
             // tool stream grows, so it must not be the only place which tells
             // the reader that the turn is still active.
-            const showWorking = working;
+            // A steered Codex task can span several visible narrative rows.
+            // Once the runtime has an exact owner, only that row may render
+            // the session-level working affordance. Older rows can still keep
+            // their own background/process lifecycle inside the disclosure,
+            // but a delayed child update must not create a second top-level
+            // spark beside the current steer row.
+            const showWorking = working && (
+              enclosingTaskActive
+              || (ambiguousActiveTurnIdSet.has(t.id)
+                && fallbackWorkingTurnId === t.id)
+            );
             // Compact can close a display segment before the enclosing native
             // task reaches its terminal boundary. Completion time, copy and
             // fork belong to that real boundary, never to the segment bit.
@@ -2514,6 +2824,19 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 ? externalPlanProgress.itemId : null;
             const detailRetryBefore = t.detailRetryBefore;
             const detailRetryDirection = t.detailRetryDirection;
+            const standaloneDetailPage = detailRetryDirection
+              ? [detailRetryBefore, detailRetryDirection] as const
+              : !hasDeferredContent && canReadOlderDetail
+                ? [t.detailOldestCursor, "older"] as const
+                : !hasDeferredContent && canReadNewerDetail
+                  ? [t.detailNewerCursor, "newer"] as const
+                  : [undefined, "initial"] as const;
+            const deferredProcessCount = (!t.detailLoaded || !!t.detailLoading)
+                && processDetailState === "present"
+              ? processItems.length === 0
+                ? Math.max(1, t.detailEventCount ?? 0)
+                : t.detailEventCount ?? 0
+              : 0;
             const historyImagesReady = !!t.imageRefs?.length
               && t.imageRefs.every((image) => (
                 historyImageAssets?.[historyImageAssetKey(
@@ -2540,7 +2863,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               }}>
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
-                {t.prompt && <div className="ubub">{t.prompt}</div>}
+                {t.prompt && <div className="ubub">{supplemental.replies.has(t.id)
+                  ? <div className="supplemental-answer">
+                      <details className="supplemental-answer-context">
+                        <summary><Icon name="message" size={13} />查看问题<Icon name="chev" size={12} /></summary>
+                        <div>{supplemental.replies.get(t.id)!.map((answer, index) =>
+                          <p key={index}>{answer.question}</p>)}</div>
+                      </details>
+                      {supplemental.replies.get(t.id)!.map((answer, index) =>
+                        <p key={index}>{answer.answer}</p>)}
+                    </div>
+                  : t.prompt}</div>}
                 {t.images && t.images.length > 0 && (
                   <div className="ubub-imgs">
                     {t.images.map((img, i) => {
@@ -2608,33 +2941,31 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             {showProcessTimeline && (
               <ProcessTimeline blocks={timelineBlocks} done={t.done}
                 active={activePhase === "process"} engine={engine}
-                durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
-                deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
+                durationMs={engine === "codex" ? undefined : t.durationMs}
+                startTs={engine === "codex" ? t.processStartedTs : t.ts}
+                doneTs={engine === "codex" ? t.processDoneTs : t.doneTs}
+                deferredCount={deferredProcessCount}
                 detailLoading={t.detailLoading}
-                detailError={t.detailError}
+                detailError={processDetailError}
                 externalPlanItemId={externalPlanItemId}
                 onLoadDetail={onLoadDetail
                   ? () => requestProcessDetail(
-                      t.id, undefined, "initial", true)
+                      t.id, undefined, "initial", false)
                   : undefined}
                 onRetryDetail={onLoadDetail && detailRetryDirection
                   ? () => requestProcessDetail(
                       t.id,
                       detailRetryBefore,
                       detailRetryDirection,
-                      detailRetryDirection === "initial")
+                      false)
                   : undefined}
-                canLoadEarlier={
-                  !!t.detailHasMore && !!t.detailOldestCursor
-                }
-                canLoadNewer={
-                  !!t.detailHasNewer && !!t.detailNewerCursor
-                }
-                onLoadEarlier={onLoadDetail && t.detailOldestCursor
+                canLoadEarlier={canReadOlderDetail}
+                canLoadNewer={canReadNewerDetail}
+                onLoadEarlier={onLoadDetail && canReadOlderDetail
                   ? () => requestProcessDetail(
                       t.id, t.detailOldestCursor, "older")
                   : undefined}
-                onLoadNewer={onLoadDetail && t.detailNewerCursor
+                onLoadNewer={onLoadDetail && canReadNewerDetail
                   ? () => requestProcessDetail(
                       t.id, t.detailNewerCursor, "newer")
                   : undefined}
@@ -2650,6 +2981,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                   imageId,
                   alt: "查看过的图片",
                 })}
+                onOpenAgent={onOpenAgent}
                 onInteractionStart={beginProcessInteraction}
                 onInteractionEnd={endProcessInteraction}
                 openOverride={
@@ -2666,41 +2998,104 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 )}
                 onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
             )}
+            {generatedImages.length > 0 && <div className="generated-image-gallery">
+              {generatedImages.map((block) => <GeneratedImagePreview key={generatedImageIdentity(block)}
+                block={block} imageAssets={imageAssets} onLoadImage={onLoadImage}
+                onAuthorizeImage={onAuthorizeImage}
+                historyTurnId={historyTurnId} historyImageAssets={historyImageAssets}
+                onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })}
+                onPreviewHistoryImage={(turnId, imageId) => setZoom({
+                  kind: "history", turnId, imageId, alt: "生成的图片",
+                })} />)}
+            </div>}
             {t.blocks.length > 0 && (
               <>
                 {finalBlocks.map((block) => (
-                  <MessageBlock key={block.message_id} text={block.text}
-                    done={block.done} onOpenFile={onOpenFile}
-                    imageAssets={imageAssets} onLoadImage={onLoadImage}
-                    onAuthorizeImage={onAuthorizeImage}
-                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+                  <div key={block.message_id} className="assistant-answer-segment">
+                    {followupBoundaries.has(block.message_id) && (
+                      <div className="background-followup-boundary">
+                        <span className="background-followup-icon">
+                          <Icon name="check" size={13} />
+                        </span>
+                        <span>{backgroundFollowupLabel(
+                          followupBoundaries.get(block.message_id)
+                            ?? undefined,
+                        )} · Claude 随后继续回复</span>
+                        {(followupBoundaries.get(block.message_id)?.terminalTs
+                            || block.startedTs) && (
+                          <time>{formatTime(
+                            followupBoundaries.get(block.message_id)?.terminalTs
+                              ?? block.startedTs!,
+                          )}</time>
+                        )}
+                      </div>
+                    )}
+                    {block.delivery === "async" && block.questions?.length
+                      ? <Suspense fallback={<span className="async-question-hint">助手询问…</span>}>
+                          <AsyncQuestionCard questions={block.questions}
+                            answered={supplemental.answered.has(asyncQuestionKey(t.id, block.message_id))}
+                            onOpen={() => {
+                              pauseOutputFollow();
+                              setOpenAsyncQuestion({ scope: asyncQuestionScope, messageId: block.message_id });
+                            }} />
+                        </Suspense>
+                      : <MessageBlock text={block.text}
+                      done={block.done} onOpenFile={onOpenFile}
+                      imageAssets={imageAssets} onLoadImage={onLoadImage}
+                      onAuthorizeImage={onAuthorizeImage}
+                      onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />}
+                  </div>
                 ))}
-                {showCompletionFooter && (
-                  <>
-                    <div className="ubub-meta ai-meta">
-                      {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
-                      {finalBlocks.length > 0 && <button
-                        className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
-                        onClick={() => copyText(t.id + "-ai", aiText(t))}
-                        aria-label="复制">
-                        <Icon name="copy" size={13} />
-                      </button>}
-                      {onFork && canForkTurn(engine, t) && (
-                        <button className="ubub-act" aria-label="派生"
-                          data-tooltip="从此回复派生新会话"
-                          aria-busy={forkingPointId === t.forkPointId}
-                          disabled={!!forkingPointId}
-                          onClick={() => onFork(t.forkPointId)}>
-                          <Icon name="branch" size={13} />
-                        </button>
-                      )}
-                    </div>
-                    {ti === turns.length - 1
-                      && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
-                  </>
-                )}
+                {/* Late page metadata shares a stable slot; completion metadata
+                    still requires a real terminal, including after compaction. */}
+                <div className={`ubub-meta ${showCompletionFooter ? "ai-meta" : "page-meta"}`}>
+                  {showCompletionFooter && t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
+                  {showCompletionFooter && finalBlocks.length > 0 && <button
+                    className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
+                    onClick={() => copyText(t.id + "-ai", aiText(t))}
+                    aria-label="复制">
+                    <Icon name="copy" size={13} />
+                  </button>}
+                  {showCompletionFooter && onFork && canForkTurn(engine, t) && (
+                    <button className="ubub-act" aria-label="派生"
+                      data-tooltip="从此回复派生新会话"
+                      aria-busy={forkingPointId === t.forkPointId}
+                      disabled={!!forkingPointId}
+                      onClick={() => onFork(t.forkPointId)}>
+                      <Icon name="branch" size={13} />
+                    </button>
+                  )}
+                  <Suspense fallback={null}><PagePreviewLinks turn={t} sid={sid} /></Suspense>
+                </div>
+                {showCompletionFooter && ti === turns.length - 1
+                  && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
               </>
             )}
+              {(showStandaloneDetail
+                  || (!!t.detailError && !showProcessTimeline)) && (
+                <div className="turn-detail-entry">
+                  <button type="button" className="turn-detail-entry-btn"
+                    disabled={!onLoadDetail || !!t.detailLoading}
+                    aria-busy={!!t.detailLoading}
+                    onClick={() => requestProcessDetail(
+                      t.id,
+                      ...standaloneDetailPage,
+                      false,
+                    )}>
+                    {t.detailLoading
+                      ? <span className="process-spin" aria-hidden="true" />
+                      : <Icon name="chev" size={14} />}
+                    <span>{t.detailLoading
+                      ? "正在加载详情…" : standaloneDetailLabel}</span>
+                  </button>
+                  {t.detailError && (
+                    <span className="turn-detail-entry-error">
+                      {t.detailError}
+                    </span>
+                  )}
+                </div>
+              )}
               {showWorking && (
                 <div className="turn-working" role="status" aria-live="polite">
                   <ClaudeWorking size={24} />
@@ -2721,16 +3116,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             overflowAnchor: "none",
           }} />
         </div>
-      </div>
-      {(!scrollState.followOutput || !scrollState.nearBottom) && (
-        <div className="scroll-bottom-wrap">
-          <button className="scroll-bottom-btn" onClick={returnToLatest}
-            aria-label={browseMode ? "回到最新" : "滚动到底部"}
-            data-tooltip={browseMode ? "回到最新" : undefined}>
-            <Icon name="chev" size={20} />
-          </button>
         </div>
-      )}
+        {(!scrollState.followOutput || !scrollState.nearBottom) && (
+          <div className="scroll-bottom-wrap">
+            <button className="scroll-bottom-btn" onClick={returnToLatest}
+              aria-label={browseMode ? "回到最新" : "滚动到底部"}
+              data-tooltip={browseMode ? "回到最新" : undefined}>
+              <Icon name="chev" size={20} />
+            </button>
+          </div>
+        )}
+      </div>
+      <BackgroundProcessDock processes={backgroundProcesses}
+        onOpenFile={onOpenFile} onOpenAgent={onOpenAgent} />
+      {openAsyncQuestion?.scope === asyncQuestionScope && <Suspense fallback={null}>
+        <AsyncQuestionHost key={asyncQuestionScope}
+          messageId={openAsyncQuestion.messageId}
+          turns={turns} answeredKeys={supplemental.answered}
+          replyMode={asyncReplyMode} onReply={onReplyAsyncQuestion}
+          onClose={() => setOpenAsyncQuestion(q => q ? { ...q, messageId: null } : null)} />
+      </Suspense>}
       {zoom && (() => {
         const asset = zoom.kind === "history" ? historyImageAssets?.[
           historyImageAssetKey(zoom.turnId, zoom.imageId, "full")

@@ -63,6 +63,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { MARKDOWN_HTML_GITHUB_README, MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README } from "./fixtures/markdown-html";
 import { SessionsSidebar } from "../src/components/SessionsSidebar";
 import { useMobileViewport } from "../src/use-mobile-viewport";
 import {
@@ -345,6 +346,7 @@ function detailPagingTurn(
   page: DetailFixturePage,
   expanded = false,
   retainedPreview = false,
+  autoLoad = false,
 ): Turn {
   const finalBlock = finalTurn("detail-page", 2).blocks[0];
   if (page === "deferred") {
@@ -378,6 +380,8 @@ function detailPagingTurn(
       done: true,
       ts: Date.now(),
       doneTs: Date.now(),
+      processDetailState: "present",
+      detailReasons: ["process"],
       detailEventCount: 24,
       detailLoaded: false,
     };
@@ -408,13 +412,15 @@ function detailPagingTurn(
     done: true,
     ts: Date.now(),
     doneTs: Date.now(),
+    processDetailState: "present",
+    detailReasons: ["process"],
     detailEventCount: 24,
     detailLoaded: true,
     detailHasMore: page === "latest",
     detailOldestCursor: page === "latest" ? "detail-older" : undefined,
     detailHasNewer: false,
     detailNewerCursor: undefined,
-    detailAutoLoad: page === "latest",
+    detailAutoLoad: page === "latest" && autoLoad,
   };
 }
 
@@ -1053,6 +1059,7 @@ function HistoryConversationBrowserFixture() {
   const growthDelayMs = Number(params.get("growth-delay") ?? "500");
   const manualGrowth = params.has("manual-growth");
   const largeCount = Number(params.get("large") ?? "0");
+  const paragraphs = Number(params.get("paragraphs") ?? "2");
   const pageCount = Math.max(1, Number(params.get("pages") ?? "1"));
   const large = largeCount > 0;
   const timeline = params.has("timeline");
@@ -1065,6 +1072,7 @@ function HistoryConversationBrowserFixture() {
   const detailErrorOnce = params.has("detail-error-once");
   const detailOlderErrorOnce = params.has("detail-older-error-once");
   const detailRetainedPreview = params.has("detail-retained-preview");
+  const detailRestoredPage = params.get("detail-restored-page");
   const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
   const actualMermaid = params.has("actual-mermaid");
@@ -1085,6 +1093,7 @@ function HistoryConversationBrowserFixture() {
   const recoveryReplacement = params.has("recovery-replace");
   const pendingRevisionReplacement = params.has("pending-revision-replace");
   const deepBrowse = params.has("deep-browse");
+  const dirtyLiveBrowse = params.has("dirty-live-browse");
   const runtimeBrowse = params.has("runtime-browse");
   const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
@@ -1098,8 +1107,25 @@ function HistoryConversationBrowserFixture() {
       return [compactToolsTurn()];
     }
     if (detailPaging) {
+      let detailTurn = detailPagingTurn("deferred", false, detailRetainedPreview);
+      if (detailRestoredPage === "process") {
+        detailTurn = {
+          ...detailPagingTurn("latest"),
+          detailLoaded: false, detailRestoreIncomplete: true,
+          processStartedTs: 10_000, processDoneTs: 10_000 + 129 * 60_000,
+        };
+      } else if (detailRestoredPage === "older" || detailRestoredPage === "newer") {
+        detailTurn = {
+          ...detailTurn,
+          processDetailState: "unknown", detailReasons: [], detailEventCount: 0,
+          detailHasMore: detailRestoredPage === "older",
+          detailOldestCursor: detailRestoredPage === "older" ? "detail-older" : undefined,
+          detailHasNewer: detailRestoredPage === "newer",
+          detailNewerCursor: detailRestoredPage === "newer" ? "detail-newer" : undefined,
+        };
+      }
       return [
-        detailPagingTurn("deferred", false, detailRetainedPreview),
+        detailTurn,
         ...(detailScrollCancel
           ? Array.from({ length: 6 }, (_, index) =>
             finalTurn(`detail-after-${index + 1}`, 3))
@@ -1129,7 +1155,7 @@ function HistoryConversationBrowserFixture() {
     }
     if (large) {
       return Array.from({ length: largeCount }, (_, index) =>
-        finalTurn(`m${index + 1}`, 2));
+        finalTurn(`m${index + 1}`, paragraphs));
     }
     if (deepBrowse) {
       return Array.from({ length: 20 }, (_, index) =>
@@ -1158,10 +1184,10 @@ function HistoryConversationBrowserFixture() {
     }
     return INITIAL;
   }, [
-    actualMermaid, compactTools, detailPaging, detailRetainedPreview,
+    actualMermaid, compactTools, detailPaging, detailRetainedPreview, detailRestoredPage,
     detailScrollCancel, dualImage,
     interactiveTimeline, math, streamingMath,
-    deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
+    deepBrowse, invalidMermaid, large, largeCount, paragraphs, mermaid, mermaidHistory,
     historicalPlan, persistentPlan, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
@@ -1205,7 +1231,7 @@ function HistoryConversationBrowserFixture() {
     deepBrowse
       ? Array.from({ length: 20 }, (_, index) =>
         finalTurn(`m${index + 21}`, 3))
-      : []);
+      : runtimeBrowse ? initialA : []);
   const nextLiveTurnRef = useRef(41);
   const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
   const detailRequestCountRef = useRef(0);
@@ -1370,8 +1396,26 @@ function HistoryConversationBrowserFixture() {
     const requestSid = sid;
     const session = sessions[requestSid];
     if (!browseMode || !session?.hasNewer) return false;
+    const requestedNextPage = (session.newerPagesLoaded ?? 0) + 1;
+    const requestedLast = Math.min(
+      40, 21 + (requestedNextPage - 1) * 8 + 7,
+    );
     setNewerLoads((value) => value + 1);
     window.setTimeout(() => {
+      if (dirtyLiveBrowse && requestedLast >= 40) {
+        setBrowseMode(false);
+        setHistoryViewId("runtime");
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: latestTurns,
+            hasNewer: false,
+            windowEpoch: (current[requestSid].windowEpoch ?? 0) + 1,
+          },
+        }));
+        return;
+      }
       setSessions((current) => {
         const target = current[requestSid];
         if (!target?.hasNewer) return current;
@@ -1417,18 +1461,21 @@ function HistoryConversationBrowserFixture() {
     }, delayMs);
     return true;
   }, [
-    browseMode, delayMs, historyRevision, historyViewId, sessions, sid,
+    browseMode, delayMs, dirtyLiveBrowse, historyRevision, historyViewId,
+    latestTurns, sessions, sid,
   ]);
 
   const loadDetail = useCallback((
     turnId: string,
     before?: string | null,
+    autoLoad = false,
   ): boolean => {
     if (!detailPaging || turnId !== "detail-page") return false;
     detailRequestCountRef.current += 1;
     document.documentElement.dataset.detailRequests =
       String(detailRequestCountRef.current);
-    const page: DetailFixturePage = before === "detail-older"
+    // Either explicit cursor returns the terminal combined process window.
+    const page: DetailFixturePage = before === "detail-older" || before === "detail-newer"
       ? "older" : "latest";
     document.documentElement.dataset.detailLastBefore = before ?? "initial";
     const failThisRequest = (
@@ -1448,7 +1495,8 @@ function HistoryConversationBrowserFixture() {
             detailLoading: true,
             detailError: undefined,
             detailRetryBefore: before ?? null,
-            detailRetryDirection: before == null ? "initial" : "older",
+            detailRetryDirection: before == null ? "initial"
+              : before === "detail-newer" ? "newer" : "older",
           } : turn),
       },
     }));
@@ -1474,7 +1522,8 @@ function HistoryConversationBrowserFixture() {
         [requestSid]: {
           ...current[requestSid],
           turns: current[requestSid].turns.map((turn) =>
-            turn.id === turnId ? detailPagingTurn(page) : turn),
+            turn.id === turnId
+              ? detailPagingTurn(page, false, false, autoLoad) : turn),
         },
       }));
       window.setTimeout(() => {
@@ -1486,7 +1535,7 @@ function HistoryConversationBrowserFixture() {
               turn.id === turnId
                   && (page !== "latest"
                     || turn.detailOldestCursor === "detail-older")
-                ? detailPagingTurn(page, true) : turn),
+                ? detailPagingTurn(page, true, false, autoLoad) : turn),
           },
         }));
       }, growthDelayMs);
@@ -1510,7 +1559,9 @@ function HistoryConversationBrowserFixture() {
 
   const appendTurn = () => {
     if (deepBrowse) {
-      const next = finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
+      const next = dirtyLiveBrowse
+        ? streamingTurn("live-streaming", 4)
+        : finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
       setLatestTurns((current) => [...current, next].slice(-20));
       if (!browseMode) {
         setSessions((current) => {
@@ -1883,6 +1934,12 @@ function HistoryConversationBrowserFixture() {
           onTextSelectionGuardChange={updateTextSelectionGuard}
           onEdit={() => {}}
           onGetDiff={() => {}}
+          activeTurnId={sid.endsWith("-a")
+            ? interactiveTimeline
+              ? "streaming"
+              : dirtyLiveBrowse && !browseMode
+                ? "live-streaming" : null
+            : null}
           externalPlanProgress={fixedPlanProgress ? {
             turnId: fixedPlanProgress.turnId,
             itemId: fixedPlanProgress.block.item_id,
@@ -2029,6 +2086,7 @@ function ProfileSidebarFixture() {
     params.get("profile-sidebar") === "work" ? "work" : "code",
   );
   const [newProfileId, setNewProfileId] = useState("none");
+  const [activeSessionId, setActiveSessionId] = useState("profile-sidebar-active");
   useEffect(() => {
     const root = document.documentElement;
     const previousEngine = root.dataset.engine;
@@ -2078,9 +2136,10 @@ function ProfileSidebarFixture() {
         codexProfiles={profiles}
         defaultCodexProfileId="primary"
         sessions={sessions}
-        activeSessionId="profile-sidebar-active"
+        machineId={params.get("machine") ?? "fixture-device"}
+        activeSessionId={activeSessionId}
         onSpaceChange={setSpace}
-        onSelect={noop}
+        onSelect={setActiveSessionId}
         onNew={(profileId) => setNewProfileId(profileId ?? "none")}
         onNewInDir={noop}
         onClose={noop}
@@ -2477,11 +2536,86 @@ const UNSAFE_SVG = [
   "</svg>",
 ].join("");
 
+function buildPdfFixture(): string {
+  const firstPage = [
+    "0.15 0.35 0.75 rg",
+    "20 20 260 160 re f",
+    "1 1 1 rg",
+    "BT /F1 18 Tf 45 95 Td (cc-remote PDF page 1) Tj ET",
+  ].join("\n");
+  const secondPage = [
+    "0.85 0.25 0.10 rg",
+    "20 20 260 160 re f",
+    "1 1 1 rg",
+    "BT /F1 18 Tf 45 95 Td (cc-remote PDF page 2) Tj ET",
+  ].join("\n");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${firstPage.length} >>\nstream\n${firstPage}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>",
+    `<< /Length ${secondPage.length} >>\nstream\n${secondPage}\nendstream`,
+  ];
+  let source = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(source.length);
+    source += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = source.length;
+  source += `xref\n0 ${objects.length + 1}\n`;
+  source += "0000000000 65535 f \n";
+  source += offsets.slice(1).map(
+    (offset) => `${String(offset).padStart(10, "0")} 00000 n \n`,
+  ).join("");
+  source += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`;
+  source += `startxref\n${xrefOffset}\n%%EOF\n`;
+  return window.btoa(source);
+}
+
+function buildAnimatedGifFixture(): string {
+  return [
+    "R0lGODlhEAAQAPAAAAAAAP///yH/C05FVFNDQVBFMi4wAwEAAAAh+QQECgD/ACwA",
+    "AAAAEAAQAAACDoSPqcvtD6OctNqLsz4FACH5BAUKAAAALAAAAAAQABAAAAIOjI+p",
+    "y+0Po5y02ouzPgUAOw==",
+  ].join("");
+}
+
 function ArtifactPreviewFixture({ kind }: {
-  kind: "html" | "svg" | "markdown-svg" | "markdown-source";
+  kind: "gif" | "invalid-gif" | "html" | "pdf" | "svg"
+    | "markdown-svg" | "markdown-source" | "markdown-html" | "markdown-github-html";
 }) {
+  const [openedFile, setOpenedFile] = useState("");
   const svgData = window.btoa(UNSAFE_SVG);
-  const artifact = kind === "html"
+  const htmlReadme = kind === "markdown-github-html"
+    ? MARKDOWN_HTML_GITHUB_README : MARKDOWN_HTML_LOCAL_README;
+  const artifact = kind === "pdf"
+    ? {
+      file: "report.pdf",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "pdf" as const,
+      data: buildPdfFixture(),
+      mediaType: "application/pdf" as const,
+      size: 1_024,
+      mtimeNs: "1",
+    }
+    : kind === "gif" || kind === "invalid-gif"
+    ? {
+      file: "animation.gif",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "image" as const,
+      data: kind === "gif"
+        ? buildAnimatedGifFixture()
+        : window.btoa("GIF89a-invalid"),
+      mediaType: "image/gif" as const,
+      size: 128,
+      mtimeNs: "1",
+    }
+    : kind === "html"
     ? {
       file: "preview.html",
       sid: "artifact-preview-session",
@@ -2490,10 +2624,20 @@ function ArtifactPreviewFixture({ kind }: {
       content: `<!doctype html><html><head>
         <style>#head-style { color: rgb(12, 34, 56); }</style>
         </head><body><div id="head-style">head css retained</div>
+        <div id="visualization-theme" style="color:var(--foreground);background:var(--background);border:1px solid var(--border)">visualization theme</div>
+        <button id="counter">计数 0</button>
         <script>
           document.body.dataset.scriptRan = "yes";
           try { parent.document.body.dataset.previewEscaped = "yes"; }
           catch (_) { document.body.dataset.parentBlocked = "yes"; }
+          try { localStorage.getItem("preview-isolation-test"); }
+          catch (_) { document.body.dataset.storageBlocked = "yes"; }
+          fetch("https://cc-remote-preview-test.invalid/should-not-load")
+            .catch(() => { document.body.dataset.networkBlocked = "yes"; });
+          let count = 0;
+          document.getElementById("counter").onclick = event => {
+            event.currentTarget.textContent = "计数 " + (++count);
+          };
         </script></body></html>`,
       size: 360,
       mtimeNs: "1",
@@ -2509,6 +2653,23 @@ function ArtifactPreviewFixture({ kind }: {
       mediaType: "image/svg+xml",
       size: UNSAFE_SVG.length,
       mtimeNs: "1",
+    }
+    : kind === "markdown-html" || kind === "markdown-github-html"
+    ? {
+      file: "readme_zh.md", sid: "artifact-preview-session",
+      requestId: "artifact-preview-request", kind: "md" as const,
+      content: htmlReadme, size: htmlReadme.length,
+      mtimeNs: "1", revision: "c".repeat(64),
+      assets: {
+        "header.svg": {
+          mediaType: "image/svg+xml",
+          data: window.btoa(MARKDOWN_HTML_HEADER_SVG),
+        },
+        "local-logo.png": {
+          mediaType: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3x8AAAAASUVORK5CYII=",
+        },
+      },
     }
     : kind === "markdown-source"
     ? {
@@ -2541,7 +2702,10 @@ function ArtifactPreviewFixture({ kind }: {
       },
     };
   return <main style={{ height: "100dvh" }}>
+    <output hidden data-testid="artifact-opened-file">{openedFile}</output>
     <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
+      theme={kind === "html" ? "dark" : "light"}
+      onOpenFile={(path, line) => setOpenedFile(`${path}:${line || ""}`)}
       onTab={() => {}} onClose={() => {}} />
   </main>;
 }
@@ -2573,21 +2737,106 @@ function LocalFileLinkFixture() {
   </main>;
 }
 
+function CodexVisualizationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <output data-testid="visualization-opened-path">{opened}</output>
+    <MessageBlock
+      text={"visualize{\"path\":\"/tmp/private/concept.html\","
+        + "\"title\":\"结构原理草图\"}"}
+      done onOpenFile={(path) => setOpened(path)} />
+  </main>;
+}
+
+function MarkdownDisclosureFixture() {
+  const [complete, setComplete] = useState(false);
+  const [opened, setOpened] = useState("");
+  const params = new URLSearchParams(window.location.search);
+  const title = params.has("long-title")
+    ? `文件清单：${"long_source_filename_".repeat(12)}.tsx，21 个源文件，无删除`
+    : "文件清单：21 个源文件，无删除";
+  const files = ["README.md", ...[
+    ".gitattributes", ".gitignore", "README.md", "DESIGN.md", "tools/model.py",
+    "tools/build.py", "tools/check.py", "tools/assembly_check.py",
+    "tools/structural_screen.py", "tools/verify.py", "tools/publish.py",
+    "tools/visual_qa.mjs", "viewer/index.html", "viewer/style.css",
+    "viewer/app.js", "tests/test_model.py", "tests/test_assembly.py",
+    "config/assembly.json", "config/materials.json", "output/manifest.json",
+  ].map((path) => `modules/assembly/${path}`)];
+  const body = params.has("file-list")
+    ? "仓库：example-workspace\n\n" + files.map((path, index) =>
+      `- ${index === 0 ? "修改" : "新建"}：\`${path}\``,
+    ).join("\n") + "\n\n"
+    : "- **Added** `README.md`\n- [source](/tmp/source.py)\n\n"
+      + "<details open>\n<summary>嵌套内容</summary>\n\nInner body\n\n</details>\n\n";
+  const text = `Before\n\n<details>\n<summary>${title}</summary>\n\n`
+    + body
+    + (complete ? "- Last streamed item\n\n</details>\n\nAfter" : "");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <button type="button" onClick={() => setComplete(true)}>Finish stream</button>
+    <output data-testid="disclosure-opened-path">{opened}</output>
+    <section data-testid="markdown-disclosure">
+      <MessageBlock text={text} done={complete} onOpenFile={setOpened} />
+    </section>
+    <section data-testid="inert-disclosure-html">
+      <MessageBlock done text={'<details>\n<summary>Unsafe content</summary>\n\n'
+        + '<img src="https://example.com/raw-image" onerror="alert(1)">\n\n'
+        + '<script>alert(2)</script>\n\n</details>'} />
+    </section>
+  </main>;
+}
+
+function CodexFileCitationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <output data-testid="citation-opened-path">{opened}</output>
+    <section data-testid="valid-citations">
+      <MessageBlock
+        text={"英文版 :codex-file-citation{path=\"/tmp/reports/final report.pdf\" "
+          + "label=\"报告 } 终版\" purpose=\"output\"}，动画 "
+          + ":codex-file-citation{purpose=\"output\" "
+          + "path=\"/tmp/demo} final.gif\"}。"}
+        done onOpenFile={(path) => setOpened(path)} />
+    </section>
+    <section data-testid="invalid-citation">
+      <MessageBlock
+        text={'保留 :codex-file-citation{path="/tmp/report.pdf" invalid tail}'}
+        done onOpenFile={(path) => setOpened(path)} />
+    </section>
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
     ? <ArtifactPreviewFixture kind="html" />
+    : rootParams.has("artifact-pdf")
+    ? <ArtifactPreviewFixture kind="pdf" />
+    : rootParams.has("artifact-gif")
+    ? <ArtifactPreviewFixture kind="gif" />
+    : rootParams.has("artifact-invalid-gif")
+    ? <ArtifactPreviewFixture kind="invalid-gif" />
     : rootParams.has("artifact-svg")
     ? <ArtifactPreviewFixture kind="svg" />
     : rootParams.has("artifact-markdown-svg")
     ? <ArtifactPreviewFixture kind="markdown-svg" />
     : rootParams.has("artifact-markdown-source")
     ? <ArtifactPreviewFixture kind="markdown-source" />
+    : rootParams.has("artifact-markdown-github-html")
+    ? <ArtifactPreviewFixture kind="markdown-github-html" />
+    : rootParams.has("artifact-markdown-html")
+    ? <ArtifactPreviewFixture kind="markdown-html" />
     : rootParams.has("code-copy-theme")
     ? <CodeCopyThemeFixture
         theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
     : rootParams.has("local-file-link")
     ? <LocalFileLinkFixture />
+    : rootParams.has("codex-visualization")
+    ? <CodexVisualizationFixture />
+    : rootParams.has("codex-file-citation")
+    ? <CodexFileCitationFixture />
+    : rootParams.has("markdown-disclosure")
+    ? <MarkdownDisclosureFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

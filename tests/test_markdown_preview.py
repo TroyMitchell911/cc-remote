@@ -143,12 +143,14 @@ def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_pat
     )
     (tmp_path / "diagram.svg").write_bytes(svg_bytes)
     (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    (tmp_path / "animation.gif").write_bytes(b"GIF89a\x01\x00\x01\x00preview")
     (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7\npreview")
     machine, _ = _mk_machine()
 
     html = machine._read_file_preview(str(tmp_path), "page.html")
     svg = machine._read_file_preview(str(tmp_path), "diagram.svg")
     image = machine._read_file_preview(str(tmp_path), "image.png")
+    animation = machine._read_file_preview(str(tmp_path), "animation.gif")
     pdf = machine._read_file_preview(str(tmp_path), "report.pdf")
 
     assert html["format"] == "html" and "<h1>Report</h1>" in html["content"]
@@ -157,10 +159,13 @@ def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_pat
     assert svg["data"] == svg_bytes
     assert image["format"] == "image" and image["media_type"] == "image/png"
     assert image["data"] == b"\x89PNG\r\n\x1a\npreview"
+    assert animation["format"] == "image"
+    assert animation["media_type"] == "image/gif"
+    assert animation["data"] == b"GIF89a\x01\x00\x01\x00preview"
     assert pdf["format"] == "pdf" and pdf["media_type"] == "application/pdf"
     assert pdf["data"] == b"%PDF-1.7\npreview"
     assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "diagram.svg", "image.png", "page.html", "report.pdf",
+        "animation.gif", "diagram.svg", "image.png", "page.html", "report.pdf",
     ]
 
 
@@ -1465,7 +1470,9 @@ def test_markdown_preview_rejects_invalid_utf8(tmp_path):
 
 
 def test_preview_asset_is_type_limited_and_bounded(tmp_path):
-    (tmp_path / "image.png").write_bytes(b"png")
+    png = b"\x89PNG\r\n\x1a\npreview"
+    (tmp_path / "image.png").write_bytes(png)
+    (tmp_path / "fake.gif").write_bytes(b"not-a-gif")
     vector = (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4">'
         b'<circle cx="2" cy="2" r="2"/></svg>'
@@ -1477,12 +1484,14 @@ def test_preview_asset_is_type_limited_and_bounded(tmp_path):
 
     path, media_type, data = machine._read_preview_asset(
         str(tmp_path), "image.png")
-    assert (path, media_type, data) == ("image.png", "image/png", b"png")
+    assert (path, media_type, data) == ("image.png", "image/png", png)
     assert machine._read_preview_asset(str(tmp_path), "vector.svg") == (
         "vector.svg", "image/svg+xml", vector,
     )
     with pytest.raises(ValueError, match="SVG"):
         machine._read_preview_asset(str(tmp_path), "invalid.svg")
+    with pytest.raises(ValueError, match="格式不匹配"):
+        machine._read_preview_asset(str(tmp_path), "fake.gif")
     with pytest.raises(ValueError, match="4 MiB"):
         machine._read_preview_asset(str(tmp_path), "large.webp")
 

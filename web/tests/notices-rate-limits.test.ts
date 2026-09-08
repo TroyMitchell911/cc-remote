@@ -6,6 +6,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import type { Notice, ServerEvent, StatusReport } from "../src/protocol.ts";
+import {
+  resetCreditConfirmation, resetCreditPresentation,
+} from "../src/rate-limit-reset.ts";
 
 const harness = await createServer({
   root: process.cwd(),
@@ -25,7 +28,8 @@ try {
   const { UsageMeter } = await harness.ssrLoadModule(
     "/src/components/UsageMeter.tsx");
   const {
-    accountQuotaWindows, quotaTone, quotaWindowLabel, remainingPercent,
+    accountQuotaWindows, activeRateLimits, quotaTone, quotaWindowLabel,
+    quotaWindowsForLimits, remainingPercent,
   } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
@@ -167,6 +171,21 @@ try {
   assert.equal(merged?.rate_limit_reached_type, "rate_limit_reached");
   assert.equal(Object.hasOwn(merged ?? {}, "credits"), false);
   assert.equal(Object.hasOwn(merged ?? {}, "individualLimit"), false);
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_update",
+    limit_id: "codex",
+    name: null,
+    plan_type: null,
+    reached_type: "",
+    primary: { used_percent: 10, resets_at: null, window_duration_mins: 300 },
+    secondary: null,
+  }) });
+  merged = state.runtimes[sid].statusReport?.rate_limits[0];
+  assert.equal(merged?.rate_limit_reached_type, "");
+  assert.equal(merged?.primary?.used_percent, 10,
+    "an explicit allowed transition replaces exhausted usage without reset proof");
+  assert.equal(merged?.primary?.resets_at, null,
+    "an explicit allowed transition clears the exhausted period's old reset");
 
   // A delayed status response must not replace the newest in-flight read.
   state = reduce(state, {
@@ -180,12 +199,12 @@ try {
   } as StatusReport;
   state = reduce(state, { type: "event", event: staleStatus });
   assert.equal(state.runtimes[sid].statusRequestId, "status-new");
-  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 10,
     "stale status response must not replace the installed report");
   const uncorrelatedStatus = { ...staleStatus, request_id: undefined } as StatusReport;
   state = reduce(state, { type: "event", event: uncorrelatedStatus });
   assert.equal(state.runtimes[sid].statusRequestId, "status-new");
-  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 100,
+  assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 10,
     "uncorrelated status response must not replace an in-flight request");
   const currentStatus = {
     ...report, request_id: "status-new",
@@ -197,6 +216,111 @@ try {
   assert.equal(state.runtimes[sid].statusRequestId, null);
   assert.equal(state.runtimes[sid].statusReport?.rate_limits[0]?.primary?.used_percent, 0,
     "the matching status response installs and completes the request");
+
+  const resetStatus = {
+    ...currentStatus,
+    request_id: "reset-status",
+    reset_credits: {
+      available_count: 2,
+      credits: [{
+        id: "credit/one",
+        granted_at: 1_700_000_000,
+        expires_at: 1_800_000_000,
+        reset_type: "codexRateLimits" as const,
+        status: "available" as const,
+        title: "Launch reset",
+        description: "Reset an eligible Codex limit window",
+      }],
+    },
+  } satisfies StatusReport;
+  state = reduce(state, { type: "event", event: resetStatus });
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "reset-current",
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_reset_result",
+    to: "browser",
+    request_id: "reset-stale",
+    outcome: "reset",
+    credit_id: "credit/one",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, "reset-current");
+  assert.equal(state.runtimes[sid].resetCreditResult, null,
+    "a stale coupon result must not settle a newer click");
+  state = reduce(state, { type: "event", event: event({
+    type: "rate_limit_reset_result",
+    to: "browser",
+    request_id: "reset-current",
+    outcome: "reset",
+    credit_id: "credit/one",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].resetCreditResult?.outcome, "reset");
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits, null,
+    "coupon inventory must stay hidden until the authoritative refresh arrives");
+  state = reduce(state, { type: "event", event: {
+    ...resetStatus,
+    request_id: "reset-current",
+    reset_credits: { available_count: 1, credits: null },
+  } });
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits?.available_count, 1);
+
+  state = reduce(state, {
+    type: "begin_status_request", sid, requestId: "reset-error",
+  });
+  state = reduce(state, { type: "event", event: event({
+    type: "error", code: "internal", message: "provider secret detail",
+    request_id: "reset-error",
+  }) });
+  assert.equal(state.runtimes[sid].statusRequestId, null);
+  assert.equal(state.runtimes[sid].resetCreditResult, null);
+  assert.equal(state.runtimes[sid].statusError,
+    "操作未完成，请稍后重试。");
+  assert.equal(state.runtimes[sid].statusReport?.reset_credits, null,
+    "an ambiguous status operation must hide stale coupon inventory");
+
+  const claudeSid = "claude-rate-session";
+  let claudeState = {
+    ...initialState,
+    focusedSid: claudeSid,
+    runtimes: { [claudeSid]: createRuntime() },
+  };
+  for (const update of [{
+    limit_id: "claude", name: "Claude", primary: {
+      used_percent: 35, resets_at: 1_800_000_000,
+      window_duration_mins: 300,
+    },
+  }, {
+    limit_id: "claude", name: "Claude", secondary: {
+      used_percent: 70, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    },
+  }, {
+    limit_id: "claude-seven-day-opus", name: "Opus", primary: {
+      used_percent: 80, resets_at: 1_800_500_000,
+      window_duration_mins: 10_080,
+    },
+  }]) {
+    claudeState = reduce(claudeState, { type: "event", event: event({
+      type: "rate_limit_update", sid: claudeSid,
+      plan_type: null, reached_type: null,
+      primary: null, secondary: null, ...update,
+    }) });
+  }
+  assert.equal(claudeState.runtimes[claudeSid].statusReport, null,
+    "Claude quota must not fabricate a Codex StatusReport");
+  assert.equal(claudeState.runtimes[claudeSid].rateLimits.length, 2);
+  const claudeQuotas = quotaWindowsForLimits(
+    claudeState.runtimes[claudeSid].rateLimits, "claude",
+  );
+  assert.equal(remainingPercent(claudeQuotas.fiveHour), 65);
+  assert.equal(remainingPercent(claudeQuotas.weekly), 30);
+  assert.equal(activeRateLimits([{
+    limit_id: "claude", primary: {
+      used_percent: 99, resets_at: 999, window_duration_mins: 300,
+    },
+  }], 1_000).length, 0,
+  "elapsed SDK windows must disappear without waiting for another event");
 
   const officialDiagnostic = event({
     type: "notice", notice_id: "codex-notice-private-diagnostic",
@@ -444,6 +568,87 @@ try {
   assert.doesNotMatch(usageMarkup, /used_percent|rate_limit_reached/i);
   assert.match(usageMarkup, /aria-haspopup="true"/);
   assert.doesNotMatch(usageMarkup, /role="dialog"/);
+  const resetStatusMarkup = renderToStaticMarkup(createElement(StatusSheet, {
+    open: true,
+    report: { ...quotaReport, reset_credits: resetStatus.reset_credits },
+    notices: [],
+    error: null,
+    resetCreditLoading: false,
+    resetCreditDisabled: false,
+    resetCreditResult: null,
+    onClose: () => {},
+    onRefresh: () => {},
+    onConsumeResetCredit: () => true,
+  }));
+  assert.match(resetStatusMarkup, /重置券/);
+  assert.match(resetStatusMarkup, /<b>2<\/b> 张可用/);
+  assert.match(resetStatusMarkup, /Launch reset/);
+  assert.match(resetStatusMarkup, /Reset an eligible Codex limit window/);
+  assert.match(resetStatusMarkup, /使用下一张/,
+    "a capped detail list must retain the backend-selects-next action");
+  assert.doesNotMatch(resetStatusMarkup, /SECRET|paidCredits|balance/);
+  const localizedCredit = {
+    ...resetStatus.reset_credits.credits[0],
+    title: "Full reset",
+    description: "Thanks for using Codex! You've been granted one free rate limit reset.",
+  };
+  const originalCredit = JSON.stringify(localizedCredit);
+  assert.deepEqual(resetCreditPresentation(localizedCredit), {
+    title: "完整额度重置券",
+    description: "感谢使用 Codex！你已获赠一次免费的额度重置机会。",
+  });
+  const confirmation = resetCreditConfirmation(localizedCredit);
+  assert.match(confirmation, /确定使用完整额度重置券吗/);
+  assert.match(confirmation, /感谢使用 Codex！你已获赠一次免费的额度重置机会。/);
+  assert.match(confirmation, /消耗一张重置券，并重置当前符合条件的额度窗口/);
+  assert.doesNotMatch(confirmation, /Full reset|Thanks for using|You've been granted/);
+  assert.deepEqual(resetCreditPresentation(), {
+    title: "Codex 额度重置券", description: "",
+  });
+  assert.match(resetCreditConfirmation(), /确定使用一张 Codex 额度重置券吗/);
+  assert.deepEqual(resetCreditPresentation({ title: " ", description: null }), {
+    title: "Codex 额度重置券", description: "",
+  });
+  for (const copy of [
+    { title: "中文券名", description: "仅用于符合条件的窗口。" },
+    { title: "Future credit", description: "Only resets the weekly window." },
+    { title: "constructor", description: "__proto__" },
+  ]) {
+    assert.deepEqual(resetCreditPresentation(copy), copy,
+      "Chinese copy and unknown upstream conditions must not be overwritten");
+  }
+  const localizedMarkup = renderToStaticMarkup(createElement(StatusSheet, {
+    open: true,
+    report: { ...quotaReport, reset_credits: {
+      available_count: 1, credits: [localizedCredit],
+    } },
+    onClose: () => {}, onRefresh: () => {}, onConsumeResetCredit: () => true,
+  }));
+  assert.match(localizedMarkup, /<b>完整额度重置券<\/b>/);
+  assert.match(localizedMarkup, /感谢使用 Codex！你已获赠一次免费的额度重置机会。/);
+  assert.match(localizedMarkup, /到期/);
+  assert.match(localizedMarkup, />使用<\/button>/);
+  assert.doesNotMatch(localizedMarkup, /Full reset|Thanks for using|You've been granted/);
+  assert.equal(JSON.stringify(localizedCredit), originalCredit,
+    "localization must not mutate upstream coupon data or its redemption id");
+  const claudeUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    engine: "claude",
+    open: true,
+    report: null,
+    rateLimits: claudeState.runtimes[claudeSid].rateLimits,
+    error: null,
+    loading: false,
+    onToggle: () => {},
+  }));
+  assert.match(claudeUsageMarkup, /5 小时额度/);
+  assert.match(claudeUsageMarkup, /每周额度/);
+  assert.match(claudeUsageMarkup, /Opus 专项周额度/);
+  assert.match(claudeUsageMarkup, /剩余 65%/);
+  assert.match(claudeUsageMarkup, /剩余 30%/);
+  assert.match(claudeUsageMarkup, /剩余 20%/);
+  assert.match(claudeUsageMarkup, /原生额度事件自动同步/);
+  assert.doesNotMatch(claudeUsageMarkup, />刷新<|完整状态/,
+    "Claude SDK has no supported pull/status API, so the popover is push-only");
   const compactUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
     open: false,
     report: quotaReport,
@@ -550,6 +755,12 @@ try {
     /focusedEngine !== "codex"[\s\S]*refreshStatus\(\)/,
     "focused Codex sessions must load quota without opening /status");
   assert.match(appSource, /statusReport=\{rt\.statusReport\}/);
+  const statusSheetSource = readFileSync(resolve(
+    process.cwd(), "src/components/StatusSheet.tsx"), "utf8");
+  assert.match(statusSheetSource, /window\.confirm\(/,
+    "redeeming an earned reset credit must keep an explicit user confirmation");
+  assert.match(statusSheetSource, /resetLaunchRef\.current/,
+    "the lazy reset-credit UI must reject double clicks before React rerenders");
   const composerSource = readFileSync(resolve(
     process.cwd(), "src/components/Composer.tsx"), "utf8");
   assert.match(composerSource, /<UsageMeter/);

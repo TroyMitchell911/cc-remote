@@ -28,14 +28,19 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 35
+PROTOCOL_VERSION = 55
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
 # one-shot status frame into an unbounded relay/browser allocation.
 MAX_STATUS_USAGE_BUCKETS = 53 * 7
+MAX_STATUS_RESET_CREDITS = 32
 MAX_SAFE_WIRE_INTEGER = 9_007_199_254_740_991
 MAX_SAFE_WIRE_TIMESTAMP_SECONDS = MAX_SAFE_WIRE_INTEGER // 1000
+MAX_BACKGROUND_PROCESS_ITEMS = 64
+MAX_BACKGROUND_PROCESS_SUMMARY_CHARS = 8 * 1024
+MAX_BACKGROUND_PROCESS_COMMAND_CHARS = 16 * 1024
+MAX_BACKGROUND_PROCESS_CWD_CHARS = 4 * 1024
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -60,6 +65,10 @@ ProcessAppendTarget = Literal["summary", "detail", "output", "diff", "progress"]
 CodexThreadStatus = Literal["notLoaded", "idle", "systemError", "active"]
 EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+]
+AutoCompactMode = Literal["inherit", "auto", "custom"]
+AutoCompactPhase = Literal[
+    "stable", "waiting_terminal", "compacting", "reconnecting", "blocked",
 ]
 PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
@@ -86,11 +95,19 @@ WireId = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
     ),
 ]
+ResetCreditId = Annotated[
+    str, StringConstraints(min_length=1, max_length=512),
+]
+RateLimitResetOutcome = Literal[
+    "reset", "nothingToReset", "noCredit", "alreadyRedeemed", "unknown",
+]
 
 MAX_ENCODED_ATTACHMENT_CHARS = ((MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3) * 4
 MAX_QUERY_QUEUE_ITEMS = 32
 MAX_QUERY_QUEUE_BYTES = 64 * 1024 * 1024
 MAX_QUERY_QUEUE_PREVIEW_CHARS = 512
+MIN_AUTO_COMPACT_TOKENS = 100_000
+MAX_AUTO_COMPACT_TOKENS = 1_000_000
 ASK_QUESTION_MAX_CHARS = 16 * 1024
 ASK_OPTION_LABEL_MAX_CHARS = 512
 ASK_OPTION_DESCRIPTION_MAX_CHARS = 2 * 1024
@@ -273,6 +290,10 @@ class _Base(BaseModel):
     # echo this value; the relay drops them if `client_id` has since reconnected
     # onto another socket. Clients must not treat it as a durable identity.
     route_id: Optional[WireId] = None
+    # Relay-authenticated browser-account identity. Unlike ``client_id`` this
+    # survives page reloads and is shared by independent tabs signed in as the
+    # same relay user. The relay always replaces client-supplied values.
+    owner_id: Optional[WireId] = None
 
 
 class _Command(_Base):
@@ -516,6 +537,32 @@ class SetEffort(_Command):
     effort: EffortLevel
 
 
+class SetAutoCompact(_Command):
+    """Set one Claude session's spawn-time automatic compaction threshold.
+
+    ``inherit`` omits Claude's CLI flag, ``auto`` asks Claude to choose its
+    recommended threshold, and ``custom`` carries an exact bounded token count.
+    The wrapper may defer the reconnect until the active turn reaches its real
+    terminal boundary; it never interrupts a turn to apply this command.
+    """
+
+    type: Literal["set_auto_compact"] = "set_auto_compact"
+    mode: AutoCompactMode
+    threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+
+    @model_validator(mode="after")
+    def threshold_matches_mode(self):
+        if self.mode == "custom" and self.threshold_tokens is None:
+            raise ValueError("custom autocompact requires threshold_tokens")
+        if self.mode != "custom" and self.threshold_tokens is not None:
+            raise ValueError("threshold_tokens is only valid for custom autocompact")
+        return self
+
+
 class SetServiceTier(_Command):
     """client -> wrapper: set the Codex service tier (codex only). "fast" maps to
     app-server's persisted per-thread service tier; "" / "default" clears the
@@ -549,6 +596,14 @@ class CloseBtw(_Command):
     """client -> wrapper: discard the /btw fork `sid` (tear down, never persisted)."""
     type: Literal["close_btw"] = "close_btw"
     # `sid` (inherited) = the btw fork to close.
+
+
+class SyncBtw(_Command):
+    """Hydrate one visible resident BTW from its bounded replay ring."""
+
+    type: Literal["sync_btw"] = "sync_btw"
+    cursor: Optional[int] = Field(default=None, ge=0)
+    generation: Optional[WireId] = None
 
 
 class Ping(_Base):
@@ -637,6 +692,49 @@ class Effort(_Base):
     effort: str
 
 
+class AutoCompact(_Base):
+    """Claude session-level automatic compaction control state.
+
+    Desired and applied values are separate because this is a process-start
+    option. ``pending`` remains true until a safe resume reconnect succeeds.
+    ``mutable`` is false while an official terminal/broker owns the session;
+    those surfaces are observed but never controlled through Web commands.
+    """
+
+    type: Literal["auto_compact"] = "auto_compact"
+    mode: AutoCompactMode = "inherit"
+    threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+    applied_mode: Optional[AutoCompactMode] = None
+    applied_threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
+    pending: bool = False
+    phase: AutoCompactPhase = "stable"
+    mutable: bool = True
+    error: Optional[str] = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def thresholds_match_modes(self):
+        if self.mode == "custom" and self.threshold_tokens is None:
+            raise ValueError("custom autocompact requires threshold_tokens")
+        if self.mode != "custom" and self.threshold_tokens is not None:
+            raise ValueError("threshold_tokens is only valid for custom autocompact")
+        if self.applied_mode == "custom" and self.applied_threshold_tokens is None:
+            raise ValueError(
+                "applied custom autocompact requires applied_threshold_tokens")
+        if (self.applied_mode != "custom"
+                and self.applied_threshold_tokens is not None):
+            raise ValueError(
+                "applied_threshold_tokens is only valid for applied custom autocompact")
+        return self
+
+
 class Fast(_Base):
     """Codex Fast-mode (service_tier) state, downstream. Emitted after a /fast
     toggle and on each codex turn so the client shows whether the next reply is on
@@ -658,7 +756,42 @@ class BtwOpened(_Base):
     request_id: WireId
     btw_sid: WireId
     parent_sid: WireId
-    engine: str
+    engine: Engine
+    created_at: float = Field(ge=0)
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+
+
+class BtwSessionInfo(BaseModel):
+    """One owner-scoped resident side chat in an authoritative BTW catalog."""
+
+    model_config = ConfigDict(extra="forbid")
+    btw_sid: WireId
+    parent_sid: WireId
+    engine: Literal["claude", "codex"]
+    created_at: float = Field(ge=0)
+    state: State = "idle"
+
+
+class BtwSync(_Base):
+    """Wrapper -> client: complete resident BTW catalog for this client.
+
+    This reconnect baseline is intentionally independent of the narrative ring:
+    an idle fork still exists even when no recent event mentions it.
+    """
+
+    type: Literal["btw_sync"] = "btw_sync"
+    generation: WireId
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
+    sessions: list[BtwSessionInfo] = Field(max_length=64)
+
+
+class BtwClosed(_Base):
+    """Wrapper -> owner: one resident side chat was explicitly discarded."""
+
+    type: Literal["btw_closed"] = "btw_closed"
+    btw_sid: WireId
+    parent_sid: WireId
+    revision: int = Field(ge=0, le=9_007_199_254_740_991)
 
 
 class UserMsg(_Base):
@@ -695,12 +828,16 @@ class TurnSteered(_Base):
 class AssistantMsgStart(_Base):
     type: Literal["assistant_msg_start"] = "assistant_msg_start"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
 
 
 class Delta(_Base):
     type: Literal["delta"] = "delta"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     text: str
     # Some engines only reveal whether text is commentary or final on the
     # assembled message. Repeating the channel on deltas/end lets the client
@@ -712,6 +849,8 @@ class ToolUse(_Base):
     type: Literal["tool_use"] = "tool_use"
     message_id: WireId
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     tool: str
     input: dict[str, Any]
     category: ToolCategory = "tool"
@@ -724,6 +863,8 @@ class ToolDelta(_Base):
     """Incremental progress/output for a previously-started tool call."""
     type: Literal["tool_delta"] = "tool_delta"
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     stream: Literal["progress", "output", "diff", "summary", "terminal"]
     delta: str = Field(max_length=512 * 1024)
 
@@ -731,6 +872,8 @@ class ToolDelta(_Base):
 class ToolResult(_Base):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     content: str
     is_error: bool
     truncated: Optional[bool] = None
@@ -741,10 +884,34 @@ class ToolResult(_Base):
     duration_ms: Optional[int] = Field(default=None, ge=0)
 
 
+class AsyncQuestionSpec(BaseModel):
+    """Native non-blocking question; a reply is ordinary user input, not approval."""
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=8192)
+    options: Optional[list[Annotated[str, Field(min_length=1, max_length=1024)]]] = Field(
+        default=None, max_length=16)
+
+
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
     message_id: WireId
+    turn_id: Optional[WireId] = None
+    background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
+    # These are message content, not pending AskUser/Future state. They survive
+    # history/reconnect and may be answered while the native turn keeps running.
+    delivery: Optional[Literal["async"]] = None
+    questions: Optional[list[AsyncQuestionSpec]] = Field(default=None, max_length=16)
+
+    @model_validator(mode="after")
+    def bounded_async_questions(self):
+        if self.questions is not None:
+            if self.delivery != "async":
+                raise ValueError("questions require async delivery")
+            if len(json.dumps([q.model_dump() for q in self.questions],
+                              ensure_ascii=False)) > 16 * 1024:
+                raise ValueError("async question metadata exceeds 16 KiB")
+        return self
 
 
 class ProcessEvent(_Base):
@@ -777,6 +944,52 @@ class ProcessEvent(_Base):
     exit_code: Optional[int] = None
     duration_ms: Optional[int] = Field(default=None, ge=0)
     truncated: Optional[bool] = None
+    # Claude Agent work may outlive the parent ResultMessage. It remains visible
+    # in that turn's collaboration card, but must not re-open the session-wide
+    # running indicator after the parent turn has authoritatively completed.
+    background: Optional[bool] = None
+
+
+class BackgroundProcessItem(BaseModel):
+    """Bounded public snapshot of one currently-live detached process.
+
+    The native engine owns membership.  This shape intentionally mirrors the
+    presentation subset of ``ProcessEvent`` without carrying routing/sequence
+    fields, raw task output, or private environment data.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    item_id: WireId
+    kind: Literal["agent", "task"]
+    status: ProcessStatus = "running"
+    turn_id: Optional[WireId] = None
+    parent_id: Optional[WireId] = None
+    title: str = Field(min_length=1, max_length=1024)
+    summary: Optional[str] = Field(
+        default=None, max_length=MAX_BACKGROUND_PROCESS_SUMMARY_CHARS)
+    progress: Optional[str] = Field(
+        default=None, max_length=MAX_BACKGROUND_PROCESS_SUMMARY_CHARS)
+    command: Optional[str] = Field(
+        default=None, max_length=MAX_BACKGROUND_PROCESS_COMMAND_CHARS)
+    cwd: Optional[str] = Field(
+        default=None, max_length=MAX_BACKGROUND_PROCESS_CWD_CHARS)
+    started_at: Optional[float] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS)
+    updated_at: Optional[float] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS)
+
+
+class BackgroundProcessSync(_Base):
+    """Authoritative full replacement for one session's live background work.
+
+    Unlike replayable edge events, an empty snapshot is meaningful: it clears
+    stale browser/IndexedDB cards after a missed terminal or process restart.
+    """
+
+    type: Literal["background_process_sync"] = "background_process_sync"
+    generation: Optional[WireId] = None
+    items: list[BackgroundProcessItem] = Field(
+        default_factory=list, max_length=MAX_BACKGROUND_PROCESS_ITEMS)
 
 
 class TurnPlan(_Base):
@@ -885,6 +1098,14 @@ class CodexProfileInfo(BaseModel):
     error: Optional[str] = Field(default=None, min_length=1, max_length=384)
 
 
+class ClaudeProfileInfo(BaseModel):
+    """Public account metadata. CLAUDE_CONFIG_DIR never crosses the wire."""
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    label: str = Field(min_length=1, max_length=48)
+    error: Optional[str] = Field(default=None, min_length=1, max_length=384)
+
+
 class SessionInfo(BaseModel):
     """A row in the sessions sidebar (subset of SDK SDKSessionInfo)."""
     model_config = ConfigDict(extra="forbid")
@@ -902,10 +1123,11 @@ class SessionInfo(BaseModel):
     codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
     space: Space = "code"
     work_id: Optional[WireId] = None
-    # ``session_id`` is the routing id. When multiple Codex profiles are
-    # configured, every profile is namespaced; copy/resume surfaces should use
-    # the native id below.
+    # ``session_id`` is the routing id. Multi-profile engines namespace it;
+    # copy/resume surfaces should use the native id below.
     native_session_id: Optional[WireId] = None
+    claude_profile_id: Optional[WireId] = None
+    claude_profile_label: Optional[str] = Field(default=None, max_length=48)
     codex_profile_id: Optional[WireId] = None
     codex_profile_label: Optional[str] = Field(default=None, max_length=48)
     # A catalog read also repairs completion receipts for cold/evicted sessions
@@ -933,6 +1155,9 @@ class SessionList(_Base):
     # then a refreshed list, so both responses intentionally carry the same id.
     request_id: Optional[WireId] = None
     sessions: list[SessionInfo]
+    claude_profiles: list[ClaudeProfileInfo] = Field(
+        default_factory=list, max_length=32)
+    default_claude_profile_id: Optional[WireId] = None
     codex_profiles: list[CodexProfileInfo] = Field(default_factory=list, max_length=32)
     default_codex_profile_id: Optional[WireId] = None
 
@@ -988,11 +1213,19 @@ class NewSession(_Command):
     request_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     engine: Engine = "claude"
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     space: Space = "code"
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
     effort: Optional[EffortLevel] = None  # None -> engine default
+    # Claude only. None delegates to Claude Code's model/provider default.
+    auto_compact_mode: Optional[AutoCompactMode] = None
+    auto_compact_threshold_tokens: Optional[int] = Field(
+        default=None,
+        ge=MIN_AUTO_COMPACT_TOKENS,
+        le=MAX_AUTO_COMPACT_TOKENS,
+    )
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
     permission_mode: Optional[
         Literal["never", "on-request", "untrusted"]
@@ -1025,6 +1258,21 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if self.claude_profile_id is not None and self.engine != "claude":
+            raise ValueError(
+                "claude_profile_id only supported for Claude sessions")
+        if (self.auto_compact_mode is not None
+                or self.auto_compact_threshold_tokens is not None):
+            if self.engine != "claude":
+                raise ValueError("autocompact only supported for Claude sessions")
+            if (self.auto_compact_mode == "custom"
+                    and self.auto_compact_threshold_tokens is None):
+                raise ValueError(
+                    "custom autocompact requires auto_compact_threshold_tokens")
+            if (self.auto_compact_mode != "custom"
+                    and self.auto_compact_threshold_tokens is not None):
+                raise ValueError(
+                    "auto_compact_threshold_tokens is only valid for custom autocompact")
         if self.space == "work" and self.cwd is not None:
             raise ValueError("Work session cwd is assigned by the wrapper")
         if self.space == "work" and self.web_search is not None:
@@ -1092,7 +1340,7 @@ class RollbackResult(_Base):
 class CompactSession(_Command):
     type: Literal["compact_session"] = "compact_session"
     session_id: WireId
-    engine: Literal["codex"] = "codex"
+    engine: Literal["claude", "codex"] = "codex"
     space: Literal["code"] = "code"
 
 
@@ -1152,6 +1400,7 @@ class WorkScheduleInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schedule_id: WireId
     project_id: Optional[WireId] = None
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     title: str = Field(max_length=200)
     prompt: str = Field(max_length=64 * 1024)
@@ -1241,6 +1490,7 @@ class CreateWorkSchedule(_Command):
     type: Literal["create_work_schedule"] = "create_work_schedule"
     engine: Engine = "claude"
     project_id: Optional[WireId] = None
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     title: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1, max_length=64 * 1024)
@@ -1251,6 +1501,9 @@ class CreateWorkSchedule(_Command):
     def profile_matches_engine(self):
         if self.engine != "codex" and self.codex_profile_id is not None:
             raise ValueError("Codex profile is only valid for Codex schedules")
+        if self.engine != "claude" and self.claude_profile_id is not None:
+            raise ValueError(
+                "Claude profile is only valid for Claude schedules")
         return self
 
 
@@ -1433,9 +1686,10 @@ class GetModels(_Command):
     type: Literal["get_models"] = "get_models"
     engine: Optional[Literal["cc", "claude", "codex"]] = None
     client_id: Optional[WireId] = None  # requester, so the wrapper routes Models back to=<client_id>
-    # Claude defaults can depend on project/local settings, so resolve them in
-    # the same directory the prospective new session will use.
+    # Legacy Claude defaults can depend on project/local settings, so resolve
+    # them in the prospective cwd. Explicit account profiles remain user-scoped.
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1457,6 +1711,7 @@ class Models(_Base):
     # Echoes GetModels.cwd for cwd-sensitive Claude defaults so a late response
     # can never be rendered against a different directory in the new-chat form.
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1468,6 +1723,7 @@ class GetEngineCapabilities(_Command):
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     skills_only: bool = False
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1480,6 +1736,7 @@ class ManageEnginePlugin(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1496,6 +1753,7 @@ class ManageEngineSkill(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1513,6 +1771,7 @@ class ManageEngineHook(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1548,6 +1807,7 @@ class EngineCapabilities(_Base):
     errors: list[str] = Field(default_factory=list, max_length=32)
     notes: list[str] = Field(default_factory=list, max_length=32)
     skills_only: bool = False
+    claude_profile_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
 
 
@@ -1617,12 +1877,20 @@ class WebSearch(_Base):
 class GetContext(_Command):
     """client -> wrapper: request current context window usage."""
     type: Literal["get_context"] = "get_context"
+    # Automatic focus/TurnEnd reads stay cache-only so an optional Claude
+    # control request can never block the next prompt. User-opened /context
+    # explicitly asks for a fresh native breakdown.
+    refresh: bool = False
 
 
 class ContextReport(_Base):
     """wrapper -> client: context window usage (one-shot response to GetContext,
     like SessionList — not buffered)."""
     type: Literal["context_report"] = "context_report"
+    # Correlate one-shot reports with their GetContext command. Internal
+    # wrapper-owned refreshes omit this field; browsers may still consume their
+    # value but must not let them settle a newer explicit request.
+    request_id: Optional[WireId] = None
     total_tokens: int
     max_tokens: int
     percentage: float
@@ -1631,6 +1899,12 @@ class ContextReport(_Base):
     # unavailable instead of presenting a fabricated 0% to the user.  ``None``
     # is omitted so older Code reports retain their exact historical shape.
     available: Optional[bool] = None
+    # Claude may fall back to the most recent exact control response or the
+    # newest main-chain assistant usage. Omitted reports retain the historical
+    # exact/control meaning (including all Codex reports).
+    source: Optional[
+        Literal["control", "cached_control", "recent_turn"]
+    ] = None
     # Work reports keep the engine's real context usage above for honest
     # remaining-capacity calculations, while exposing the fresh-session startup
     # zero point separately so Work shows later conversation growth.
@@ -1640,6 +1914,11 @@ class ContextReport(_Base):
     session_percentage: Optional[float] = None
     model: Optional[str] = None
     is_auto_compact_enabled: Optional[bool] = None
+    # Claude's effective automatic-compaction boundary and physical context
+    # capacity. They are observations from get_context_usage(), not substitutes
+    # for the desired/applied session control carried by AutoCompact.
+    auto_compact_threshold_tokens: Optional[int] = Field(default=None, ge=0)
+    raw_max_tokens: Optional[int] = Field(default=None, ge=0)
     categories: list[dict[str, Any]] = []
 
 
@@ -1651,6 +1930,23 @@ class GetStatus(_Command):
     re-run when a response/ACK is lost.
     """
     type: Literal["get_status"] = "get_status"
+
+
+class ConsumeRateLimitResetCredit(_Command):
+    """client -> wrapper: redeem one Codex account reset credit.
+
+    ``cmd_id`` is also the native app-server idempotency key, so a transport
+    retry or wrapper restart cannot redeem the same logical action twice.
+    Omitting ``credit_id`` lets the account backend select the next available
+    reset credit.
+    """
+    type: Literal[
+        "consume_rate_limit_reset_credit"
+    ] = "consume_rate_limit_reset_credit"
+    sid: WireId
+    cmd_id: WireId
+    client_id: WireId
+    credit_id: Optional[ResetCreditId] = None
 
 
 class _StatusPart(BaseModel):
@@ -1714,6 +2010,27 @@ class StatusRateLimit(_StatusPart):
     secondary: Optional[StatusRateLimitWindow] = None
 
 
+class StatusRateLimitResetCredit(_StatusPart):
+    id: ResetCreditId
+    granted_at: int = Field(ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS)
+    expires_at: Optional[int] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+    )
+    reset_type: Literal["codexRateLimits", "unknown"]
+    status: Literal["available", "redeeming", "redeemed", "unknown"]
+    title: Optional[str] = Field(default=None, max_length=256)
+    description: Optional[str] = Field(default=None, max_length=2048)
+
+
+class StatusRateLimitResetCredits(_StatusPart):
+    available_count: int = Field(ge=0, le=MAX_SAFE_WIRE_INTEGER)
+    # ``None`` means the backend exposed only the count. An empty list means it
+    # did return detail rows and none were available. The list may be capped.
+    credits: Optional[list[StatusRateLimitResetCredit]] = Field(
+        default=None, max_length=MAX_STATUS_RESET_CREDITS,
+    )
+
+
 class StatusDailyUsageBucket(_StatusPart):
     start_date: Annotated[
         str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -1737,8 +2054,10 @@ class StatusReport(_Base):
 
     Every nested model forbids extras. The wrapper copies only explicitly
     approved display fields; account email, credentials, config instructions,
-    rollout paths/previews and credit balances never cross the wire. Daily
-    activity is limited to validated date/token pairs for the latest 53 weeks.
+    rollout paths/previews and paid credit balances never cross the wire.
+    Earned rate-limit reset credits are a separate, explicitly allow-listed
+    control surface. Daily activity is limited to validated date/token pairs
+    for the latest 53 weeks.
     ``component_errors`` makes partial RPC failure visible without hiding the
     successful sections.
     """
@@ -1751,10 +2070,21 @@ class StatusReport(_Base):
     context: StatusContext
     account: Optional[StatusAccount] = None
     rate_limits: list[StatusRateLimit] = Field(default_factory=list, max_length=16)
+    reset_credits: Optional[StatusRateLimitResetCredits] = None
     usage: Optional[StatusUsage] = None
     # Entries are ``<component>: <generic reason>``. Raw RPC error text is never
     # allowed, because it may contain provider or account details.
     component_errors: list[StatusErrorText] = Field(default_factory=list, max_length=5)
+
+
+class RateLimitResetResult(_Base):
+    """Private result of one idempotent reset-credit redemption attempt."""
+    type: Literal["rate_limit_reset_result"] = "rate_limit_reset_result"
+    sid: WireId
+    to: WireId
+    request_id: WireId
+    outcome: RateLimitResetOutcome
+    credit_id: Optional[ResetCreditId] = None
 
 
 class Notice(_Base):
@@ -1776,12 +2106,12 @@ class Notice(_Base):
 
 
 class RateLimitUpdate(_Base):
-    """Sparse-safe, sanitized rolling Codex rate-limit state.
+    """Sparse-safe, sanitized rolling engine rate-limit state.
 
-    The app-server's credits, individual spend control and future unknown
-    fields are intentionally absent.  Names differ slightly from StatusReport
-    so the live event remains concise; the Web reducer projects them into the
-    existing StatusRateLimit view model.
+    Codex app-server credits/spend controls and Claude SDK raw/account fields
+    are intentionally absent. Names differ slightly from StatusReport so the
+    live event remains concise; the Web reducer projects both engines into the
+    shared StatusRateLimit view model.
     """
     type: Literal["rate_limit_update"] = "rate_limit_update"
     limit_id: Optional[str] = Field(default=None, max_length=128)
@@ -1974,6 +2304,17 @@ class ConversationTurn(BaseModel):
     ts: Optional[int] = Field(default=None, ge=0)
     doneTs: Optional[int] = Field(default=None, ge=0)
     durationMs: Optional[int] = Field(default=None, ge=0)
+    # Detail size and process visibility are deliberately separate. A deferred
+    # payload may contain only a truncated prompt/final answer (or an image),
+    # while an official Codex summary may not reveal whether process items
+    # exist at all. The browser must never turn either case into a fake
+    # "processed" row.
+    processDetailState: Literal["none", "present", "unknown"] = "none"
+    detailReasons: list[Literal[
+        "process", "prompt_truncated", "answer_truncated", "image_deferred",
+    ]] = Field(default_factory=list, max_length=4)
+    processStartedTs: Optional[int] = Field(default=None, ge=0)
+    processDoneTs: Optional[int] = Field(default=None, ge=0)
     detailEventCount: int = Field(default=0, ge=0)
     detailLoaded: bool = False
 
@@ -2025,7 +2366,7 @@ class History(_Base):
     # sampled/changed-during-read preview while an exact refresh runs in background.
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
-    events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = Field(default_factory=list)
     turns: list[ConversationTurn] = []
     detail: Literal["summary", "full"] = "full"
     has_more: bool = False            # older turns exist beyond what's returned (pagination)
@@ -2086,7 +2427,53 @@ class TurnDetail(_Base):
     revision: WireId
     authoritative: bool = True
     error: Optional[str] = Field(default=None, max_length=4096)
-    events: list[dict[str, Any]] = []
+    # The requested opaque page no longer has its immutable backing snapshot.
+    # Browsers must restart this turn at before=None rather than retrying the
+    # same cursor or treating a silently substituted newest page as older.
+    reset_required: bool = False
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    has_more: bool = False
+    oldest_cursor: Optional[WireId] = None
+    has_newer: bool = False
+    newer_cursor: Optional[WireId] = None
+    before: Optional[WireId] = None
+
+
+class GetAgentDetail(_Command):
+    """client -> wrapper: fetch one Claude subagent's public process projection."""
+    type: Literal["get_agent_detail"] = "get_agent_detail"
+    session_id: WireId
+    run_id: WireId
+    request_id: WireId
+    client_id: Optional[WireId] = None
+    revision: Optional[WireId] = None
+    detail_revision: Optional[WireId] = None
+    before: Optional[WireId] = None
+    limit: int = Field(default=192, ge=1, le=256)
+
+
+class AgentDetail(_Base):
+    """wrapper -> browser: one read-only page from a Claude subagent run.
+
+    ``run_id`` is a stable public hash of the spawning Agent tool call. Raw
+    Claude agent ids, delegated prompts and output-file paths never cross this
+    boundary. Live batches are unbuffered hints; a normal response is always a
+    source-backed or resident authoritative snapshot.
+    """
+    type: Literal["agent_detail"] = "agent_detail"
+    session_id: WireId
+    run_id: WireId
+    request_id: Optional[WireId] = None
+    revision: WireId
+    detail_revision: WireId
+    authoritative: bool = True
+    live: bool = False
+    title: str = Field(default="协作代理", min_length=1, max_length=1024)
+    parent_run_id: Optional[WireId] = None
+    status: ProcessStatus = "unknown"
+    error: Optional[str] = Field(default=None, max_length=4096)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    through_seq: int = Field(default=0, ge=0)
     has_more: bool = False
     oldest_cursor: Optional[WireId] = None
     has_newer: bool = False
@@ -2167,6 +2554,17 @@ class AskUser(_Base):
         if self.multi_select and len(self.options) < ASK_OPTION_MIN_COUNT:
             raise ValueError("multi-select ask_user requires 2-5 options")
         return self
+
+
+class AskUserSync(_Base):
+    """Wrapper -> one client: authoritative pending-question baseline.
+
+    This unsequenced Hello frame means that every AskUser immediately following
+    it for the same ``sid`` is the complete set visible to that client. It is
+    deliberately independent of the replay ring: a retained historical ask is
+    not evidence that the question is still open.
+    """
+    type: Literal["ask_user_sync"] = "ask_user_sync"
 
 
 class AskUserClosed(_Base):
@@ -2279,8 +2677,8 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
-    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, SyncBtw, BtwOpened, BtwSync, BtwClosed, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, AutoCompact, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, RateLimitResetResult, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, AgentDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserSync, AskUserClosed, AnswerQuestion, BackgroundProcessSync,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2291,10 +2689,12 @@ AnyMessage = Union[
 ]
 
 # Session-narrative events the wrapper seqs and buffers. Replay/snapshot/
-# control frames (replay_start, replay_end, snapshot, wrapper_disconnected,
-# wrapper_reconnected) are synthesized per-reconnect and are NOT seq'd/buffered.
+# control frames (replay_start, replay_end, snapshot, ask_user_sync,
+# background_process_sync,
+# wrapper_disconnected, wrapper_reconnected) are synthesized per-reconnect and
+# are NOT seq'd/buffered.
 DOWNSTREAM_TYPES = frozenset({
-    "user_msg", "turn_steered", "state", "model", "effort", "perm",
+    "user_msg", "turn_steered", "state", "model", "effort", "auto_compact", "perm",
     "permission_profile", "web_search", "fast",
     "collaboration_mode", "session_control", "query_queue", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
@@ -2319,11 +2719,15 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "session_control": SessionControl,
     "set_model": SetModel,
     "set_effort": SetEffort,
+    "set_auto_compact": SetAutoCompact,
     "set_service_tier": SetServiceTier,
     "set_collaboration_mode": SetCollaborationMode,
     "open_btw": OpenBtw,
     "close_btw": CloseBtw,
+    "sync_btw": SyncBtw,
     "btw_opened": BtwOpened,
+    "btw_sync": BtwSync,
+    "btw_closed": BtwClosed,
     "set_perm": SetPerm,
     "get_permission_profiles": GetPermissionProfiles,
     "permission_profiles": PermissionProfiles,
@@ -2333,6 +2737,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "web_search": WebSearch,
     "get_context": GetContext,
     "get_status": GetStatus,
+    "consume_rate_limit_reset_credit": ConsumeRateLimitResetCredit,
     "get_diff": GetDiff,
     "get_file_preview": GetFilePreview,
     "save_markdown": SaveMarkdown,
@@ -2340,6 +2745,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "authorize_preview": AuthorizePreview,
     "get_history": GetHistory,
     "get_turn_detail": GetTurnDetail,
+    "get_agent_detail": GetAgentDetail,
     "get_history_image": GetHistoryImage,
     "get_models": GetModels,
     "models": Models,
@@ -2386,11 +2792,13 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "state": StateEvent,
     "model": Model,
     "effort": Effort,
+    "auto_compact": AutoCompact,
     "fast": Fast,
     "collaboration_mode": CollaborationMode,
     "perm": Perm,
     "context_report": ContextReport,
     "status_report": StatusReport,
+    "rate_limit_reset_result": RateLimitResetResult,
     "notice": Notice,
     "rate_limit_update": RateLimitUpdate,
     "diff_report": DiffReport,
@@ -2402,10 +2810,12 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "work_artifacts": WorkArtifacts,
     "history": History,
     "turn_detail": TurnDetail,
+    "agent_detail": AgentDetail,
     "history_image": HistoryImage,
     "history_invalidated": HistoryInvalidated,
     "artifact_invalidated": ArtifactInvalidated,
     "ask_user": AskUser,
+    "ask_user_sync": AskUserSync,
     "ask_user_closed": AskUserClosed,
     "answer_question": AnswerQuestion,
     "get_goal": GetGoal,
@@ -2430,6 +2840,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "tool_result": ToolResult,
     "assistant_msg_end": AssistantMsgEnd,
     "process": ProcessEvent,
+    "background_process_sync": BackgroundProcessSync,
     "turn_plan": TurnPlan,
     "turn_diff": TurnDiff,
     "turn_binding": TurnBinding,
@@ -2473,8 +2884,12 @@ def deserialize(raw: str | bytes) -> AnyMessage:
 
 
 def serialize(msg: BaseModel) -> str:
+    # ``owner_id`` is a relay-only routing envelope. Avoid adding a null field
+    # to every ordinary event.
+    common_exclude = ({"owner_id"}
+                      if getattr(msg, "owner_id", None) is None else set())
     if isinstance(msg, ContextReport):
-        exclude: set[str] = set()
+        exclude: set[str] = set(common_exclude)
         if all(value is None for value in (
                 msg.session_tokens, msg.fixed_tokens,
                 msg.session_percentage)):
@@ -2486,9 +2901,13 @@ def serialize(msg: BaseModel) -> str:
             })
         if msg.available is None:
             exclude.add("available")
+        if msg.auto_compact_threshold_tokens is None:
+            exclude.add("auto_compact_threshold_tokens")
+        if msg.raw_max_tokens is None:
+            exclude.add("raw_max_tokens")
         if exclude:
             return msg.model_dump_json(exclude=exclude)
-    return msg.model_dump_json()
+    return msg.model_dump_json(exclude=common_exclude)
 
 
 def is_downstream(msg: BaseModel) -> bool:

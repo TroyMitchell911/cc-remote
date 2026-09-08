@@ -8,6 +8,7 @@ import {
   type TurnDetailProjection,
 } from "./domain/conversation.ts";
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
+import { generatedImageIdentity, generatedOutputImages } from "./process-blocks.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
@@ -48,6 +49,104 @@ function isFinalTextBlock(
   block: Block,
 ): block is TextBlock & { channel: "final" } {
   return block.kind === "text" && block.channel === "final";
+}
+
+type ProcessDetailState = NonNullable<Turn["processDetailState"]>;
+type TurnDetailReason = NonNullable<Turn["detailReasons"]>[number];
+
+function isPresentableProcessBlock(block: Block): boolean {
+  if (block.kind === "tool") return true;
+  if (block.kind === "text") {
+    return block.channel === "commentary" && block.text.length > 0;
+  }
+  if (block.processKind === "reasoning") return false;
+  if (block.processKind !== "hook") return true;
+  return ["failed", "declined", "cancelled", "interrupted"].includes(
+    block.status,
+  );
+}
+
+function statedProcessDetailState(turn: Turn): ProcessDetailState {
+  if (turn.processDetailState) return turn.processDetailState;
+  return (turn.detailEventCount ?? 0) > 0 ? "unknown" : "none";
+}
+
+function hasDeferredTurnDetail(turn: Turn): boolean {
+  return statedProcessDetailState(turn) !== "none"
+    || (turn.detailReasons?.length ?? 0) > 0
+    || (turn.detailEventCount ?? 0) > 0;
+}
+
+/** Merge only same-revision process evidence. A concrete browser/detail
+ * projection refines an opaque native summary, while an opaque refresh can
+ * never erase an exact conclusion already learned for that revision. */
+function mergedProcessDetailState(
+  history: Turn,
+  live: Turn,
+  blocks: readonly Block[],
+): ProcessDetailState {
+  if (blocks.some(isPresentableProcessBlock)) return "present";
+  const historyState = statedProcessDetailState(history);
+  const liveState = statedProcessDetailState(live);
+  // Visible process is immutable within one history revision. A later opaque
+  // or final-only page may replace the currently retained block window, but it
+  // cannot prove that a process observed on another page never existed.
+  if (historyState === "present" || liveState === "present") return "present";
+  if (historyState !== "unknown") return historyState;
+  if (liveState !== "unknown") return liveState;
+  return "unknown";
+}
+
+function mergedDetailReasons(
+  history: Turn,
+  live: Turn,
+  processState: ProcessDetailState,
+): TurnDetailReason[] {
+  const reasons = new Set<TurnDetailReason>([
+    ...(history.detailReasons ?? []),
+    ...(live.detailReasons ?? []),
+  ]);
+  if (processState === "present") reasons.add("process");
+  else if (processState === "none") reasons.delete("process");
+  return [...reasons];
+}
+
+function earliestTimestamp(
+  first: number | undefined,
+  second: number | undefined,
+): number | undefined {
+  if (first == null) return second;
+  if (second == null) return first;
+  return Math.min(first, second);
+}
+
+function latestTimestamp(
+  first: number | undefined,
+  second: number | undefined,
+): number | undefined {
+  if (first == null) return second;
+  if (second == null) return first;
+  return Math.max(first, second);
+}
+
+function trustworthyProcessStartedTs(turn: Turn): number | undefined {
+  const started = turn.processStartedTs;
+  const done = turn.processDoneTs;
+  if (started == null) return undefined;
+  // Older projections assigned every hydrated native item the same parser
+  // timestamp. Do not let that invalid zero interval combine with a newer
+  // source witness and manufacture a duration stretching to refresh time.
+  if (done != null && done - started < 500) return undefined;
+  return started;
+}
+
+function trustworthyProcessDoneTs(turn: Turn): number | undefined {
+  const started = turn.processStartedTs;
+  const done = turn.processDoneTs;
+  if (started == null || done == null || done - started < 500) {
+    return undefined;
+  }
+  return done;
 }
 
 function processBlockMatches(
@@ -202,6 +301,7 @@ function mergeBlocks(
         return !matchedTextIndexes.has(index)
           && !reservedExactHistoryIndexes.has(index)
           && textChannel(candidate) === textChannel(block)
+          && candidate.delivery === block.delivery
           && canCompatibilityMatchText(candidate);
       });
       let bestScore = 0;
@@ -235,6 +335,10 @@ function mergeBlocks(
         : combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
+      if (block.delivery === "async") {
+        existing.delivery = "async";
+        if (block.questions?.length) existing.questions = block.questions;
+      }
       if (block.liveOrder != null) {
         existing.liveOrder = existing.liveOrder == null
           ? block.liveOrder : Math.min(existing.liveOrder, block.liveOrder);
@@ -257,6 +361,7 @@ function mergeBlocks(
         const candidate = out[index] as TextBlock;
         return candidate.done
           && textChannel(candidate) === textChannel(block)
+          && candidate.delivery === block.delivery
           && candidate.text === block.text;
       });
       if (!canonicalDuplicate) out.push({ ...block });
@@ -507,6 +612,34 @@ function cloneSettledCachedDetailBlock(
   return cloned;
 }
 
+/** Repair the one pre-v36 cache shape which treated every task correlation as
+ * a clickable Agent. A real Agent process is parented by an Agent/Task tool;
+ * an explicitly observed non-Agent parent is therefore safe to demote. When
+ * the parent shell was evicted, retain the block unchanged and let canonical
+ * TurnDetail replace it instead of guessing. */
+function repairCachedAgentClassification(blocks: readonly Block[]): Block[] {
+  const parentTools = new Map<string, ToolBlock>();
+  for (const block of blocks) {
+    if (block.kind === "tool") parentTools.set(block.tool_use_id, block);
+  }
+  return blocks.map((block) => {
+    if (block.kind !== "process" || block.processKind !== "agent"
+        || !block.parent_id) return block;
+    const parent = parentTools.get(block.parent_id);
+    if (!parent) return block;
+    const tool = parent.tool.toLowerCase();
+    if (parent.category === "agent" || tool === "agent" || tool === "task") {
+      return block;
+    }
+    return {
+      ...block,
+      processKind: "task",
+      title: block.title === "协作代理" ? "后台任务" : block.title,
+      background: true,
+    };
+  });
+}
+
 /** Paint only heavyweight blocks from a same-revision/generation browser
  * cache over an authoritative summary row.
  *
@@ -523,7 +656,7 @@ function installCachedDetailRestore(
 ): Turn {
   if (!summary.done || !cached.done || summary.detailLoaded
       || summary.detailProjection
-      || (summary.detailEventCount ?? 0) <= 0) return summary;
+      || statedProcessDetailState(summary) === "none") return summary;
   const source = cached.detailProjection?.blocks ?? cached.blocks;
   // A session-wide running bit is not turn ownership. The next task may have
   // started before its UserMsg/TurnBinding while a same-revision cache row from
@@ -533,12 +666,28 @@ function installCachedDetailRestore(
     || (authority === "running" && !!activeOwnerId
       && exactTurnAliases(summary).has(activeOwnerId)
       && exactTurnAliases(cached).has(activeOwnerId));
-  const blocks = source.filter((block) => !isFinalTextBlock(block))
-    .map((block) => cloneSettledCachedDetailBlock(
-      block, summary, preserveOpenPlans));
+  const blocks = repairCachedAgentClassification(
+    source.filter((block) => !isFinalTextBlock(block)),
+  ).map((block) => cloneSettledCachedDetailBlock(
+    block, summary, preserveOpenPlans));
   if (blocks.length === 0) return summary;
+  const processDetailState = mergedProcessDetailState(
+    summary, cached, blocks);
   return {
     ...summary,
+    processDetailState,
+    detailReasons: mergedDetailReasons(
+      summary, cached, processDetailState),
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(summary),
+          trustworthyProcessStartedTs(cached))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(summary),
+          trustworthyProcessDoneTs(cached))
+      : undefined,
     detailLoaded: false,
     detailLoading: false,
     detailError: undefined,
@@ -633,8 +782,23 @@ export function restoreObservedLiveTurnDetails(
         && (block.kind !== "text" || block.text.length > 0))
       .map(cloneDetailBlock);
     if (blocks.length === 0) continue;
+    const processDetailState = mergedProcessDetailState(
+      summary, observed, blocks);
     restored[summaryIndex] = {
       ...summary,
+      processDetailState,
+      detailReasons: mergedDetailReasons(
+        summary, observed, processDetailState),
+      processStartedTs: processDetailState === "present"
+        ? earliestTimestamp(
+            trustworthyProcessStartedTs(summary),
+            trustworthyProcessStartedTs(observed))
+        : undefined,
+      processDoneTs: processDetailState === "present"
+        ? latestTimestamp(
+            trustworthyProcessDoneTs(summary),
+            trustworthyProcessDoneTs(observed))
+        : undefined,
       detailLoaded: false,
       detailLoading: false,
       detailError: undefined,
@@ -768,6 +932,10 @@ function mergeTurn(
     completedTextAuthority,
     settledCanonicalText,
   );
+  const processDetailState = mergedProcessDetailState(
+    history, live, blocks);
+  const detailReasons = mergedDetailReasons(
+    history, live, processDetailState);
   // A Plan is durable session-level progress and ChatView may lift it into the
   // composer-adjacent progress strip.  It therefore cannot prove that this
   // turn's heavyweight process projection is still resident: treating a lone
@@ -828,6 +996,18 @@ function mergeTurn(
     durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
       ? live.durationMs
       : history.durationMs ?? live.durationMs,
+    processDetailState,
+    detailReasons,
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(history),
+          trustworthyProcessStartedTs(live))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(history),
+          trustworthyProcessDoneTs(live))
+      : undefined,
     // Detail is a monotonic, revision-bound local projection. A later summary
     // may legitimately contain no heavyweight blocks; it must not erase pages
     // which the user already expanded in this same revision.
@@ -842,9 +1022,11 @@ function mergeTurn(
     // turn timeline.
     detailLoaded: !!(detailProjection
       || (live.detailLoaded || history.detailLoaded)
-        && (hasLoadedDetailPayload || !history.detailEventCount)),
+        && (hasLoadedDetailPayload || !hasDeferredTurnDetail(history))),
     detailLoading: live.detailLoading ?? history.detailLoading,
     detailError: live.detailError ?? history.detailError,
+    detailResetPending:
+      live.detailResetPending ?? history.detailResetPending,
     detailHasMore: detailProjection
       ? detailProjection.hasMore
       : live.detailHasMore ?? history.detailHasMore,
@@ -931,6 +1113,7 @@ export function mergeAuthoritativeTurnDetail(
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: detail.detailProjection ?? summary.detailProjection,
     detailHasMore: detail.detailProjection
       ? detail.detailProjection.hasMore
@@ -957,7 +1140,8 @@ export function mergeAuthoritativeTurnDetail(
  *
  * Pages are source-disjoint and may be visited in either direction, so the
  * visible process window is replaced instead of accumulated. Keep the summary's
- * final answer outside that window when an older page does not contain it. */
+ * final answer and generated output images outside that window when a page
+ * does not contain them. */
 export function installAuthoritativeTurnDetailPage(
   summary: Turn,
   detail: Turn,
@@ -1031,6 +1215,28 @@ export function installAuthoritativeTurnDetailPage(
     ? detailProjection.newerCursor : page.newerCursor ?? null;
   const restoreIncomplete =
     summary.detailRestoreIncomplete === true && hasMore;
+  const processBlocks = detailProjection?.blocks ?? detailWithoutFinals;
+  // Output images are bounded narrative assets, not members of the currently
+  // selected heavy-process page. Expanding or paging details must not make
+  // their gallery disappear again. Retain references only, never image bytes.
+  const outputImages = generatedOutputImages([...summary.blocks, ...processBlocks]);
+  const detailImageIds = new Set(generatedOutputImages(detailWithoutFinals)
+    .map(generatedImageIdentity));
+  let processDetailState = mergedProcessDetailState(
+    summary, detail, processBlocks);
+  // A bounded page containing only the final answer is not an exact
+  // process-free conclusion while adjacent source pages remain unread. Keep
+  // the honest unknown state mounted so automatic/manual pagination cannot
+  // make its detail affordance blink out between responses.
+  if (processDetailState === "none"
+      && statedProcessDetailState(summary) === "unknown"
+      && (hasMore || hasNewer)) {
+    processDetailState = "unknown";
+  }
+  const incompleteUnknownProcess = processDetailState === "unknown"
+    && (hasMore || hasNewer);
+  const retryDirection = hasMore ? "older" : hasNewer ? "newer" : undefined;
+  const retryBefore = hasMore ? oldestCursor : hasNewer ? newerCursor : null;
   return {
     ...summary,
     prompt: detail.prompt || summary.prompt,
@@ -1042,19 +1248,37 @@ export function installAuthoritativeTurnDetailPage(
     // ordinary live-turn 256 item / 16 MiB cap cannot evict them. Legacy
     // callers without a projection retain the pre-v21 behavior.
     blocks: detailProjection
-      ? canonicalFinals : [...detailWithoutFinals, ...canonicalFinals],
+      ? [...outputImages, ...canonicalFinals]
+      : [...detailWithoutFinals,
+          ...outputImages.filter(image => !detailImageIds.has(generatedImageIdentity(image))),
+          ...canonicalFinals],
     done: summary.done,
     doneTs: summary.doneTs,
     durationMs: summary.durationMs,
+    processDetailState,
+    detailReasons: mergedDetailReasons(
+      summary, detail, processDetailState),
+    processStartedTs: processDetailState === "present"
+      ? earliestTimestamp(
+          trustworthyProcessStartedTs(summary),
+          trustworthyProcessStartedTs(detail))
+      : undefined,
+    processDoneTs: processDetailState === "present"
+      ? latestTimestamp(
+          trustworthyProcessDoneTs(summary),
+          trustworthyProcessDoneTs(detail))
+      : undefined,
     interrupted: summary.interrupted,
     error: summary.error,
     progress: summary.progress,
     detailEventCount: summary.detailEventCount,
-    detailLoaded: !restoreIncomplete,
+    detailLoaded: !restoreIncomplete && !incompleteUnknownProcess,
     detailLoading: false,
     detailError: undefined,
-    detailRetryBefore: undefined,
-    detailRetryDirection: undefined,
+    detailRetryBefore: incompleteUnknownProcess ? retryBefore : undefined,
+    detailRetryDirection: incompleteUnknownProcess
+      ? retryDirection : undefined,
+    detailResetPending: false,
     detailProjection,
     detailHasMore: hasMore,
     detailOldestCursor: oldestCursor,

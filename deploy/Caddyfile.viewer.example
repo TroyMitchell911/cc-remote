@@ -1,0 +1,11 @@
+# Optional isolated Viewer site; not an automatically installed configuration.
+# Resolve DNS/TLS inventory from the operator. See docs/remote-viewer.md.
+# Main app example: https://app.example.com
+# Relay: VIEWER_ORIGIN_TEMPLATE=https://{id}.preview.example.com
+# Add ONLY https://*.preview.example.com to the MAIN app's frame-src.
+# Do not copy the main app's CSP or X-Frame-Options headers into this site.
+# Provision a wildcard certificate via the operator's existing mechanism.
+*.preview.example.com {
+	tls /path/to/preview-fullchain.pem /path/to/preview-key.pem
+	reverse_proxy 127.0.0.1:8765
+}

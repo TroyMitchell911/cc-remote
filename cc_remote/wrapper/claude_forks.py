@@ -22,13 +22,18 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from claude_agent_sdk import list_sessions
 from claude_agent_sdk._internal.session_mutations import (
     _find_session_file_with_dir,
 )
+from cc_remote.protocol import (
+    MAX_AUTO_COMPACT_TOKENS,
+    MIN_AUTO_COMPACT_TOKENS,
+)
+from cc_remote.wrapper import claude_catalog
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -40,6 +45,7 @@ _MAX_RECORD_BYTES = 16 * 1024 * 1024
 _MAX_TAIL_BYTES = 2 * _MAX_RECORD_BYTES
 _MAX_CWD_BYTES = 4096
 _MAX_ERROR_CHARS = 512
+_PROFILE_META_KEY = "__cc_remote_profile__"
 _STATUSES = {
     "intent", "alias", "submitted", "uncertain", "complete", "rejected",
     "delete_pending", "deleted",
@@ -106,7 +112,50 @@ class ClaudeForkJournal:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "claude-forks.json"
         self._lock = threading.RLock()
+        self._profile_revision = 0
         self.entries = self._load()
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate account-local ids once per topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ClaudeForkJournalError("invalid Claude profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: OrderedDict[str, dict[str, Any]] = OrderedDict()
+            migrated = 0
+            for request_id, entry in self.entries.items():
+                value = dict(entry)
+                parent = _safe_id(
+                    transform(value["parent_session_id"]),
+                    "parent session id",
+                )
+                migrated += parent != value["parent_session_id"]
+                value["parent_session_id"] = parent
+                child = value.get("session_id")
+                if child is not None:
+                    routed = _safe_id(
+                        transform(child), "forked session id")
+                    migrated += routed != child
+                    value["session_id"] = routed
+                updated[request_id] = value
+            self._validate_aliases(updated)
+            # Persist even when the ids do not change: the revision fence is
+            # what prevents a later profile-id swap from being replayed after
+            # a wrapper crash between independent store migrations.
+            self._persist(updated, profile_revision=profile_revision)
+            self.entries = updated
+            self._profile_revision = profile_revision
+            return migrated
 
     def _load(self) -> OrderedDict[str, dict[str, Any]]:
         entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -119,7 +168,21 @@ class ClaudeForkJournal:
             if len(raw_bytes) > _MAX_FILE_BYTES:
                 raise ValueError("Claude fork journal exceeds size limit")
             raw = json.loads(raw_bytes.decode("utf-8"))
-            if not isinstance(raw, dict) or len(raw) > _MAX_ENTRIES:
+            if not isinstance(raw, dict):
+                raise ValueError("Claude fork journal has an invalid shape")
+            profile_meta = raw.pop(_PROFILE_META_KEY, None)
+            if profile_meta is not None:
+                if (
+                    not isinstance(profile_meta, dict)
+                    or set(profile_meta) != {"revision"}
+                    or isinstance(profile_meta.get("revision"), bool)
+                    or not isinstance(profile_meta.get("revision"), int)
+                    or profile_meta["revision"] < 0
+                ):
+                    raise ValueError(
+                        "Claude fork journal profile metadata is invalid")
+                self._profile_revision = profile_meta["revision"]
+            if len(raw) > _MAX_ENTRIES:
                 raise ValueError("Claude fork journal has an invalid shape")
             for request_id, entry in raw.items():
                 self._validate_entry(request_id, entry)
@@ -134,7 +197,63 @@ class ClaudeForkJournal:
         return entries
 
     @staticmethod
-    def _validate_entry(request_id: Any, entry: Any) -> None:
+    def _validate_controls(controls: Any) -> None:
+        if not isinstance(controls, dict) or set(controls) - {
+            "model", "effort", "permission_mode",
+            "auto_compact_mode", "auto_compact_threshold_tokens",
+            "applied_auto_compact_mode",
+            "applied_auto_compact_threshold_tokens",
+        }:
+            raise ValueError("invalid Claude fork controls")
+        model = controls.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not model or len(model) > 256
+        ):
+            raise ValueError("invalid Claude fork model")
+        effort = controls.get("effort")
+        if effort is not None and effort not in {
+            "low", "medium", "high", "xhigh", "max",
+        }:
+            raise ValueError("invalid Claude fork effort")
+        permission = controls.get("permission_mode")
+        if permission is not None and permission not in {
+            "default", "acceptEdits", "plan", "auto", "bypassPermissions",
+        }:
+            raise ValueError("invalid Claude fork permission mode")
+        auto_mode = controls.get("auto_compact_mode", "inherit")
+        if auto_mode not in {"inherit", "auto", "custom"}:
+            raise ValueError("invalid Claude fork autocompact mode")
+        auto_threshold = controls.get("auto_compact_threshold_tokens")
+        if auto_mode == "custom":
+            if (not isinstance(auto_threshold, int)
+                    or isinstance(auto_threshold, bool)
+                    or not MIN_AUTO_COMPACT_TOKENS <= auto_threshold
+                    <= MAX_AUTO_COMPACT_TOKENS):
+                raise ValueError("invalid Claude fork autocompact threshold")
+        elif auto_threshold is not None:
+            raise ValueError("unexpected Claude fork autocompact threshold")
+        applied_mode = controls.get("applied_auto_compact_mode")
+        applied_threshold = controls.get(
+            "applied_auto_compact_threshold_tokens")
+        if applied_mode is None:
+            if applied_threshold is not None:
+                raise ValueError(
+                    "unexpected Claude fork applied autocompact threshold")
+        elif applied_mode not in {"inherit", "auto", "custom"}:
+            raise ValueError("invalid Claude fork applied autocompact mode")
+        elif applied_mode == "custom":
+            if (not isinstance(applied_threshold, int)
+                    or isinstance(applied_threshold, bool)
+                    or not MIN_AUTO_COMPACT_TOKENS <= applied_threshold
+                    <= MAX_AUTO_COMPACT_TOKENS):
+                raise ValueError(
+                    "invalid Claude fork applied autocompact threshold")
+        elif applied_threshold is not None:
+            raise ValueError(
+                "unexpected Claude fork applied autocompact threshold")
+
+    @classmethod
+    def _validate_entry(cls, request_id: Any, entry: Any) -> None:
         request_id = _safe_id(request_id, "fork request id")
         if not isinstance(entry, dict):
             raise ValueError("invalid Claude fork journal entry")
@@ -180,26 +299,7 @@ class ClaudeForkJournal:
                 or not math.isfinite(created_at)
                 or created_at < 0):
             raise ValueError("invalid Claude fork timestamp")
-        controls = entry.get("controls", {})
-        if not isinstance(controls, dict) or set(controls) - {
-            "model", "effort", "permission_mode",
-        }:
-            raise ValueError("invalid Claude fork controls")
-        model = controls.get("model")
-        if model is not None and (
-            not isinstance(model, str) or not model or len(model) > 256
-        ):
-            raise ValueError("invalid Claude fork model")
-        effort = controls.get("effort")
-        if effort is not None and effort not in {
-            "low", "medium", "high", "xhigh", "max",
-        }:
-            raise ValueError("invalid Claude fork effort")
-        permission = controls.get("permission_mode")
-        if permission is not None and permission not in {
-            "default", "acceptEdits", "plan", "auto", "bypassPermissions",
-        }:
-            raise ValueError("invalid Claude fork permission mode")
+        cls._validate_controls(entry.get("controls", {}))
 
     @staticmethod
     def _validate_aliases(
@@ -239,7 +339,7 @@ class ClaudeForkJournal:
         parent_session_id: str,
         cutoff_message_id: str,
         cwd: str,
-        controls: Optional[dict[str, str]] = None,
+        controls: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         request_id = _safe_id(request_id, "fork request id")
         parent_session_id = _safe_id(parent_session_id, "parent session id")
@@ -251,6 +351,14 @@ class ClaudeForkJournal:
             "cwd": cwd,
         }
         control_snapshot = dict(controls or {})
+        # Validate before touching the durable journal.  Direct callers are not
+        # required to construct their snapshot through ClaudeControlStore, and
+        # persisting a malformed intent would make the whole journal unreadable
+        # after the next wrapper restart.
+        try:
+            self._validate_controls(control_snapshot)
+        except ValueError as exc:
+            raise ClaudeForkJournalError(str(exc)) from exc
         with self._lock:
             existing = self.entries.get(request_id)
             if existing is not None:
@@ -554,12 +662,25 @@ class ClaudeForkJournal:
             raise ClaudeForkJournalError("canonical fork intent is missing")
         return canonical_id, canonical
 
-    def _persist(self, entries: OrderedDict[str, dict[str, Any]]) -> None:
+    def _persist(
+        self,
+        entries: OrderedDict[str, dict[str, Any]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         tmp = self.path.with_suffix(f".{os.getpid()}.{uuid4().hex}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
-            payload = json.dumps(entries, separators=(",", ":")).encode("utf-8")
+            serializable = OrderedDict(entries)
+            serializable[_PROFILE_META_KEY] = {
+                "revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+            }
+            payload = json.dumps(
+                serializable, separators=(",", ":")).encode("utf-8")
             if len(payload) > _MAX_FILE_BYTES:
                 raise ValueError("Claude fork journal exceeds size limit")
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -667,6 +788,7 @@ def find_claude_fork(
     cwd: str,
     *,
     max_sessions: int = 1000,
+    config_dir: str | os.PathLike[str] | None = None,
 ) -> Optional[dict[str, str]]:
     """Find one marker-titled child and verify its raw fork boundary.
 
@@ -682,7 +804,15 @@ def find_claude_fork(
             or not 1 <= max_sessions <= _MAX_SESSIONS):
         raise ClaudeForkJournalError("invalid Claude fork scan bound")
     try:
-        sessions = list_sessions(limit=max_sessions)
+        sessions = (
+            list_sessions(limit=max_sessions)
+            if config_dir is None
+            else claude_catalog.list_sessions(
+                config_dir,
+                directory=cwd,
+                limit=max_sessions,
+            )
+        )
     except Exception as exc:
         raise ClaudeForkJournalError(
             "Claude session list is unavailable during fork recovery") from exc
@@ -701,7 +831,12 @@ def find_claude_fork(
     if info_cwd is not None and _canonical_cwd(info_cwd) != cwd:
         return None
     try:
-        located = _find_session_file_with_dir(session_id, cwd)
+        if config_dir is None:
+            located = _find_session_file_with_dir(session_id, cwd)
+        else:
+            path = claude_catalog.find_session_file(
+                config_dir, session_id, directory=cwd)
+            located = (path, path.parent) if path is not None else None
     except Exception as exc:
         raise ClaudeForkJournalError(
             "Claude fork transcript lookup failed") from exc

@@ -4,6 +4,97 @@
 
 ## 未发布
 
+- 修复主目录页面发现（protocol v55）：明确引用的 HTML，以及经核验由当前用户
+  运行的 Python 静态服务器链接，无需逐项目登记即可成为私有的会话预览。保留手动
+  发布、云端链接、不跟随符号链接的文件检查和独立二进制通道；不会扫描主目录，
+  也不会把自动发现的页面加入全局目录。支持本地 Three.js 扩展所用的 import map
+  精确匹配与最长前缀匹配。
+- 新增会话级页面关联（protocol v54），由主会话所属的 Wrapper 持久保存。根据
+  已登记的源资源发布核验明确引用或写入的 HTML，在过程详情之外提供紧凑的
+  “查看页面”入口；全局目录作为需要主动打开的辅助关联选择器。云端链接保持原生
+  行为，保留资源来源设备身份，不扩大可访问路径范围。
+- 新增已登记静态资源的远程 Viewer 预览（protocol v53）：默认使用不透明来源的
+  Bridge iframe，复用 HTTPS 或明确允许的 HTTP/IP 来源，无需额外 DNS/TLS；
+  可选 Isolated 模式为每个预览保留独立来源。资源在所属设备上明确登记，通过独立、
+  按需拉取的二进制通道传输，支持桌面侧栏和移动端全屏查看。目录穿越、符号链接和
+  未登记资源均拒绝访问。不引入浏览器引擎、模型调用或任意局域网 HTTP 代理。
+  详见 `docs/remote-viewer.md`。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v52。Codex 原生异步提问的
+  有界结构化元数据会保留在实时事件和历史中，显示为不阻塞任务的内联表单。回答复用
+  会话作用域内的 query/steer 发件箱，不伪装成审批，也不把运行中的回合标成完成。
+  旧版 Codex 历史投影会重新构建。
+- BTW 面板的打开状态按设备、工作空间、引擎和主会话隔离，切换会话时不再留下
+  无关的空面板；后台侧聊继续保留。旧的无作用域显示开关不再恢复，但不会删除任何
+  侧聊。支持安全的 Markdown details/summary 折叠内容，并修复 Mac 原生拖选滚动
+  在延迟布局更新时被拉回的问题。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v51。`/btw` 现在是常驻
+  侧边对话工作区：快捷键只收起面板而不销毁会话，每条主会话可同时保留多个可单独
+  关闭的侧聊；经 Relay 认证的 owner 权威目录与有界 ring replay 会在刷新、
+  重连以及同一账号的其他标签页或设备上恢复这些侧聊；页面级连接 ID 保证
+  复制出的标签页互不顶替。Codex 侧聊也会走 Codex 展示路径，隐藏成功的
+  hook 管线事件，仅保留需要处理的失败。新侧聊默认使用 `xhigh` 思考强度
+  （按所选模型能力自动夹取）；移动端输入法打开时，紧凑 Goal/计划条会临时让出
+  输入空间，并在输入法关闭后原样恢复。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v49，并将实验性的 Codex
+  托管浏览器 / Computer Use 完整拆到独立功能分支。Claude runtime 主线不再携带
+  Playwright、浏览器控制帧、动态浏览器工具和 `/browser` UI；图片、PDF、GIF、
+  SVG、Markdown 与 HTML artifact 预览继续保留。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v48。Codex ChatGPT
+  账号现在可在现有脱敏状态界面查看获赠的额度重置券，并通过官方 app-server
+  接口使用。兑换只允许在空闲会话进行，必须二次确认，结果仅回给请求端；可靠命令
+  ID 同时作为原生幂等键。付费 credits 余额和消费控制仍不会离开本机。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v47。Remote 托管的 Claude
+  会话默认不再覆盖自动压缩窗口，由 Claude Code 根据所选模型、账号、网关和原生
+  设置决定；v3 控制记录中由 cc-remote 短期强制写入的 500K 默认会迁回原生行为。
+  显式降低窗口时仍会先执行原生压缩并确认 compact boundary，再用新阈值重连；
+  desired/applied 状态会跨重启和 fork 持久化，不会提前套用更小窗口。延迟到达的 SDK
+  标题元数据不再触发伪外部重载；真正需要重载 transcript 时也会保留已选长上下文
+  模型。cc-remote 不再拦截或改写 Claude 原生的图片/PDF `Read` 工具；模型上下文
+  限制、媒体处理和自动压缩全部交还 Claude Code。
+- Codex Work 的新建与已有会话现在都可选择 Fast 服务档位，同时保持 Claude Work
+  使用引擎中立的命令面板。
+- 经过验证的 Claude Agent SDK 固定版本升级到 `0.2.151`（内置 Claude Code
+  `2.1.258`）；内置 Fable 5 与 Mythos 5 模型卡替换为官方
+  `claude-fable-5-1` 和 `claude-mythos-5-1`。托管 Code 会话通过 Claude Code 原生的
+  `[1m]` 上下文标记选择它们（路由到 Provider 前会移除标记）；旧会话中未带后缀的
+  内置模型别名会保留原系列/版本并规范为该标记，其他真实记录的模型身份保持不变。
+  Wrapper 现在会拒绝低于 `2.1.258` 的日常 Claude Code，不再在缺失本集成依赖的
+  原生运行控制时静默启动。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v44，并新增 Claude 多账号
+  Profile。每个用户自定义 Profile 独占一个明确的 `CLAUDE_CONFIG_DIR`；Code、Work、
+  定时任务、模型、Skills、扩展、历史、外部进程归属和 fork 都保持账号绑定。空配置
+  继续沿用原来的单账号 ID 和界面。Profile 拓扑按配置目录真实路径迁移本地归属，
+  遇到歧义会 fail-closed，并与 Codex Profile 一样纳入可回滚的 Work 发布事务。
+  Claude 的后台任务全量状态现在会在每次客户端 Hello 时恢复原生风格的 Bash/Agent
+  监视区，同时不会把空闲会话重新标成运行中；任务完成后的续答保留真实时间分界，
+  transcript 中真实的 compact boundary 也会复用现有“压缩上下文”过程标签。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v42。Claude 与 Codex 的
+  待回答问题现在是会话权威状态，每次客户端 Hello 都会独立于 replay ring 恢复；
+  超长活动回合即使淘汰开头标记，也会保留压缩后的 live 后缀，并只自动安装一页
+  有界 canonical detail，更早过程继续通过现有分页显式加载；中断边界之后也不会
+  发布排队中的旧问题。Claude 冷恢复时晚到的内部任务通知不再推进已完成答案的
+  终态时钟，受影响的服务端与浏览器投影会一次性重建。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v41。Claude 上下文的自动
+  读取不再发起可能阻塞的原生控制请求；用户显式执行 `/context` 时会优先读取精确
+  明细，若可选控制面超时则保留并明确标注最近一次缓存或最近一轮 token 总量。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v40。Codex 重型回合详情
+  的每个分页 cursor 现在都绑定到不可变、源文件隔离的快照；即使数百 MiB 的
+  rollout 仍在持续追加，下一页也不会失效或被静默替换成另一段内容。若这个有界
+  快照之后被淘汰，Web 会保留已经展开的内容并只执行一次最新页重置，不会反复
+  请求旧 cursor、重复合并行或改变用户的阅读位置。
+- Codex 共享 daemon 被意外替换时现在会按“不完整控制边界”处理：只重连一次，
+  不重放 prompt，也不伪造回合终态；替换后的 resume 返回空思考强度时，仅在原生
+  thread、模型与工作目录均未变化的前提下保留此前明确选择的强度。
+- Claude Agent SDK 升级到 `0.2.142`；wrapper 继续固定到这个经过验证的精确
+  patch 版本，并仍然启动用户配置的 Claude Code 可执行文件。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v39。Claude 子代理详情、
+  脱离父回合的后台过程归属、分页回合详情、脱敏后的 Claude 额度事件及会话级自动
+  压缩控制现在具有明确的兼容边界。Code、Work、BTW、新会话与 fork 可选择跟随
+  Claude、自动模式或 `100K–1M` token 阈值；忙碌时的修改会等待可确认的回合终态。
+  Codex steer 归属冲突也不会再把空闲会话的旧火花重新点亮。
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v36。会话摘要现在会区分
+  “确定有可展示过程”“确定为直接回复”和“原生摘要尚不能确定”；截断正文使用独立
+  的详情入口，Codex 过程计时也改从首个真实可展示事件开始，不再继承用户消息时间。
 - 新增 Relay 的官方容器化部署：`deploy/Dockerfile` 分阶段构建——Node 阶段从源码
   编译 `web/dist`，Python 阶段以非 root 的 `ccremote` 用户按哈希锁安装依赖；附
   `docker-compose.yml` 与 Docker 版 `env.relay.docker.example`。compose 只把端口

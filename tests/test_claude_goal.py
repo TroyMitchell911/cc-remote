@@ -82,6 +82,40 @@ def test_transcript_goal_status_recovers_progress_and_clear(tmp_path, monkeypatc
     assert read_claude_goal("session-1", now=1_783_814_410) == (True, None)
 
 
+def test_profile_sdk_goal_refresh_reads_only_its_config_dir(
+    tmp_path, monkeypatch,
+):
+    session_id = "11111111-1111-4111-8111-111111111111"
+    transcript = (
+        tmp_path / "company" / "projects" / "-repo"
+        / f"{session_id}.jsonl"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps(_record(
+        "attachment",
+        timestamp="2026-07-12T00:00:00Z",
+        attachment={
+            "type": "goal_status",
+            "met": False,
+            "sentinel": True,
+            "condition": "company goal",
+        },
+    )) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        goal_module,
+        "transcript_path",
+        lambda _sid: (_ for _ in ()).throw(
+            AssertionError("ambient Claude catalog must not be read")),
+    )
+
+    handle = SdkHandle(
+        SimpleNamespace(), claude_config_dir=str(tmp_path / "company"))
+    goal = asyncio.run(handle.refresh_goal(session_id))
+
+    assert goal["threadId"] == session_id
+    assert goal["objective"] == "company goal"
+
+
 def test_raw_active_goal_schema_maps_to_common_contract():
     message = SystemMessage(subtype="active_goal", data={
         "type": "active_goal",
@@ -165,18 +199,20 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
         handle = SdkHandle(SimpleNamespace())
 
         async def context_usage():
-            return {"totalTokens": 123}
+            raise AssertionError(
+                "Goal creation must not issue a native Context RPC")
 
         handle.get_context_usage = context_usage
+        handle._record_context_usage({"totalTokens": 123})
         ctx.sdk = handle
         machine.sessions[ctx.key] = ctx
         queries = []
 
-        async def handle_query(query):
+        async def handle_query(_ctx, query):
             queries.append(query)
             return None
 
-        machine._handle_query = handle_query
+        machine._handle_immediate_query = handle_query
         result = await machine._handle_set_goal(SimpleNamespace(
             sid=ctx.key, objective="finish tests", status="active",
             token_budget=None,
@@ -201,5 +237,31 @@ def test_machine_routes_claude_goal_commands_through_normal_turn():
                   if isinstance(message, GoalState)]
         assert states[-2].goal.objective == "finish tests"
         assert states[-1].goal is None
+
+    asyncio.run(run())
+
+
+def test_clear_goal_preserves_state_during_autonomous_claude_followup():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-goal-followup", "claude-goal-followup")
+        ctx.engine = "claude"
+        handle = SdkHandle(SimpleNamespace())
+        handle.goal = make_claude_goal(
+            ctx.session_id, "keep this goal", now=100)
+        handle.goal_session_id = ctx.session_id
+        ctx.sdk = handle
+        ctx.goal_visible = True
+        ctx.claude_background_followup_pending = True
+        machine.sessions[ctx.key] = ctx
+
+        result = await machine._handle_clear_goal(SimpleNamespace(sid=ctx.key))
+
+        assert isinstance(result, Error)
+        assert result.code == "busy"
+        assert handle.goal is not None
+        assert handle.goal["objective"] == "keep this goal"
+        assert ctx.goal_visible is True
+        assert transport.sent[-1] is result
 
     asyncio.run(run())

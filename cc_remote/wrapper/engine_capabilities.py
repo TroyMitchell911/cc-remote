@@ -22,7 +22,10 @@ from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
 from cc_remote.claude_paths import claude_config_dir
-from cc_remote.wrapper.child_env import sanitized_child_env
+from cc_remote.wrapper.child_env import (
+    claude_profile_process_env,
+    sanitized_child_env,
+)
 from cc_remote.wrapper.claude_runtime import resolve_claude_cli
 from cc_remote.wrapper.codex_rpc import (
     CodexRpcOutcomeUnknown,
@@ -77,10 +80,20 @@ def _codex_config_home(
     return (Path.home() / ".codex").resolve(strict=False)
 
 
+def _claude_config_home(
+    config_root: str | os.PathLike[str] | None = None,
+) -> Path:
+    return (
+        Path(config_root).resolve(strict=False)
+        if config_root is not None else claude_config_dir()
+    )
+
+
 def _skill_roots(
     engine: str,
     cwd: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, tuple[Path, ...]]:
     project = Path(cwd)
     if engine == "codex":
@@ -93,7 +106,7 @@ def _skill_roots(
             ),
         }
     return {
-        "user": (claude_config_dir() / "skills",),
+        "user": (_claude_config_home(claude_config_root) / "skills",),
         "project": (project / ".claude" / "skills",),
     }
 
@@ -103,10 +116,11 @@ def _skill_containment_base(
     scope: str,
     cwd: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> Path:
     if scope == "user":
         return (
-            claude_config_dir()
+            _claude_config_home(claude_config_root)
             if engine == "claude"
             else _codex_config_home(codex_home)
         )
@@ -118,13 +132,16 @@ def _skill_scope(
     engine: str,
     cwd: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> str | None:
     resolved = path.resolve(strict=False)
     for scope, roots in _skill_roots(
         engine, cwd, codex_home=codex_home,
+        claude_config_root=claude_config_root,
     ).items():
         base = _skill_containment_base(
             engine, scope, cwd, codex_home=codex_home,
+            claude_config_root=claude_config_root,
         ).resolve(strict=False)
         for root in roots:
             resolved_root = root.resolve(strict=False)
@@ -382,12 +399,18 @@ def _manifest_metadata(path: Path) -> tuple[str | None, str | None]:
     )
 
 
-def _claude_skills(cwd: str) -> list[dict]:
+def _claude_skills(
+    cwd: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+) -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
-    for scope, roots in _skill_roots("claude", cwd).items():
+    for scope, roots in _skill_roots(
+        "claude", cwd, claude_config_root=claude_config_root,
+    ).items():
         base = _skill_containment_base(
-            "claude", scope, cwd
+            "claude", scope, cwd,
+            claude_config_root=claude_config_root,
         ).resolve(strict=False)
         for root in roots:
             if (root.is_symlink()
@@ -416,18 +439,29 @@ def _claude_skills(cwd: str) -> list[dict]:
     return items
 
 
-def _claude_settings_files(cwd: str) -> tuple[tuple[Path, str], ...]:
+def _claude_settings_files(
+    cwd: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
+) -> tuple[tuple[Path, str], ...]:
     project = Path(cwd) / ".claude"
-    return (
-        (claude_config_dir() / "settings.json", "user"),
+    files = (
+        (_claude_config_home(claude_config_root) / "settings.json", "user"),
         (project / "settings.json", "project"),
         (project / "settings.local.json", "project-local"),
     )
+    return files[:1] if isolate_account_env else files
 
 
-def _settings_path_safe(path: Path, cwd: str, scope: str) -> bool:
+def _settings_path_safe(
+    path: Path,
+    cwd: str,
+    scope: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+) -> bool:
     base = (
-        claude_config_dir() if scope == "user" else Path(cwd)
+        _claude_config_home(claude_config_root)
+        if scope == "user" else Path(cwd)
     ).resolve(strict=False)
     try:
         return (not path.parent.is_symlink()
@@ -455,10 +489,17 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 def _claude_hook_rows(
     cwd: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> list[tuple[dict[str, Any], Path, str, str, int, int, str | None]]:
     rows: list[tuple[dict[str, Any], Path, str, str, int, int, str | None]] = []
-    for path, scope in _claude_settings_files(cwd):
-        if not _settings_path_safe(path, cwd, scope):
+    for path, scope in _claude_settings_files(
+        cwd,
+        claude_config_root,
+        isolate_account_env,
+    ):
+        if not _settings_path_safe(
+            path, cwd, scope, claude_config_root):
             continue
         try:
             settings = _read_json_object(path)
@@ -486,9 +527,15 @@ def _claude_hook_rows(
     return rows
 
 
-def _claude_hooks(cwd: str) -> list[dict]:
+def _claude_hooks(
+    cwd: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
+) -> list[dict]:
     items: list[dict] = []
-    for handler, path, scope, event, group_index, hook_index, matcher in _claude_hook_rows(cwd):
+    for handler, path, scope, event, group_index, hook_index, matcher in (
+        _claude_hook_rows(cwd, claude_config_root, isolate_account_env)
+    ):
         handler_type = _text(handler.get("type"), 128) or "command"
         command = _text(handler.get("command"), 16 * 1024) or ""
         hook_id = _opaque_id(
@@ -507,11 +554,25 @@ def _claude_hooks(cwd: str) -> list[dict]:
     return items[:_MAX_ITEMS]
 
 
-async def _claude_plugins(binary: str) -> list[dict]:
+async def _claude_plugins(
+    binary: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
+) -> list[dict]:
+    source_args = (
+        ("--setting-sources=user",) if isolate_account_env else ()
+    )
     proc = await asyncio.create_subprocess_exec(
-        binary, "plugin", "list", "--json",
+        binary, *source_args, "plugin", "list", "--json",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        env=sanitized_child_env(),
+        env=(
+            sanitized_child_env()
+            if claude_config_root is None else
+            claude_profile_process_env(
+                str(claude_config_root),
+                isolate_account_env=isolate_account_env,
+            )
+        ),
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), _COMPONENT_TIMEOUT)
@@ -621,13 +682,27 @@ async def _manage_codex_plugin(
 
 
 async def _manage_claude_plugin(
-    plugin_id: str, action: str, binary: str
+    plugin_id: str,
+    action: str,
+    binary: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> None:
     verb = "install" if action == "install" else "uninstall"
+    source_args = (
+        ("--setting-sources=user",) if isolate_account_env else ()
+    )
     proc = await asyncio.create_subprocess_exec(
-        binary, "plugin", verb, plugin_id,
+        binary, *source_args, "plugin", verb, plugin_id,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        env=sanitized_child_env(),
+        env=(
+            sanitized_child_env()
+            if claude_config_root is None else
+            claude_profile_process_env(
+                str(claude_config_root),
+                isolate_account_env=isolate_account_env,
+            )
+        ),
     )
     try:
         await asyncio.wait_for(proc.wait(), 60.0)
@@ -644,13 +719,16 @@ def _local_skill_path(
     skill_id: str,
     cwd: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> Path:
     for scope, roots in _skill_roots(
         engine, cwd, codex_home=codex_home,
+        claude_config_root=claude_config_root,
     ).items():
         for root in roots:
             base = _skill_containment_base(
                 engine, scope, cwd, codex_home=codex_home,
+                claude_config_root=claude_config_root,
             ).resolve(strict=False)
             if root.is_symlink() or not _inside(root.resolve(strict=False), base):
                 continue
@@ -718,10 +796,16 @@ def _create_skill(
     description: str,
     instructions: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> None:
     if not _SKILL_NAME.fullmatch(name):
         raise ValueError("Skill 名称仅允许字母、数字、点、下划线和短横线")
-    roots = _skill_roots(engine, cwd, codex_home=codex_home)[scope]
+    roots = _skill_roots(
+        engine,
+        cwd,
+        codex_home=codex_home,
+        claude_config_root=claude_config_root,
+    )[scope]
     root = roots[0] if scope == "user" or engine != "codex" else roots[-1]
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
@@ -729,6 +813,7 @@ def _create_skill(
     root = root.resolve(strict=True)
     base = _skill_containment_base(
         engine, scope, cwd, codex_home=codex_home,
+        claude_config_root=claude_config_root,
     ).resolve(strict=True)
     if not _inside(root, base):
         raise ValueError("Skill 根目录不能指向用户或项目目录之外")
@@ -766,13 +851,25 @@ def _trash_skill(
     engine: str,
     cwd: str,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> None:
     if path.is_symlink() or not path.is_dir():
         raise ValueError("Skill 目录不安全")
-    scope = _skill_scope(path, engine, cwd, codex_home=codex_home)
+    scope = _skill_scope(
+        path,
+        engine,
+        cwd,
+        codex_home=codex_home,
+        claude_config_root=claude_config_root,
+    )
     if scope is None:
         raise ValueError("系统或管理员 Skill 不能删除")
-    roots = _skill_roots(engine, cwd, codex_home=codex_home)[scope]
+    roots = _skill_roots(
+        engine,
+        cwd,
+        codex_home=codex_home,
+        claude_config_root=claude_config_root,
+    )[scope]
     root = next((root.resolve(strict=False) for root in roots
                  if path.resolve(strict=True).parent == root.resolve(strict=False)), None)
     if root is None:
@@ -795,6 +892,7 @@ async def manage_engine_skill(
     instructions: str = "",
     scope: str = "user",
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改 Code 扩展")
@@ -806,7 +904,7 @@ async def manage_engine_skill(
             raise ValueError("创建 Skill 需要名称和说明")
         await asyncio.to_thread(
             _create_skill, engine, target, scope, name,
-            description, instructions, codex_home,
+            description, instructions, codex_home, claude_config_root,
         )
         return
     if not skill_id:
@@ -840,10 +938,20 @@ async def manage_engine_skill(
             raise ValueError("系统或管理员 Skill 不能删除")
     else:
         path = await asyncio.to_thread(
-            _local_skill_path, engine, skill_id, target, codex_home,
+            _local_skill_path,
+            engine,
+            skill_id,
+            target,
+            codex_home,
+            claude_config_root,
         )
     await asyncio.to_thread(
-        _trash_skill, path.resolve(strict=True), engine, target, codex_home,
+        _trash_skill,
+        path.resolve(strict=True),
+        engine,
+        target,
+        codex_home,
+        claude_config_root,
     )
 
 
@@ -891,9 +999,14 @@ def _atomic_update_json(path: Path, mutate) -> None:
         os.close(lock_fd)
 
 
-def _claude_hook_path(cwd: str, scope: str) -> Path:
+def _claude_hook_path(
+    cwd: str,
+    scope: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+) -> Path:
     base = (
-        claude_config_dir() if scope == "user" else Path(cwd)
+        _claude_config_home(claude_config_root)
+        if scope == "user" else Path(cwd)
     ).resolve(strict=False)
     directory = base if scope == "user" else base / ".claude"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -903,13 +1016,19 @@ def _claude_hook_path(cwd: str, scope: str) -> Path:
 
 
 def _create_claude_hook(
-    cwd: str, scope: str, event: str, matcher: str, command: str, timeout: int,
+    cwd: str,
+    scope: str,
+    event: str,
+    matcher: str,
+    command: str,
+    timeout: int,
+    claude_config_root: str | os.PathLike[str] | None = None,
 ) -> None:
     if event not in _CLAUDE_HOOK_EVENTS:
         raise ValueError("不支持的 Claude Hook 事件")
     if not command.strip():
         raise ValueError("Hook 命令不能为空")
-    path = _claude_hook_path(cwd, scope)
+    path = _claude_hook_path(cwd, scope, claude_config_root)
 
     def mutate(settings: dict[str, Any]) -> dict[str, Any]:
         hooks = settings.setdefault("hooks", {})
@@ -930,9 +1049,18 @@ def _create_claude_hook(
     _atomic_update_json(path, mutate)
 
 
-def _remove_claude_hook(cwd: str, hook_id: str) -> None:
+def _remove_claude_hook(
+    cwd: str,
+    hook_id: str,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
+) -> None:
     match = None
-    for row in _claude_hook_rows(cwd):
+    for row in _claude_hook_rows(
+        cwd,
+        claude_config_root,
+        isolate_account_env,
+    ):
         handler, path, _scope, event, group_index, hook_index, _matcher = row
         command = _text(handler.get("command"), 16 * 1024) or ""
         candidate = _opaque_id(
@@ -986,6 +1114,8 @@ async def manage_engine_hook(
     command: str = "",
     timeout: int = 60,
     scope: str = "user",
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_claude_account_env: bool = False,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改 Code 扩展")
@@ -997,13 +1127,28 @@ async def manage_engine_hook(
     if action == "create":
         if not event:
             raise ValueError("缺少 Hook 事件")
+        if isolate_claude_account_env and scope != "user":
+            raise ValueError("显式 Claude 账号只加载账号级 Hook")
         await asyncio.to_thread(
-            _create_claude_hook, target, scope, event, matcher, command, timeout,
+            _create_claude_hook,
+            target,
+            scope,
+            event,
+            matcher,
+            command,
+            timeout,
+            claude_config_root,
         )
         return
     if action != "remove" or not hook_id:
         raise ValueError("缺少 Hook 标识")
-    await asyncio.to_thread(_remove_claude_hook, target, hook_id)
+    await asyncio.to_thread(
+        _remove_claude_hook,
+        target,
+        hook_id,
+        claude_config_root,
+        isolate_claude_account_env,
+    )
 
 
 async def manage_engine_plugin(
@@ -1015,6 +1160,8 @@ async def manage_engine_plugin(
     space: str = "code",
     claude_bin: str = "",
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_claude_account_env: bool = False,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改引擎插件")
@@ -1027,7 +1174,13 @@ async def manage_engine_plugin(
         )
     else:
         binary, _ = resolve_claude_cli(claude_bin)
-        await _manage_claude_plugin(plugin_id, action, binary)
+        await _manage_claude_plugin(
+            plugin_id,
+            action,
+            binary,
+            claude_config_root,
+            isolate_claude_account_env,
+        )
 
 
 async def claude_capabilities(
@@ -1036,22 +1189,45 @@ async def claude_capabilities(
     claude_bin: str = "",
     *,
     skills_only: bool = False,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_account_env: bool = False,
 ) -> tuple[list[dict], list[str], list[str]]:
     if space == "work":
         return [], [], [
             "Claude Work 为防止 Code 配置泄漏，明确禁用了用户/项目技能、插件、Hook 与 MCP。"
         ]
-    items = await asyncio.to_thread(_claude_skills, cwd)
+    skills_args = (
+        (cwd,)
+        if claude_config_root is None
+        else (cwd, claude_config_root)
+    )
+    items = await asyncio.to_thread(_claude_skills, *skills_args)
     if skills_only:
         return items[:2000], [], []
-    items.extend(await asyncio.to_thread(_claude_hooks, cwd))
+    hooks_args = (
+        (cwd,)
+        if claude_config_root is None
+        else (cwd, claude_config_root, isolate_account_env)
+    )
+    items.extend(await asyncio.to_thread(_claude_hooks, *hooks_args))
     errors: list[str] = []
     try:
         binary, _ = resolve_claude_cli(claude_bin)
-        items.extend(await _claude_plugins(binary))
+        if claude_config_root is None:
+            items.extend(await _claude_plugins(binary))
+        else:
+            items.extend(await _claude_plugins(
+                binary,
+                claude_config_root,
+                isolate_account_env,
+            ))
     except Exception:
         errors.append("plugins: claude CLI request failed")
-    return items[:2000], errors, []
+    notes = (
+        ["显式 Claude 账号只加载所选账号的 settings；项目说明与技能仍由 Claude 原生发现。"]
+        if isolate_account_env else []
+    )
+    return items[:2000], errors, notes
 
 
 async def engine_capabilities(
@@ -1062,6 +1238,8 @@ async def engine_capabilities(
     *,
     skills_only: bool = False,
     codex_home: str | os.PathLike[str] | None = None,
+    claude_config_root: str | os.PathLike[str] | None = None,
+    isolate_claude_account_env: bool = False,
 ):
     target = os.path.realpath(os.path.expanduser(cwd))
     if not os.path.isdir(target):
@@ -1071,5 +1249,10 @@ async def engine_capabilities(
             target, space, skills_only=skills_only, codex_home=codex_home,
         )
     return await claude_capabilities(
-        target, space, claude_bin, skills_only=skills_only,
+        target,
+        space,
+        claude_bin,
+        skills_only=skills_only,
+        claude_config_root=claude_config_root,
+        isolate_account_env=isolate_claude_account_env,
     )

@@ -147,7 +147,8 @@ class SessionPresentationStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "session-presentation.json"
         self._lock = threading.RLock()
-        self._sessions, self._profile_revision = self._load()
+        self._sessions, self._profile_revisions = self._load()
+        self._profile_revision = self._profile_revisions["codex"]
 
     def get(
         self, engine: str, session_id: str,
@@ -422,7 +423,7 @@ class SessionPresentationStore:
             raise SessionPresentationStoreError(
                 "invalid Codex profile revision")
         with self._lock:
-            if self._profile_revision >= profile_revision:
+            if self._profile_revisions["codex"] >= profile_revision:
                 return 0
             updated: OrderedDict[str, SessionPresentationSnapshot] = (
                 OrderedDict()
@@ -445,15 +446,66 @@ class SessionPresentationStore:
                         "presentation profile migration collides")
                 updated[target] = snapshot
                 migrated += target != key
+            revisions = dict(self._profile_revisions)
+            revisions["codex"] = profile_revision
             self._persist_bounded(
-                updated, profile_revision=profile_revision)
+                updated,
+                profile_revision=profile_revision,
+                profile_revisions=revisions,
+            )
             self._sessions = updated
             self._profile_revision = profile_revision
+            self._profile_revisions = revisions
+            return migrated
+
+    def migrate_claude_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Translate only explicitly Claude-owned presentation scopes."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise SessionPresentationStoreError(
+                "invalid Claude profile revision")
+        with self._lock:
+            if self._profile_revisions["claude"] >= profile_revision:
+                return 0
+            updated: OrderedDict[str, SessionPresentationSnapshot] = (
+                OrderedDict()
+            )
+            migrated = 0
+            for key, snapshot in self._sessions.items():
+                engine, session_id = _split_persisted_scope_key(key)
+                target_id = (
+                    str(_wire_id(transform(session_id)))
+                    if engine == "claude" else session_id
+                )
+                target = (
+                    _legacy_scope_key(target_id)
+                    if engine == _LEGACY_ENGINE
+                    else _scope_key(engine, target_id)
+                )
+                existing = updated.get(target)
+                if existing is not None and existing != snapshot:
+                    raise SessionPresentationStoreError(
+                        "presentation profile migration collides")
+                updated[target] = snapshot
+                migrated += target != key
+            revisions = dict(self._profile_revisions)
+            revisions["claude"] = profile_revision
+            self._persist_bounded(updated, profile_revisions=revisions)
+            self._sessions = updated
+            self._profile_revisions = revisions
             return migrated
 
     def _load(self) -> tuple[
         OrderedDict[str, SessionPresentationSnapshot],
-        int,
+        dict[str, int],
     ]:
         try:
             info = self.path.lstat()
@@ -468,11 +520,15 @@ class SessionPresentationStore:
             if not isinstance(raw, dict) or set(raw) not in (
                 {"version", "sessions"},
                 {"version", "profile_revision", "sessions"},
+                {
+                    "version", "profile_revision", "profile_revisions",
+                    "sessions",
+                },
             ):
                 raise ValueError(
                     "session presentation store has an invalid envelope"
                 )
-            if raw.get("version") not in {1, 2, 3} or not isinstance(
+            if raw.get("version") not in {1, 2, 3, 4} or not isinstance(
                 raw.get("sessions"), dict
             ):
                 raise ValueError(
@@ -487,6 +543,28 @@ class SessionPresentationStore:
             ):
                 raise ValueError(
                     "session presentation profile revision is invalid")
+            profile_revisions = raw.get("profile_revisions")
+            if profile_revisions is None:
+                profile_revisions = {
+                    "claude": 0,
+                    "codex": profile_revision,
+                }
+            if (
+                not isinstance(profile_revisions, dict)
+                or set(profile_revisions) != {"claude", "codex"}
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in profile_revisions.values()
+                )
+            ):
+                raise ValueError(
+                    "session presentation profile revisions are invalid")
+            if profile_revisions["codex"] != profile_revision:
+                raise ValueError(
+                    "session presentation Codex profile revisions are inconsistent"
+                )
             loaded: OrderedDict[
                 str, SessionPresentationSnapshot
             ] = OrderedDict()
@@ -512,9 +590,9 @@ class SessionPresentationStore:
                     loaded[session_id] = snapshot
             if len(loaded) > _MAX_ENTRIES:
                 raise ValueError("session presentation store has too many entries")
-            return loaded, profile_revision
+            return loaded, dict(profile_revisions)
         except FileNotFoundError:
-            return OrderedDict(), 0
+            return OrderedDict(), {"claude": 0, "codex": 0}
         except Exception as exc:
             raise SessionPresentationStoreError(
                 "session presentation store is unreadable"
@@ -525,11 +603,13 @@ class SessionPresentationStore:
         sessions: OrderedDict[str, SessionPresentationSnapshot],
         *,
         profile_revision: int,
+        profile_revisions: dict[str, int],
     ) -> bytes:
         return json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "profile_revision": profile_revision,
+                "profile_revisions": profile_revisions,
                 "sessions": {
                     session_id: snapshot.as_dict()
                     for session_id, snapshot in sessions.items()
@@ -544,17 +624,29 @@ class SessionPresentationStore:
         sessions: OrderedDict[str, SessionPresentationSnapshot],
         *,
         profile_revision: int | None = None,
+        profile_revisions: dict[str, int] | None = None,
     ) -> None:
         bounded = OrderedDict(sessions)
         revision = (
             self._profile_revision
             if profile_revision is None else profile_revision
         )
-        payload = self._payload(bounded, profile_revision=revision)
+        revisions = (
+            self._profile_revisions
+            if profile_revisions is None else profile_revisions
+        )
+        payload = self._payload(
+            bounded,
+            profile_revision=revision,
+            profile_revisions=revisions,
+        )
         while len(payload) > _MAX_FILE_BYTES and len(bounded) > 1:
             bounded.popitem(last=False)
             payload = self._payload(
-                bounded, profile_revision=revision)
+                bounded,
+                profile_revision=revision,
+                profile_revisions=revisions,
+            )
         if len(payload) > _MAX_FILE_BYTES:
             raise SessionPresentationStoreError(
                 "session presentation store exceeds size limit"

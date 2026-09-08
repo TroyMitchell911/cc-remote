@@ -1,12 +1,15 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const NEW_CHAT_CONTROL_TESTS =
-  /new-chat controls|256-character profile id|Work multi-account controls/;
+  /new-chat controls|default permission picker|256-character profile id|Work multi-account controls/;
+const WEBKIT_VIEWER_TESTS = /remote Viewer/;
 const WEBKIT_LIVE_INTERACTION_TESTS =
-  /live append follows|returning to a background-grown live turn|iOS pointercancel releases process interactions|multi-line IME growth|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
+  /async question|side chat scope|right panel layout|live append follows|scrolling a live-dirty history window|returning to a background-grown live turn|iOS pointercancel releases process interactions|switching sessions clears retained desktop text selection|nested process disclosures|stationary press opens|dragging a process header|dragging nested process|multi-line IME growth|long paste|oversized edited paste|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =
-  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image|profile keycaps|profile session card edges/;
+  /generated image|external preview|Codex visualize output|Codex file citations|local Markdown file link|mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg|pdf|gif|invalid-gif)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|Markdown disclosures|real wide Robot|pending composer image|profile keycaps|profile session card (?:edges|manual unread)/;
 const WEBKIT_GOAL_PLAN_TESTS = /[Pp]lan|[Gg]oal/;
+const WEBKIT_SELECTION_TESTS =
+  /desktop (text selection|native selection|wheel scrolling)|extending a released native selection|late cached-newer page cannot evict an active text selection/;
 
 export default defineConfig({
   testDir: "./tests",
@@ -33,16 +36,33 @@ export default defineConfig({
       },
     },
     {
+      name: "webkit-desktop-selection",
+      grep: /desktop (text selection|native selection|wheel scrolling)/,
+      use: {
+        ...devices["Desktop Safari"],
+        viewport: { width: 900, height: 720 },
+      },
+    },
+    {
       name: "webkit",
       grepInvert: [
         NEW_CHAT_CONTROL_TESTS,
+        WEBKIT_VIEWER_TESTS,
         WEBKIT_LIVE_INTERACTION_TESTS,
         WEBKIT_RENDERING_TESTS,
         WEBKIT_GOAL_PLAN_TESTS,
+        WEBKIT_SELECTION_TESTS,
       ],
       use: {
         ...devices["iPhone 15"],
       },
+    },
+    {
+      // Viewer coverage must not push the general WebKit worker past its
+      // context-churn limit. Keep all selection assertions, in a fresh browser.
+      name: "webkit-selection",
+      grep: WEBKIT_SELECTION_TESTS,
+      use: { ...devices["iPhone 15"] },
     },
     {
       // Keep every serial WebKit browser lifecycle below its macOS context-churn
@@ -54,6 +74,13 @@ export default defineConfig({
       use: {
         ...devices["iPhone 15"],
       },
+    },
+    {
+      // Catalog cases add browser contexts, not live-chat coverage. Keep them
+      // isolated so existing interaction tests retain a fresh WebKit process.
+      name: "webkit-viewer",
+      grep: WEBKIT_VIEWER_TESTS,
+      use: { ...devices["iPhone 15"] },
     },
     {
       name: "webkit-live-interactions",

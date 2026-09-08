@@ -8,6 +8,7 @@ from typing import get_args
 
 from cc_remote.protocol import (
     AssistantChannel,
+    AutoCompactMode,
     CodexThreadStatus,
     CollaborationModeName,
     ControlMode,
@@ -31,7 +32,10 @@ from cc_remote.protocol import (
     PROTOCOL_VERSION,
     SessionInfo,
     StatusDailyUsageBucket,
+    StatusRateLimitResetCredit,
+    StatusRateLimitResetCredits,
     StatusUsage,
+    RateLimitResetOutcome,
     TurnNotificationContext,
 )
 
@@ -152,6 +156,8 @@ def test_nested_wire_models_keep_fields_and_requiredness():
         ("ThreadGoal", ThreadGoal),
         ("TurnNotificationContext", TurnNotificationContext),
         ("StatusDailyUsageBucket", StatusDailyUsageBucket),
+        ("StatusRateLimitResetCredit", StatusRateLimitResetCredit),
+        ("StatusRateLimitResetCredits", StatusRateLimitResetCredits),
         ("StatusUsage", StatusUsage),
     ):
         for field, definition in model.model_fields.items():
@@ -173,6 +179,7 @@ def test_literal_unions_match_python_protocol():
         "ProcessStatus": ProcessStatus,
         "ProcessAppendTarget": ProcessAppendTarget,
         "EffortLevel": EffortLevel,
+        "AutoCompactMode": AutoCompactMode,
         "PermissionMode": PermissionMode,
         "CollaborationModeName": CollaborationModeName,
         "ControlMode": ControlMode,
@@ -180,6 +187,7 @@ def test_literal_unions_match_python_protocol():
         "GoalStatus": GoalStatus,
         "NoticeSeverity": NoticeSeverity,
         "NoticeCategory": NoticeCategory,
+        "RateLimitResetOutcome": RateLimitResetOutcome,
         "CodexThreadStatus": CodexThreadStatus,
         "ServiceTier": SetServiceTier.model_fields["service_tier"].annotation,
     }

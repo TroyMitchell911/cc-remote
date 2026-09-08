@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
-import type { CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
+import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
 import { Icon, ClaudeMark } from "../icons";
 import {
@@ -8,6 +8,8 @@ import {
   visibleDirectorySessions,
 } from "../session-order";
 import {
+  canDeleteSidebarSession,
+  isSessionArchiveBlockedByState,
   isSessionMigrationBlockedByState,
   isWorktreeForkBlockedByState,
   sessionMenuCapabilities,
@@ -15,12 +17,17 @@ import {
 import { useImeSubmit } from "../use-ime-submit";
 import { codexProfilePresentation } from "../codex-profile-presentation";
 import { newWorkProfileForSidebarFilter } from "../work-profile-selection";
+import { manualUnreadKey } from "../manual-unread";
+import { useManualUnread } from "../use-manual-unread";
 
 interface Props {
   open: boolean;
   engine: Engine;
   space: Space;
   profileScopeKey: string;
+  machineId?: string;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   onSpaceChange: (space: Space) => void;
@@ -30,8 +37,8 @@ interface Props {
   liveStates?: Record<string, State>;
   completionBadges?: Record<string, CompletionBadgeKind>;
   activeSessionId: string | null;
-  onSelect: (id: string) => void;
-  onNew: (codexProfileId?: string) => void;
+  onSelect: (id: string) => void | boolean;
+  onNew: (profileId?: string) => void;
   onNewInDir: (cwd: string) => void;
   onClose: () => void;
   onRename: (id: string, title: string) => void;
@@ -65,16 +72,18 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 }
 
 export function SessionsSidebar({ open, engine, space,
-  profileScopeKey, codexProfiles = [], defaultCodexProfileId,
+  profileScopeKey, machineId, claudeProfiles = [], defaultClaudeProfileId,
+  codexProfiles = [], defaultCodexProfileId,
   onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
+  const manualUnread = useManualUnread();
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
   const [lifting, setLifting] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [codexProfileFilters, setCodexProfileFilters] =
+  const [profileFilters, setProfileFilters] =
     useState<Record<string, string>>({});
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
@@ -82,11 +91,13 @@ export function SessionsSidebar({ open, engine, space,
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
 
-  const showCodexProfileManagement =
-    engine === "codex" && codexProfiles.length > 1;
-  const codexProfileFilter = codexProfileFilters[profileScopeKey] ?? "all";
-  const setCodexProfileFilter = (profileId: string) => {
-    setCodexProfileFilters((current) => (
+  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = engine === "codex"
+    ? defaultCodexProfileId : defaultClaudeProfileId;
+  const showProfileManagement = accountProfiles.length > 1;
+  const profileFilter = profileFilters[profileScopeKey] ?? "all";
+  const setProfileFilter = (profileId: string) => {
+    setProfileFilters((current) => (
       current[profileScopeKey] === profileId
         ? current
         : { ...current, [profileScopeKey]: profileId }
@@ -94,24 +105,25 @@ export function SessionsSidebar({ open, engine, space,
   };
 
   const profilePresentationFor = (session: SessionInfo) =>
-    engine === "codex"
-      ? codexProfilePresentation(
-        codexProfiles,
-        defaultCodexProfileId,
-        session.codex_profile_id,
-      )
-      : null;
+    codexProfilePresentation(
+      accountProfiles,
+      defaultAccountProfileId,
+      engine === "codex"
+        ? session.codex_profile_id : session.claude_profile_id,
+    );
   const filter = q.toLowerCase();
   const matches = (s: SessionInfo) => {
     const profilePresentation = profilePresentationFor(s);
     return (
-      (!showCodexProfileManagement
-        || codexProfileFilter === "all"
-        || s.codex_profile_id === codexProfileFilter)
+      (!showProfileManagement
+        || profileFilter === "all"
+        || (engine === "codex"
+          ? s.codex_profile_id : s.claude_profile_id) === profileFilter)
       && (!filter
         || (s.summary || "").toLowerCase().includes(filter)
         || (s.first_prompt || "").toLowerCase().includes(filter)
         || (s.cwd || "").toLowerCase().includes(filter)
+        || (s.claude_profile_label || "").toLowerCase().includes(filter)
         || (s.codex_profile_label || "").toLowerCase().includes(filter)
         || (profilePresentation?.fullLabel ?? "").toLowerCase().includes(filter)
         || (s.native_session_id || s.session_id).toLowerCase().includes(filter))
@@ -177,20 +189,20 @@ export function SessionsSidebar({ open, engine, space,
   useEffect(() => { if (!open) { setMenuCardId(null); setLifting(false); } }, [open]);
 
   useEffect(() => {
-    if (!showCodexProfileManagement
-        || (codexProfileFilter !== "all"
-          && !codexProfiles.some(
-            (profile) => profile.id === codexProfileFilter))) {
-      setCodexProfileFilters((current) => {
+    if (!showProfileManagement
+        || (profileFilter !== "all"
+          && !accountProfiles.some(
+            (profile) => profile.id === profileFilter))) {
+      setProfileFilters((current) => {
         if ((current[profileScopeKey] ?? "all") === "all") return current;
         return { ...current, [profileScopeKey]: "all" };
       });
     }
   }, [
-    codexProfileFilter,
-    codexProfiles,
+    accountProfiles,
+    profileFilter,
     profileScopeKey,
-    showCodexProfileManagement,
+    showProfileManagement,
   ]);
 
   // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
@@ -273,16 +285,22 @@ export function SessionsSidebar({ open, engine, space,
     }
     const onTitleClick = () => {
       if (lifting) { closeMenu(); return; }
-      onSelect(s.session_id);
+      if (onSelect(s.session_id) !== false && machineId) {
+        manualUnread.update({ machineId, engine: s.engine ?? engine, space: s.space ?? space }, s.session_id, false);
+      }
     };
     // Prefer live runtime state (resident session) over the list snapshot.
     const st = liveStates?.[s.session_id] ?? s.state;
-    const completion = completionBadges?.[s.session_id];
-    const completionLabel = completion === "btw" ? "BTW 完成"
+    const unreadScope = machineId ? { machineId, engine: s.engine ?? engine, space: s.space ?? space } : null;
+    const completion = unreadScope && manualUnread.marks[manualUnreadKey(unreadScope, s.session_id)]
+      ? "unread" : completionBadges?.[s.session_id];
+    const completionLabel = completion === "unread" ? "未读" : completion === "btw" ? "BTW 完成"
       : completion === "both" ? "2 项完成"
       : completion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
     const migrationBlocked = isSessionMigrationBlockedByState(st);
+    const archiveBlocked = !isArchived && engine === "codex"
+      && isSessionArchiveBlockedByState(st);
     const profilePresentation = profilePresentationFor(s);
     return (
       <div
@@ -296,8 +314,8 @@ export function SessionsSidebar({ open, engine, space,
         {profilePresentation && (
           <span
             className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
-            title={`Codex 账号：${profilePresentation.fullLabel}`}
-            aria-label={`Codex 账号：${profilePresentation.fullLabel}`}
+            title={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
+            aria-label={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
           >
             {profilePresentation.name}
           </span>
@@ -310,7 +328,7 @@ export function SessionsSidebar({ open, engine, space,
           {(st === "running" || st === "interrupting") && (
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
           )}
-          {completionLabel && st !== "running" && st !== "interrupting" && (
+          {completionLabel && (completion === "unread" || (st !== "running" && st !== "interrupting")) && (
             <span className="pill completed"><span className="sd" />{completionLabel}</span>
           )}
         </div>
@@ -335,6 +353,9 @@ export function SessionsSidebar({ open, engine, space,
             <button onClick={() => doPin(s)}>
               <Icon name="pin" size={15} />{s.pinned ? "取消置顶" : "置顶"}
             </button>
+            {unreadScope && <button onClick={() => {
+              manualUnread.update(unreadScope, s.session_id, true); setMenuCardId(null); setLifting(false);
+            }}><Icon name="message" size={15} />标记为未读</button>}
             {space === "code" && capabilities.forkWorktree && (
               <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
                 title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>
@@ -353,9 +374,13 @@ export function SessionsSidebar({ open, engine, space,
             {capabilities.archive && (isArchived ? (
               <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
             ) : (
-              <button onClick={() => doArchive(s, true)}><Icon name="archive" size={15} />归档</button>
+              <button onClick={() => doArchive(s, true)} disabled={archiveBlocked}
+                title={archiveBlocked ? "请停止当前任务并清空排队后再归档" : "归档会话"}>
+                <Icon name="archive" size={15} />归档
+              </button>
             ))}
-            {capabilities.delete && (
+            {capabilities.delete
+                && canDeleteSidebarSession(engine, space, isArchived) && (
               <button className="danger" onClick={() => doDelete(s)}>
                 <Icon name="trash" size={15} />{space === "work" ? "删除工作" : "删除会话"}
               </button>
@@ -445,19 +470,19 @@ export function SessionsSidebar({ open, engine, space,
               <Icon name="code" size={18} />Code
             </button>
           </div>
-          {showCodexProfileManagement && (
+          {showProfileManagement && (
             <div className="codex-profile-filter" role="group"
-              aria-label="筛选 Codex 账号">
-              <button className={codexProfileFilter === "all" ? "active" : ""}
-                onClick={() => setCodexProfileFilter("all")}>全部</button>
-              {codexProfiles.map((profile) => (
+              aria-label={`筛选 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
+              <button className={profileFilter === "all" ? "active" : ""}
+                onClick={() => setProfileFilter("all")}>全部</button>
+              {accountProfiles.map((profile) => (
                 (() => {
                   const presentation = codexProfilePresentation(
-                    codexProfiles, defaultCodexProfileId, profile.id);
+                    accountProfiles, defaultAccountProfileId, profile.id);
                   return (
                     <button key={profile.id}
-                      className={codexProfileFilter === profile.id ? "active" : ""}
-                      onClick={() => setCodexProfileFilter(profile.id)}
+                      className={profileFilter === profile.id ? "active" : ""}
+                      onClick={() => setProfileFilter(profile.id)}
                       title={profile.error ?? presentation?.fullLabel ?? profile.label}>
                       {presentation && (
                         <i className={`profile-tone tone-${presentation.tone}`} />
@@ -485,7 +510,7 @@ export function SessionsSidebar({ open, engine, space,
           <div className="s-foot">
             <button className="newbtn" onClick={() => onNew(
               newWorkProfileForSidebarFilter(
-                engine, space, codexProfileFilter,
+                engine, space, profileFilter,
               ),
             )}><Icon name="plus" size={19} />{space === "work" ? "新工作" : "新会话"}</button>
           </div>

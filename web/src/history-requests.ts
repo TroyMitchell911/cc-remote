@@ -62,6 +62,7 @@ interface PendingHistoryRequest extends HistoryRequestKey {
   connectionEpoch: number;
   startedAt: number;
   browseWaiters: HistoryBrowseRequestContext[];
+  causalKey?: string | null;
 }
 
 interface RetiredHistoryRequest {
@@ -69,6 +70,8 @@ interface RetiredHistoryRequest {
   before?: string | null;
   generation?: string | null;
   revision?: string | null;
+  /** Newest causal boundary still ambiguous with this retired request. */
+  causalKey?: string | null;
 }
 
 // RelayWs can retain this many reliable commands. Keep the same bounded number
@@ -81,6 +84,20 @@ const MAX_RETIRED_HISTORY_REQUESTS = 256;
 export interface HistoryRequestCompletion {
   matched: HistoryBrowseRequestContext[];
   stale: HistoryBrowseRequestContext[];
+  /** Present only when this response (or the last response in an ambiguous
+   * same-cursor group) proves that the named causal request completed. */
+  settledCausalKey?: string;
+}
+
+export interface HistoryRequestOptions {
+  /** The caller observed a causal boundary newer than any request already in
+   * flight (for example a durable completion receipt published after
+   * TurnEnd). Send a replacement instead of sharing the older snapshot. */
+  supersedePending?: boolean;
+  /** Durable boundary already known when this source snapshot was asked for.
+   * A repair may share an in-flight request carrying the same completion/idle
+   * boundary, but must replace one started before that boundary existed. */
+  causalKey?: string | null;
 }
 
 export interface CancelledHistoryBrowseRequest {
@@ -164,6 +181,7 @@ export class HistoryRequestCoordinator {
         before: pending.before,
         generation: pending.generation,
         revision: pending.revision,
+        causalKey: pending.causalKey,
       });
     }
     this.pending.clear();
@@ -180,11 +198,16 @@ export class HistoryRequestCoordinator {
     send: () => boolean,
     onCancelled: (cancelled: CancelledHistoryBrowseRequest[]) => void =
       () => undefined,
+    options: HistoryRequestOptions = {},
   ): boolean {
     const key = HistoryRequestCoordinator.key(request);
     const existing = this.pending.get(key);
     const now = this.now();
-    if (existing && existing.connectionEpoch === this.connectionEpoch
+    const pendingIncludesBoundary = !options.supersedePending
+      || (!!options.causalKey
+        && existing?.causalKey === options.causalKey);
+    if (pendingIncludesBoundary
+        && existing && existing.connectionEpoch === this.connectionEpoch
         && now - existing.startedAt < this.timeoutMs) {
       // A newly revealed destructive revision must issue a replacement even
       // when an ordinary focus read is already in flight.  The reverse is safe:
@@ -218,6 +241,7 @@ export class HistoryRequestCoordinator {
       connectionEpoch: this.connectionEpoch,
       startedAt: now,
       browseWaiters: request.browse ? [{ ...request.browse }] : [],
+      causalKey: options.causalKey,
     };
     // Outbox saturation/disconnection is a real rejection. Do not leave a
     // phantom pending entry which suppresses the user's next pagination
@@ -233,6 +257,7 @@ export class HistoryRequestCoordinator {
         before: existing.before,
         generation: existing.generation,
         revision: existing.revision,
+        causalKey: existing.causalKey,
       });
       this.boundRetired();
       if (cancelled.length > 0) onCancelled(cancelled);
@@ -249,15 +274,19 @@ export class HistoryRequestCoordinator {
   }): HistoryRequestCompletion {
     const matched: HistoryBrowseRequestContext[] = [];
     const stale: HistoryBrowseRequestContext[] = [];
+    let settledCausalKey: string | undefined;
+    const retiredMatches = (retired: RetiredHistoryRequest) => (
+      retired.sid === response.session_id
+      && (retired.before ?? "") === (response.before ?? "")
+      && (!retired.generation
+        || retired.generation === response.generation)
+      && (!retired.revision
+        || retired.revision === response.revision)
+    );
     let retiredMatch = -1;
     for (let index = this.retired.length - 1; index >= 0; index -= 1) {
       const retired = this.retired[index];
-      if (retired.sid !== response.session_id
-          || (retired.before ?? "") !== (response.before ?? "")
-          || (retired.generation
-            && retired.generation !== response.generation)
-          || (retired.revision
-            && retired.revision !== response.revision)) continue;
+      if (!retiredMatches(retired)) continue;
       retiredMatch = index;
       break;
     }
@@ -291,13 +320,28 @@ export class HistoryRequestCoordinator {
             ? retired.generation : undefined,
           revision: retired.revision === matchedActive.revision
             ? retired.revision : undefined,
+          causalKey: matchedActive.causalKey ?? retired.causalKey,
         };
       } else {
         // One response accounts for exactly one retired wire request. Preserve
         // duplicate tombstones so a second delayed response cannot consume a
         // newer same-cursor request later.
-        this.retired.splice(retiredMatch, 1);
+        const [retired] = this.retired.splice(retiredMatch, 1);
+        let remainingMatch = -1;
+        for (let index = this.retired.length - 1; index >= 0; index -= 1) {
+          if (!retiredMatches(this.retired[index])) continue;
+          remainingMatch = index;
+          break;
+        }
+        if (remainingMatch >= 0) {
+          const target = this.retired[remainingMatch];
+          target.causalKey = retired.causalKey ?? target.causalKey;
+        } else {
+          settledCausalKey = retired.causalKey ?? undefined;
+        }
       }
+    } else if (matchedActive?.causalKey) {
+      settledCausalKey = matchedActive.causalKey;
     }
     // Only an otherwise-unattributable response proves that the active browse
     // request itself crossed a revision/generation boundary. A response which
@@ -310,7 +354,13 @@ export class HistoryRequestCoordinator {
         this.pending.delete(key);
       }
     }
-    return { matched, stale };
+    return {
+      matched,
+      stale,
+      ...(settledCausalKey
+        ? { settledCausalKey }
+        : {}),
+    };
   }
 
   size(): number {
@@ -470,6 +520,31 @@ export class HistoryDetailRequestCoordinator {
       this.pending.delete(key);
       this.cancelTimer(pending.timer);
     }
+  }
+
+  cancelTurn(input: {
+    sid: string;
+    revision: string;
+    turnId: string;
+  }): HistoryDetailRequestContext[] {
+    const cancelled: HistoryDetailRequestContext[] = [];
+    for (const [key, pending] of this.pending) {
+      const retained = pending.contexts.filter((context) => {
+        const matches = context.sid === input.sid
+          && context.revision === input.revision
+          && context.turnId === input.turnId;
+        if (matches) cancelled.push({ ...context });
+        return !matches;
+      });
+      if (retained.length === pending.contexts.length) continue;
+      if (retained.length > 0) {
+        pending.contexts = retained;
+      } else {
+        this.pending.delete(key);
+        this.cancelTimer(pending.timer);
+      }
+    }
+    return cancelled;
   }
 
   clear(): HistoryDetailRequestContext[] {

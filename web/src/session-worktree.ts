@@ -1,4 +1,4 @@
-import type { SessionInfo, State } from "./protocol";
+import type { Engine, SessionInfo, Space, State } from "./protocol";
 
 export const WORKTREE_FORK_NAME_MAX = 80;
 
@@ -34,6 +34,7 @@ export interface ForkFocusLease {
   machineId: string;
   cwd: string;
   gitBranch?: string | null;
+  claudeProfileId?: string | null;
   codexProfileId?: string | null;
   refreshAt: number;
 }
@@ -60,7 +61,10 @@ export function forkFocusLeaseSession(
     engine: lease.engine,
     space: lease.space,
     forked_from_id: lease.parentSessionId,
-    codex_profile_id: lease.codexProfileId,
+    ...(lease.claudeProfileId
+      ? { claude_profile_id: lease.claudeProfileId } : {}),
+    ...(lease.codexProfileId
+      ? { codex_profile_id: lease.codexProfileId } : {}),
     state: "idle",
     provisional_fork: true,
   };
@@ -92,11 +96,25 @@ export function sessionMenuCapabilities(session: SessionInfo): SessionMenuCapabi
   };
 }
 
+export function canDeleteSidebarSession(
+  engine: Engine,
+  space: Space,
+  archived: boolean,
+): boolean {
+  return space === "work" || engine !== "codex" || archived;
+}
+
 export function isWorktreeForkBlockedByState(state?: State | null): boolean {
   return state === "running" || state === "interrupting";
 }
 
 export function isSessionMigrationBlockedByState(state?: State | null): boolean {
+  return state === "running"
+    || state === "interrupting"
+    || state === "draining";
+}
+
+export function isSessionArchiveBlockedByState(state?: State | null): boolean {
   return state === "running"
     || state === "interrupting"
     || state === "draining";

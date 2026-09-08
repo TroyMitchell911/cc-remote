@@ -2,6 +2,8 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  lazy,
+  Suspense,
   useRef,
   useState,
   type ClipboardEvent,
@@ -9,8 +11,9 @@ import {
 } from "react";
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
+  StatusRateLimit,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem, PermissionProfileInfo,
+  EngineCapabilityItem, PermissionProfileInfo, AutoCompact,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -45,6 +48,14 @@ import { QueuedQueryChip } from "./QueuedQueryDialog";
 import { UsageMeter } from "./UsageMeter";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
+import {
+  normalizeAutoCompactSelection,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+
+const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
+const ContextPopover = lazy(() => import("./ContextPopover"));
 
 interface Props {
   draftKey: string;
@@ -64,6 +75,7 @@ interface Props {
   replaceQueueCapacity: QueueCapacity;
   model: string;
   effort: string;
+  autoCompact?: AutoCompact | null;
   perm: string;
   permissionProfile: string | null;
   permissionProfiles: PermissionProfileInfo[] | null;
@@ -78,6 +90,7 @@ interface Props {
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
   engine?: "claude" | "codex";
+  archived?: boolean;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -90,6 +103,7 @@ interface Props {
   onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
+  onSetAutoCompact?: (selection: AutoCompactSelection) => boolean;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
   onSetPermissionProfile: (profile: string) => void;
@@ -115,8 +129,12 @@ interface Props {
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
+  contextExactReport?: ContextReport | null;
+  contextLoading?: boolean;
+  contextDeferred?: boolean;
   contextError?: string | null;
   statusReport?: StatusReport | null;
+  rateLimits?: StatusRateLimit[];
   statusError?: string | null;
   statusLoading?: boolean;
 }
@@ -165,6 +183,7 @@ export function Composer(p: Props) {
   };
   const [ctxOpen, setCtxOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -188,6 +207,7 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     setNotice(null);
     if (noticeTimer.current !== null) {
       window.clearTimeout(noticeTimer.current);
@@ -196,18 +216,20 @@ export function Composer(p: Props) {
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [p.draftKey, p.draftStore]);
 
-  // Context and account-usage popovers share one anchor and close together.
+  // Context, account usage and autocompact share one anchor, but each has its
+  // own small popover. Only one may be visible at a time.
   useEffect(() => {
-    if (!ctxOpen && !usageOpen) return;
+    if (!ctxOpen && !usageOpen && !autoCompactOpen) return;
     const onDoc = (e: MouseEvent) => {
       if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) {
         setCtxOpen(false);
         setUsageOpen(false);
+        setAutoCompactOpen(false);
       }
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [ctxOpen, usageOpen]);
+  }, [autoCompactOpen, ctxOpen, usageOpen]);
 
   // <details> has no controlled open state here, so keep one document-level
   // listener active for mouse and touch and close it when focus moves outside.
@@ -217,6 +239,7 @@ export function Composer(p: Props) {
       workSettingsRef.current.open = false;
       setCtxOpen(false);
       setUsageOpen(false);
+      setAutoCompactOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = workSettingsRef.current;
@@ -250,7 +273,7 @@ export function Composer(p: Props) {
       ) : null;
   const controlUi = p.control ? presentSessionControl(p.control) : legacyControl;
   // The connection and authoritative write state independently gate input.
-  const locked = offline || !!controlUi?.locked;
+  const locked = offline || !!controlUi?.locked || p.archived === true;
   const externalClaudeOwner = p.engine === "claude"
     ? (p.control?.control_mode === "external_cli" ? "外部 CLI"
       : p.control?.control_mode === "agent_view" ? "Agent View"
@@ -270,6 +293,7 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
 
@@ -496,8 +520,41 @@ export function Composer(p: Props) {
       case "context":
         p.onContext();
         setUsageOpen(false);
+        setAutoCompactOpen(false);
         setCtxOpen(true);
         break;
+      case "autocompact": {
+        if (p.engine !== "claude") {
+          flash("自动压缩阈值仅适用于 Claude 会话。");
+          break;
+        }
+        if (!args.trim()) {
+          p.onContext();
+          setUsageOpen(false);
+          setCtxOpen(false);
+          setAutoCompactOpen(true);
+          if (p.surface === "work" && workSettingsRef.current) {
+            workSettingsRef.current.open = true;
+          }
+          break;
+        }
+        const parsed = parseAutoCompactArgument(args);
+        if (!parsed.ok) {
+          flash(parsed.error);
+          return;
+        }
+        if (p.autoCompact && !p.autoCompact.mutable) {
+          flash("本机 Claude TUI 正在控制此会话，请在终端启动时设置。");
+          return;
+        }
+        const queued = p.onSetAutoCompact?.(parsed.selection) ?? false;
+        flash(queued
+          ? (busy
+            ? "已保存，将在下一次可确认的回合终态或下一条消息前切换。"
+            : "正在应用自动压缩设置…")
+          : "自动压缩设置暂未发送，请稍后重试。");
+        break;
+      }
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
       case "rewind": flash("Claude Rewind 暂未开放"); break;
@@ -527,7 +584,7 @@ export function Composer(p: Props) {
       case "compact":
         if (args.trim()) { flash("/compact 不接受参数"); return; }
         p.onCompact?.();
-        flash("正在启动 Codex 原生上下文压缩…");
+        flash("正在启动原生上下文压缩…");
         break;
       case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
@@ -582,6 +639,14 @@ export function Composer(p: Props) {
   // Pick a command from the palette. Client commands run now; cc skills
   // (/code-review …) fill the composer so the user can add args, then send.
   const pickCommand = (slash: string) => {
+    // Autocompact is intentionally command-only: choosing its suggestion fills
+    // the composer, and only an explicit send may apply a value or open the UI.
+    if (slash === "autocompact") {
+      setInput("/autocompact ");
+      focusTa();
+      growTa();
+      return;
+    }
     if (clientSlashesFor(p.engine).has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
     setInput("/" + slash + " ");
     focusTa(); growTa();
@@ -647,9 +712,39 @@ export function Composer(p: Props) {
   const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
   const workSurface = p.surface === "work";
   const contextAvailable = p.contextReport?.available !== false;
-  const workContext = workSurface && p.contextReport && contextAvailable
-    ? workContextMetrics(p.contextReport)
+  const currentContextExact = !!p.contextReport && contextAvailable
+    && p.contextReport.source !== "recent_turn";
+  const lastExactContextReport = currentContextExact
+    ? p.contextReport : p.contextExactReport ?? null;
+  const exactContextReport = lastExactContextReport?.available !== false
+    ? lastExactContextReport : null;
+  const contextHasCapacity = (exactContextReport?.max_tokens ?? 0) > 0;
+  const contextRingHasCapacity = contextAvailable
+    && (p.contextReport?.max_tokens ?? 0) > 0;
+  const workContext = workSurface && exactContextReport
+    ? workContextMetrics(exactContextReport)
     : null;
+  const autoCompactSelection = normalizeAutoCompactSelection(
+    p.autoCompact?.mode ?? "inherit",
+    p.autoCompact?.threshold_tokens ?? null,
+  );
+  const autoCompactControl = (
+    <Suspense fallback={
+      <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
+      <AutoCompactControl
+        value={autoCompactSelection}
+        state={p.autoCompact}
+        effectiveThresholdTokens={
+          p.contextReport?.auto_compact_threshold_tokens}
+        rawMaxTokens={p.contextReport?.raw_max_tokens}
+        disabled={locked || !p.onSetAutoCompact}
+        onChange={(selection) => {
+          if (!p.onSetAutoCompact?.(selection)) {
+            flash("自动压缩设置暂未发送，请稍后重试。");
+          }
+        }} />
+    </Suspense>
+  );
   // Do not substitute catalog defaults for an existing session.  Until the
   // wrapper reports its authoritative settings, the controls explicitly show
   // that they are still being read.  Unknown/hidden ids remain visible verbatim.
@@ -679,6 +774,7 @@ export function Composer(p: Props) {
       value={input}
       placeholder={importing ? "正在安全导入附件…"
         : offline ? "机器离线 — 等待重连…"
+        : p.archived ? "会话已归档 — 取消归档后可继续对话"
         : (controlUi?.placeholder
           ?? (busy && (p.engine ?? "claude") === "codex"
             ? "输入以引导当前任务，或选择排队…"
@@ -842,7 +938,13 @@ export function Composer(p: Props) {
                   <span>Artifacts · {p.workArtifactCount}</span>
                 </button>
               )}
-              <details className="work-settings" ref={workSettingsRef}>
+              <details className="work-settings" ref={workSettingsRef}
+                onToggle={(event) => {
+                  if (event.currentTarget.open) return;
+                  setCtxOpen(false);
+                  setUsageOpen(false);
+                  setAutoCompactOpen(false);
+                }}>
                 <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
                 <div className="work-settings-pop" ref={ctxWrapRef}>
                   <button type="button" onClick={() => setSheetKind("models")}
@@ -853,34 +955,42 @@ export function Composer(p: Props) {
                     disabled={locked}>
                     <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
-                    <span>会话上下文</span><b>{p.contextReport?.available === false
-                      ? "暂不可用"
-                      : workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
+                  {p.engine === "codex" && (
+                    <button type="button" className="work-fast-setting"
+                      aria-pressed={!!p.fast}
+                      onClick={() => p.onSetServiceTier?.("toggle")}
+                      disabled={locked || !p.onSetServiceTier}
+                      title="Fast：快速 / 标准（下条消息生效）">
+                      <span>服务档位</span><b>{p.fast == null
+                        ? "读取中" : p.fast ? "快速" : "标准"}</b>
+                    </button>
+                  )}
+                  <button type="button" aria-expanded={ctxOpen}
+                    onClick={() => {
+                      if (!ctxOpen) p.onContext();
+                      setUsageOpen(false);
+                      setAutoCompactOpen(false);
+                      setCtxOpen((o) => !o);
+                    }}>
+                    <span>会话上下文</span><b>{workContext && contextHasCapacity
+                        ? `${workContext.sessionPercentage.toFixed(0)}%`
+                        : workContext
+                          ? `${workContext.sessionTokens.toLocaleString()} tokens`
+                          : "查看"}</b>
                   </button>
                   {ctxOpen && (
-                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
-                      {p.contextReport?.available === false ? (
-                        <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后更新。</div>
-                      ) : p.contextReport && workContext ? (
-                        <>
-                          <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
-                            <span className="ctx-pop-nums">{workContext.sessionTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.sessionPercentage.toFixed(0)}%)</span>
-                          </div>
-                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(workContext.sessionPercentage, 100)}%` }} /></div>
-                          {workContext.hasBreakdown && (
-                            <div className="work-ctx-details">
-                              <div className="ctx-pop-row"><span>真实总占用</span>
-                                <span className="ctx-pop-nums">{workContext.totalTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.totalPercentage.toFixed(0)}%)</span>
-                              </div>
-                              <div className="ctx-pop-row"><span>Work 启动基线</span>
-                                <span className="ctx-pop-nums">{workContext.fixedTokens.toLocaleString()}</span>
-                              </div>
-                            </div>
-                          )}
-                          <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                        </>
-                      ) : <div className="ctx-pop-loading">读取上下文占用…</div>}
+                    <Suspense fallback={<div className="ctx-pop work-ctx-pop">
+                      <div className="ctx-pop-loading">正在读取真实上下文…</div>
+                    </div>}>
+                      <ContextPopover report={exactContextReport}
+                        loading={p.contextLoading} deferred={p.contextDeferred}
+                        error={p.contextError} work={workContext} />
+                    </Suspense>
+                  )}
+                  {p.engine === "claude" && autoCompactOpen && (
+                    <div className="ctx-pop work-ctx-pop auto-compact-pop"
+                      role="dialog" aria-label="Work 自动压缩">
+                      {autoCompactControl}
                     </div>
                   )}
                 </div>
@@ -954,32 +1064,43 @@ export function Composer(p: Props) {
                 title="Fast 服务档位:快 / 标准(下条消息生效)"
               >{p.fast == null ? "档位读取中" : p.fast ? "快速" : "标准"}</button>
             )}
-            {p.engine === "codex" && (
+            {(p.engine === "codex" || p.engine === "claude") && (
               <UsageMeter
+                engine={p.engine}
                 open={usageOpen}
                 report={p.statusReport ?? null}
-                error={p.statusError}
-                loading={p.statusLoading}
+                rateLimits={p.rateLimits}
+                error={p.engine === "codex" ? p.statusError : null}
+                loading={p.engine === "codex" && p.statusLoading}
+                disabled={locked}
                 onToggle={() => {
+                  if (locked) return;
                   const opening = !usageOpen;
                   setCtxOpen(false);
+                  setAutoCompactOpen(false);
                   setUsageOpen(opening);
-                  if (opening) p.onRefreshUsage?.();
+                  if (opening && p.engine === "codex") p.onRefreshUsage?.();
                 }}
-                onRefresh={() => p.onRefreshUsage?.()}
-                onOpenStatus={p.onStatus ? () => {
+                onRefresh={p.engine === "codex"
+                  ? () => p.onRefreshUsage?.() : undefined}
+                onOpenStatus={p.engine === "codex" && p.onStatus ? () => {
                   setUsageOpen(false);
                   p.onStatus?.();
                 } : undefined}
               />
             )}
             <button
-              className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
+              className={"hint-ring"
+                + (contextAvailable ? "" : " unavailable")}
+              aria-expanded={ctxOpen}
               aria-label="上下文占用"
               title="上下文占用"
+              disabled={locked}
               onClick={() => {
-                p.onContext();
+                if (locked) return;
+                if (!ctxOpen) p.onContext();
                 setUsageOpen(false);
+                setAutoCompactOpen(false);
                 setCtxOpen((o) => !o);
               }}
             >
@@ -990,43 +1111,25 @@ export function Composer(p: Props) {
                   cx="18" cy="18" r="15"
                   strokeDasharray="94.25"
                   strokeDashoffset={94.25 * (1 - Math.min(
-                    contextAvailable ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
+                    contextRingHasCapacity
+                      ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
                   transform="rotate(-90 18 18)"
                 />
               </svg>
             </button>
             {ctxOpen && (
-              <div className="ctx-pop" role="dialog" aria-label="上下文占用">
-                {p.contextError ? (
-                  <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
-                ) : p.contextReport?.available === false ? (
-                  <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后会自动更新。上下文仍由 Codex 原生管理。</div>
-                ) : p.contextReport ? (
-                  <>
-                    <div className="ctx-pop-row">
-                      <span>上下文窗口</span>
-                      <span className="ctx-pop-nums">
-                        {p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({p.contextReport.percentage.toFixed(0)}%)
-                      </span>
-                    </div>
-                    <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
-                    {p.contextReport.categories.length > 0 && (
-                      <div className="ctx-pop-cats">
-                        {p.contextReport.categories.map((c, i) => (
-                          <div className="ctx-pop-cat" key={i}>
-                            <span className="ctx-cat-dot" style={{ background: c.color }} />
-                            <span className="ctx-pop-cat-name">{c.name}</span>
-                            <span className="ctx-pop-cat-tok">{c.tokens.toLocaleString()}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {p.contextReport.is_auto_compact_enabled && <div className="ctx-pop-auto">autocompact 已启用</div>}
-                    <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                  </>
-                ) : (
-                  <div className="ctx-pop-loading">读取上下文占用…</div>
-                )}
+              <Suspense fallback={<div className="ctx-pop">
+                <div className="ctx-pop-loading">正在读取真实上下文…</div>
+              </div>}>
+                <ContextPopover report={exactContextReport}
+                  loading={p.contextLoading} deferred={p.contextDeferred}
+                  error={p.contextError} />
+              </Suspense>
+            )}
+            {p.engine === "claude" && autoCompactOpen && (
+              <div className="ctx-pop auto-compact-pop" role="dialog"
+                aria-label="自动压缩">
+                {autoCompactControl}
               </div>
             )}
           </div>

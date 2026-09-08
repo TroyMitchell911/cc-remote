@@ -27,6 +27,7 @@ from claude_agent_sdk.types import (
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
     AssistantMsgEnd,
+    BackgroundProcessSync,
     Delta,
     ProcessEvent,
     ToolDelta,
@@ -36,11 +37,15 @@ from cc_remote.protocol import (
     TurnResult,
     UserMsg,
 )
-from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.wrapper.sdk import (
+    ClaudeAutonomousFollowupPending,
+    SdkHandle,
+)
 from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     merge_subagent_history,
+    public_agent_run_id,
     translate_history,
     translate_subagent_history,
 )
@@ -500,6 +505,233 @@ def test_task_updates_keep_origin_turn_across_translator_instances():
     assert "must-not-forward" not in wire and "/private/task-output" not in wire
 
 
+def test_delayed_tool_events_keep_origin_turn_across_translator_instances():
+    item_turns = {}
+    item_titles = {}
+    item_meta = {}
+    first = StreamTranslator(
+        4096, turn_id="old-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    original = first.feed(_assistant([
+        ToolUseBlock(
+            id="delayed-tool", name="Bash",
+            input={"command": "make check"},
+        ),
+    ], stop_reason="tool_use"))
+    assert next(
+        event for event in original if isinstance(event, ToolUse)
+    ).turn_id == "old-turn"
+
+    # Claude's stream is continuous across Result boundaries.  If an assembled
+    # tool record is replayed into the next translator before its delayed
+    # progress/result arrives, every correlated event must retain the turn that
+    # first introduced the tool rather than adopting the new browser turn.
+    second = StreamTranslator(
+        4096, turn_id="new-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    replayed = second.feed(_assistant([
+        ToolUseBlock(
+            id="delayed-tool", name="Bash",
+            input={"command": "make check"},
+        ),
+    ], stop_reason="tool_use"))
+    progress = second.feed(SystemMessage(
+        subtype="tool_progress",
+        data={"tool_use_id": "delayed-tool", "message": "still running"},
+    ))
+    completed = second.feed(UserMessage(content=[ToolResultBlock(
+        tool_use_id="delayed-tool", content="ok", is_error=False,
+    )]))
+
+    routed = [
+        *[event for event in replayed if isinstance(event, ToolUse)],
+        *[event for event in progress if isinstance(event, ToolDelta)],
+        *[event for event in completed if isinstance(event, ToolResult)],
+    ]
+    assert [type(event) for event in routed] == [
+        ToolUse, ToolDelta, ToolResult,
+    ]
+    assert all(event.turn_id == "old-turn" for event in routed)
+    assert all(event.background is True for event in routed)
+
+
+def test_background_bash_task_is_not_presented_as_collaborating_agent():
+    item_turns = {}
+    item_titles = {}
+    item_meta = {}
+    first = StreamTranslator(
+        4096, turn_id="bash-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    first.feed(_assistant([ToolUseBlock(
+        id="bash-tool", name="Bash",
+        input={"command": "make check", "run_in_background": True},
+    )], stop_reason="tool_use"))
+    started = first.feed(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="bash-task",
+        description="Run checks", uuid="bash-start", session_id="s1",
+        tool_use_id="bash-tool", task_type="local_bash",
+    ))
+
+    assert len(started) == 1
+    assert started[0].item_id == "bash-task"
+    assert started[0].kind == "task"
+    assert started[0].parent_id == "bash-tool"
+    assert started[0].background is True
+
+    second = StreamTranslator(
+        4096, turn_id="later-turn", item_turns=item_turns,
+        item_titles=item_titles, item_meta=item_meta)
+    completed = second.feed(TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id="bash-task",
+        status="completed", output_file="/private/output",
+        summary="checks passed", uuid="bash-end", session_id="s1",
+        tool_use_id="bash-tool",
+    ))
+    assert len(completed) == 1
+    assert completed[0].item_id == "bash-task"
+    assert completed[0].kind == "task"
+    assert completed[0].turn_id == "bash-turn"
+    assert completed[0].status == "succeeded"
+    assert completed[0].background is True
+
+
+def test_native_background_task_level_is_authoritative_and_bounded():
+    item_turns = {}
+    item_titles = {}
+    item_meta = {}
+    item_commands = {}
+    translator = StreamTranslator(
+        4096,
+        turn_id="bash-turn",
+        item_turns=item_turns,
+        item_titles=item_titles,
+        item_meta=item_meta,
+        item_commands=item_commands,
+    )
+    translator.feed(_assistant([ToolUseBlock(
+        id="bash-tool", name="Bash",
+        input={"command": "make verify", "run_in_background": True},
+    )], stop_reason="tool_use"))
+    translator.feed(TaskStartedMessage(
+        subtype="task_started", data={}, task_id="bash-task",
+        description="Run verification", uuid="bash-start", session_id="s1",
+        tool_use_id="bash-tool", task_type="local_bash",
+    ))
+
+    populated = translator.feed(SystemMessage(
+        subtype="background_tasks_changed",
+        data={"tasks": [
+            {"task_id": "ambient", "task_type": "local_bash",
+             "description": "internal watcher", "ambient": True},
+            {"task_id": "bash-task", "task_type": "local_bash",
+             "description": "Run verification"},
+        ]},
+    ))
+    assert len(populated) == 1
+    assert isinstance(populated[0], BackgroundProcessSync)
+    assert len(populated[0].items) == 1
+    item = populated[0].items[0]
+    assert item.item_id == "bash-task" and item.kind == "task"
+    assert item.title == "Run verification"
+    assert item.command == "make verify"
+
+    bounded = translator.feed(SystemMessage(
+        subtype="background_tasks_changed",
+        data={"tasks": [
+            {"task_id": f"task-{index}", "task_type": "local_bash",
+             "description": f"Task {index}"}
+            for index in range(80)
+        ]},
+    ))
+    assert len(bounded[0].items) == 64
+
+    cleared = translator.feed(SystemMessage(
+        subtype="background_tasks_changed", data={"tasks": []},
+    ))
+    assert len(cleared) == 1
+    assert isinstance(cleared[0], BackgroundProcessSync)
+    assert cleared[0].items == []
+
+
+def test_live_compact_boundary_uses_existing_process_event():
+    [event] = StreamTranslator(4096, turn_id="turn-1").feed(SystemMessage(
+        subtype="compact_boundary",
+        data={
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "compact-boundary",
+            "timestamp": "2026-08-31T01:34:35.339Z",
+            "compactMetadata": {
+                "trigger": "auto", "preTokens": 168_193,
+                "postTokens": 4_862, "durationMs": 188_390,
+            },
+        },
+    ))
+    assert isinstance(event, ProcessEvent)
+    assert event.item_id == "compact-boundary"
+    assert event.kind == "compaction" and event.title == "压缩上下文"
+    assert event.summary == "自动压缩 · 168,193 → 4,862 tokens"
+    assert event.turn_id == "turn-1" and event.duration_ms == 188_390
+
+
+def test_history_marks_task_completion_followup_as_later_background_segment():
+    answer_before = "11111111-1111-4111-8111-111111111111"
+    answer_after = "22222222-2222-4222-8222-222222222222"
+    messages = [
+        SimpleNamespace(
+            uuid="user-1", type="user", parent_tool_use_id=None,
+            message={"role": "user", "content": "run it"},
+        ),
+        SimpleNamespace(
+            uuid=answer_before, type="assistant", parent_tool_use_id=None,
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Build is running."}]},
+        ),
+        SimpleNamespace(
+            uuid="notification", type="user", parent_tool_use_id=None,
+            message={"role": "user", "content": "<task-notification/>"},
+        ),
+        SimpleNamespace(
+            uuid=answer_after, type="assistant", parent_tool_use_id=None,
+            message={"role": "assistant", "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "Build passed."}]},
+        ),
+    ]
+    internal = {
+        "notification": ProcessEvent(
+            item_id="task-1", kind="task", phase="end",
+            status="succeeded", title="Build", background=True,
+        ),
+    }
+    timestamps = {
+        "user-1": 1.0, answer_before: 2.0,
+        "notification": 20.0, answer_after: 21.0,
+    }
+
+    events = translate_history(
+        messages, 4096, timestamps=timestamps,
+        internal_user_events=internal,
+    )
+    starts = [
+        event for event in events
+        if event.type == "assistant_msg_start" and event.channel == "final"
+    ]
+    assert [event.message_id for event in starts] == [
+        answer_before, answer_after,
+    ]
+    assert starts[0].background is None and starts[0].ts == 2.0
+    assert starts[1].background is True and starts[1].ts == 21.0
+    notification = next(
+        event for event in events
+        if isinstance(event, ProcessEvent) and event.item_id == "task-1"
+    )
+    assert notification.ts == 20.0 and notification.background is True
+    terminal = next(event for event in events if isinstance(event, TurnEnd))
+    assert terminal.ts == 2.0
+    assert terminal.result.duration_ms == 1_000
+    assert terminal.turn_id == answer_after
+
+
 def test_live_agent_tool_has_dedicated_realtime_lifecycle():
     translator = StreamTranslator(10_000, turn_id="user-turn")
     started = translator.feed(_assistant([
@@ -515,7 +747,7 @@ def test_live_agent_tool_has_dedicated_realtime_lifecycle():
     tool = next(event for event in started if isinstance(event, ToolUse))
     agent = next(event for event in started if isinstance(event, ProcessEvent))
     assert tool.category == "agent"
-    assert agent.item_id == "agent:agent-tool"
+    assert agent.item_id == public_agent_run_id("agent-tool")
     assert agent.parent_id == "agent-tool"
     assert agent.kind == "agent" and agent.status == "running"
     assert agent.title == "审查后端并报告风险"
@@ -678,7 +910,7 @@ def test_history_does_not_promote_ambiguous_commentary_before_separate_tool_acti
     assert commentary.channel == "commentary"
 
 
-def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path, monkeypatch):
+def test_subagent_history_keeps_only_async_lifecycle_card(tmp_path, monkeypatch):
     sid = "88888888-8888-4888-8888-888888888888"
     main = tmp_path / f"{sid}.jsonl"
     rows = [
@@ -690,10 +922,20 @@ def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path
              "input": {"description": "Review backend"},
          }]}},
         {"type": "user", "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-         "toolUseResult": {"agentId": "agent-123", "status": "completed"},
+         "toolUseResult": {"agentId": "agent-123", "status": "async_launched",
+                           "isAsync": True},
          "message": {"role": "user", "content": [{
-             "type": "tool_result", "tool_use_id": "agent-tool", "content": "done",
+             "type": "tool_result", "tool_use_id": "agent-tool",
+             "content": "Async agent launched successfully.",
          }]}},
+        {"type": "user", "uuid": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+         "timestamp": "2026-07-13T01:00:03Z",
+         "origin": {"kind": "task-notification"},
+         "message": {"role": "user", "content": (
+             "<task-notification><task-id>agent-123</task-id>"
+             "<tool-use-id>agent-tool</tool-use-id><status>completed</status>"
+             "<summary>review complete</summary></task-notification>"
+         )}},
     ]
     main.write_text("".join(json.dumps(row) + "\n" for row in rows))
     subdir = tmp_path / sid / "subagents"
@@ -718,14 +960,15 @@ def test_subagent_history_is_correlated_nested_and_omits_private_prompt(tmp_path
     monkeypatch.setattr(stream_module, "transcript_path", lambda _sid: str(main))
 
     recovered = translate_subagent_history(sid, 10_000)
-    assert isinstance(recovered[0], ProcessEvent) and recovered[0].phase == "start"
-    assert isinstance(recovered[-1], ProcessEvent) and recovered[-1].phase == "end"
+    assert len(recovered) == 1
+    assert isinstance(recovered[0], ProcessEvent)
+    assert recovered[0].phase == "end" and recovered[0].status == "succeeded"
     assert recovered[0].parent_id == "agent-tool"
-    assert [event.channel for event in recovered if isinstance(event, Delta)] == [
-        "thinking", "commentary"]
+    assert recovered[0].background is True
     wire = _wire_json(recovered)
     assert "PRIVATE DELEGATED PROMPT" not in wire
     assert "PRIVATE-SIGNATURE" not in wire
+    assert "agent-123" not in wire
 
     main_events = [
         UserMsg(msg_id="99999999-9999-4999-8999-999999999999", prompt="review it"),
@@ -742,6 +985,7 @@ def test_sdk_enables_hook_events_explicitly():
     options = SdkHandle(WrapperConfig())._options(None, "/tmp")
     assert options.include_partial_messages is True
     assert options.include_hook_events is True
+    assert options.max_buffer_size == 16 * 1024 * 1024
 
 
 def test_sdk_single_pump_forwards_post_result_background_events_immediately():
@@ -771,17 +1015,21 @@ def test_sdk_single_pump_forwards_post_result_background_events_immediately():
             async def query(self, prompt):
                 self.queries.append(prompt)
 
-        def result():
-            return {
+        def result(origin=None):
+            payload = {
                 "type": "result", "subtype": "success",
                 "duration_ms": 1, "duration_api_ms": 1,
                 "is_error": False, "num_turns": 1,
                 "session_id": "session-1",
             }
+            if origin is not None:
+                payload["origin"] = origin
+            return payload
 
         query = Query()
         handle = SdkHandle(SimpleNamespace(turn_reader_queue_cap=2))
         handle.client = Client(query)
+        handle.context_probe_suppressed = True
         background = []
         delivered = asyncio.Event()
 
@@ -795,6 +1043,12 @@ def test_sdk_single_pump_forwards_post_result_background_events_immediately():
             handle.next_turn_id = "origin-turn"
             await handle.query("first")
             response_task = asyncio.create_task(_collect(handle.receive_response()))
+            await query.queue.put({
+                "type": "user",
+                "message": {"role": "user", "content": "first"},
+                "parent_tool_use_id": None,
+                "uuid": "human-user-1",
+            })
             await query.queue.put({
                 "type": "system", "subtype": "task_started",
                 "task_id": "task-1", "description": "Background review",
@@ -812,8 +1066,10 @@ def test_sdk_single_pump_forwards_post_result_background_events_immediately():
             first = await asyncio.wait_for(response_task, timeout=1)
             await asyncio.wait_for(query.progress_read.wait(), timeout=1)
             await asyncio.sleep(0)
-            assert isinstance(first[0], TaskStartedMessage)
+            assert isinstance(first[0], UserMessage)
+            assert isinstance(first[1], TaskStartedMessage)
             assert isinstance(first[-1], ResultMessage)
+            assert handle.context_probe_suppressed is False
             assert background == []  # Result has not been released by Machine.
 
             handle.release_background_messages()
@@ -821,11 +1077,9 @@ def test_sdk_single_pump_forwards_post_result_background_events_immediately():
             assert isinstance(background[0][0], TaskProgressMessage)
             assert background[0][1] == "origin-turn"
 
-            # A delayed old-task event racing the next query is consumed by the
-            # same pump and delivered through that turn's response queue. The
-            # shared translator maps still attach it to its original turn.
-            await handle.query("second")
-            second_task = asyncio.create_task(_collect(handle.receive_response()))
+            # These autonomous frames are already waiting in the SDK's private
+            # queue, but the sole pump has not been scheduled yet. Submitting a
+            # browser query in this gap must not claim any of them.
             await query.queue.put({
                 "type": "system", "subtype": "task_notification",
                 "task_id": "task-1", "status": "completed",
@@ -833,11 +1087,40 @@ def test_sdk_single_pump_forwards_post_result_background_events_immediately():
                 "uuid": "u3", "session_id": "session-1",
                 "tool_use_id": "agent-tool",
             })
+            await query.queue.put({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "<task-notification>done</task-notification>",
+                },
+                "parent_tool_use_id": None,
+                "uuid": "autonomous-user-1",
+                "origin": {"kind": "task-notification"},
+            })
+            await query.queue.put(result(
+                {"kind": "task-notification"}))
+            await handle.query("second")
+            second_task = asyncio.create_task(_collect(handle.receive_response()))
+            for _ in range(20):
+                if len(background) >= 4:
+                    break
+                await asyncio.sleep(0)
+            assert second_task.done() is False
+            assert isinstance(background[1][0], TaskNotificationMessage)
+            assert isinstance(background[2][0], UserMessage)
+            assert isinstance(background[3][0], ResultMessage)
+
+            await query.queue.put({
+                "type": "user",
+                "message": {"role": "user", "content": "second"},
+                "parent_tool_use_id": None,
+                "uuid": "human-user-2",
+            })
             await query.queue.put(result())
             second = await asyncio.wait_for(second_task, timeout=1)
-            assert isinstance(second[0], TaskNotificationMessage)
+            assert isinstance(second[0], UserMessage)
             assert isinstance(second[-1], ResultMessage)
-            assert len(background) == 1
+            assert len(background) == 4
             assert query.consumers == 1
         finally:
             handle.release_background_messages()
@@ -884,10 +1167,16 @@ def test_sdk_pump_releases_turn_barrier_on_query_failure_and_disconnect():
                 raise AssertionError("query failure was not propagated")
             failed_barrier = handle._turn_background_release
             assert failed_barrier is not None and failed_barrier.is_set()
+            assert handle._pending_turn_background_release is None
 
             client.fail = False
             await handle.query("disconnects")
-            disconnect_barrier = handle._turn_background_release
+            # The submitted turn's barrier remains pending until its
+            # origin-marked human User/Result reaches the sole message pump. An
+            # older autonomous turn already waiting inside the SDK must continue
+            # to use the released preceding barrier.
+            assert handle._turn_background_release is failed_barrier
+            disconnect_barrier = handle._pending_turn_background_release
             assert disconnect_barrier is not None
             assert disconnect_barrier.is_set() is False
             await handle.disconnect()
@@ -896,5 +1185,203 @@ def test_sdk_pump_releases_turn_barrier_on_query_failure_and_disconnect():
         finally:
             if handle._message_pump_task is not None:
                 await handle._stop_message_pump()
+
+    asyncio.run(run())
+
+
+def test_sdk_query_waits_for_routed_background_callback_before_launch():
+    async def run():
+        class Client:
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.queries = []
+
+            async def receive_messages(self):
+                while True:
+                    yield await self.queue.get()
+
+            async def query(self, prompt):
+                self.queries.append(prompt)
+
+        client = Client()
+        handle = SdkHandle(SimpleNamespace(turn_reader_queue_cap=2))
+        handle.client = client
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+
+        async def on_background(_message, _turn_id):
+            callback_started.set()
+            await release_callback.wait()
+
+        handle.background_message_callback = on_background
+        handle._start_message_pump()
+        try:
+            await handle.query("first")
+            response_task = asyncio.create_task(
+                _collect(handle.receive_response()))
+            await client.queue.put(ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-1",
+            ))
+            await asyncio.wait_for(response_task, timeout=1)
+            handle.release_background_messages()
+            await client.queue.put(TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="task-1",
+                status="completed",
+                output_file="/tmp/task-1",
+                summary="done",
+                uuid="notification-1",
+                session_id="session-1",
+                tool_use_id="tool-1",
+            ))
+            await asyncio.wait_for(callback_started.wait(), timeout=1)
+
+            second = asyncio.create_task(handle.query("second"))
+            await asyncio.sleep(0)
+            assert second.done() is False
+            assert client.queries == ["first"]
+
+            release_callback.set()
+            await asyncio.wait_for(second, timeout=1)
+            assert client.queries == ["first", "second"]
+        finally:
+            release_callback.set()
+            handle.release_background_messages()
+            await handle._stop_message_pump()
+
+    async def _collect(source):
+        return [message async for message in source]
+
+    asyncio.run(run())
+
+
+def test_sdk_final_launch_guard_rejects_before_client_query():
+    async def run():
+        class Client:
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.queries = []
+
+            async def receive_messages(self):
+                while True:
+                    yield await self.queue.get()
+
+            async def query(self, prompt):
+                self.queries.append(prompt)
+
+        client = Client()
+        handle = SdkHandle(SimpleNamespace(turn_reader_queue_cap=2))
+        handle.client = client
+        followup_pending = False
+        delivered = asyncio.Event()
+
+        async def on_background(_message, _turn_id):
+            nonlocal followup_pending
+            followup_pending = True
+            delivered.set()
+
+        def guard():
+            if followup_pending:
+                raise ClaudeAutonomousFollowupPending("background owns stream")
+
+        handle.background_message_callback = on_background
+        handle.query_launch_guard = guard
+        handle._start_message_pump()
+        try:
+            await handle.query("first")
+            response_task = asyncio.create_task(
+                _collect(handle.receive_response()))
+            await client.queue.put(ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-1",
+            ))
+            await asyncio.wait_for(response_task, timeout=1)
+            handle.release_background_messages()
+            await client.queue.put(TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="task-1",
+                status="completed",
+                output_file="/tmp/task-1",
+                summary="done",
+                uuid="notification-1",
+                session_id="session-1",
+                tool_use_id="tool-1",
+            ))
+            await asyncio.wait_for(delivered.wait(), timeout=1)
+            # Let the worker's finally block publish the drained boundary.
+            await asyncio.sleep(0)
+
+            handle.next_turn_id = "rejected-browser-turn"
+            try:
+                await handle.query("must not be written")
+            except ClaudeAutonomousFollowupPending:
+                pass
+            else:
+                raise AssertionError("launch guard did not reject the query")
+
+            assert client.queries == ["first"]
+            assert handle.next_turn_id is None
+            assert handle._turn_active is False
+        finally:
+            handle.release_background_messages()
+            await handle._stop_message_pump()
+
+    async def _collect(source):
+        return [message async for message in source]
+
+    asyncio.run(run())
+
+
+def test_sdk_pump_failure_requires_reconnect_before_another_query():
+    async def run():
+        class Query:
+            async def receive_messages(self):
+                if False:
+                    yield None
+                raise RuntimeError("reader failed")
+
+        class Client:
+            def __init__(self):
+                self._query = Query()
+
+            async def query(self, _prompt):
+                return None
+
+        handle = SdkHandle(SimpleNamespace(turn_reader_queue_cap=2))
+        handle.client = Client()
+        failures = []
+
+        async def on_failure(error):
+            failures.append(error)
+
+        handle.message_pump_failure_callback = on_failure
+        handle._start_message_pump()
+        assert handle._message_pump_task is not None
+        await handle._message_pump_task
+
+        assert handle.message_pump_failed is True
+        assert len(failures) == 1
+        assert str(failures[0]) == "reader failed"
+        try:
+            await handle.query("must not send")
+        except RuntimeError as exc:
+            assert str(exc) == "Claude SDK message pump is not running"
+            assert isinstance(exc.__cause__, RuntimeError)
+            assert str(exc.__cause__) == "reader failed"
+        else:
+            raise AssertionError("query reused a failed Claude message pump")
+
+        await handle._stop_message_pump()
 
     asyncio.run(run())

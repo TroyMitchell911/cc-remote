@@ -1,4 +1,24 @@
-import type { Block, TextBlock, Turn } from "./domain/conversation";
+import type { Block, ProcessBlock, TextBlock, Turn } from "./domain/conversation";
+
+export function generatedImageIdentity(block: ProcessBlock): string {
+  const ref = block.input?.history_image as { image_id?: unknown } | undefined;
+  return typeof ref?.image_id === "string" ? ref.image_id : block.item_id;
+}
+
+/** Show distinct output images, not duplicate live/history views of the same
+ * content. Every native activity stays in the timeline; only the gallery is
+ * deduplicated. Prefer its live snapshot handle while available. */
+export function generatedOutputImages(blocks: readonly Block[]): ProcessBlock[] {
+  const images = new Map<string, ProcessBlock>();
+  for (const block of blocks) {
+    if (block.kind !== "process" || block.tool !== "image_generation"
+        || block.status !== "succeeded" || block.phase !== "end" || !block.done) continue;
+    const identity = generatedImageIdentity(block);
+    const previous = images.get(identity);
+    if (!previous || typeof block.input?.preview_id === "string") images.set(identity, block);
+  }
+  return [...images.values()].slice(-8);
+}
 
 /** Resolve runtime activity onto exactly one displayed narrative row. Session
  * state alone is deliberately insufficient: aliases can collide in migrated
@@ -8,11 +28,33 @@ export function exactActiveTurnId(
   ownerTurnId: string | null | undefined,
   active: boolean,
 ): string | null {
-  if (!active || !ownerTurnId) return null;
-  const matches = turns.filter((turn) => [
+  const candidates = activeTurnCandidateIds(turns, ownerTurnId, active);
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** Return only rows which exactly alias the active native/browser owner. An
+ * empty result means inactive, absent from this projection, or unowned;
+ * multiple results are the one ambiguity ChatView may resolve to a latest row. */
+export function activeTurnCandidateIds(
+  turns: readonly Pick<Turn, "id" | "clientMsgId" | "historyTurnId">[],
+  ownerTurnId: string | null | undefined,
+  active: boolean,
+): string[] {
+  if (!active || !ownerTurnId) return [];
+  return turns.flatMap((turn) => [
     turn.id, turn.clientMsgId, turn.historyTurnId,
-  ].includes(ownerTurnId));
-  return matches.length === 1 ? matches[0].id : null;
+  ].includes(ownerTurnId) ? [turn.id] : []);
+}
+
+/** A newly submitted browser turn is an explicit, already-painted owner. It
+ * must win over the prior native owner retained for late-event correlation;
+ * otherwise the working spark briefly jumps back to the completed row until
+ * the engine acknowledges and binds the new turn. */
+export function displayActiveTurnOwnerId(
+  liveOwnerTurnId: string | null | undefined,
+  acceptancePending: string | null | undefined,
+): string | null {
+  return acceptancePending ?? liveOwnerTurnId ?? null;
 }
 
 export function processBlocks(blocks: Block[]): Block[] {
@@ -23,6 +65,7 @@ export function processBlocks(blocks: Block[]): Block[] {
   return blocks.filter((block) => {
     if (block.kind === "text") {
       return block.text.length > 0
+        && block.delivery !== "async"
         && (block.channel === "thinking" || block.channel === "commentary");
     }
     // Keep ToolUse in reducer state for result correlation and older peers,
@@ -36,10 +79,33 @@ export function processBlocks(blocks: Block[]): Block[] {
   });
 }
 
+export function isCodexPresentationNoise(block: Block): boolean {
+  if (block.kind === "text" && block.channel === "thinking") return true;
+  if (block.kind !== "process") return false;
+  if (block.processKind === "reasoning") return true;
+  if (block.processKind !== "hook") return false;
+  // Successful/pending hooks are plumbing around useful tool activity. Keep
+  // only actionable hook failures in Codex's public process projection.
+  return !["failed", "declined", "cancelled", "interrupted"].includes(
+    block.status,
+  );
+}
+
+export function presentableProcessBlocks(
+  blocks: Block[],
+  engine: "claude" | "codex",
+): Block[] {
+  const items = processBlocks(blocks);
+  return engine === "codex"
+    ? items.filter((block) => !isCodexPresentationNoise(block))
+    : items;
+}
+
 export function finalTextBlocks(blocks: Block[]): TextBlock[] {
   return blocks.filter((block): block is TextBlock => block.kind === "text"
     && block.text.length > 0
-    && (block.channel == null || block.channel === "final" || block.channel === "unknown"));
+    && (block.delivery === "async"
+      || block.channel == null || block.channel === "final" || block.channel === "unknown"));
 }
 
 /** A main answer can finish before a background task or agent reports its

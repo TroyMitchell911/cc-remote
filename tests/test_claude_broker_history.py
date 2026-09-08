@@ -47,6 +47,10 @@ def test_multimodal_prompt_counts_but_meta_and_sidechain_do_not():
 def test_sdk_user_identity_requires_provenance_and_real_top_level_prompt():
     data = b"".join([
         _row(type="queue-operation", operation="enqueue"),
+        _row(type="user", uuid="interrupt", entrypoint="sdk-py",
+             message={"role": "user", "content": [{
+                 "type": "text", "text": "[Request interrupted by user]",
+             }]}),
         _row(type="user", uuid="tool-result", entrypoint="sdk-py",
              message={"role": "user", "content": [{"type": "tool_result"}]}),
         _row(type="user", uuid="sidechain", promptSource="sdk",
@@ -57,6 +61,7 @@ def test_sdk_user_identity_requires_provenance_and_real_top_level_prompt():
     ])
 
     assert first_claude_sdk_user_id(data) == "real"
+    assert parse_claude_broker_lifecycle(data).started == ("real",)
     assert first_claude_sdk_user_id(_row(
         type="user",
         uuid="unproven",

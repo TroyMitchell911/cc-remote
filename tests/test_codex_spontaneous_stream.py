@@ -13,8 +13,9 @@ from cc_remote.protocol import (
     TurnPlan, TurnSteered, UserMsg,
 )
 from cc_remote.wrapper.codex_handle import (
-    CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
-    CodexSteerUserIdentityProof,
+    CodexAppServerDisconnected, CodexHandle, CodexSpontaneousClosed,
+    CodexSpontaneousOverflow, CodexSteerUserIdentityProof,
+    CodexTurnStartDisconnected,
 )
 from cc_remote.wrapper.history_store import HistorySourceFingerprint
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -733,6 +734,279 @@ def test_turn_start_binds_exact_client_user_to_split_stream_task():
         assert handle.owned_turn_ids.issuperset({
             "control-turn", "rollout-task",
         })
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("with_exact_user_proof", [False, True])
+def test_turn_start_disconnect_never_blindly_replays_submission(
+        with_exact_user_proof):
+    async def run():
+        handle = CodexHandle(_Cfg(), daemon_mode="auto")
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-spontaneous"
+        handle.app_server_version = "0.150.0"
+        handle._daemon_proxy_established = True
+        requests = []
+
+        async def send(request):
+            requests.append(request)
+            if with_exact_user_proof:
+                await handle._dispatch(_notification(
+                    "item/started",
+                    "native-task",
+                    item={
+                        "id": "native-query-user",
+                        "clientId": "browser-query-message",
+                        "type": "userMessage",
+                        "content": [
+                            {"type": "text", "text": "private"},
+                        ],
+                    },
+                ))
+            handle._pending[request["id"]].set_exception(
+                CodexAppServerDisconnected("0.150.0", 7))
+
+        handle._send = send
+        with pytest.raises(CodexTurnStartDisconnected) as raised:
+            await handle.query(
+                "do one non-idempotent task",
+                client_user_message_id="browser-query-message",
+            )
+
+        error = raised.value
+        assert len(requests) == 1
+        assert error.accepted is with_exact_user_proof
+        assert error.app_server_version == "0.150.0"
+        assert error.generation == 7
+        assert error.client_message_id == "browser-query-message"
+        assert error.native_turn_id == (
+            "native-task" if with_exact_user_proof else None)
+        assert error.native_message_id == (
+            "native-query-user" if with_exact_user_proof else None)
+        assert handle.turn_active is False
+        assert handle.turn_start_pending is False
+        assert handle._turn_q is None
+
+    asyncio.run(run())
+
+
+def test_turn_start_reconciliation_uses_exact_user_identity_and_liveness():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "native-user",
+                        "clientId": "browser-query-message",
+                        "type": "userMessage",
+                    }],
+                }],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        probe = await handle.reconcile_turn_start(
+            "browser-query-message",
+            native_turn_id="native-task",
+            native_message_id="native-user",
+        )
+
+        assert probe.thread_active is True
+        assert probe.active_turn_id == "control-turn"
+        assert probe.matched_turn_id == "control-turn"
+        assert probe.matched_turn_active is True
+        assert requests == [
+            ("thread/read", {
+                "threadId": "thread-spontaneous",
+                "includeTurns": False,
+            }),
+            ("thread/turns/list", {
+                "threadId": "thread-spontaneous",
+                "cursor": None,
+                "limit": 8,
+                "sortDirection": "desc",
+                "itemsView": "summary",
+            }),
+        ]
+
+    asyncio.run(run())
+
+
+def test_turn_start_reconciliation_does_not_claim_unmatched_active_turn():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            return {
+                "data": [{
+                    "id": "foreign-active-turn",
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "foreign-user",
+                        "clientId": "another-client",
+                        "type": "userMessage",
+                    }],
+                }],
+            }
+
+        handle._request = request
+        probe = await handle.reconcile_turn_start("browser-query-message")
+
+        assert probe.thread_active is True
+        assert probe.active_turn_id == "foreign-active-turn"
+        assert probe.matched_turn_id is None
+        assert probe.matched_turn_active is False
+
+    asyncio.run(run())
+
+
+def test_turn_start_reconciliation_prefers_newer_active_turn_page_over_idle_read():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "idle"},
+                    },
+                }
+            return {
+                "data": [{
+                    "id": "new-active-turn",
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "native-user",
+                        "clientId": "browser-query-message",
+                        "type": "userMessage",
+                    }],
+                }],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        probe = await handle.reconcile_turn_start(
+            "browser-query-message",
+        )
+
+        assert probe.thread_active is True
+        assert probe.active_turn_id == "new-active-turn"
+        assert probe.latest_turn_id == "new-active-turn"
+        assert probe.matched_turn_id == "new-active-turn"
+        assert probe.matched_turn_active is True
+        assert probe.matched_turn_is_latest is True
+        assert probe.newer_turns_present is False
+
+    asyncio.run(run())
+
+
+def test_turn_start_reconciliation_reports_completed_successor_ordering():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "idle"},
+                    },
+                }
+            return {
+                "data": [
+                    {
+                        "id": "completed-successor",
+                        "status": "completed",
+                        "items": [],
+                    },
+                    {
+                        "id": "submitted-turn",
+                        "status": "completed",
+                        "items": [{
+                            "id": "native-user",
+                            "clientId": "browser-query-message",
+                            "type": "userMessage",
+                        }],
+                    },
+                ],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        probe = await handle.reconcile_turn_start(
+            "browser-query-message",
+        )
+
+        assert probe.thread_active is False
+        assert probe.latest_turn_id == "completed-successor"
+        assert probe.matched_turn_id == "submitted-turn"
+        assert probe.matched_turn_is_latest is False
+        assert probe.newer_turns_present is True
+        assert probe.page_truncated is False
+
+    asyncio.run(run())
+
+
+def test_turn_start_reconciliation_marks_bounded_page_truncation():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "idle"},
+                    },
+                }
+            return {
+                "data": [{
+                    "id": f"newer-{index}",
+                    "status": "completed",
+                    "items": [],
+                } for index in range(8)],
+                "nextCursor": "older-page",
+            }
+
+        handle._request = request
+        probe = await handle.reconcile_turn_start(
+            "browser-query-message",
+            native_turn_id="submitted-turn",
+            native_message_id="native-user",
+        )
+
+        assert probe.thread_active is False
+        assert probe.latest_turn_id == "newer-0"
+        assert probe.matched_turn_id is None
+        assert probe.page_truncated is True
 
     asyncio.run(run())
 

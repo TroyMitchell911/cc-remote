@@ -7,9 +7,11 @@ import {
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
 import {
+  canDeleteSidebarSession,
   canForkTurn,
   FORK_FOCUS_REFRESH_MS,
   forkFocusLeaseSession,
+  isSessionArchiveBlockedByState,
   isSessionMigrationBlockedByState,
   isTerminalSessionMigrationError,
   isWorktreeForkNameValid,
@@ -48,6 +50,14 @@ assert.equal(sessionMenuCapabilities(archivedCodex).migrate, false);
 assert.equal(sessionMenuCapabilities({
   ...codex, space: "work",
 }).migrate, false);
+assert.equal(canDeleteSidebarSession("codex", "code", false), false,
+  "active Codex Code sessions must be archived before deletion is offered");
+assert.equal(canDeleteSidebarSession("codex", "code", true), true,
+  "archived Codex Code sessions remain deletable");
+assert.equal(canDeleteSidebarSession("claude", "code", false), true,
+  "Claude Code keeps its existing direct-delete lifecycle");
+assert.equal(canDeleteSidebarSession("codex", "work", false), true,
+  "Work deletion remains independent from native Code archival");
 assert.equal(isWorktreeForkBlockedByState("running"), true);
 assert.equal(isWorktreeForkBlockedByState("interrupting"), true);
 assert.equal(isWorktreeForkBlockedByState("idle"), false);
@@ -56,6 +66,11 @@ assert.equal(isSessionMigrationBlockedByState("interrupting"), true);
 assert.equal(isSessionMigrationBlockedByState("draining"), true);
 assert.equal(isSessionMigrationBlockedByState(undefined), false);
 assert.equal(isSessionMigrationBlockedByState("idle"), false);
+assert.equal(isSessionArchiveBlockedByState("running"), true);
+assert.equal(isSessionArchiveBlockedByState("interrupting"), true);
+assert.equal(isSessionArchiveBlockedByState("draining"), true);
+assert.equal(isSessionArchiveBlockedByState(undefined), false);
+assert.equal(isSessionArchiveBlockedByState("idle"), false);
 
 assert.equal(normalizeWorktreeForkName("  fix-login  "), "fix-login");
 assert.equal(isWorktreeForkNameValid(""), false);
@@ -151,6 +166,32 @@ assert.deepEqual(
     provisional_fork: true,
   },
   "a transient empty catalog keeps the exact fork child visible",
+);
+const claudeFocusLease = {
+  ...focusLease,
+  parentSessionId: "company@claude-parent",
+  childSessionId: "company@claude-child",
+  engine: "claude" as const,
+  gitBranch: null,
+  codexProfileId: null,
+  claudeProfileId: "company",
+};
+assert.deepEqual(
+  forkFocusLeaseSession(
+    claudeFocusLease, [claude], "machine-1", "claude", "code"),
+  {
+    session_id: "company@claude-child",
+    summary: "派生会话",
+    cwd: "/repo",
+    git_branch: null,
+    engine: "claude",
+    space: "code",
+    forked_from_id: "company@claude-parent",
+    claude_profile_id: "company",
+    state: "idle",
+    provisional_fork: true,
+  },
+  "a Claude fork placeholder retains its config-directory account",
 );
 assert.equal(forkFocusLeaseSession(
   focusLease, [{ session_id: "codex-child" }],

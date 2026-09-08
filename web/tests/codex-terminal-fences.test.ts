@@ -15,7 +15,7 @@ try {
   const { createRuntime, initialState, reduce } =
     await harness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
-    v: 35, ts: 10, ...body,
+    v: 37, ts: 10, ...body,
   } as ServerEvent);
   const history = (
     sid: string,

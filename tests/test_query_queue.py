@@ -138,9 +138,13 @@ def test_wrapper_starts_queued_query_after_turn_without_browser_callback():
         launched: list[Query] = []
         launched_event = asyncio.Event()
 
-        async def launch_without_engine(_ctx, command):
+        async def launch_without_engine(
+            _ctx, command, *, launch_receipt=None,
+        ):
             launched.append(command)
             _ctx.state = "running"
+            if launch_receipt is not None and not launch_receipt.done():
+                launch_receipt.set_result(True)
             launched_event.set()
 
         machine._handle_immediate_query = launch_without_engine
@@ -204,7 +208,9 @@ def test_queue_item_stays_owned_until_launch_preflight_accepts():
         accepted = asyncio.Event()
         attempts = 0
 
-        async def launch_after_retry(_ctx, command):
+        async def launch_after_retry(
+            _ctx, command, *, launch_receipt=None,
+        ):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
@@ -216,6 +222,8 @@ def test_queue_item_stays_owned_until_launch_preflight_accepts():
                     msg_id=command.msg_id,
                 )
             _ctx.state = "running"
+            if launch_receipt is not None and not launch_receipt.done():
+                launch_receipt.set_result(True)
             accepted.set()
             return None
 

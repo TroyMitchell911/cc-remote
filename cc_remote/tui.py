@@ -664,7 +664,8 @@ class Tui:
                 self._line(DIM("usage: /effort <low|medium|high|xhigh|max>"))
         elif cmd == "context":
             if self.attached_sid:
-                await self._send(GetContext(sid=self.attached_sid))
+                await self._send(GetContext(
+                    sid=self.attached_sid, refresh=True))
         elif cmd == "engine":
             if arg in ("claude", "codex"):
                 self.engine = arg
@@ -951,6 +952,9 @@ class Tui:
             self._line(RED(
                 f"!! {_safe_remote_text(d.get('code'))}: "
                 f"{_safe_remote_text(d.get('message'))}"))
+        elif t == "ask_user_sync":
+            if isinstance(sid, str):
+                self.pending_asks.pop(sid, None)
         elif t == "ask_user":
             if isinstance(sid, str):
                 ask = {
@@ -1057,11 +1061,31 @@ class Tui:
         ))
 
     def _render_context(self, d: dict) -> None:
-        tot, mx = d.get("total_tokens", 0), d.get("max_tokens", 0)
-        pct = d.get("percentage", 0)
+        if d.get("available") is False:
+            self._line(CYAN("[context: temporarily unavailable]"))
+            return
+        raw_total = d.get("total_tokens")
+        raw_max = d.get("max_tokens")
+        raw_percentage = d.get("percentage")
+        total = (raw_total if isinstance(raw_total, int)
+                 and not isinstance(raw_total, bool) and raw_total >= 0 else 0)
+        maximum = (raw_max if isinstance(raw_max, int)
+                   and not isinstance(raw_max, bool) and raw_max > 0 else 0)
+        percentage = (raw_percentage if isinstance(raw_percentage, (int, float))
+                      and not isinstance(raw_percentage, bool) else 0.0)
+        amount = (
+            f"{total:,}/{maximum:,} tokens ({percentage:.0f}%)"
+            if maximum else f"{total:,} tokens"
+        )
+        source = {
+            "cached_control": "cached",
+            "recent_turn": "recent turn",
+        }.get(d.get("source"), "")
+        suffix = "  ".join(filter(None, (
+            _safe_remote_text(d.get("model", "")), source,
+        )))
         self._line(CYAN(
-            f"[context: {tot:,}/{mx:,} tokens ({pct:.0f}%)  "
-            f"{_safe_remote_text(d.get('model', ''))}]"))
+            f"[context: {amount}{'  ' + suffix if suffix else ''}]"))
 
 
 def main() -> None:

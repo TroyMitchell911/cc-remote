@@ -24,27 +24,30 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.128`**: message-type shapes and the
-  interrupt/drain contract can shift between minor versions. Re-run the
+- **SDK pinned to `claude-agent-sdk==0.2.151`**: message-type shapes and the
+  interrupt/drain contract can shift between patch versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
-  the major/minor at startup).
-- **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
+  the exact verified patch at startup).
+- **Claude Code is the user's daily CLI, not the SDK bundle**: Claude Code
+  `>=2.1.258` is required and checked before a Claude session starts. The wrapper
   defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
   to the SDK. An empty value keeps this default; only another absolute path may
   override it. Keep that CLI updated and signed in before starting the wrapper.
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.128). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.151). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
   Text deltas still stream live via `StreamEvent`.
-- **Claude only — don't set `setting_sources=[]`**: we WANT `~/.claude/settings.json` loaded so
-  `claude` inherits the model link (`ANTHROPIC_BASE_URL`), model id, and
-  `bypassPermissions`. Note: settings.json's `env` block overrides the process
-  env, so redirecting the model backend from cc-remote is not possible — it's
-  the user's `settings.json` that decides.
+- **Claude only — don't set `setting_sources=[]` for Code**: single-account Code
+  intentionally loads the user's native settings. Explicit multi-account
+  profiles keep their own `CLAUDE_CONFIG_DIR` and load only the selected user
+  settings source. Project/local settings cannot replace the selected model
+  link, and the complete user file is never promoted through `--settings`.
+  Single-account Code retains Claude's normal source precedence. Work remains
+  isolated with one wrapper-owned settings policy and `setting_sources=[]`.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -66,7 +69,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v35 is declared by
+- **Protocol version gate**: current wire protocol v55 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all

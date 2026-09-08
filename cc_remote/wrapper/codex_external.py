@@ -18,7 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
@@ -441,6 +441,95 @@ def _is_interactive_codex_tui(
     )
 
 
+def _fold_npm_tui_launchers(
+    scan: HolderScan,
+    processes: Iterable[DarwinProcessInfo],
+    *,
+    read_process: Callable[[int], DarwinProcessInfo | None],
+) -> set[ProcessIdentity]:
+    """Count npm's Node launcher and its native child as one terminal client.
+
+    Only fold a direct, unique native TUI child with the same terminal and
+    forwarded arguments. Re-read both complete process identities before
+    suppressing the launcher's weak evidence; PID reuse, exit/exec races and
+    ambiguous or independent TUIs must remain unknown rather than fail open.
+    Actual writable rollout FDs are never discarded, even on a launcher.
+    """
+    rows = list(processes)
+    children: dict[int, list[DarwinProcessInfo]] = {}
+    for row in rows:
+        _identity, ppid, tty_nr, args = row
+        if (args and args[0].rsplit(b"/", 1)[-1] in {b"codex", b"codex.exe"}
+                and _is_interactive_codex_tui(args, tty_nr)):
+            children.setdefault(ppid, []).append(row)
+
+    folded: set[ProcessIdentity] = set()
+    for parent in rows:
+        identity, _ppid, tty_nr, args = parent
+        if (len(args) < 2
+                or args[0].rsplit(b"/", 1)[-1] not in {
+                    b"node", b"nodejs", b"node.exe"}
+                or args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+                or not _is_interactive_codex_tui(args, tty_nr)):
+            continue
+        candidates = children.get(identity.pid, [])
+        if len(candidates) != 1:
+            continue
+        child = candidates[0]
+        child_identity, _child_ppid, child_tty, child_args = child
+        if (child_tty != tty_nr
+                or child_identity.start_ticks < identity.start_ticks
+                or child_args[1:] != args[2:]):
+            continue
+        if (read_process(identity.pid) != parent
+                or read_process(child_identity.pid) != child):
+            continue
+        folded.add(identity)
+        scan.client_proxies.pop(identity, None)
+        for sid, logical in scan.logical_holders.items():
+            if identity in logical:
+                logical.discard(identity)
+                scan.holders[sid].discard(identity)
+    return folded
+
+
+def _is_owned_npm_app_server_child(
+    child: DarwinProcessInfo,
+    own_roots: Mapping[int, ProcessIdentity],
+    *,
+    read_process: Callable[[int], DarwinProcessInfo | None],
+) -> bool:
+    """Recognize the native server behind an exact wrapper-owned npm launcher.
+
+    ``CodexHandle.proc`` is Node for npm installs, not the native server/proxy.
+    Exclude only its direct headless Codex child with identical forwarded argv.
+    This is not recursive descendant ownership: shells, TUIs, shared daemons
+    and other clients started by a model must still be scanned independently.
+    Re-read the whole parent/child/parent chain to reject PID reuse, exec and
+    reparenting races instead of trusting names or a stale parent PID alone.
+    """
+    identity, ppid, tty_nr, args = child
+    root = own_roots.get(ppid)
+    if (root is None or tty_nr != 0 or not args
+            or args[0].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.exe"}
+            or args[1:3] not in {
+                (b"app-server", b"proxy"), (b"app-server", b"--stdio")}):
+        return False
+    parent = read_process(ppid)
+    if parent is None:
+        return False
+    parent_identity, _parent_ppid, parent_tty, parent_args = parent
+    if (parent_identity != root or parent_tty != 0 or len(parent_args) < 3
+            or parent_args[0].rsplit(b"/", 1)[-1] not in {
+                b"node", b"nodejs", b"node.exe"}
+            or parent_args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+            or identity.start_ticks < root.start_ticks
+            or args[1:] != parent_args[2:]):
+        return False
+    return (read_process(identity.pid) == child
+            and read_process(ppid) == parent)
+
+
 def _rollout_cwd(path: str) -> str | None:
     """Read only the bounded session_meta cwd needed for TUI attribution."""
     try:
@@ -578,6 +667,12 @@ def _darwin_writable_rollout_holders(
     snapshot = process_snapshot or darwin_process_snapshot()
     processes, process_scan_complete = snapshot
     complete = process_scan_complete
+    own_roots = {identity.pid: identity for identity in own}
+    for row in processes:
+        if row[0] not in own and _is_owned_npm_app_server_child(
+            row, own_roots, read_process=_darwin_process_info,
+        ):
+            own.add(row[0])
     for identity, _ppid, tty_nr, args in processes:
         if identity in own:
             continue
@@ -646,11 +741,16 @@ def _darwin_writable_rollout_holders(
                 passive[sid].add(identity)
                 if not _is_managed_shared_app_server(args):
                     private[sid].add(identity)
-    return HolderScan(
+    scan = HolderScan(
         result, complete, passive, client_proxies, private,
         logical_holders=logical,
         darwin_snapshot=snapshot,
     )
+    _fold_npm_tui_launchers(
+        scan, (row for row in processes if row[0] not in own),
+        read_process=_darwin_process_info,
+    )
+    return scan
 
 
 def writable_rollout_holders(
@@ -688,12 +788,24 @@ def writable_rollout_holders(
         return HolderScan(result, True, passive, client_proxies, private)
 
     own = set(own_processes)
+    own_roots = {identity.pid: identity for identity in own}
     root = Path(proc_root)
+
+    def read_process(pid: int) -> DarwinProcessInfo | None:
+        proc_dir = root / str(pid)
+        before = _process_stat(proc_dir)
+        args = _process_cmdline(proc_dir)
+        if before is None or args is None or _process_stat(proc_dir) != before:
+            return None
+        ppid, start, tty_nr = before
+        return ProcessIdentity(pid, start), ppid, tty_nr, args
+
     if shell_snapshot_root is None:
         codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
         shell_snapshot_root = os.path.join(codex_home, "shell_snapshots")
     snapshots = _shell_snapshot_rows(paths, shell_snapshot_root)
     unresolved_tuis: list[tuple[ProcessIdentity, int, str]] = []
+    tui_processes: list[DarwinProcessInfo] = []
     if own:
         own_fd_visible = False
         for identity in own:
@@ -719,11 +831,16 @@ def writable_rollout_holders(
             proc_stat = _process_stat(proc_dir)
             if proc_stat is None:
                 continue
-            _, start, tty_nr = proc_stat
+            ppid, start, tty_nr = proc_stat
             identity = ProcessIdentity(pid, start)
             if identity in own:
                 continue
             args = _process_cmdline(proc_dir)
+            if args and _is_owned_npm_app_server_child(
+                (identity, ppid, tty_nr, args), own_roots,
+                read_process=read_process,
+            ):
+                continue
             interactive_tui = _is_interactive_codex_tui(args, tty_nr)
             if _is_app_server_proxy(args, tty_nr) or interactive_tui:
                 try:
@@ -769,6 +886,8 @@ def writable_rollout_holders(
             # its descriptors/cmdline were scanned. Only accept a stable identity.
             if _process_start_ticks(proc_dir) != start:
                 continue
+            if interactive_tui and args:
+                tui_processes.append((identity, ppid, tty_nr, args))
             if not logical_sids and interactive_tui:
                 try:
                     cwd = os.path.realpath(os.readlink(proc_dir / "cwd"))
@@ -789,12 +908,16 @@ def writable_rollout_holders(
                         private[sid].add(identity)
     except OSError:
         return HolderScan(result, False, passive, client_proxies, private)
+
+    scan = HolderScan(result, complete, passive, client_proxies, private,
+                      logical_holders=logical)
+    folded = _fold_npm_tui_launchers(
+        scan, tui_processes, read_process=read_process)
     for identity, sid in _snapshot_tui_bindings(
-        unresolved_tuis, snapshots,
+        [row for row in unresolved_tuis if row[0] not in folded], snapshots,
     ).items():
         result[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies, private,
-                      logical_holders=logical)
+    return scan
 
 
 def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:

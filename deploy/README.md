@@ -4,6 +4,62 @@ Reference files for the production deploy (public VPS relay + wrapper on your
 machine). The **full step-by-step guide is in the main [README](../README.md#生产部署公网-vps-中继--你机器上的-wrapper)**
 ([English](../README_en.md#production-deploy-public-vps-relay--wrapper-on-your-machine)).
 
+## Deployment contract for automation
+
+This directory is the deployment source of truth for humans and automation.
+Machine inventory is deliberately external: host aliases, usernames, domains,
+addresses, home directories, and credentials belong to the operator's
+environment, not this repository. Replace documented placeholders only with
+values the operator supplied or that were read from the existing installation;
+never guess them.
+
+Before changing a live service:
+
+1. Inspect the source worktree, target installation, current release, service
+   manager, and health. Preserve unrelated changes; do not normalize a dirty
+   worktree or silently replace a custom installation layout.
+2. Select the matching supported path. Use `install.sh` for a published release.
+   Use the main README's source-staging/manual production path for the current
+   source tree. An existing nonstandard installation must retain its established
+   service ownership and configuration boundaries rather than being overwritten
+   with a first-install template.
+3. Run the complete gate in `AGENTS.md`, build `web/dist`, and validate the
+   Python/Web protocol pair with `validate_protocol_bundle.py`.
+4. Freeze those tested bytes once. Every Relay, Web client, and Wrapper in the
+   maintenance window must come from that same snapshot or coordinated artifact
+   set. Do not rebuild independently on different hosts.
+5. Stage and validate every target before activation. Keep `.env`, device
+   authority, profile configuration, private databases, and other runtime state
+   outside immutable release trees. Never upload secrets as part of a source
+   snapshot.
+
+Activate a coordinated protocol change in the order documented by the current
+protocol note below: stop incompatible old Wrappers, activate Relay + Web as one
+transaction, then activate/start every Wrapper and hard-refresh clients. Use the
+repository installers' immutable `releases/` plus atomic `current` switch; never
+overlay the live tree with `rsync --delete`. If Wrapper state requires a schema
+snapshot, create it while the Wrapper is stopped and keep it with the previous
+release.
+
+A command that loses SSH, terminal, or cc-remote connectivity has an **unknown
+result**, not a failed result. Inspect the exact service/job, `current` target,
+logs, health endpoint, PID, and restart count before retrying. Never start a
+second installer merely because the first caller stopped receiving output.
+A Wrapper must not be its own only deployment controller: activate it from an
+independent terminal/SSH connection or from exactly one OS-owned one-shot job
+that can finish after the old Wrapper exits.
+
+Success requires all of the following: the expected immutable releases are
+active, Python and served Web build metadata report the same protocol/product,
+services have stable PIDs without restart loops, the public health endpoint is
+healthy, expected Wrappers reconnect, and recent logs contain no new fatal
+errors. Installations using Codex Code must also verify the
+[shared CLI control plane](#codex-code-shared-control-plane-acceptance);
+an online Wrapper alone does not prove bidirectional CLI access.
+On failure, use the installer-owned rollback or the retained previous
+release and matching state snapshot; do not delete old releases during the
+deployment.
+
 - `install.sh` — versioned GitHub Release bootstrap. It requires an explicit
   `relay` or `wrapper` role, detects OS/CPU, downloads that one role archive,
   verifies its `SHA256SUMS` entry before extraction, rejects unsafe archive
@@ -27,6 +83,13 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   restores the previous release/service definition on failure. The installer
   requires and explicitly selects the service user's daily
   `~/.local/bin/claude`; it never silently falls back to the SDK-bundled CLI.
+- `prepare_wrapper_stage.py` — unprivileged preflight for an existing manual
+  immutable-Wrapper topology. It reuses an active venv only when the dependency
+  lock and Python pin are identical; otherwise it builds a platform-local venv
+  with the pinned uv/Python, hashed binary wheels, and copy link mode. It
+  validates imports plus the Python/Web protocol pair and writes a bound stage
+  manifest for the separate privileged activation step. It never switches
+  `current` or restarts a service.
 - `setup-vps.sh` — atomic VPS release installer. It validates a user-owned
   upload, copies it to a new root-owned
   `/opt/cc-remote/releases/release-*` directory, builds that release's own
@@ -42,7 +105,13 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   `/opt/cc-remote/current/web/dist`.
 - `Caddyfile` — reverse proxy + auto Let's Encrypt TLS (`wss://domain/ws` →
   `127.0.0.1:8765`) plus an early 4 KiB login-body limit. Replace
-  `cc-remote.example.com` with your domain.
+  `cc-remote.example.com` with your domain. The application CSP allows HTTPS
+  images from the exact GitHub hosts listed in the template, including the
+  dedicated attachment redirect bucket, but not arbitrary external images,
+  scripts, or fetch connections. The HTML preview runner remains isolated.
+  Image-policy changes require the managed Caddy configuration to be updated
+  through the VPS activation transaction; replacing the Web bundle alone is
+  insufficient. Do not replace the host allowlist with `https:` or wildcards.
 - `Caddyfile.insecure` — explicit plain-HTTP public-IP template selected only
   when `ALLOW_INSECURE_HTTP=1`, the setup target is a public IPv4 address, and
   `PUBLIC_ORIGIN` exactly matches `http://that-address`. It omits HSTS and
@@ -67,26 +136,29 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   hosts that already run nginx instead of the managed Caddy. Loopback-only
   requirement is documented in the file header.
 - `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
-  through SQLite's backup API, restores the matching pre-release images before
-  an older wrapper is restarted, and verifies the v34 Codex ownership backfill.
+  through SQLite's backup API plus the complete private Claude/Codex profile
+  migration transaction, restores matching pre-release data before an older
+  wrapper is restarted, and verifies both engines' Work ownership backfills.
 
-Protocol v35 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v55 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v35 relay/web release; then start the v35 wrapper.
+activate the v55 relay/web release; then start the v55 wrapper.
 
-The wrapper installer treats local Work data as part of the release
+The wrapper installer treats local Work data and versioned private control state
+as part of the release
 transaction. It stops the existing service, writes a private snapshot below
 the install root's `rollback-data/`, starts the new release, and refuses the
-activation unless the Codex Work schema and all legacy ownership rows are
-ready. On failure it stops the new process, restores both SQLite images, then
-restores and starts the previous code. If data restoration fails, it leaves the
+activation unless the Claude and Codex Work schemas and all legacy profile
+ownership rows are ready. On failure it stops the new process, restores both
+SQLite images and the matching private profile state, then restores and starts
+the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v35, and retain that snapshot with the previous release. To roll back,
-stop v35, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v55, and retain that snapshot with the previous release. To roll back,
+stop v55, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state
@@ -94,7 +166,38 @@ created after activation will no longer be registered (their private files are
 not deleted). Use this for immediate failed activation; after normal use,
 prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
 
+Snapshot format v3 includes an explicit allowlist of Claude/Codex controls,
+turn leases, pins, aliases, fork/BTW records, plans, presentation receipts,
+Viewer associations, and both pending/completed profile journals. An absent
+file is recorded too and removed on rollback if activation created it. Codex
+checkpoint journals include their directory layout and local object data:
+profile migration renames those directories, so manifest-only backup is not
+sufficient. This private archive rejects symlinks and special files and is
+bounded to 65,536 entries / 8 GiB of payload; exceeding a limit aborts before
+activation, not with a partial usable snapshot. Restoring checkpoints retains
+the displaced tree in `.checkpoint-displaced-*` under the private state
+directory for recovery. Account configuration, credentials, native transcripts,
+and project files are not part of this snapshot. Retain snapshots locally;
+never publish them as release artifacts. Legacy v1/v2 snapshots remain
+restorable only within their original, narrower scope; they cannot provide
+complete rollback for a new profile migration.
+
 ## Container deploy (Docker) and the nginx alternative
+
+For the optional static remote Viewer feature, also read
+[`docs/remote-viewer.md`](../docs/remote-viewer.md). Default Bridge mode reuses
+the existing origin, including explicitly allowed HTTP/IP access; no extra DNS/TLS
+is needed. Include the runner asset and both Viewer WebSocket routes; preserve
+the relay's HTTP sandbox/CSP on `/__cc_viewer/bridge/*` using the updated proxy
+template. Home-directory page discovery is enabled by default; opt out with
+`CC_REMOTE_VIEWER_HOME_PREVIEW=0` in the Wrapper environment. It verifies explicit
+HTML references or owned Python static listeners, not arbitrary URL proxies;
+automatic pages stay in their session lists. Existing manual publications are
+preserved. Check one actual page on each resource device, not just the catalog.
+Optional Isolated mode
+still requires wildcard TLS and a narrow frame-src addition. Never serve raw
+Viewer scripts on the main application origin. Verify real mobile access before
+reporting this optional feature as deployed.
 
 The official relay install is a systemd venv staged by `setup-vps.sh` behind a
 managed Caddy. Two alternative topologies are supported for hosts that already
@@ -152,6 +255,69 @@ docker build -f deploy/Dockerfile \
   of the Code settings. Codex Work sessions and schedules may select any
   configured profile; the local registry freezes that ownership across retries
   and default-profile changes.
+
+### Codex Code shared control plane acceptance
+
+The required topology is **CLI → the same official app-server ← Wrapper**,
+not merely two processes reading the same rollout. Check every enabled Code
+account separately; never merge accounts into one `CODEX_HOME` to get sharing.
+This does not apply to Work's deliberately private app-server.
+
+1. Resolve the actual daily CLI (including shell aliases/launchers), the
+   Wrapper's selected executable (`CODEX_BIN` if set), service user, and each
+   account's effective `CODEX_HOME`. Compare real paths, not command names.
+   A Codex CLI `--profile` is a configuration profile, not cc-remote's account
+   home selection. Do not read or copy auth files. Both selected CLIs must
+   support `app-server daemon` and `app-server proxy`; an npm installation
+   alone neither proves nor disproves that capability.
+2. Keep `CC_REMOTE_CODEX_DAEMON=auto` for sharing. Wrapper startup already
+   prepares each account's daemon and enables remote control before connecting
+   to Relay; do not add a second daemon or another startup service. Check the
+   current startup's `Codex profile shared daemon ready` log and
+   `remote_control=true`. A prewarm failure, `using stdio`, or an unverified
+   existing-server candidate is not proof of shared readiness.
+3. As the same OS user, compare the following **read-only** probes using the
+   resolved account home and both executable paths (replace placeholders):
+
+   ```bash
+   CODEX_HOME="<account-home>" "<daily-codex-bin>" app-server daemon version
+   CODEX_HOME="<account-home>" "<wrapper-codex-bin>" app-server daemon version
+   ```
+
+   Require a running daemon, compatible CLI/app-server versions, and the same
+   resolved `socketPath`/managed server identity. For an already connected Code
+   session, also check the Wrapper's actual `app-server proxy --sock …` target
+   and successful connection, not just that a socket file exists. With npm,
+   Node and its native Codex child are one launch chain, not two independent
+   clients. Do not expose complete process environments or user prompts in logs.
+4. Verify the operator's normal `codex resume <session-id>` workflow actually
+   connects to that same endpoint. Use an operator-approved idle test session
+   or an already connected terminal; do not resume a busy production session
+   for testing. Current Unix-socket connection evidence or structured app-server
+   connection records tied to that CLI's lifetime can establish the route;
+   old log rows, matching home paths and `active writer` errors alone cannot.
+   Confirm a shared session does not become read-only solely because its CLI is
+   open. A live two-direction prompt test spends model tokens and requires
+   explicit authorization; otherwise report transport verification separately
+   from an untested live-message round trip.
+
+The official CLI supports explicit endpoint selection with
+`codex resume --remote unix:// <session-id>` for the selected home's default
+socket, or `--remote unix://<absolute-socket-path>` for a specific endpoint.
+See [the official connection documentation](https://learn.chatgpt.com/docs/app-server#connect-the-cli-terminal-ui).
+This is a diagnostic/explicit connection option, **not a mandatory suffix for
+all resumes**. If explicit connection works but plain resume does not, sharing
+via automatic discovery has not passed acceptance: compare the actual CLI
+build, home, endpoint and startup/connection errors. Do not assume all builds
+auto-attach simply because a daemon is running, or mask the difference by
+silently changing the user's shell alias.
+
+An existing private CLI writer is not migrated into the daemon by starting it
+later. Let the operator finish and exit that CLI normally, then reconnect to
+the verified shared endpoint. Never kill an active CLI, delete locks/rollouts,
+disable ownership checks, or force takeover to make this check pass. Report any
+unverified account or stdio fallback as a remaining coordination issue, even
+when Relay/Web health is green; do not claim bidirectional deployment complete.
 
 ## Security (short version)
 

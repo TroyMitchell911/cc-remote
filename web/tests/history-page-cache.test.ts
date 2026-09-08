@@ -395,6 +395,33 @@ assert.deepEqual(
   [legacyCodexKey, legacyCodexV2Key, legacyCodexV3Key],
 );
 
+// A source revision can stay unchanged when the backend repairs only its
+// summary projection. Reject v6 question-only pages rather than repaint them.
+const staleAsyncStorage = new MemoryStorage();
+const staleAsyncCache = new HistoryPageCache({ storage: staleAsyncStorage });
+const staleAsyncPage: HistoryBrowsePage = {
+  pageKey: "async-legacy-answer",
+  turns: [turn("async-user", { blocks: [{
+    kind: "text", message_id: "question", text: "Question?", done: true,
+    channel: "final", delivery: "async", questions: [{ title: "Question?" }],
+  }] })],
+  hasOlder: false,
+  olderCursor: "async-user",
+};
+assert.equal((await staleAsyncCache.putPage(scope, staleAsyncPage)).ok, true);
+const staleAsyncKey = staleAsyncCache.pageKey(scope, staleAsyncPage.pageKey);
+(staleAsyncStorage.records.get(staleAsyncKey) as { version: number }).version = 6;
+assert.equal(await staleAsyncCache.getPage(scope, staleAsyncPage.pageKey), null);
+assert.deepEqual(staleAsyncStorage.deletedKeys, [staleAsyncKey]);
+staleAsyncPage.turns[0].blocks.push({
+  kind: "text", message_id: "answer", text: "Finished.", done: true, channel: "final",
+});
+assert.equal((await staleAsyncCache.putPage(scope, staleAsyncPage)).ok, true);
+const reopenedAsyncCache = new HistoryPageCache({ storage: staleAsyncStorage });
+assert.deepEqual((await reopenedAsyncCache.getPage(scope, staleAsyncPage.pageKey))
+  ?.turns[0].blocks.map((block) => block.kind === "text" ? block.text : null),
+["Question?", "Finished."]);
+
 const claudeScope = { ...scope, engine: "claude" };
 const legacyClaudeStorage = new MemoryStorage();
 const legacyClaudeCache = new HistoryPageCache({ storage: legacyClaudeStorage });

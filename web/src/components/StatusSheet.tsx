@@ -1,6 +1,12 @@
-import type { ReactNode } from "react";
-import type { Notice, StatusRateLimit, StatusRateWindow, StatusReport } from "../protocol";
+import { useEffect, useRef, type ReactNode } from "react";
+import type {
+  Notice, RateLimitResetResult, StatusRateLimit,
+  StatusRateLimitResetCredit, StatusRateWindow, StatusReport,
+} from "../protocol";
 import { Icon } from "../icons";
+import {
+  resetCreditConfirmation, resetCreditOutcomeMessage, resetCreditPresentation,
+} from "../rate-limit-reset";
 import { accountStatsNote } from "../status-capabilities";
 import { statusNotices } from "../notice-presentation";
 import {
@@ -14,8 +20,12 @@ interface Props {
   report: StatusReport | null;
   notices?: Notice[];
   error?: string | null;
+  resetCreditLoading?: boolean;
+  resetCreditResult?: RateLimitResetResult | null;
+  resetCreditDisabled?: boolean;
   onClose: () => void;
   onRefresh: () => void;
+  onConsumeResetCredit?: (creditId?: string | null) => boolean;
   onDismissNotice?: (noticeId: string) => void;
 }
 
@@ -32,6 +42,36 @@ function resetTime(value?: number | null): string {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
   }).format(new Date(value * 1000));
+}
+
+function confirmResetCredit(credit?: StatusRateLimitResetCredit): boolean {
+  return window.confirm(resetCreditConfirmation(credit));
+}
+
+function ResetCredit({ credit, loading, disabled, onConsume }: {
+  credit: StatusRateLimitResetCredit;
+  loading: boolean;
+  disabled: boolean;
+  onConsume?: (credit: StatusRateLimitResetCredit) => void;
+}) {
+  const available = credit.status === "available";
+  const copy = resetCreditPresentation(credit);
+  return <article className="status-reset-credit">
+    <span>
+      <b>{copy.title}</b>
+      {copy.description && <small>{copy.description}</small>}
+      <small>{credit.expires_at
+        ? `${resetTime(credit.expires_at)} 到期`
+        : "长期有效"}</small>
+    </span>
+    {available && onConsume
+      ? <button type="button" disabled={loading || disabled}
+          onClick={() => onConsume(credit)}>
+          {loading ? "使用中…" : "使用"}
+        </button>
+      : <em>{credit.status === "redeeming" ? "处理中"
+        : credit.status === "redeemed" ? "已使用" : "不可用"}</em>}
+  </article>;
 }
 
 function Row({ label, children, mono = false }: { label: string; children: ReactNode; mono?: boolean }) {
@@ -59,12 +99,32 @@ function RateLimit({ limit }: { limit: StatusRateLimit }) {
 }
 
 export function StatusSheet({ open, report, notices = [], error, onClose,
-  onRefresh, onDismissNotice }: Props) {
+  resetCreditLoading = false, resetCreditResult,
+  resetCreditDisabled = false, onRefresh, onConsumeResetCredit,
+  onDismissNotice }: Props) {
+  const resetLaunchRef = useRef(false);
+  useEffect(() => {
+    if (!resetCreditLoading) resetLaunchRef.current = false;
+  }, [resetCreditLoading]);
   if (!open) return null;
   const thread = report?.thread;
   const runtime = report?.runtime;
   const context = report?.context;
   const usage = report?.usage;
+  const resetCredits = report?.reset_credits;
+  const resetCreditRows = resetCredits?.credits ?? [];
+  const detailedAvailable = resetCreditRows.filter(
+    (credit) => credit.status === "available").length;
+  const hasUndetailedCredits = !!resetCredits
+    && resetCredits.available_count > detailedAvailable;
+  const consumeResetCredit = (credit?: StatusRateLimitResetCredit) => {
+    if (!onConsumeResetCredit || resetLaunchRef.current
+        || !confirmResetCredit(credit)) return;
+    resetLaunchRef.current = true;
+    if (!onConsumeResetCredit(credit?.id ?? null)) {
+      resetLaunchRef.current = false;
+    }
+  };
   const statsNote = accountStatsNote(report?.account);
   const presentedNotices = statusNotices(notices);
   return <>
@@ -144,6 +204,34 @@ export function StatusSheet({ open, report, notices = [], error, onClose,
           <h3>使用限额</h3>
           <div className="status-rates">{report.rate_limits.map((limit, index) => <RateLimit key={limit.limit_id || index} limit={limit} />)}</div>
         </section>}
+
+        {(resetCredits || resetCreditResult) &&
+          <section className="status-section">
+            <h3>重置券</h3>
+            {resetCredits && <div className="status-reset-summary">
+              <span><b>{resetCredits.available_count}</b> 张可用</span>
+              <small>仅重置符合条件的 Codex 额度窗口</small>
+            </div>}
+            {resetCreditRows.length > 0 && <div className="status-reset-list">
+              {resetCreditRows.map((credit) => <ResetCredit
+                key={credit.id}
+                credit={credit}
+                loading={resetCreditLoading}
+                disabled={resetCreditDisabled
+                  || (resetCredits?.available_count ?? 0) < 1}
+                onConsume={consumeResetCredit}
+              />)}
+            </div>}
+            {hasUndetailedCredits && onConsumeResetCredit &&
+              <button type="button" className="status-reset-next"
+                disabled={resetCreditLoading || resetCreditDisabled}
+                onClick={() => consumeResetCredit()}>
+                {resetCreditLoading ? "使用中…" : "使用下一张"}
+              </button>}
+            {resetCreditResult && <div className="status-reset-result" role="status">
+              {resetCreditOutcomeMessage(resetCreditResult.outcome)}
+            </div>}
+          </section>}
 
         {usage && <section className="status-section">
           <h3>账户用量</h3>

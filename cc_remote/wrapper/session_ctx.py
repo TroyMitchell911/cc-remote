@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
 
-from cc_remote.protocol import State
+from cc_remote.protocol import AskUser, BackgroundProcessItem, State
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.stream import StreamTranslator
@@ -69,6 +69,40 @@ class ActiveTurnBinding:
     generation: str
 
 
+@dataclass(frozen=True)
+class PendingAskResolution:
+    """One terminal outcome for an interactive question.
+
+    The Future always resolves normally with this value.  Keeping cancellation,
+    timeout, supersede, and answer on one result channel avoids un-retrieved
+    Future exceptions when the surrounding engine task is cancelled at the
+    same time as the question closes.
+    """
+
+    reason: str
+    answer: str | list[str] | None = None
+
+
+@dataclass
+class PendingAskState:
+    """Authoritative, reconnectable state for one still-open question.
+
+    ``event`` is an unsequenced template: it never enters the replay ring and
+    is copied independently for the original live emit and every eligible
+    client Hello.  ``deadline`` is the original monotonic deadline and is never
+    recomputed by reconnects.
+    """
+
+    event: AskUser
+    future: asyncio.Future[PendingAskResolution]
+    labels: frozenset[str]
+    allow_text: bool
+    multi_select: bool
+    created_at: float
+    deadline: float
+    target: Optional[str] = None
+
+
 @dataclass
 class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
@@ -86,10 +120,13 @@ class SessionContext:
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    # Claude's complete local account boundary. ``session_id`` remains the
+    # native UUID while ``key`` is namespaced when multiple profiles exist.
+    claude_profile_id: Optional[str] = None
     # Codex's complete local account boundary. ``session_id`` remains the
     # native app-server UUID while ``key`` is the browser-facing routing id
     # (namespaced for every profile when multiple profiles are configured).
-    # Claude leaves this unset.
+    # Claude uses the parallel field above.
     codex_profile_id: Optional[str] = None
     # Product-space identity. Work sessions are native engine sessions whose
     # cwd and metadata are owned by cc-remote's private Work registry.
@@ -103,6 +140,11 @@ class SessionContext:
     # rows with no baseline must keep showing the authoritative raw total rather
     # than silently reclassifying their existing conversation as engine cost.
     work_context_baseline_pending: bool = False
+    # Only an explicitly native Claude transcript mutation may replace the
+    # current Remote model/effort on reload. Origin-less metadata still makes
+    # the in-memory conversation stale, but must not roll back a newer Remote
+    # control selection to an older completed transcript row.
+    claude_native_controls_dirty: bool = False
     turn_task: Optional[asyncio.Task] = None
     # Browser queue mode transfers complete Query commands here immediately.
     # The wrapper-owned drain keeps running while browsers are disconnected or
@@ -125,6 +167,10 @@ class SessionContext:
     # consumed the original binding frame. It never survives a terminal/idle
     # boundary and is not a substitute for the engine's native lifecycle.
     active_turn_binding: Optional[ActiveTurnBinding] = None
+    # First visible Codex process work is persisted once per exact logical /
+    # native owner. This in-memory marker only suppresses repeated sidecar reads
+    # for commentary deltas; it never participates in running/idle ownership.
+    codex_process_clock_binding: Optional[tuple[str, str]] = None
     # Interrupt must wake a consumer that is already blocked in queue.get().  The
     # absolute monotonic deadline prevents each subsequent queue item from
     # restarting the drain timeout.
@@ -137,17 +183,88 @@ class SessionContext:
     claude_item_turns: dict[str, str] = field(default_factory=dict)
     claude_item_titles: dict[str, str] = field(default_factory=dict)
     claude_item_meta: dict[str, tuple[str, str | None]] = field(default_factory=dict)
+    # Read-only projection of Claude-owned Agent runs. Kept resident across SDK
+    # reconnects; Work and broker-owned TUI sessions leave it unset.
+    claude_agents: Any = None
+    # Connection-local Claude task lifecycle, independent from the optional
+    # Agent detail projection above. Work deliberately has no Agent registry but
+    # still permits Bash(run_in_background=true), so spawn-time controls must
+    # wait for these tasks and their autonomous post-result follow-up to drain.
+    claude_active_tasks: set[str] = field(default_factory=set)
+    claude_task_tracking_overflow: bool = False
+    # Public, bounded activity projection used for reconnect/Hello replacement.
+    # Membership follows Claude's native background task level; ProcessEvent
+    # edges enrich these snapshots without becoming reconnect authority.
+    claude_background_processes: dict[str, BackgroundProcessItem] = field(
+        default_factory=dict)
+    # Sanitized Bash command metadata survives ResultMessage translator swaps
+    # so a later task_started edge can still expose the script in the dock.
+    claude_item_commands: dict[str, str] = field(default_factory=dict)
+    # Every terminal background notification can enqueue its own autonomous
+    # Claude turn.  Keep an insertion-ordered ledger instead of a boolean so an
+    # earlier Result cannot release a later notification which was already
+    # delivered. Values are ``notified`` until the injected top-level user
+    # boundary is observed, then ``active`` until that turn's Result.
+    claude_background_followups: dict[str, str] = field(default_factory=dict)
+    claude_background_followup_nonce: int = 0
+    # A corrupt or adversarial stream must not grow the exact-origin ledger
+    # without bound. Overflow fails closed until one controlled reconnect resets
+    # the complete connection-local lifecycle.
+    claude_background_followup_overflow: bool = False
+    claude_followup_recovery_task: Optional[asyncio.Task] = None
+    # One injected Claude turn can contain streamed text and several assembled
+    # tool blocks after its parent Result. Preserve translator state until that
+    # injected turn's own Result so live rendering matches history translation.
+    claude_background_translator: Optional[StreamTranslator] = None
+    # An autonomous post-Result continuation has no managed turn consumer.
+    # Stop therefore owns a bounded watchdog which reconnects the child if its
+    # terminal Result never reaches the background pump.
+    claude_autonomous_interrupt_task: Optional[asyncio.Task] = None
+    claude_autonomous_interrupt_wakeup: asyncio.Event = field(
+        default_factory=asyncio.Event)
     # /btw ephemeral fork: a throwaway side-session forked from `parent_sid` that
     # inherits its context. Never persisted, excluded from the session list, and
     # discarded on close. Its turns reuse the normal _run_turn path.
     btw: bool = False
     parent_sid: Optional[str] = None
+    # Relay-authenticated account identity for a private side chat. The legacy
+    # attribute name is retained for state/test compatibility; this is not a
+    # page-lifetime WebSocket client id.
     owner_client_id: Optional[str] = None
+    # Stable wall-clock ordering for the owner-scoped side-chat catalog. This
+    # is process-local just like the ephemeral native fork itself.
+    btw_created_at: float = 0.0
+    # The native fork is inserted before its one-shot open response is sent.
+    # Hello must not catalog/replay it until that response has established the
+    # browser runtime, otherwise a reconnect can receive Snapshot first.
+    btw_announced: bool = False
+    # A proven-lost native ephemeral fork remains resident for read-only replay
+    # until its owner explicitly closes it. Never reuse its routing identity.
+    btw_destroyed: bool = False
     # cc fork_session persists a transcript under a new id (unlike codex's
     # ephemeral fork); capture it here so close_btw can hard-delete it.
     btw_real_id: Optional[str] = None
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
+    # Claude autocompact is a spawn-time session option.  Keep the last public
+    # projection and any recoverable reconnect error on the resident context so
+    # hello/focus refreshes do not make a still-pending choice look applied.
+    announced_auto_compact: Optional[tuple[object, ...]] = None
+    auto_compact_error: Optional[str] = None
+    auto_compact_phase: str = "stable"
+    auto_compact_compaction_done: bool = False
+    auto_compact_apply_task: Optional[asyncio.Task] = None
+    auto_compact_apply_started_revision: Optional[int] = None
+    # Monotonic proof that this resident context completed a real native
+    # compact transaction. A manual command snapshots it before waiting for the
+    # query lock so it cannot repeat maintenance that won the same race.
+    claude_compaction_revision: int = 0
+    # Model/effort/permission mutations and the spawn-time autocompact control
+    # use separate command paths.  Persist one coherent SDK snapshot per
+    # resident Claude session so an older async write cannot land after a newer
+    # control and silently undo it in the private store/broker preferences.
+    claude_control_persist_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock)
     # Model/cwd/process changes and thread/settings notifications can arrive
     # while config/read or model/list is resolving a nullable Codex effort.
     # Serialize those presentation-only probes per resident session; the
@@ -229,6 +346,17 @@ class SessionContext:
     codex_checkpoint_ready: bool = False
     codex_checkpoint_accepted: bool = False
     codex_checkpoint_unavailable_reason: Optional[str] = None
+    # A shared ``turn/start`` response can be lost during an official daemon
+    # replacement. The original runner remains the sole write owner while it
+    # reconciles exact native identity; a reconnect-time turn/started callback
+    # must not mistake that recovery for a competing automatic turn.
+    codex_turn_start_reconciling: bool = False
+    codex_deferred_turn_start_id: Optional[str] = None
+    # Every native lifecycle callback advances this fence while reconciliation
+    # owns the session. The recovery loop snapshots it after an ordered status
+    # probe and refuses to unlock if a turn started or completed during any
+    # subsequent await.
+    codex_turn_start_reconcile_revision: int = 0
     # ---- external-write mirroring (a native `claude`/`codex` in the user's
     # terminal owns this session and is appending to its transcript) ----
     # epoch of the last append this wrapper did NOT make. Recent => the session is
@@ -279,10 +407,10 @@ class SessionContext:
     # stores only the broker generation needed to reject a stale PID/socket
     # record; it never owns or kills that process on an ordinary disconnect.
     claude_broker_generation: Optional[str] = None
-    pending_asks: dict = field(default_factory=dict)
-    # Semantic metadata stays separate from the Future map so every answer can
-    # be validated against the exact prompt that created it.
-    pending_ask_specs: dict = field(default_factory=dict)
+    # Questions are durable for the lifetime of this resident context rather
+    # than one-shot ring events. Registration and every terminal transition are
+    # serialized by ``emit_lock`` so Hello cannot resurrect a closed question.
+    pending_asks: dict[str, PendingAskState] = field(default_factory=dict)
     # The browser presents one question card per session. Serialize whole
     # batches so concurrent tools/subagents cannot overwrite that card.
     ask_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -333,6 +461,26 @@ class SessionContext:
 
     def __post_init__(self) -> None:
         self.codex_steer_gate.set()
+
+    @property
+    def claude_background_followup_pending(self) -> bool:
+        """Compatibility view for callers which only need the aggregate latch."""
+        return bool(
+            self.claude_background_followups
+            or self.claude_background_followup_overflow
+        )
+
+    @claude_background_followup_pending.setter
+    def claude_background_followup_pending(self, pending: bool) -> None:
+        # Narrow tests and embedded adapters historically seeded this latch
+        # directly. Preserve that API without letting production lifecycle code
+        # collapse the real per-origin ledger back into one boolean.
+        if pending:
+            if not self.claude_background_followups:
+                self.claude_background_followups["legacy:manual"] = "active"
+        else:
+            self.claude_background_followups.clear()
+            self.claude_background_followup_overflow = False
 
     def next_seq(self) -> int:
         self.seq += 1

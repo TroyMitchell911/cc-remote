@@ -141,6 +141,20 @@ export function acceptsCachedNewerPage(
     && projection.newerPageKey === guard.pageKey;
 }
 
+/** A cached latest page is only a navigation link after live output changed.
+ * Installing its stale rows would hide the active tail. Reaching that link by
+ * an explicit downward gesture must switch to SessionRuntime instead. */
+export function cachedLatestRequiresLiveRuntime(
+  projection: HistoryBrowseProjection,
+  page: Pick<HistoryBrowsePage, "isLatest"> | null | undefined,
+  latestPageKey?: string,
+): boolean {
+  return projection.latestDirty && (
+    !!page?.isLatest
+    || (!!latestPageKey && projection.newerPageKey === latestPageKey)
+  );
+}
+
 export function canonicalTurnId(turn: Pick<Turn, "id" | "historyTurnId">): string {
   return turn.historyTurnId || turn.id;
 }
@@ -559,6 +573,7 @@ export function markBrowseDetailLoading(
     before: string | null;
     direction: "initial" | "older" | "newer";
   } | null,
+  resetPending?: boolean,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -575,7 +590,9 @@ export function markBrowseDetailLoading(
             || (turn.detailRetryBefore === (
               retry === null ? undefined : retry.before)
               && turn.detailRetryDirection === (
-                retry === null ? undefined : retry.direction)))) return turn;
+                retry === null ? undefined : retry.direction)))
+          && (resetPending === undefined
+            || !!turn.detailResetPending === resetPending)) return turn;
       changed = true;
       return {
         ...turn,
@@ -587,6 +604,8 @@ export function markBrowseDetailLoading(
           ? turn.detailRetryBefore : retry?.before,
         detailRetryDirection: retry === undefined
           ? turn.detailRetryDirection : retry?.direction,
+        detailResetPending:
+          resetPending ?? turn.detailResetPending,
       };
     }),
   }));

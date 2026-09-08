@@ -37,7 +37,13 @@ export function quotaWindowLabel(minutes?: number | null): string {
 export function accountQuotaWindows(
   report?: StatusReport | null,
 ): QuotaWindows {
-  const limits = report?.rate_limits ?? [];
+  return quotaWindowsForLimits(report?.rate_limits ?? [], "codex");
+}
+
+export function quotaWindowsForLimits(
+  limits: readonly StatusRateLimit[],
+  accountLimitId: "codex" | "claude",
+): QuotaWindows {
   const hasWindow = (limit: StatusRateLimit, duration: number): boolean =>
     [limit.primary, limit.secondary].some(
       (window) => window?.window_duration_mins === duration,
@@ -61,7 +67,7 @@ export function accountQuotaWindows(
     candidate.limit_id == null && hasAccountWindow(candidate)
   );
   const limit = limits.find((candidate) =>
-    candidate.limit_id === "codex" && hasUsableWindow(candidate)
+    candidate.limit_id === accountLimitId && hasUsableWindow(candidate)
   ) ?? legacyLimits.find((candidate) =>
     hasWindow(candidate, 300) && hasWindow(candidate, 10_080),
   ) ?? legacyLimits[0] ?? null;
@@ -87,6 +93,42 @@ export function accountQuotaWindows(
     overall,
     limit,
   };
+}
+
+function activeWindow(
+  window: StatusRateWindow | null | undefined,
+  nowSeconds: number,
+): StatusRateWindow | null | undefined {
+  if (window?.resets_at != null && window.resets_at <= nowSeconds) return null;
+  return window;
+}
+
+/** Remove elapsed windows at presentation time. The wrapper also expires its
+ * Claude cache, but a browser can remain open across a reset without receiving
+ * another SDK event at that exact second. */
+export function activeRateLimits(
+  limits: readonly StatusRateLimit[],
+  nowSeconds = Date.now() / 1000,
+): StatusRateLimit[] {
+  return limits.flatMap((limit) => {
+    const primary = activeWindow(limit.primary, nowSeconds);
+    const secondary = activeWindow(limit.secondary, nowSeconds);
+    if (!primary && !secondary) return [];
+    return [{ ...limit, primary, secondary }];
+  });
+}
+
+export function nextRateLimitReset(
+  limits: readonly StatusRateLimit[],
+  nowSeconds = Date.now() / 1000,
+): number | null {
+  const future = limits.flatMap((limit) => [
+    limit.primary?.resets_at,
+    limit.secondary?.resets_at,
+  ]).filter((value): value is number => (
+    value != null && Number.isFinite(value) && value > nowSeconds
+  ));
+  return future.length > 0 ? Math.min(...future) : null;
 }
 
 export function quotaTone(value: number | null): QuotaTone {

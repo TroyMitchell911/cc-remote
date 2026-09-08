@@ -11,6 +11,7 @@ import asyncio
 from typing import Any, Optional
 
 from cc_remote.claude_broker.client import BrokerClient, BrokerClientError
+from cc_remote.wrapper.claude_controls import claude_auto_compact_from_cli
 
 
 class ClaudeBrokerHandle:
@@ -19,6 +20,10 @@ class ClaudeBrokerHandle:
     effort: Optional[str] = None
     applied_effort: Optional[str] = None
     permission_mode: str = "default"
+    auto_compact_mode: str = "inherit"
+    auto_compact_threshold_tokens: Optional[int] = None
+    applied_auto_compact_mode: str = "inherit"
+    applied_auto_compact_threshold_tokens: Optional[int] = None
 
     def __init__(
         self,
@@ -38,11 +43,17 @@ class ClaudeBrokerHandle:
         model = metadata.get("model")
         effort = metadata.get("effort")
         permission = metadata.get("permission_mode")
+        auto_mode, auto_threshold = claude_auto_compact_from_cli(
+            metadata.get("auto_compact"))
         self.model = model if isinstance(model, str) and model else None
         self.effort = effort if isinstance(effort, str) and effort else None
         self.applied_effort = self.effort
         if isinstance(permission, str) and permission:
             self.permission_mode = permission
+        self.auto_compact_mode = auto_mode
+        self.auto_compact_threshold_tokens = auto_threshold
+        self.applied_auto_compact_mode = auto_mode
+        self.applied_auto_compact_threshold_tokens = auto_threshold
 
     def _adopt_runtime_response(
         self, response: dict[str, Any], operation: str,

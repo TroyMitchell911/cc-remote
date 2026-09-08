@@ -31,7 +31,9 @@ def test_claude_options_enable_file_checkpoints_and_user_message_replay():
     options = SdkHandle(WrapperConfig())._options(None, "/tmp")
 
     assert options.enable_file_checkpointing is True
-    assert options.extra_args == {"replay-user-messages": None}
+    assert options.extra_args == {
+        "replay-user-messages": None,
+    }
 
 
 def test_claude_file_rewind_uses_public_sdk_and_structured_errors():
@@ -515,7 +517,7 @@ def test_claude_rewind_preparation_reconnects_and_reprobes_capability():
                 "resume_id": SESSION_ID,
                 "cwd": "/tmp/project",
                 "reason": "prepare conversation rewind",
-                "preserve_model": False,
+                "preserve_model": True,
             }),
             ("capability", True),
         ]
@@ -637,7 +639,7 @@ def test_claude_rewind_reloads_stale_context_before_native_mutation():
                 "resume_id": SESSION_ID,
                 "cwd": "/tmp/claude-stale-rewind",
                 "reason": "external transcript change before 回滚",
-                "preserve_model": False,
+                "preserve_model": True,
             },
         )
         assert ctx.sdk.calls[1] == ("rewind", TARGET_ID, False)

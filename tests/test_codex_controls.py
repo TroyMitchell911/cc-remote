@@ -14,7 +14,8 @@ from pydantic import ValidationError
 from cc_remote import __version__
 from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
-    CollaborationMode, CommandAck, Delta, Effort, Error, GoalState, Interrupt, Model,
+    AnswerQuestion, CollaborationMode, CommandAck, Delta, Effort, Error,
+    GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
     TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
     SetPermissionProfile, SetWebSearch, WebSearch,
@@ -30,6 +31,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexManagedOverflow,
     _provider_error_diagnostic,
 )
+from cc_remote.wrapper.claude_runtime import UnsupportedClaudeCliVersion
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.session_ctx import CodexGoalMutation
 from cc_remote.wrapper.work_prompt import (
@@ -155,6 +157,8 @@ def test_codex_work_btw_uses_private_profile_bound_runtime(
         assert handle.permission_profile == "cc_remote_work"
         assert handle.web_search_override is None
         assert handle.web_search == "cached"
+        assert handle.effort == handle.applied_effort == "xhigh"
+        assert handle.display_effort == "xhigh"
 
     asyncio.run(run())
 
@@ -189,6 +193,7 @@ def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
 
         async def connect(self, **_kwargs):
             self.thread_id = "forked-code"
+            self.thread_started_callback(self.thread_id)
 
         async def disconnect(self):
             return None
@@ -216,6 +221,11 @@ def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
         assert "work_mode" not in handle.init
         assert "codex_home" not in handle.init
         assert fork.space == "code" and fork.work_id is None
+        assert fork.btw_real_id == "forked-code"
+        assert ("primary", "forked-code") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "forked-code") not in (
+            machine._codex_thread_started_hints)
         assert handle.approval == handle.approval_policy == "on-request"
         assert handle.permission_profile == ":read-only"
         assert handle.web_search_override == handle.web_search == "live"
@@ -254,6 +264,7 @@ def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
 
         async def connect(self, **_kwargs):
             self.thread_id = "partial-fork"
+            self.thread_started_callback(self.thread_id)
 
         async def disconnect(self):
             self.disconnected = True
@@ -282,6 +293,10 @@ def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
 
         assert created[-1].disconnected is True
         assert list(machine.sessions) == ["parent-code"]
+        assert ("primary", "partial-fork") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "partial-fork") not in (
+            machine._codex_thread_started_hints)
 
     asyncio.run(run())
 
@@ -417,6 +432,98 @@ def test_codex_delete_thread_uses_loaded_app_server_connection():
     asyncio.run(run())
 
 
+def test_codex_archive_thread_uses_loaded_owner_and_collects_descendants():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "child-1"},
+            })
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "thread-1"},
+            })
+            return {}
+
+        handle._request = request
+
+        archived = await handle.archive_thread("thread-1")
+
+        assert requests == [(
+            "thread/archive",
+            {"threadId": "thread-1"},
+        )]
+        assert archived == ("child-1", "thread-1")
+        assert handle.thread_id is None
+        assert handle._capture_thread_archived_notification({
+            "method": "thread/archived",
+            "params": {"threadId": "unrelated"},
+        }) is False
+
+    asyncio.run(run())
+
+
+def test_codex_archive_thread_rejects_wrong_or_active_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid archive must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(ValueError, match="does not match"):
+            await handle.archive_thread("thread-2")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="turn is active"):
+            await handle.archive_thread("thread-1")
+
+    asyncio.run(run())
+
+
+def test_codex_control_connection_unarchives_and_renames_without_resume():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._control_only_connection = True
+        handle._using_daemon_proxy = True
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._dead = False
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if method == "thread/unarchive":
+                return {"thread": {"id": params["threadId"], "name": "old"}}
+            return {}
+
+        handle._request = request
+
+        await handle.set_thread_name("thread-1", "new")
+        restored = await handle.unarchive_thread("thread-1")
+
+        assert restored == {"id": "thread-1", "name": "old"}
+        assert requests == [
+            (
+                "thread/name/set",
+                {"threadId": "thread-1", "name": "new"},
+            ),
+            (
+                "thread/unarchive",
+                {"threadId": "thread-1"},
+            ),
+        ]
+        assert handle.thread_id is None
+
+    asyncio.run(run())
+
+
 def test_codex_read_thread_parent_uses_exact_loaded_thread_metadata():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -511,6 +618,31 @@ def test_codex_delete_catalog_pages_active_and_archived_threads():
                 "sortKey": "updated_at",
                 "sortDirection": "desc",
             },
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_loaded_thread_catalog_is_bounded_and_paginated():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if params.get("cursor") == "next":
+                return {"data": ["thread-2"], "nextCursor": None}
+            return {"data": ["thread-1"], "nextCursor": "next"}
+
+        handle._request = request
+
+        assert await handle.list_loaded_thread_ids() == (
+            "thread-1",
+            "thread-2",
+        )
+        assert requests == [
+            ("thread/loaded/list", {"limit": 100}),
+            ("thread/loaded/list", {"limit": 100, "cursor": "next"}),
         ]
 
     asyncio.run(run())
@@ -3001,23 +3133,23 @@ def test_machine_resolves_nullable_codex_effort_without_loading_forever(
         ctx.sdk.display_effort_model = None
 
         async def clamp(_model, effort, *, codex_home=None):
-            assert effort == "low"
+            assert effort == "xhigh"
             return effort
 
         monkeypatch.setattr(machine_module, "clamp_effort", clamp)
         assert await machine._resolve_codex_session_effort(
-            ctx, preferred="low") == "low"
-        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
-        assert ctx.sdk.display_effort == "low"
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
+        assert ctx.sdk.display_effort == "xhigh"
         assert ctx.sdk.display_effort_model == "gpt-default"
 
         # thread/fork may echo the parent's explicit setting. BTW's wrapper-
-        # owned low choice must still win before its first query.
+        # owned xhigh choice must still win before its first query.
         ctx.sdk.effort = "high"
         ctx.sdk.applied_effort = "high"
         assert await machine._resolve_codex_session_effort(
-            ctx, preferred="low") == "low"
-        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
 
     asyncio.run(run())
 
@@ -4046,6 +4178,66 @@ def test_codex_force_reconnect_preserves_live_thread_controls():
     asyncio.run(run())
 
 
+def test_codex_force_reconnect_restores_only_same_scope_explicit_effort():
+    async def reconnect_case(
+        *, resumed_model="gpt-test", resumed_cwd="/tmp/project",
+        resumed_effort=None,
+    ):
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "resume-thread"
+        handle.model = "gpt-test"
+        handle.effort = "max"
+        handle.applied_effort = "max"
+        handle.display_effort = "max"
+        handle._generation = 7
+
+        async def disconnect():
+            return None
+
+        async def connect(**_kwargs):
+            handle._generation += 1
+            handle.thread_id = "resume-thread"
+            handle.model = resumed_model
+            handle._cwd = resumed_cwd
+            handle.effort = resumed_effort
+            handle.applied_effort = resumed_effort
+            handle.display_effort = resumed_effort
+            handle.display_effort_model = (
+                resumed_model if resumed_effort else None)
+            handle.display_effort_cwd = (
+                os.path.realpath(resumed_cwd) if resumed_effort else None)
+            handle.display_effort_generation = (
+                handle._generation if resumed_effort else None)
+
+        handle.disconnect = disconnect
+        handle.connect = connect
+        await handle.force_reconnect(
+            "resume-thread", "/tmp/project", reason="daemon replaced")
+        return handle
+
+    async def run():
+        restored = await reconnect_case()
+        assert restored.effort == restored.applied_effort == "max"
+        assert restored.display_effort == "max"
+        assert restored.display_effort_model == "gpt-test"
+        assert restored.display_effort_cwd == os.path.realpath("/tmp/project")
+        assert restored.display_effort_generation == 8
+
+        authoritative = await reconnect_case(resumed_effort="high")
+        assert authoritative.effort == authoritative.applied_effort == "high"
+        assert authoritative.display_effort == "high"
+
+        changed_model = await reconnect_case(resumed_model="gpt-new")
+        assert changed_model.effort is None
+        assert changed_model.display_effort is None
+
+        changed_cwd = await reconnect_case(resumed_cwd="/tmp/other")
+        assert changed_cwd.effort is None
+        assert changed_cwd.display_effort is None
+
+    asyncio.run(run())
+
+
 def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         monkeypatch):
     async def run():
@@ -4064,7 +4256,16 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         with pytest.raises(RuntimeError, match="captured work profile"):
             await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
 
-        assert spawned[:3] == ["/usr/bin/codex", "app-server", "--stdio"]
+        stdio_index = spawned.index("/usr/bin/codex")
+        assert spawned[stdio_index:stdio_index + 3] == [
+            "/usr/bin/codex", "app-server", "--stdio",
+        ]
+        if os.name == "posix":
+            assert spawned[:3] == [
+                codex_handle_module.sys.executable,
+                codex_handle_module._RLIMIT_EXEC,
+                str(codex_handle_module._APP_SERVER_NOFILE_SOFT_LIMIT),
+            ]
         overrides = [
             spawned[index + 1]
             for index, value in enumerate(spawned[:-1])
@@ -5016,6 +5217,7 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         ctx = _mk_ctx("claude-question", "claude-question")
         ctx.state = "running"
         ctx.active_msg_id = "claude-question-turn"
+        machine.sessions[ctx.key] = ctx
         tool_input = {
             "questions": [
                 {
@@ -5052,7 +5254,12 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert first_event.multi_select is False
         assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
-        ctx.pending_asks[first_id].set_result("Windows")
+        assert await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=first_id,
+            answer="Windows",
+            client_id="client-1",
+        )) is None
 
         while not ctx.pending_asks or first_id in ctx.pending_asks:
             await asyncio.sleep(0)
@@ -5063,7 +5270,12 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert second_event.header == "Checks"
         assert second_event.multi_select is True
         assert second_event.allow_text is True
-        ctx.pending_asks[second_id].set_result(["Tests", "Custom audit"])
+        assert await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=second_id,
+            answer=["Tests", "Custom audit"],
+            client_id="client-1",
+        )) is None
 
         result = await task
         assert isinstance(result, PermissionResultAllow)
@@ -7484,10 +7696,11 @@ def test_external_codex_turn_refreshes_collaboration_mode_without_changing_appro
     asyncio.run(run())
 
 
-def test_fast_toggle_updates_only_target_codex_thread():
+def test_fast_toggle_updates_only_target_codex_thread_including_work():
     async def run():
         machine, transport = _mk_machine()
         one = _control_ctx("c1", "codex")
+        one.space = "work"
         two = _control_ctx("c2", "codex")
         claude = _control_ctx("cc", "claude")
         machine.sessions = {"c1": one, "c2": two, "cc": claude}
@@ -7565,12 +7778,58 @@ def test_fast_accepts_app_server_priority_normalization():
 
 def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sessions(
         monkeypatch):
+    class OwnerSdk(_ControlSdk):
+        def __init__(self):
+            super().__init__()
+            self.thread_id = "codex-id"
+            self.turn_active = False
+            self.turn_start_pending = False
+            self.using_daemon_proxy = True
+            self.shared_daemon_affinity = True
+            self.daemon_mode = "auto"
+            self.calls = []
+            self.thread_archive_notifications_overflowed = False
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def list_thread_delete_candidates(self):
+            return (("codex-id", False),)
+
+        async def read_thread_parent(self, _thread_id):
+            return None
+
+        async def archive_thread(self, thread_id):
+            self.calls.append(("archive", thread_id))
+            self.thread_id = None
+            return (thread_id,)
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+            await super().disconnect()
+
+    class ColdOwner:
+        def __init__(self):
+            self.calls = []
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def unarchive_thread(self, thread_id):
+            self.calls.append(("unarchive", thread_id))
+            return {"id": thread_id}
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+
     async def run():
         machine, transport = _mk_machine()
-        ctx = _control_ctx("codex-id", "codex")
+        owner = OwnerSdk()
+        ctx = _control_ctx("codex-id", "codex", owner)
         machine.sessions = {"codex-id": ctx}
         rpc_calls = []
         refreshes = []
+        cold_owners = []
 
         async def rpc(method, params, cwd=None):
             rpc_calls.append((method, params, cwd))
@@ -7586,6 +7845,47 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         monkeypatch.setattr(machine_module, "rename_session", claude_only)
         monkeypatch.setattr(machine_module, "tag_session", claude_only)
         machine._list_codex_sessions = refresh
+
+        async def runtime_preflight(*_args, **_kwargs):
+            return None
+
+        async def no_external_owner(_sid):
+            return False
+
+        async def cold_control(_sid):
+            control = ColdOwner()
+            cold_owners.append(control)
+            return control
+
+        machine._runtime_control_preflight = runtime_preflight
+        machine._codex_delete_external_owner = no_external_owner
+        machine._codex_shared_control_for_wire = cold_control
+
+        async def exact_archive_states(_profile, native_sids):
+            return {
+                native_sid: (
+                    native_sid == "cold-codex-id"
+                    or ("archive", native_sid) in owner.calls
+                )
+                for native_sid in native_sids
+            }
+
+        machine._codex_exact_archive_states = exact_archive_states
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_parent_maps",
+            lambda **_kwargs: ({}, {}),
+        )
+        local_rollout = str(
+            machine._codex_profile().home
+            / "sessions"
+            / "rollout-codex-id.jsonl"
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_rollout_record",
+            lambda _sid, **_kwargs: (local_rollout, False),
+        )
 
         rename_hot = SimpleNamespace(session_id="codex-id", title="new")
         archive_hot = SimpleNamespace(session_id="codex-id", archived=True)
@@ -7607,16 +7907,22 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         await machine._handle_rename_session(rename_cold)
         await machine._handle_archive_session(unarchive_cold)
 
-        assert rpc_calls == [
-            ("thread/name/set", {"threadId": "codex-id", "name": "new"}, None),
-            ("thread/archive", {"threadId": "codex-id"}, None),
-            (
-                "thread/name/set",
-                {"threadId": "cold-codex-id", "name": "cold new"},
-                None,
-            ),
-            ("thread/unarchive", {"threadId": "cold-codex-id"}, None),
+        assert owner.calls == [
+            ("rename", "codex-id", "new"),
+            ("archive", "codex-id"),
+            ("disconnect",),
         ]
+        assert [control.calls for control in cold_owners] == [
+            [
+                ("rename", "cold-codex-id", "cold new"),
+                ("disconnect",),
+            ],
+            [
+                ("unarchive", "cold-codex-id"),
+                ("disconnect",),
+            ],
+        ]
+        assert rpc_calls == []
         assert refreshes == [rename_hot, archive_hot, rename_cold, unarchive_cold]
         assert not [message for message in transport.sent if message.type == "error"]
 
@@ -7754,10 +8060,19 @@ class _FiniteTransport:
             yield command
 
 
+@pytest.mark.parametrize(
+    ("unsupported_cli", "expected_message"),
+    [
+        (False, "Claude 暂时不可用"),
+        (True, "Claude CLI 2.1.257 版本过旧"),
+    ],
+)
 def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, unsupported_cli, expected_message):
     async def run():
         def fail(_cli_path):
+            if unsupported_cli:
+                raise UnsupportedClaudeCliVersion("2.1.257", "2.1.258")
             raise RuntimeError("claude unavailable")
 
         monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
@@ -7773,8 +8088,10 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
         assert transport.started is True and transport.stopped is True
         assert machine.sessions == {} and machine.focused_sid is None
         assert any(message.type == "hello" for message in transport.sent)
-        assert any(message.type == "error" and "Claude 暂时不可用" in message.message
-                   for message in transport.sent)
+        assert any(
+            message.type == "error" and expected_message in message.message
+            for message in transport.sent
+        )
 
     asyncio.run(run())
 
@@ -8540,6 +8857,82 @@ def test_wrapper_rejects_new_steer_after_interrupt_has_started():
         assert result.code == ERR_NOT_STEERABLE
         assert sdk.calls == 0
         assert ctx.state == "interrupting"
+
+    asyncio.run(run())
+
+
+def test_wrapper_rejects_steer_while_turn_start_owner_is_unproven():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        ctx.codex_turn_start_reconciling = True
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="must not reach an unproven turn",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert result.to == "client-1"
+        assert sdk.calls == 0
+        assert not any(
+            isinstance(event, TurnSteered) for event in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_wrapper_rechecks_turn_start_reconciliation_inside_steer_lock():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        await ctx.steer_lock.acquire()
+        try:
+            task = asyncio.create_task(machine._handle_steer(Steer(
+                sid=ctx.key,
+                prompt="races the generation disconnect",
+                msg_id="steer-message",
+                cmd_id="steer-command",
+                client_id="client-1",
+            )))
+            # Let the command pass its initial check and block on steer_lock.
+            await asyncio.sleep(0)
+            ctx.codex_turn_start_reconciling = True
+        finally:
+            ctx.steer_lock.release()
+
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert sdk.calls == 0
 
     asyncio.run(run())
 

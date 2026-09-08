@@ -50,7 +50,24 @@ const SCHEMA = 1;
 // seeded after (instead of before) its proven replay suffix. Those rows can
 // contain a canonical History owner plus a second prompt-less live layer; the
 // cache is rebuildable, so one clean reload is safer than shape-based guessing.
-const CACHE_VER = 18;
+// v19 persists exact process presence independently from deferred detail size.
+// Older rows can resurrect an empty "已处理" shell or hide a known process
+// after a detail page is replaced, so they must be rebuilt from v36 History.
+// v20 discards v19 Codex process clocks which may contain parser-time defaults.
+// SQLite projection migrations cannot invalidate a browser's IndexedDB copy,
+// and a hard refresh deliberately preserves that local cache.
+// v21 discards Claude projections which may have persisted an interrupt marker
+// as the browser alias for the following native user row.  The rebuilt v22
+// History store fixes the owner, but IndexedDB needs its own explicit fence.
+// v22 discards Codex turns whose bounded post-compact tail persisted a late
+// process start. The wrapper now overlays an exact source-bound live clock.
+// v23 discards Codex projections which may contain a prompt-less leading
+// compaction row split from the real user message that owns the turn.
+// v24 discards Claude rows whose completion clock could include late internal
+// resume bookkeeping, and projections bloated by automatic full-detail paging.
+// v25 reprojects native async questions instead of preserving plain-answer shells.
+// v26 discards summaries where those questions hid ordinary unphased replies.
+const CACHE_VER = 26;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -237,6 +254,8 @@ function projectTurnForCache(turn: Turn): Turn {
     error: clipCacheString(turn.error, 32 * 1024) ?? undefined,
     progress: clipCacheString(turn.progress, 8 * 1024) ?? undefined,
     blocks,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
     // Keep a small optimistic attachment set for a flicker-free first paint.
     // Larger bodies stay in the transcript image store and are refilled through
     // History image references instead of evicting the whole turn.
@@ -252,6 +271,7 @@ function projectTurnForCache(turn: Turn): Turn {
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: undefined,
     detailHasMore: false,
     detailOldestCursor: null,
@@ -512,6 +532,9 @@ export interface CachedSession {
   revision: string;
   generation?: string;
   control?: SessionControl | null;
+  /** Paint-only proof that the saved projection reached the first turn.
+   * It never carries or authorizes a pagination cursor. */
+  historyAtStart?: boolean;
   savedAt: number;
 }
 
@@ -640,6 +663,7 @@ const pending = new Map<string, {
   sid: string; turns: unknown[]; lastSeq: number; revision: string;
   generation?: string;
   control?: SessionControl | null;
+  historyAtStart?: boolean;
   epoch: number;
 }>();
 // A destructive history mutation must invalidate both the committed IDB row
@@ -661,6 +685,7 @@ function sessionEpoch(sessionId: string): number {
 export function saveSession(
   sessionId: string, turns: unknown[], lastSeq: number, revision: string,
   generation?: string, control?: SessionControl | null,
+  historyAtStart?: boolean,
 ): void {
   if (typeof indexedDB === "undefined" || !sessionId || !revision) return;
   if (invalidatedSessions.has(sessionId)) return;
@@ -675,6 +700,7 @@ export function saveSession(
     revision,
     generation,
     control: controlForCachedSession(sessionId, control),
+    historyAtStart: historyAtStart === true,
     epoch: sessionEpoch(sessionId),
   });
   if (saveTimer) return;
@@ -703,6 +729,11 @@ async function flush(): Promise<void> {
           { v: CACHE_VER, turns, lastSeq: job.lastSeq,
             revision: job.revision, generation: job.generation,
             control: job.control,
+            // If cache bounding dropped an older row, this projection no
+            // longer proves the conversation start even when the live runtime
+            // had loaded it before saving.
+            historyAtStart: job.historyAtStart === true
+              && turns.length === job.turns.length,
             savedAt: Date.now() }, job.sid);
       }
       tx.oncomplete = () => resolve();

@@ -220,6 +220,7 @@ class BrokerClient:
     async def set_preferences(
         self, session_id: str, *, model: str | None = None,
         effort: str | None = None, permission_mode: str | None = None,
+        auto_compact: str | None = None,
     ) -> dict[str, Any]:
         return await self.request(
             "set_preferences",
@@ -227,6 +228,7 @@ class BrokerClient:
             model=model,
             effort=effort,
             permission_mode=permission_mode,
+            auto_compact=auto_compact,
         )
 
     async def attach(

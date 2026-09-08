@@ -4,6 +4,10 @@ import { resolve } from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
+import {
+  BTW_PANEL_SCOPES_KEY, btwPanelScopeKey, readBtwPanelScopes,
+  rekeyBtwPanelScope, setBtwPanelScope,
+} from "../src/btw-panel-state.ts";
 
 import {
   clearLegacyAuthMarkers,
@@ -43,6 +47,7 @@ import {
 import {
   acceptsCachedNewerPage,
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
 } from "../src/history-browse.ts";
 import {
   acknowledgeCompletion,
@@ -56,6 +61,7 @@ import {
   rekeyCompletionReceipts,
 } from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
+import "./presentation-state.test.ts";
 import {
   historyImageDisplaySource,
   TurnImagePreviewCache,
@@ -66,6 +72,7 @@ import {
   historyImageAssetCacheSnapshot,
   HISTORY_IMAGE_REQUEST_TIMEOUT_MS,
   shouldAutoloadHistoryImage,
+  readyGeneratedImageAsset,
 } from "../src/history-image-assets.ts";
 import {
   InlineImageAssetCache,
@@ -85,15 +92,15 @@ import {
 } from "../src/runtime-bounds.ts";
 import { ImeSubmitGuard, shouldSubmitTextKey } from "../src/ime-submit.ts";
 import {
-  classifyBtwOpened,
-  consumeDiscardedBtwSnapshot,
   makeOpenBtwCommand,
   matchesBtwRequest,
   normalizeDiffTheme,
   normalizeEngine,
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
-import { protocolRecoveryAction, RelayWs } from "../src/ws.ts";
+import {
+  protocolRecoveryAction, RelayWs, stableTabClientId,
+} from "../src/ws.ts";
 import {
   dismissGoalUi,
   GOAL_UI_PREFERENCES_KEY,
@@ -109,8 +116,6 @@ import {
 import {
   clientSlashesFor,
   commandsFor,
-  effortIsSelectable,
-  effortNameForDisplay,
   isKnownCodeOnlySlash,
   matchCommands,
   matchSkills,
@@ -121,29 +126,6 @@ import {
   permsFor,
   skillToken,
 } from "../src/data.ts";
-
-function testEffortPresentation(): void {
-  assert.equal(
-    effortNameForDisplay("model-default"),
-    "模型默认",
-    "an unresolved official model default must not remain in loading state",
-  );
-  assert.equal(
-    effortNameForDisplay(""),
-    null,
-    "an unseeded effort must retain the loading label instead of painting blank",
-  );
-  assert.equal(
-    effortNameForDisplay("xhigh"),
-    "xhigh",
-    "ordinary effort labels retain the raw CLI/config id contract",
-  );
-  assert.equal(effortIsSelectable("model-default"), false,
-    "the model-default display sentinel is never a selectable effort override");
-  assert.equal(effortIsSelectable("high"), true,
-    "ordinary effort ids remain selectable");
-}
-testEffortPresentation();
 import {
   createMobileViewportSync,
   type MobileViewportBindings,
@@ -232,11 +214,6 @@ import {
   composerDraftKey,
 } from "../src/composer-drafts.ts";
 import {
-  composePastePrompt,
-  makeComposerPaste,
-  MAX_PROMPT_CHARS,
-} from "../src/composer-pastes.ts";
-import {
   ENGINE_SPACES_KEY,
   LEGACY_SPACE_KEY,
   readEngineSpaces,
@@ -252,23 +229,6 @@ import {
 } from "../src/codex-profile-presentation.ts";
 
 const composerDrafts = new ComposerDraftStore();
-const pasteOne = makeComposerPaste("first pasted block", "paste-1");
-const pasteTwo = makeComposerPaste("second pasted block", "paste-2");
-assert.deepEqual(
-  composePastePrompt([pasteOne, pasteTwo], "follow-up"),
-  { ok: true, prompt: "first pasted block\n\nsecond pasted block\n\nfollow-up" },
-  "paste cards must remain ordered prefixes of the visible composer text",
-);
-assert.deepEqual(
-  composePastePrompt([], "x".repeat(MAX_PROMPT_CHARS)),
-  { ok: true, prompt: "x".repeat(MAX_PROMPT_CHARS) },
-  "the protocol's exact prompt limit remains sendable",
-);
-assert.deepEqual(
-  composePastePrompt([{ text: "x".repeat(MAX_PROMPT_CHARS) }], "tail"),
-  { ok: false, chars: MAX_PROMPT_CHARS + 6, maxChars: MAX_PROMPT_CHARS },
-  "paste separators and visible text must participate in the prompt bound",
-);
 const preferenceValues = new Map<string, string>([[LEGACY_SPACE_KEY, "work"]]);
 const preferenceStorage = {
   getItem: (key: string) => preferenceValues.get(key) ?? null,
@@ -1154,15 +1114,50 @@ assert.ok(reconnectBannerSource.includes('busy && <span className="sp"'),
 
 const historyAppSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 const cacheSource = readFileSync(resolve(process.cwd(), "src/cache.ts"), "utf8");
+const autoCompactControlSource = readFileSync(resolve(
+  process.cwd(), "src/components/AutoCompactControl.tsx"), "utf8");
 assert.equal(HISTORY_INITIAL_PAGE, 4,
   "the newest history page must stay small enough for an immediate first paint");
 assert.equal(HISTORY_MORE_PAGE, 12,
   "older history must be delivered in bounded follow-up pages");
 const historyBeforeResume = historyAppSource.match(
-  /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);\s*(?:ws\.|wsRef\.current(?:\?\.|\.))sendSwitchSession/g,
+  /requestHistory\([\s\S]{0,160}?HISTORY_INITIAL_PAGE\);[\s\S]{0,160}?(?:resumeListedSession|sendSwitchSession)/g,
 ) ?? [];
-assert.equal(historyBeforeResume.length, 3,
-  "every existing-session activation must request first paint before engine resume");
+assert.equal(historyBeforeResume.length, 4,
+  "every existing-session activation, including unarchive, must paint before resume");
+assert.match(historyAppSource,
+  /const resumeListedSession[\s\S]{0,420}session\.tag === "archived"[\s\S]{0,220}return;[\s\S]{0,180}sendSwitchSession/,
+  "opening archived history must not resume its native writer");
+assert.match(historyAppSource,
+  /const archivedBrowse = archivedBrowseRef\.current;[\s\S]{0,700}sendSwitchSession/,
+  "an authoritative unarchive must resume a focused read-only session");
+assert.match(historyAppSource,
+  /const archivedBrowse = focusedSession\?\.tag === "archived";/,
+  "the focused archived row must define one shared read-only boundary");
+assert.match(historyAppSource,
+  /focusedGoalScopeKey[\s\S]{0,120}\|\| archivedBrowse[\s\S]{0,500}sendGetGoalTo/,
+  "archived history must not auto-load live Goal state");
+assert.match(historyAppSource,
+  /const refreshStatus = useCallback[\s\S]{0,300}\?\.tag === "archived"[\s\S]{0,220}sendGetStatus/,
+  "archived history must not request live Codex status");
+assert.match(historyAppSource,
+  /!archivedBrowse && \(\s*<TerminalControl/,
+  "archived history must not expose terminal takeover controls");
+assert.match(historyAppSource,
+  /<GoalPanel[\s\S]{0,180}revealed=\{!archivedBrowse[\s\S]{0,100}open=\{!archivedBrowse/,
+  "archived history must hide Goal mutations while retaining history plans");
+assert.match(historyAppSource,
+  /const requestContext = \(\) => \{[\s\S]{0,120}archivedBrowseRef\.current === focusedSid/,
+  "archived history must not request live context state");
+assert.match(historyAppSource,
+  /const forkFromTurn = \(forkPointId: string\) => \{[\s\S]{0,180}archivedBrowseRef\.current === focusedSid/,
+  "a stale message action must not fork an archived session");
+assert.match(historyAppSource,
+  /onFork=\{!historyView\.recovering && !archivedBrowse[\s\S]{0,80}space === "code"/,
+  "archived history must not render message-level fork actions");
+assert.match(historyAppSource,
+  /current\.sessions\.find\([\s\S]{0,160}\?\.tag === "archived"\) return;[\s\S]{0,120}sendGetGoalTo/,
+  "a delayed Goal retry must stop after the session becomes archived");
 assert.match(historyAppSource,
   /if \(msg\.type === "session_list" && !ownership\) return;[\s\S]*historySessionListsRef/,
   "only an ownership-accepted SessionList may seed a Claude history cwd hint");
@@ -1219,8 +1214,8 @@ const claudeWorkSlashes = commandsFor("claude", "work")
 const codexWorkSlashes = commandsFor("codex", "work")
   .filter((command) => "slash" in command)
   .map((command) => command.slash);
-assert.deepEqual(codexWorkSlashes, claudeWorkSlashes,
-  "Work must expose one engine-neutral command surface");
+assert.equal(codexWorkSlashes.includes("fast"), true,
+  "Codex Work must expose its supported Fast service tier");
 for (const slash of ["model", "goal", "btw", "preview", "context", "clear"]) {
   assert.equal(claudeWorkSlashes.includes(slash), true, `Work must retain /${slash}`);
 }
@@ -1232,7 +1227,7 @@ for (const slash of ["plan", "code-review", "security-review", "verify", "simpli
   assert.equal(claudeWorkSlashes.includes(slash), false, `Work must hide Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "claude"), true);
 }
-for (const slash of ["review", "init", "plan", "fast", "status", "compact", "rollback"]) {
+for (const slash of ["review", "init", "plan", "status", "compact", "rollback"]) {
   assert.equal(codexWorkSlashes.includes(slash), false, `Work must hide Codex Code /${slash}`);
   assert.equal(isKnownCodeOnlySlash(slash, "codex"), true);
 }
@@ -1333,11 +1328,20 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 18/,
-  "legacy native-user projections must invalidate older cache rows");
+assert.match(historyAppSource,
+  /loadRuntimeTurnDetail\(request\.turnId, request\.before, false\)/,
+  "active-turn recovery must install one bounded detail page without cascading");
+assert.match(historyAppSource,
+  /requestHistoryTurnDetail = useCallback\([\s\S]{0,120}autoLoad = false/,
+  "every detail entry point must default to one bounded page");
+assert.match(cacheSource, /const CACHE_VER = 26/,
+  "async-question repair must invalidate browser summaries missing unphased replies");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
+assert.match(autoCompactControlSource,
+  /设置已应用；上下文用量将在下一次可靠读取后更新。/,
+  "an applied setting without a fresh context report must not claim it is pending");
 
 const viewportListeners = new Map<MobileViewportEvent, Set<() => void>>();
 const viewportCss = new Map<string, string>();
@@ -3603,6 +3607,95 @@ try {
   } as ServerEvent);
   assert.equal(createRuntime().sendMode, "steer",
     "Codex running input uses steer mode by default");
+  const autoCompactSid = "claude-autocompact-context";
+  const oldContextReport = event({
+    type: "context_report",
+    sid: autoCompactSid,
+    total_tokens: 125_000,
+    max_tokens: 500_000,
+    percentage: 25,
+    auto_compact_threshold_tokens: 500_000,
+    raw_max_tokens: 1_000_000,
+    categories: [],
+  });
+  let autoCompactState = {
+    ...initialState,
+    focusedSid: autoCompactSid,
+    runtimes: {
+      [autoCompactSid]: {
+        ...createRuntime(),
+        contextReport: oldContextReport,
+        autoCompact: event({
+          type: "auto_compact",
+          sid: autoCompactSid,
+          mode: "custom",
+          threshold_tokens: 500_000,
+          applied_mode: "custom",
+          applied_threshold_tokens: 500_000,
+          pending: false,
+          phase: "stable",
+          mutable: true,
+        }),
+      },
+    },
+  };
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: event({
+      type: "auto_compact",
+      sid: autoCompactSid,
+      mode: "custom",
+      threshold_tokens: 400_000,
+      applied_mode: "custom",
+      applied_threshold_tokens: 500_000,
+      pending: true,
+      phase: "waiting_terminal",
+      mutable: true,
+    }),
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    oldContextReport,
+    "a desired autocompact change must retain usage from the still-live child",
+  );
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: event({
+      type: "auto_compact",
+      sid: autoCompactSid,
+      mode: "custom",
+      threshold_tokens: 400_000,
+      applied_mode: "custom",
+      applied_threshold_tokens: 400_000,
+      pending: false,
+      phase: "stable",
+      mutable: true,
+    }),
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    null,
+    "an applied autocompact change must invalidate the prior child context",
+  );
+  const refreshedContextReport = event({
+    type: "context_report",
+    sid: autoCompactSid,
+    total_tokens: 126_000,
+    max_tokens: 400_000,
+    percentage: 31.5,
+    auto_compact_threshold_tokens: 400_000,
+    raw_max_tokens: 1_000_000,
+    categories: [],
+  });
+  autoCompactState = reduce(autoCompactState, {
+    type: "event",
+    event: refreshedContextReport,
+  });
+  assert.equal(
+    autoCompactState.runtimes[autoCompactSid].contextReport,
+    refreshedContextReport,
+    "the next-generation context report must repopulate applied autocompact usage",
+  );
   let desktopCompletion = reduce(initialState, {
     type: "event",
     event: event({
@@ -5819,6 +5912,21 @@ try {
         ...createRuntime(),
         state: "running" as const,
         syncReady: true,
+        controlGeneration: "history-running-g1",
+        historyGeneration: "history-running-g1",
+        historyRevision: "history-running-r1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 1,
+        historyNewestId: "history-running-original",
+        lastLiveSeq: 1,
+        lastLifecycleSeq: 1,
+        liveOwner: { turnId: "history-running-original", seq: 1 },
+        pendingLiveBinding: {
+          msgId: "history-running-original",
+          turnId: runningAliasNativeTurn,
+          seq: 1,
+          generation: "history-running-g1",
+        },
         turns: [{
           id: "history-running-original",
           forkPointId: runningAliasNativeTurn,
@@ -5843,11 +5951,12 @@ try {
       session_id: runningAliasSid,
       revision: "history-running-r1",
       generation: "history-running-g1",
-      build_seq: 1,
+      build_seq: 2,
       live_seq: 2,
       detail: "summary",
       has_more: true,
       in_progress: true,
+      newest_id: "history-running-native-steer",
       events: [],
       turns: [{
         id: "history-running-native-steer",
@@ -5877,6 +5986,16 @@ try {
       liveTaskId: runningAliasNativeTurn,
     }],
     "a running History alias moves native ownership across the steer fence",
+  );
+  assert.deepEqual(
+    runningAliasState.runtimes[runningAliasSid].liveOwner,
+    { turnId: "history-running-client-steer", seq: 2 },
+    "History-only steer acceptance moves the live display owner to the new segment",
+  );
+  assert.equal(
+    runningAliasState.runtimes[runningAliasSid].pendingLiveBinding,
+    null,
+    "the same History watermark retires the predecessor binding it superseded",
   );
   runningAliasState = reduce(runningAliasState, {
     type: "event", event: event({
@@ -7299,6 +7418,71 @@ try {
   assert.equal(controlRequestState.runtimes[sid].contextError,
     "当前会话暂时不可用，请重新进入后重试。",
     "a targeted context failure must replace the infinite loading state");
+  assert.equal(controlRequestState.banner, undefined,
+    "a correlated context failure must stay inside the context control");
+  const completedContextSid = "completed-turn-context-failure";
+  const completedContextReport = event({
+    type: "context_report",
+    sid: completedContextSid,
+    total_tokens: 120_000,
+    max_tokens: 500_000,
+    percentage: 24,
+    available: true,
+    categories: [],
+  });
+  let completedContextState = {
+    ...initialState,
+    focusedSid: completedContextSid,
+    runtimes: {
+      [completedContextSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        contextReport: completedContextReport,
+        turns: [{
+          id: "completed-context-turn",
+          prompt: "finish normally",
+          done: true,
+          doneTs: 20_000,
+          blocks: [{
+            kind: "text" as const,
+            message_id: "completed-context-answer",
+            channel: "final" as const,
+            text: "done",
+            done: true,
+          }],
+        }],
+      },
+    },
+  };
+  completedContextState = reduce(completedContextState, {
+    type: "begin_context_request",
+    sid: completedContextSid,
+    requestId: "post-turn-context",
+  });
+  completedContextState = reduce(completedContextState, {
+    type: "event", event: event({
+      type: "error", sid: completedContextSid, code: "internal",
+      message: "Control request timeout: get_context_usage",
+      request_id: "post-turn-context",
+    }),
+  });
+  assert.equal(completedContextState.banner, undefined);
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].contextReport,
+    completedContextReport,
+    "a failed refresh must preserve the last valid context reading",
+  );
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].turns[0].done,
+    true,
+    "a post-turn metadata failure must not reopen the completed narrative",
+  );
+  assert.equal(
+    completedContextState.runtimes[completedContextSid].turns[0]
+      .blocks[0].done,
+    true,
+    "a post-turn metadata failure must preserve the terminal answer footer",
+  );
   controlRequestState = reduce(controlRequestState, {
     type: "begin_status_request", sid, requestId: "status-request",
   });
@@ -7923,6 +8107,71 @@ try {
   assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
+
+  const terminalCompactSid = "terminal-compact-keeps-question";
+  let terminalCompactState = {
+    ...initialState,
+    focusedSid: terminalCompactSid,
+    sessions: [{ session_id: terminalCompactSid,
+      engine: "codex" as const, space: "code" as const }],
+    runtimes: {
+      [terminalCompactSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        turns: [{ ...compactDuplicateLiveTurn }],
+      },
+    },
+  };
+  terminalCompactState = reduce(terminalCompactState, {
+    type: "event", event: event({
+      type: "history",
+      sid: terminalCompactSid,
+      session_id: terminalCompactSid,
+      revision: "terminal-compact-revision",
+      generation: "terminal-compact-generation",
+      build_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: false,
+      events: [],
+      turns: [{
+        id: "terminal-compact-user",
+        forkPointId: compactDuplicateNativeTurn,
+        prompt: "继续修复问题",
+        done: true,
+        detailEventCount: 2,
+        detailLoaded: false,
+        blocks: [{
+          kind: "process" as const,
+          item_id: "terminal-compact-marker",
+          processKind: "compaction" as const,
+          phase: "end" as const,
+          status: "succeeded" as const,
+          turn_id: compactDuplicateNativeTurn,
+          title: "压缩上下文",
+          done: true,
+        }, {
+          kind: "text" as const,
+          message_id: "terminal-compact-answer",
+          channel: "final" as const,
+          text: "已完成",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const terminalCompactTurns =
+    terminalCompactState.runtimes[terminalCompactSid].turns;
+  assert.equal(terminalCompactTurns.length, 1,
+    "terminal compact History must retain exactly one user question");
+  assert.equal(terminalCompactTurns[0].prompt, "继续修复问题");
+  assert.equal(terminalCompactTurns[0].done, true);
+  assert.equal(terminalCompactTurns[0].blocks.filter(
+    (block: { kind: string; processKind?: string }) =>
+      block.kind === "process" && block.processKind === "compaction").length, 1);
+  assert.equal(terminalCompactTurns[0].blocks.some(
+    (block: { kind: string; text?: string }) =>
+      block.kind === "text" && block.text === "已完成"), true);
 
   const cachedCompactionSid = "canonical-history-repairs-cached-compaction";
   const cachedCompactionOwner = {
@@ -8766,8 +9015,8 @@ try {
     if (!current || !acceptsCachedNewerPage(current, frozenCachedLatest)) {
       return "discarded" as const;
     }
-    if (page.isLatest && current.latestDirty) {
-      return "settle" as const;
+    if (cachedLatestRequiresLiveRuntime(current, page)) {
+      return "latest" as const;
     }
     return appendNewerPage(current, page, {
       expectedScopeKey: frozenCachedLatest.scopeKey,
@@ -8789,26 +9038,14 @@ try {
     isLatest: true,
   });
   const deferredOutcome = await deferredInstall;
-  assert.equal(deferredOutcome, "settle",
-    "a live delta during the cache read must revoke the frozen latest page");
+  assert.equal(deferredOutcome, "latest",
+    "a live delta during the cache read must return to the live runtime");
   cacheRaceState = reduce(cacheRaceState, {
-    type: "history_browse_newer_settled",
+    type: "return_to_latest",
     sid: frozenCachedLatest.sid,
-    scopeKey: frozenCachedLatest.scopeKey,
-    revision: frozenCachedLatest.revision,
-    generation: frozenCachedLatest.generation,
-    viewId: frozenCachedLatest.viewId,
-    windowEpoch: frozenCachedLatest.windowEpoch,
-    pageKey: frozenCachedLatest.pageKey,
   });
-  assert.equal(cacheRaceState.historyBrowse?.latestDirty, true);
-  assert.equal(cacheRaceState.historyBrowse?.hasNewer, true);
-  assert.equal(cacheRaceState.historyBrowse?.newerPageKey, "ordered-head",
-    "rejecting stale cached latest must not clear the newer affordance");
-  assert.equal(
-    cacheRaceState.historyBrowse?.windowEpoch,
-    frozenCachedLatest.windowEpoch + 1,
-    "settling stale cached latest must release ChatView's accepted page request");
+  assert.equal(cacheRaceState.historyBrowse, null,
+    "the explicit downward gesture must reveal the authoritative live tail");
 
   const browseAfterOtherSidSend = reduce({
     ...orderedHistory,
@@ -10241,10 +10478,10 @@ try {
   // from cwd-aware settings. An empty models array must still update them.
   state = reduce(state, { type: "event", event: event({
     type: "models", engine: "claude", models: [],
-    default_model: "claude-mythos-5[1m]", default_effort: "max",
+    default_model: "claude-mythos-5-1[1m]", default_effort: "max",
     cwd: "~",
   }) });
-  assert.equal(state.catalogDefault.claude, "claude-mythos-5");
+  assert.equal(state.catalogDefault.claude, "claude-mythos-5-1");
   assert.equal(state.catalogDefaultEffort.claude, "max");
   const {
     compatibleNewChatEffort,
@@ -10366,7 +10603,7 @@ try {
     cwd: "~", engine: "claude",
     controlScopeKey: "machine-a:code:claude",
     model: null, effort: null,
-    defaultModel: "claude-mythos-5", defaultEffort: "max",
+    defaultModel: "claude-mythos-5-1", defaultEffort: "max",
     onPickModel: () => {}, onPickEffort: () => {},
     onPickCwd: () => {},
     onSend: () => true,
@@ -10447,7 +10684,7 @@ try {
     assert.match(markup, /本机默认/);
     assert.match(markup, /默认/);
   }
-  assert.match(newChatMarkup, /本机默认 · Mythos 5/);
+  assert.match(newChatMarkup, /本机默认 · Mythos 5\.1/);
   assert.match(newChatMarkup, /默认 · max/);
   assert.match(codexNewChatMarkup, /本机默认 · GPT Future/);
   assert.match(codexNewChatMarkup, /dynamic catalog model/,
@@ -10527,6 +10764,23 @@ try {
     onDelete: () => {},
     onForkWorktree: () => {},
   };
+  const nativeLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  try {
+    // Node 25 exposes Web Storage by default, while CI's Node 24 does not.
+    // Do not let that host global mask a browser-only initialization dependency.
+    Reflect.deleteProperty(globalThis, "localStorage");
+    assert.doesNotThrow(() => renderToStaticMarkup(createElement(
+      SessionsSidebar, sidebarProps)), "the sidebar renders without Web Storage");
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      get() { throw new DOMException("blocked", "SecurityError"); },
+    });
+    assert.doesNotThrow(() => renderToStaticMarkup(createElement(
+      SessionsSidebar, sidebarProps)), "SSR must not read the host's Web Storage");
+  } finally {
+    if (nativeLocalStorage) Object.defineProperty(globalThis, "localStorage", nativeLocalStorage);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
   const completionSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar, sidebarProps));
   assert.match(completionSidebarMarkup, />已完成</);
@@ -10630,6 +10884,10 @@ try {
   const btwDraftStore = new ComposerDraftStore();
   const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
     sid: "btw-render",
+    chats: [{
+      sid: "btw-render", engine: "codex", title: "侧聊 1", state: "running",
+      needsAnswer: false,
+    }],
     rt: {
       ...createRuntime(),
       state: "running",
@@ -10668,6 +10926,9 @@ try {
     queueCapacity: {},
     replaceQueueCapacity: {},
     onTab: () => {},
+    onNew: () => {},
+    onSelect: () => {},
+    onCloseChat: () => {},
     onSend: () => true,
     onSteer: () => true,
     onInterrupt: () => {},
@@ -10678,8 +10939,10 @@ try {
     onInspectQueued: () => {},
     onSetModel: () => {},
     onSetEffort: () => {},
+    onSetAutoCompact: () => true,
+    onAnswerQuestion: () => {},
     onOpenFile: () => {},
-    onClose: () => {},
+    onCollapse: () => {},
     onDismissNotice: () => {},
   }));
   assert.match(btwPanelMarkup, /GPT-5\.6 Terra/);
@@ -10692,6 +10955,8 @@ try {
   assert.match(btwPanelMarkup, />替换</);
   assert.match(btwPanelMarkup, />未发送</);
   assert.match(btwPanelMarkup, /aria-label="停止"/);
+  assert.match(btwPanelMarkup, /aria-label="调整 BTW 面板宽度"/);
+  assert.match(btwPanelMarkup, /data-lock-horizontal-swipe="true"/);
   state = { ...state,
     newChat: { cwd: "/other", model: null, effort: null } };
   state = reduce(state, { type: "event", event: event({
@@ -11685,6 +11950,7 @@ try {
     historyRecovery: {
       sid: crossGenerationSid,
       turns: [staleCrossGenerationTurn],
+      activeOwnerId: null,
       hasMore: true,
       oldestId: "rekey-old-cursor",
       viewRevision: "rekey-old-revision",
@@ -13923,19 +14189,19 @@ try {
   state = reduce(state, { type: "query_sent", sid: richSid, prompt: "实现功能",
     msg_id: "rich-turn", ts: 30_000 });
   const richEvents = [
-    event({ type: "assistant_msg_start", sid: richSid, message_id: "comment-1", channel: "commentary" }),
-    event({ type: "delta", sid: richSid, message_id: "comment-1", channel: "commentary", text: "先检查代码。" }),
-    event({ type: "assistant_msg_end", sid: richSid, message_id: "comment-1", channel: "commentary" }),
-    event({ type: "tool_use", sid: richSid, message_id: "comment-1", tool_use_id: "cmd-1",
+    event({ type: "assistant_msg_start", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary" }),
+    event({ type: "delta", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary", text: "先检查代码。" }),
+    event({ type: "assistant_msg_end", sid: richSid, ts: 30, message_id: "comment-1", channel: "commentary" }),
+    event({ type: "tool_use", sid: richSid, ts: 30, message_id: "comment-1", tool_use_id: "cmd-1",
       tool: "shell", category: "command", input: { command: "npm test" } }),
-    event({ type: "tool_delta", sid: richSid, tool_use_id: "cmd-1", stream: "output", delta: "ok\n" }),
-    event({ type: "tool_result", sid: richSid, tool_use_id: "cmd-1", content: "ok\n",
+    event({ type: "tool_delta", sid: richSid, ts: 31, tool_use_id: "cmd-1", stream: "output", delta: "ok\n" }),
+    event({ type: "tool_result", sid: richSid, ts: 31, tool_use_id: "cmd-1", content: "ok\n",
       is_error: false, status: "succeeded", exit_code: 0, duration_ms: 1250 }),
-    event({ type: "turn_plan", sid: richSid, item_id: "plan-1", turn_id: "turn-rich",
+    event({ type: "turn_plan", sid: richSid, ts: 31, item_id: "plan-1", turn_id: "turn-rich",
       explanation: "执行计划", plan: [{ step: "检查", status: "completed" }] }),
-    event({ type: "process", sid: richSid, item_id: "hook-1", kind: "hook", phase: "end",
+    event({ type: "process", sid: richSid, ts: 31, item_id: "hook-1", kind: "hook", phase: "end",
       status: "succeeded", turn_id: "turn-rich", title: "Hook 完成", duration_ms: 20 }),
-    event({ type: "turn_diff", sid: richSid, item_id: "diff-1", turn_id: "turn-rich",
+    event({ type: "turn_diff", sid: richSid, ts: 32, item_id: "diff-1", turn_id: "turn-rich",
       diff: "diff --git a/a b/a" }),
     event({ type: "assistant_msg_start", sid: richSid, message_id: "final-1", channel: "final" }),
     event({ type: "delta", sid: richSid, message_id: "final-1", channel: "final", text: "已经完成。" }),
@@ -14776,7 +15042,8 @@ try {
     sid: "summary-session",
     turns: [{
       id: "summary-turn", prompt: "inspect", done: true,
-      blocks: [], detailEventCount: 12, detailLoaded: false,
+      blocks: [], processDetailState: "present", detailReasons: ["process"],
+      detailEventCount: 12, detailLoaded: false,
     }],
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},
     onLoadDetail: () => {},
@@ -14791,17 +15058,24 @@ try {
     sid: "summary-session",
     turns: [{
       id: "summary-turn", prompt: "inspect", done: true,
-      blocks: [], detailEventCount: 12, detailLoaded: true,
+      blocks: [], processDetailState: "present", detailReasons: ["process"],
+      detailEventCount: 12, detailLoaded: true,
     }],
     engine: "codex", onEdit: () => {}, onGetDiff: () => {},
     onLoadDetail: () => {},
   }));
   assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
+  assert.match(loadedDetailMarkup, /已处理/,
+    "a known process stays visible while its current detail page is replaced");
+  assert.match(loadedDetailMarkup, /加载失败/,
+    "a completed empty detail response must expose a retryable contradiction");
   const repairedDeferredDetail = mergeInitialHistory([{
     id: "native-summary-turn",
     clientMsgId: "browser-turn",
     prompt: "修复问题。",
     done: true,
+    processDetailState: "present",
+    detailReasons: ["process"],
     detailEventCount: 93,
     detailLoaded: false,
     blocks: [{
@@ -14851,7 +15125,8 @@ try {
     sid: richSid, turns: [richTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(richMarkup, /已处理 3s/);
+  assert.match(richMarkup, /已处理 2s/,
+    "Codex timing stops at the final visible process snapshot");
   assert.match(richMarkup, /已经完成/);
   assert.doesNotMatch(richMarkup, /复制回复/,
     "reply copy keeps the original compact icon instead of adding a text action");
@@ -14891,8 +15166,9 @@ try {
     }],
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(cachedCodexDurationMarkup, /已处理 0s/,
-    "Claude cache compatibility must not reinterpret a valid Codex duration");
+  assert.match(cachedCodexDurationMarkup, />已处理</);
+  assert.doesNotMatch(cachedCodexDurationMarkup, /已处理 0s/,
+    "Codex process timing must not fall back to the user-message interval");
   const unknownCodexDurationMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "unknown-codex-duration", engine: "codex",
     turns: [{
@@ -14918,7 +15194,8 @@ try {
       id: "thinking-live", prompt: "继续", done: false,
       blocks: [{ kind: "text", message_id: "thinking-text", channel: "thinking",
         text: "正在检查实现", done: false }],
-    }], engine: "claude", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "claude", activeTurnId: "thinking-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(thinkingMarkup, /class="turn-process open"/);
   assert.match(thinkingMarkup, /正在处理/);
@@ -14933,7 +15210,8 @@ try {
       id: "answer-live", prompt: "继续", done: false,
       blocks: [{ kind: "text", message_id: "answer-text", channel: "final",
         text: "正在回答", done: false }],
-    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "codex", activeTurnId: "answer-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(answerMarkup, /class="turn-working"/);
   assert.match(answerMarkup, /回答中/);
@@ -14950,7 +15228,8 @@ try {
         kind: "text", message_id: "answer-after-process",
         channel: "final", text: "正在总结", done: false,
       }],
-    }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    }], engine: "codex", activeTurnId: "answering-after-process",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(answeringAfterProcessMarkup, /class="turn-process open"/,
     "the process disclosure stays open until the turn terminal boundary");
@@ -14976,7 +15255,8 @@ try {
           channel: "final", text: "阶段结论", done: false,
         }],
       }],
-      engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+      engine: "codex", activeTurnId: "commentary-while-answering",
+      onEdit: () => {}, onGetDiff: () => {},
     },
   ));
   assert.match(commentaryWhileAnsweringMarkup, /turn-process-state running/);
@@ -14991,7 +15271,8 @@ try {
     sid: richSid, turns: [{
       id: "zero-token-live", clientMsgId: "zero-token-prompt",
       prompt: "开始检查", done: false, blocks: [],
-  }], engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+  }], engine: "codex", activeTurnId: "zero-token-live",
+    onEdit: () => {}, onGetDiff: () => {},
   }));
   assert.match(zeroTokenRunningMarkup, /class="turn-working"/);
   assert.match(zeroTokenRunningMarkup, /思考中/);
@@ -15857,12 +16138,14 @@ try {
   // A background task can be consumed after ResultMessage, when a new turn is
   // already open. Its authoritative engine turn id must route it back to the
   // old turn instead of creating a phantom third turn or attaching to the tail.
+  state.runtimes[richSid].turns[0].clientMsgId = "turn-rich-client";
+  state.runtimes[richSid].turns[0].historyTurnId = "turn-rich-history";
   state = reduce(state, { type: "query_sent", sid: richSid, prompt: "下一问",
     msg_id: "rich-next", ts: 34_000 });
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
-    phase: "end", status: "succeeded", turn_id: "turn-rich",
-    title: "后台代理完成",
+    phase: "end", status: "succeeded", turn_id: "turn-rich-client",
+    title: "后台代理完成", background: true,
   }) });
   assert.equal(state.runtimes[richSid].turns.length, 2);
   assert.ok(state.runtimes[richSid].turns[0].blocks.some(
@@ -15871,13 +16154,47 @@ try {
   assert.ok(!state.runtimes[richSid].turns[1].blocks.some(
     (block: { kind: string; item_id?: string }) => block.item_id === "late-agent"));
 
-  // A late background update reopens only the process shell, not the completed
-  // answer turn. The user can keep reading the final answer while the activity
-  // header truthfully reports that work is still running.
+  // Autonomous Claude narrative uses the same explicit owner. Text and tool
+  // frames must not fall through to the newer optimistic question merely
+  // because their message/tool ids have not been seen before.
+  state = reduce(state, { type: "event", event: event({
+    type: "assistant_msg_start", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "delta", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+    text: "后台结果正文",
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "tool_use", sid: richSid, message_id: "late-answer",
+    tool_use_id: "late-read", turn_id: "turn-rich-history", background: true,
+    tool: "Read", input: { file_path: "README.md" },
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "tool_result", sid: richSid, tool_use_id: "late-read",
+    turn_id: "turn-rich-history", background: true, content: "done", is_error: false,
+  }) });
+  state = reduce(state, { type: "event", event: event({
+    type: "assistant_msg_end", sid: richSid, message_id: "late-answer",
+    turn_id: "turn-rich-client", background: true, channel: "commentary",
+  }) });
+  const oldNarrativeOwner = state.runtimes[richSid].turns[0];
+  const newNarrativeTail = state.runtimes[richSid].turns[1];
+  assert.ok(oldNarrativeOwner.blocks.some((block: Block) => block.kind === "text"
+    && block.message_id === "late-answer" && block.text === "后台结果正文"));
+  assert.ok(oldNarrativeOwner.blocks.some((block: Block) => block.kind === "tool"
+    && block.tool_use_id === "late-read" && block.done));
+  assert.ok(!newNarrativeTail.blocks.some((block: Block) => block.kind === "text"
+    ? block.message_id === "late-answer"
+    : block.kind === "tool" && block.tool_use_id === "late-read"));
+
+  // A late detached background update remains visible inside the completed
+  // turn without reopening its session-level working affordance.
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "update", status: "running", turn_id: "turn-rich",
-    title: "后台代理运行中", progress: "继续检查",
+    title: "后台代理运行中", progress: "继续检查", background: true,
   }) });
   const backgroundTurn = state.runtimes[richSid].turns[0];
   assert.equal(backgroundTurn.done, true);
@@ -15886,20 +16203,18 @@ try {
     sid: richSid, turns: [backgroundTurn], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {},
   }));
-  assert.match(backgroundMarkup, /正在处理/);
-  assert.match(backgroundMarkup, /继续检查/);
-  assert.match(backgroundMarkup, /class="turn-working"[\s\S]*处理中/,
-    "a live background process keeps its animated marker at the turn tail");
+  assert.doesNotMatch(backgroundMarkup, /class="turn-working"/,
+    "detached Agent work cannot reopen the completed turn's top-level spark");
   assert.match(
     backgroundMarkup,
-    /turn-process-state running"><svg/,
-    "the background process header stays static beside the tail animation",
+    /turn-process-state done"><svg/,
+    "the completed parent header stays settled while Agent detail remains live",
   );
-  assert.doesNotMatch(backgroundMarkup, /class="turn-done-mark"/);
+  assert.match(backgroundMarkup, /class="turn-done-mark"/);
   state = reduce(state, { type: "event", event: event({
     type: "process", sid: richSid, item_id: "late-agent", kind: "agent",
     phase: "end", status: "succeeded", turn_id: "turn-rich",
-    title: "后台代理完成",
+    title: "后台代理完成", background: true,
   }) });
   assert.equal(hasActiveProcess(state.runtimes[richSid].turns[0].blocks), false);
 
@@ -16547,7 +16862,10 @@ try {
     ...initialState,
     focusedSid: "parent-a",
     btwByParentSid: {
-      "parent-a": { sid: pinnedBtwSid, engine: "codex" },
+      "parent-a": {
+        chats: [{ sid: pinnedBtwSid, engine: "codex", createdAt: 1 }],
+        activeSid: pinnedBtwSid,
+      },
     },
     runtimes: {
       "parent-a": createRuntime(),
@@ -16571,10 +16889,15 @@ try {
       btw_sid: "btw-parent-b",
       parent_sid: "parent-b",
       engine: "claude",
+      created_at: 2,
+      revision: 1,
     }),
   });
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "each parent session keeps an independent BTW binding");
   pinnedBtwState = reduce(pinnedBtwState, {
     type: "restore_session_list",
@@ -16584,7 +16907,8 @@ try {
     type: "enter_new_chat", cwd: "~", cwdSource: "default",
   });
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-a"], {
-    sid: pinnedBtwSid, engine: "codex",
+    chats: [{ sid: pinnedBtwSid, engine: "codex", createdAt: 1 }],
+    activeSid: pinnedBtwSid,
   });
   assert.deepEqual(
     pinnedBtwState.runtimes[pinnedBtwSid]?.turns,
@@ -16644,13 +16968,16 @@ try {
     ["btw-queue"],
   );
   pinnedBtwState = reduce(pinnedBtwState, {
-    type: "clear_btw", parentSid: "parent-a",
+    type: "clear_btw", parentSid: "parent-a", btwSid: pinnedBtwSid,
   });
   assert.equal(pinnedBtwState.btwByParentSid["parent-a"], undefined);
   assert.equal(pinnedBtwSid in pinnedBtwState.runtimes, false,
     "explicit close discards only that parent's ephemeral BTW runtime");
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-b"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "closing one session's BTW must not close a sibling session's BTW");
   assert.equal("btw-parent-b" in pinnedBtwState.runtimes, true);
 
@@ -16664,7 +16991,10 @@ try {
   });
   assert.equal(pinnedBtwState.btwByParentSid["parent-b"], undefined);
   assert.deepEqual(pinnedBtwState.btwByParentSid["parent-real"], {
-    sid: "btw-parent-b", engine: "claude",
+    chats: [{
+      sid: "btw-parent-b", engine: "claude", createdAt: 2, state: "idle",
+    }],
+    activeSid: "btw-parent-b",
   }, "a parent id capture must carry its BTW binding to the real session id");
 
   pinnedBtwState = reduce(pinnedBtwState, { type: "clear_all_btw" });
@@ -16724,23 +17054,6 @@ assert.equal(openFrame.ts, 123);
 assert.equal(matchesBtwRequest("btw-request-1", "btw-request-1"), true);
 assert.equal(matchesBtwRequest("btw-request-new", "btw-request-old"), false);
 assert.equal(matchesBtwRequest(null, "btw-request-old"), false);
-assert.equal(classifyBtwOpened(
-  "btw-request-1", null,
-  { request_id: "btw-request-1", btw_sid: "btw-1" }), "accept");
-assert.equal(classifyBtwOpened(
-  null, { requestId: "btw-request-1", sid: "btw-1" },
-  { request_id: "btw-request-1", btw_sid: "btw-1" }), "duplicate");
-assert.equal(classifyBtwOpened(
-  "btw-request-new", null,
-  { request_id: "btw-request-old", btw_sid: "btw-old" }), "stale");
-const discardedBtwSids = new Set(["btw-stale"]);
-assert.equal(consumeDiscardedBtwSnapshot(
-  discardedBtwSids, { sid: "normal-session" }), false);
-assert.equal(discardedBtwSids.has("btw-stale"), true);
-assert.equal(consumeDiscardedBtwSnapshot(
-  discardedBtwSids, { sid: "btw-stale" }), true);
-assert.equal(discardedBtwSids.size, 0);
-
 const boundedCache = boundCachedTurns(Array.from(
   { length: 120 }, (_, id) => ({ id, prompt: `turn-${id}` })));
 assert.equal(boundedCache.length, 100);
@@ -17061,6 +17374,15 @@ Object.assign(globalThis, {
   sessionStorage: browserSessionStorage,
 });
 
+sessionValues.set("cc-remote:tab-client-id", "copied-tab-id-must-be-ignored");
+const persistentClientId = stableTabClientId();
+assert.match(persistentClientId,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+assert.notEqual(persistentClientId, "copied-tab-id-must-be-ignored",
+  "a duplicated tab must receive its own connection identity");
+assert.equal(stableTabClientId(), persistentClientId,
+  "reconnects within one page lifetime must retain their routing identity");
+
 assert.deepEqual(
   protocolRecoveryAction(null, PROTOCOL_VERSION), { kind: "wait" });
 assert.deepEqual(
@@ -17204,6 +17526,25 @@ Object.assign(globalThis, {
   sessionStorage: browserSessionStorage,
 });
 
+function assertAutomaticPreviewReads() {
+  const previewRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  previewRelay.start();
+  const previewSocket = FakeWebSocket.instances.at(-1)!;
+  previewSocket.onopen?.();
+  try {
+    const read = previewRelay.sendAuthorizePreview("file-identity-1", "read-intent-1", "allow", "preview-session");
+    assert.ok(read);
+    const count = previewSocket.sent.length;
+    assert.equal(previewRelay.sendAuthorizePreview("file-identity-1", "read-intent-1", "allow", "preview-session"), read);
+    assert.equal(previewSocket.sent.length, count, "duplicate preview mounts share the exact request");
+    assert.equal(previewRelay.sendAuthorizePreview("file-identity-2", "read-intent-1", "allow", "preview-session"), null);
+    assert.equal(previewSocket.sent.length, count, "replacement files must not trigger an automatic authorization loop");
+    assert.ok(previewRelay.sendAuthorizePreview("file-identity-2", "read-intent-2", "allow", "preview-session"), "explicit refresh starts a fresh read");
+    assert.ok(previewRelay.sendAuthorizePreview("other-file", "read-intent-1", "allow", "other-preview-session"), "read guards are session-scoped");
+  } finally { previewRelay.stop(); }
+}
+assertAutomaticPreviewReads();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({
@@ -17326,8 +17667,8 @@ assert.equal(matchModelId("claude-opus-5", "claude"),
   "claude-opus-5[1m]",
   "the legacy unqualified Opus 5 alias must resolve to the curated 1M model");
 assert.equal(matchModelId("claude-mythos-5[1m]", "claude"),
-  "claude-mythos-5",
-  "context suffix compatibility must remain for existing Claude cards");
+  "claude-mythos-5[1m]",
+  "an old model id must retain its exact identity after a catalog upgrade");
 assert.equal(matchModelId("claude-opus-5-custom", "claude"),
   "claude-opus-5-custom",
   "a provider-specific model id must not be swallowed by the curated Opus alias");
@@ -17463,10 +17804,15 @@ const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>[\s\S]{0,120}<GoalPanel/,
   "Goal lazy loading must keep a stable chip placeholder");
 assert.match(appSource,
-  /fallback=\{\(\(goalUi\?\.revealed && !completedGoalRetired\)[\s\S]{0,120}\|\| goalUi\?\.open \|\| planProgress\)[\s\S]{0,180}goal-suspense/,
-  "a remembered non-retired Goal or current Plan stays visible while its component chunk loads");
+  /fallback=\{\(\(!archivedBrowse[\s\S]{0,180}goalUi\?\.open\)\) \|\| planProgress\)[\s\S]{0,180}goal-suspense/,
+  "a live Goal or current Plan stays visible while its component chunk loads");
 assert.match(appSource, /externalPlanProgress=\{planProgress/,
   "the session strip must explicitly take ownership from the message row");
+assert.match(appSource,
+  /const previewAgentFile = [\s\S]{0,180}setAgentPanel\(null\)/,
+  "opening a file from Agent detail must switch the shared right slot");
+assert.match(appSource, /onOpenFile=\{previewAgentFile\}/,
+  "Agent file links must use the right-slot switching callback");
 assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
   "a transient Goal read failure must be retried in the same connection");
 assert.doesNotMatch(appSource,
@@ -17480,7 +17826,9 @@ const btwPanelSource = readFileSync(
 for (const optimisticAction of ["set_model", "set_effort", "set_perm", "set_collaboration_mode"]) {
   assert.doesNotMatch(appSource, new RegExp(`dispatch\\(\\{ type: ["']${optimisticAction}["']`));
 }
-assert.match(appSource, /const \{ cwd, cwdSource, model, effort \} = state\.newChat/);
+assert.match(appSource,
+  /const \{[\s\S]{0,160}cwd,[\s\S]{0,160}autoCompactMode,[\s\S]{0,120}\} = state\.newChat/,
+  "new-session autocompact must be captured with cwd/model before the atomic create");
 assert.match(appSource, /data-lock-horizontal-swipe/);
 assert.match(appSource, /surface=\{space\}/);
 assert.match(appSource, /draftKey=\{focusedComposerDraftKey\}/);
@@ -17530,12 +17878,59 @@ assert.match(appSource,
 assert.doesNotMatch(appSource,
   /sendCloseBtw\(s\); dispatch\(\{ type: "clear_btw" \}\); \}\s*[\s\S]{0,120}\}, \[focusedSid, engine\]\)/,
   "session and harness navigation must retain a session-scoped BTW");
+function testBtwPanelScopes() {
+  const btwScope = btwPanelScopeKey("machine-a", "code", "codex", "parent-a");
+  const otherBtwScopes = [
+    btwPanelScopeKey("machine-b", "code", "codex", "parent-a"),
+    btwPanelScopeKey("machine-a", "work", "codex", "parent-a"),
+    btwPanelScopeKey("machine-a", "code", "claude", "parent-a"),
+    btwPanelScopeKey("machine-a", "code", "codex", "parent-b"),
+  ];
+  const openedBtwScopes = setBtwPanelScope([], btwScope, true);
+  assert.ok(otherBtwScopes.every((key) => !openedBtwScopes.includes(key)),
+    "visibility must not leak between machines, surfaces, engines or parents");
+  assert.deepEqual(setBtwPanelScope(openedBtwScopes, btwScope, false), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: (key) => (
+    key === BTW_PANEL_SCOPES_KEY ? JSON.stringify(openedBtwScopes) : null
+  ) }), openedBtwScopes, "refresh restores only the explicitly opened parent");
+  assert.deepEqual(readBtwPanelScopes({ getItem: (key) => (
+    key === "cc-remote:btw-panel-visible" ? "1" : null
+  ) }), [], "a legacy global open flag has no trustworthy parent and cannot migrate");
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => "{broken" }), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => { throw new Error("private"); } }), []);
+  assert.deepEqual(readBtwPanelScopes({ getItem: () => JSON.stringify([
+    btwScope, "true", "null", "{}", "[]", '["a","invalid","codex","b"]', btwScope,
+  ]) }), openedBtwScopes, "untrusted storage is shape-checked and deduplicated");
+  let boundedBtwScopes: string[] = [];
+  for (let i = 0; i < 100; i++) boundedBtwScopes = setBtwPanelScope(
+    boundedBtwScopes, btwPanelScopeKey("m", "code", "codex", String(i)), true);
+  assert.equal(boundedBtwScopes.length, 64);
+  assert.deepEqual(rekeyBtwPanelScope(openedBtwScopes, btwScope, otherBtwScopes[3]),
+    [otherBtwScopes[3]], "native id capture moves only the original parent's preference");
+  assert.equal(rekeyBtwPanelScope(openedBtwScopes, "missing", btwScope), openedBtwScopes);
+}
+testBtwPanelScopes();
 assert.match(appSource,
-  /const activeBtw = visibleParentSid \? state\.btwByParentSid\[visibleParentSid\] : undefined/,
-  "only the focused parent session may expose its BTW binding");
+  /const activeBtwGroup = visibleParentSid[\s\S]{0,100}state\.btwByParentSid\[visibleParentSid\][\s\S]{0,160}activeBtwGroup\.activeSid/,
+  "only the focused parent session may expose its selected side chat");
 assert.match(appSource,
-  /const closeBtw = \(\) => \{[\s\S]*?sendCloseBtw\(activeBtw\.sid\)/,
-  "the explicit close action must target only the visible session's BTW");
+  /const openBtw = \(\) => \{\s*if \(!confirmArtifactDiscard\(\)\) return;/,
+  "opening side chat must preserve the dirty Markdown discard guard");
+assert.match(appSource,
+  /const closeBtw = \(btwSid = activeBtwSid\) => \{[\s\S]*?sendCloseBtw\(btwSid\)/,
+  "the explicit close action must target only the selected side chat");
+assert.match(appSource,
+  /latest\.collapseBtw\(\);[\s\S]{0,80}else latest\.openBtw\(\)/,
+  "the keyboard shortcut must collapse the panel without destroying a chat");
+assert.match(appSource, /onNew=\{createBtw\}/,
+  "the visible side-chat panel must expose creation of additional chats");
+assert.doesNotMatch(appSource, /sendCloseBtw\(msg\.btw_sid\)/,
+  "navigation or a late open response must never destroy a side chat");
+assert.match(appSource,
+  /msg\.revision < stateRef\.current\.btwRevision[\s\S]{0,650}pendingBtwByParentRef\.current\.delete\(requestedParent\)[\s\S]{0,450}setBtwOpeningFor\(requestedParent, false\)/,
+  "a newer BTW catalog must settle its stale cached open response");
+assert.equal((appSource.match(/sendCloseBtw\(/g) ?? []).length, 1,
+  "only the explicit per-chat close action may destroy a side chat");
 assert.match(appSource,
   /const previewBtwFile = [\s\S]{0,120}previewFileForSid\(activeBtwSid/,
   "BTW file actions must stay bound to the visible session's fork");
@@ -17549,8 +17944,10 @@ assert.match(appSource,
   /focusedSid !== sid[\s\S]{0,180}activeBtwSid !== sid/,
   "background sessions outside the focused main and visible BTW stay unable to read files");
 assert.match(btwPanelSource,
-  /<ChatView[\s\S]{0,220}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
+  /<ChatView[\s\S]{0,400}imageAssets=\{p\.imageAssets\}[\s\S]{0,120}onLoadImage=\{p\.onLoadImage\}[\s\S]{0,120}onAuthorizeImage=\{p\.onAuthorizeImage\}/,
   "BTW chat rendering must receive the same bounded image authorization channel");
+assert.match(btwPanelSource, /<ChatView[\s\S]{0,100}engine=\{p\.engine\}/,
+  "BTW rendering must use its real engine so Codex hook plumbing stays filtered");
 assert.match(appSource, /sendInterruptTo\(sid\)/,
   "BTW stop must target the captured fork sid");
 assert.match(appSource, /sendSetModelTo\(sid, model\)/,
@@ -17574,13 +17971,13 @@ assert.match(appSource, /legacyExternal=\{!rt\.control && !!rt\.external\}/,
 assert.match(appSource, /sessionControlLocksInput\(rt\.control\)/,
   "Shift+Tab must not mutate controls while the authoritative session is read-only");
 assert.match(appSource,
-  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,300}sendGetContext\(\)[\s\S]{0,200}begin_context_request/,
+  /state\.connState !== "connected" \|\| !state\.wrapperOnline\) return;[\s\S]{0,520}sendContextRequestTo\(focusedSid, deferred\)/,
   "a focused session must prime its context ring after initial sync and reconnect");
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 assert.match(appSource,
-  /focusedSession\?\.native_session_id[\s\S]{0,180}nativeCodexSessionId\(rt\.ccSessionId\)/,
+  /focusedSession\?\.native_session_id[\s\S]{0,180}nativeProfileSessionId\(rt\.ccSessionId\)/,
   "the Work header must not expose a profile-namespaced routing id");
 assert.match(appSource,
   /<span className=\{`work-profile-owner tone-\$\{focusedWorkProfile\.tone\}`\}/,
@@ -17601,7 +17998,10 @@ const sidebarSource = readFileSync(
   resolve(process.cwd(), "src/components/SessionsSidebar.tsx"), "utf8");
 assert.doesNotMatch(sidebarSource, /onGrant|目录授权/);
 assert.match(sidebarSource,
-  /codexProfileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
+  /disabled=\{archiveBlocked\}[\s\S]{0,160}请停止当前任务并清空排队后再归档/,
+  "running Codex sessions must not expose an actionable archive command");
+assert.match(sidebarSource,
+  /profileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
   "Code, Work and different devices must not share one account filter");
 const newChatSource = readFileSync(
   resolve(process.cwd(), "src/components/NewChatView.tsx"), "utf8");
@@ -17617,6 +18017,17 @@ assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.match(composerSource,
+  /locked = offline \|\| !!controlUi\?\.locked \|\| p\.archived === true/,
+  "archived history must keep the composer read-only");
+assert.match(composerSource,
+  /loading=\{p\.engine === "codex" && p\.statusLoading\}[\s\S]{0,80}disabled=\{locked\}[\s\S]{0,100}if \(locked\) return/,
+  "a locked composer must not reopen live account controls");
+assert.match(composerSource,
+  /aria-label="上下文占用"[\s\S]{0,100}disabled=\{locked\}[\s\S]{0,100}if \(locked\) return/,
+  "a locked composer must not reopen or request live context");
+const contextPopoverSource = readFileSync(
+  resolve(process.cwd(), "src/components/ContextPopover.tsx"), "utf8");
 for (const [surface, source] of [
   ["session composer", composerSource],
   ["new chat", newChatSource],
@@ -17639,14 +18050,15 @@ assert.match(composerSource, /Artifacts · \{p\.workArtifactCount\}/);
 assert.doesNotMatch(composerSource, /交付物/);
 assert.doesNotMatch(composerSource, /项目与资料/);
 assert.match(composerSource, /工作设置/);
-assert.match(composerSource, /会话新增上下文/);
+assert.match(contextPopoverSource, /会话新增上下文/);
 assert.match(composerSource, /workContext\.sessionPercentage\.toFixed\(0\)/);
-assert.match(composerSource, /p\.contextReport\.percentage\.toFixed\(0\)/,
-  "Code must retain the engine-total context reading");
+assert.match(contextPopoverSource,
+  /usage\(p\.report\.total_tokens, p\.report\.percentage\)/,
+  "Code must render the last native engine-total context reading");
 assert.match(composerSource, /contextAvailable = p\.contextReport\?\.available !== false/,
   "an absent tokenUsage report must not be rendered as a real zero");
-assert.match(composerSource, /尚未收到 Codex 的 tokenUsage/,
-  "the context popover must explain the temporary unknown state");
+assert.match(contextPopoverSource, /正在读取真实上下文/,
+  "the context popover must explain that its native reading is still loading");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
 assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "选择模型"/,
@@ -17686,8 +18098,8 @@ assert.match(appSource,
 assert.match(appSource,
   /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
   "a failed Skill refresh must not replace a usable cached catalog");
-assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
-  "focused Codex sessions must prefetch Skills before the user types $");
+assert.match(appSource, /Warm the cwd\/account-scoped Skill catalog[\s\S]*requestSkillCatalog/,
+  "focused sessions must prefetch account-scoped Skills before the user types $");
 assert.match(appSource,
   /msg\.type === "wrapper_reconnected"[\s\S]*skillCatalogsRef\.current = \{\}[\s\S]*requestSkillCatalog\(focusedSkills, true\)/,
   "a wrapper generation change must invalidate and rewarm native Skill catalogs");
@@ -17812,7 +18224,7 @@ assert.match(appSource,
   /<HeaderMenu[\s\S]*engine=\{engine\}[\s\S]*onOpenUsageActivity=\{openUsageActivity\}/,
   "the app must wire the selected engine and activity opener into the menu");
 assert.match(appSource,
-  /<UsageActivitySheet[\s\S]*open=\{usageActivityOpen && engine === "codex"\}/,
+  /usageActivityOpen && engine === "codex" && <Suspense[\s\S]{0,120}<UsageActivitySheet/,
   "the activity sheet must fail closed when the selected surface is Claude");
 assert.match(layoutCss, /\.header-menu-card\{[^}]*position:fixed/s);
 assert.match(layoutCss,
@@ -18129,6 +18541,9 @@ assert.equal(normalizeDiffTheme(null), "light");
 relay.setFocusedSid("codex-control-session", "codex");
 const reliableControlFrames: Array<[string, () => void]> = [
   ["get_status", () => relay.sendGetStatus()],
+  ["consume_rate_limit_reset_credit", () =>
+    relay.sendConsumeRateLimitResetCredit(
+      "codex-control-session", "opaque/credit")],
   ["get_goal", () => relay.sendGetGoal()],
   ["set_goal", () => relay.sendSetGoal("ship it", "active", 1024)],
   ["clear_goal", () => relay.sendClearGoal()],
@@ -18141,6 +18556,9 @@ for (const [type, sendCommand] of reliableControlFrames) {
   assert.equal(frame.sid, "codex-control-session");
   assert.equal(typeof frame.cmd_id, "string");
   assert.equal(typeof frame.client_id, "string");
+  if (type === "consume_rate_limit_reset_credit") {
+    assert.equal(frame.credit_id, "opaque/credit");
+  }
 }
 const targetedGoalRequest = relay.sendGetGoalTo("background-goal-session");
 assert.equal(typeof targetedGoalRequest, "string");
@@ -18201,7 +18619,7 @@ assert.equal(relay.lastSeqFor("s1"), 1);
 // only notified the App when a per-btw generation had already been recorded.
 socket.receive({
   type: "btw_opened", request_id: "btw-gap", btw_sid: "btw-old",
-  parent_sid: "s1", engine: "claude",
+  parent_sid: "s1", engine: "claude", created_at: 1, revision: 1,
 });
 socket.receive({
   type: "snapshot", sid: "s1", cc_session_id: "s1", generation: "g2",
@@ -18219,6 +18637,24 @@ socket.receive({
   state: "idle", tail_text: "",
 });
 assert.equal(wrapperGenerationChanges, 1); // one notice per wrapper generation
+
+// BtwSync itself may be the first new-generation frame after a sleeping
+// browser reconnects. Its newly installed catalog must survive generation
+// invalidation so the selected chat's following bounded replay is accepted.
+socket.receive({
+  type: "btw_sync", generation: "g3", revision: 1,
+  sessions: [{
+    btw_sid: "btw-restored", parent_sid: "s2", engine: "codex",
+    created_at: 3, state: "running",
+  }],
+});
+socket.receive({
+  type: "model", sid: "btw-restored", seq: 1, model: "gpt-restored",
+});
+assert.equal(wrapperGenerationChanges, 2);
+assert.equal(observed.filter((event) => event.type === "model"
+  && event.sid === "btw-restored" && event.model === "gpt-restored").length, 1,
+"a BtwSync catalog must remain authoritative after it changes generation");
 relay.stop();
 
 // A separate socket exercises the v15 control watermark without perturbing
@@ -19265,5 +19701,38 @@ aliasSteerSocket.receive({
 assert.equal(aliasSteerRelay.pendingQueryFor("alias-steer"), null,
   "UserMsg.client_msg_id releases a full-history steer acceptance latch");
 aliasSteerRelay.stop();
+
+function testGeneratedImageCacheAliases() {
+const generatedImagesCache = new HistoryImageAssetCache(2);
+assert.equal(generatedImagesCache.begin({
+  sid: "generated-session", turnId: "old-public-id", imageId: "img-native-hash",
+  variant: "full", requestId: "generated-full", revision: "generated-r1",
+}), true);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash"), undefined,
+"an unfinished image request must not be aliased");
+assert.equal(generatedImagesCache.accept({
+  v: 52, ts: 1, type: "history_image", session_id: "generated-session",
+  turn_id: "old-public-id", image_id: "img-native-hash", variant: "full",
+  request_id: "generated-full", revision: "generated-r1",
+  data: "original-bytes", media_type: "image/png", width: 1400, height: 900,
+}), true);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash")?.data, "original-bytes");
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("another-session"), "img-native-hash"), undefined);
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "another-image"), undefined);
+assert.equal(readyGeneratedImageAsset({
+  [historyImageAssetKey("old-public-id", "img-native-hash", "thumbnail")]: {
+    status: "ready", data: "low-res", mediaType: "image/png",
+  },
+}, "img-native-hash"), undefined, "a thumbnail must not replace a full-width generated image");
+generatedImagesCache.dropSession("generated-session");
+assert.equal(readyGeneratedImageAsset(
+  generatedImagesCache.forSession("generated-session"), "img-native-hash"), undefined,
+"hard history invalidation must also drop the warm image alias");
+}
+testGeneratedImageCacheAliases();
 
 console.log("web reliability tests passed");

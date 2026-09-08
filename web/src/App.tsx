@@ -9,12 +9,18 @@ import {
   type TouchEvent,
 } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
+import { RemoteViewerContext, useRemoteViewerLinks } from "./remote-viewer-context";
+import { ViewerPagesProvider } from "./components/ViewerPagesProvider";
+import { MANUAL_UNREAD_STORAGE } from "./manual-unread-storage";
+import type { ViewerPage } from "./remote-viewer";
+import { readViewerSelections, writeViewerSelections, viewerScopeKey, setViewerSelection,
+  type ViewerSelection } from "./remote-viewer";
 import {
   createRuntime,
   deferredQueueCapacity,
   initialState,
   modelCatalogScopeKey,
-  nativeCodexSessionId,
+  nativeProfileSessionId,
   reduce,
   type PendingQuery,
   type PreviewAuthorizationState,
@@ -32,7 +38,6 @@ import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
 import { presentCommandProblem } from "./problem-presentation";
 import { LoginForm } from "./components/LoginForm";
-import { SessionsSidebar } from "./components/SessionsSidebar";
 import { DirPicker } from "./components/DirPicker";
 import {
   compatibleNewChatEffort,
@@ -42,20 +47,22 @@ import {
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
 import { QuestionSheet } from "./components/QuestionSheet";
-import { StatusSheet } from "./components/StatusSheet";
-import { UsageActivitySheet } from "./components/UsageActivitySheet";
-import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
 import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
-import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
-import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
+import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
 import {
+  claudeProfileIdForSession,
+  claudeProfilePresentation,
   codexProfileIdForSession,
   codexProfilePresentation,
 } from "./codex-profile-presentation";
 import { parseGoalCommand } from "./goal-command";
+import {
+  BTW_PANEL_SCOPES_KEY, btwPanelScopeKey, readBtwPanelScopes,
+  rekeyBtwPanelScope, setBtwPanelScope,
+} from "./btw-panel-state";
 import {
   dismissGoalUi,
   goalStableIdentity,
@@ -71,13 +78,18 @@ import {
 } from "./scoped-goal-ui";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor, type Catalog } from "./data";
+import type { AutoCompactSelection } from "./auto-compact";
 import {
   normalizeSessionList,
+  scopedFocusForSessionList,
   shouldAcceptSessionList,
   updateScopedSessionLifecycle,
 } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
-import { nextAutoLoadDetailTurn } from "./history-detail-projection";
+import {
+  nextActiveDetailRequest,
+  nextAutoLoadDetailTurn,
+} from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectUnconfirmedQueries,
@@ -99,21 +111,22 @@ import {
   type PendingWorktreeFork,
   withoutForkFocusPlaceholder,
 } from "./session-worktree";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
+import { matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
   type DiffTheme, type Engine, type Space,
-  type SessionControl, type History, sessionControlLocksInput } from "./protocol";
+  type SessionControl, type History,
+  sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { parseGitDiff } from "./diff";
 import { resolveSidebarSwipe } from "./responsive-layout";
 import {
   bumpSessionActivity,
-  compareSessionsByActivity,
   mergeSessionActivityState,
+  selectSurfaceSession,
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
@@ -156,6 +169,7 @@ import {
   type CancelledHistoryBrowseRequest,
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
+  type HistoryRequestOptions,
 } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
@@ -171,6 +185,7 @@ import {
 import {
   acceptsCachedNewerPage,
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
   prependOlderPage,
   type HistoryBrowsePage,
@@ -196,12 +211,17 @@ import {
   catalogCompletionProjection,
   completionAcknowledgementId,
   completionBadgeKind,
+  completionNeedsHistoryRepair,
   discardBtwCompletionReceipts,
+  idleTurnNeedsHistoryRepair,
   markCompletionUnread,
+  nextTerminalHistoryRepairAttempt,
   newestCompletionProjection,
   rekeyCompletionReceipts,
+  settleTerminalHistoryRepairAttempt,
   type CompletionBadgeKind,
   type CompletionReceipts,
+  type TerminalHistoryRepairAttempt,
 } from "./completion-badges";
 import {
   cacheSkillCatalog,
@@ -224,7 +244,13 @@ import {
   readEngineSpaces,
   rememberEngineSpace,
 } from "./surface-preferences";
-import { exactActiveTurnId } from "./process-blocks";
+import {
+  activeTurnCandidateIds,
+  displayActiveTurnOwnerId,
+} from "./process-blocks";
+import type { AgentDetail } from "./protocol";
+import type { AgentDetailSelection } from "./components/AgentDetailController";
+import type { RightPanelView } from "./components/PanelTabs";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -238,6 +264,30 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
 ));
+const RemoteViewerPanel = lazy(() => import("./components/RemoteViewerPanel").then(
+  ({ RemoteViewerPanel: Panel }) => ({ default: Panel }),
+));
+const StatusSheet = lazy(() => import("./components/StatusSheet").then(
+  ({ StatusSheet: Sheet }) => ({ default: Sheet }),
+));
+const ForkWorktreeSheet = lazy(() => import("./components/ForkWorktreeSheet").then(
+  ({ ForkWorktreeSheet: Sheet }) => ({ default: Sheet }),
+));
+const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
+  ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
+));
+const WorkArtifactsSheet = lazy(() => import("./components/WorkArtifactsSheet").then(
+  ({ WorkArtifactsSheet: Sheet }) => ({ default: Sheet }),
+));
+const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").then(
+  ({ CapabilitiesSheet: Sheet }) => ({ default: Sheet }),
+));
+const AgentDetailController = lazy(() => import("./components/AgentDetailController").then(
+  ({ AgentDetailController: Controller }) => ({ default: Controller }),
+));
+const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
+  ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
+));
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
   detailRequestId: string | null;
@@ -245,24 +295,25 @@ interface QueuedQueryEditorState extends QueuedQueryEditor {
   pendingPrompt: string | null;
 }
 
+const MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS = 2;
+
 // The sidebar is an overlay on mobile (<980px, matches index.css) but a
 // persistent grid column on desktop. So auto-close it after picking a session
 // ONLY on mobile; on desktop keep it open.
 const isMobile = () => window.matchMedia("(max-width: 979px)").matches;
 
-/** Present one account's Codex catalog under the historical `codex` key used
- * by model pickers. The underlying cache remains profile-keyed, so a missing
+/** Present one account's catalog under the historical engine key used by
+ * model pickers. The underlying cache remains profile-keyed, so a missing
  * secondary-account response never falls back to another account's models. */
 function catalogForEngineProfile(
   catalog: Catalog,
   engine: Engine,
-  codexProfileId?: string | null,
+  profileId?: string | null,
 ): Catalog {
-  if (engine !== "codex") return catalog;
-  const scoped = catalog[modelCatalogScopeKey(engine, codexProfileId)];
+  const scoped = catalog[modelCatalogScopeKey(engine, profileId)];
   return {
     ...catalog,
-    codex: scoped ?? (codexProfileId ? [] : (catalog.codex ?? [])),
+    [engine]: scoped ?? (profileId ? [] : (catalog[engine] ?? [])),
   };
 }
 
@@ -280,11 +331,29 @@ export default function App() {
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
+  // A cold Work/Code or engine switch has no trustworthy row to paint until
+  // its scoped SessionList arrives. Keep that gap non-interactive: rendering a
+  // default `~` composer here can create a real session in the wrong cwd before
+  // the wrapper has had a chance to restore the remembered conversation.
+  const [restoringSurfaceScope, setRestoringSurfaceScope] =
+    useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
-  // right slot is shared by diff + /btw; rightView picks which shows.
-  const [rightView, setRightView] = useState<"diff" | "btw">("diff");
+  // The right slot is shared by artifacts and /btw.
+  const [btwPanelScopes, setBtwPanelScopes] = useState(
+    () => readBtwPanelScopes(sessionStorage));
+  const [rightView, setRightView] = useState<RightPanelView>(
+    btwPanelScopes.length ? "btw" : "diff");
+  const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
+  const [viewerSelections, setViewerSelections] = useState(() => readViewerSelections(sessionStorage));
+  const [viewerUrl, setViewerUrl] = useState<{ key: string; href: string; openId: string } | null>(null);
+  useEffect(() => writeViewerSelections(sessionStorage, viewerSelections), [viewerSelections]);
+  const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
+  const setAgentDetailListener = useCallback(
+    (listener: ((message: AgentDetail) => void) | null) => {
+      agentDetailListenerRef.current = listener;
+    }, []);
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpeningByParentSid, setBtwOpeningByParentSid] = useState<Record<string, boolean>>({});
@@ -383,9 +452,17 @@ export default function App() {
   }
   const stateRef = useRef(state);
   stateRef.current = state;
-  const rightViewRef = useRef(rightView);
-  rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
+  const archivedBrowseRef = useRef<string | null>(null);
+  // Reducer state becomes visible after React commits. Keep the command id in a
+  // synchronous ref as well so a close/reopen double click (or two idle frames
+  // in one WebSocket batch) cannot enqueue duplicate native Context RPCs.
+  const contextRequestLaunchesRef = useRef<Map<string, string>>(new Map());
+  // An idle State can be published a few milliseconds before the managed
+  // Claude runner drops its final task/write claims.  Bound the compensating
+  // retries for that narrow finalizer race; a genuinely active turn still
+  // waits for its next authoritative idle frame.
+  const contextDeferredRetryAttemptsRef = useRef<Map<string, number>>(new Map());
   const wsLifecycleEpochRef = useRef(0);
   const goalUiPreferencesRef = useRef<GoalUiPreferences>(
     readGoalUiPreferences(localStorage));
@@ -400,6 +477,34 @@ export default function App() {
   const persistGoalUiPreferences = useCallback((next: GoalUiPreferences) => {
     goalUiPreferencesRef.current = writeGoalUiPreferences(localStorage, next);
   }, []);
+  const sendContextRequestTo = useCallback((
+    sid: string,
+    refresh: boolean,
+    transport: RelayWs | null = wsRef.current,
+  ): string | null => {
+    const runtime = stateRef.current.runtimes[sid];
+    if (runtime?.contextRequestId
+        || contextRequestLaunchesRef.current.has(sid)) return null;
+    const requestId = transport?.sendGetContextTo(sid, refresh) ?? null;
+    if (!requestId) return null;
+    contextRequestLaunchesRef.current.set(sid, requestId);
+    dispatch({ type: "begin_context_request", sid, requestId });
+    return requestId;
+  }, []);
+  const resumeListedSession = useCallback((
+    session: SessionInfo,
+    targetEngine: Engine,
+    targetSpace: Space,
+    transport: RelayWs | null = wsRef.current,
+  ) => {
+    if (session.tag === "archived") {
+      archivedBrowseRef.current = session.session_id;
+      return;
+    }
+    archivedBrowseRef.current = null;
+    transport?.sendSwitchSession(
+      session.session_id, targetEngine, targetSpace);
+  }, []);
   const skillCatalogsRef =
     useRef<Record<string, SkillCatalogCacheEntry>>({});
   const skillCatalogRequestsRef =
@@ -412,6 +517,7 @@ export default function App() {
         request.cwd,
         request.skillsOnly,
         request.codexProfileId,
+        request.claudeProfileId,
       ) ?? null,
     );
   }
@@ -421,14 +527,22 @@ export default function App() {
     space: Space;
     cwd: string;
     skillsOnly: boolean;
+    claudeProfileId?: string | null;
     codexProfileId?: string | null;
   } | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const terminalHistoryRepairRef = useRef<Map<
+    string, TerminalHistoryRepairAttempt
+  >>(new Map());
+  const [terminalHistoryRepairEpoch, setTerminalHistoryRepairEpoch] =
+    useState(0);
+  const btwHydrationKeyRef = useRef("");
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
     (context) => {
       dispatch({ type: "history_detail_cancelled", context });
     },
   ));
+  const historyDetailResetAttemptsRef = useRef(new Set<string>());
   const clearHistoryDetailRequests = useCallback(() => {
     for (const context of historyDetailRequestsRef.current.clear()) {
       dispatch({ type: "history_detail_cancelled", context });
@@ -486,11 +600,10 @@ export default function App() {
   const activeBtwByParentRef = useRef<Map<
     string, { requestId: string; sid: string }
   >>(new Map());
-  // Retain recently cancelled ids so a late response can be identified and
-  // discarded (and a late successful fork can be closed) without disturbing a
-  // newer opening spinner. Bounded because a peer may disappear permanently.
+  // Correlate each pending creation with its original parent. Navigating away
+  // never destroys the result: the owner-scoped open remains pinned there
+  // until its explicit close button is used.
   const btwRequestParentsRef = useRef<Map<string, string>>(new Map());
-  const discardedBtwSidsRef = useRef<Set<string>>(new Set());
   // A marker may arrive while its session is in the background and while an
   // IndexedDB read is already in flight. The set blocks new cache use; the
   // epoch rejects reads that started before the destructive mutation.
@@ -581,9 +694,22 @@ export default function App() {
     generation?: string | null,
     revision?: string | null,
     browse?: HistoryBrowseRequestContext,
+    options?: HistoryRequestOptions,
   ) => {
     const ws = wsRef.current;
     if (!ws) return false;
+    const current = stateRef.current;
+    const completion = newestCompletionProjection(
+      current.runtimes[sid]?.completion,
+      catalogCompletionProjection(current.sessions.find(
+        (session) => session.session_id === sid)),
+    );
+    const requestOptions: HistoryRequestOptions = {
+      ...options,
+      causalKey: options?.causalKey === undefined
+        ? completion?.id ?? null
+        : options.causalKey,
+    };
     return historyRequestsRef.current.request({
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
@@ -594,8 +720,22 @@ export default function App() {
       before,
       limit,
       resolveHistoryCwdHint(historySessionListsRef.current, sid),
-    ), settleCancelledHistoryBrowse);
+    ), settleCancelledHistoryBrowse, requestOptions);
   }, [settleCancelledHistoryBrowse]);
+  const settleTerminalHistoryRepair = useCallback((
+    sid: string,
+    causalKey: string,
+  ) => {
+    const current = terminalHistoryRepairRef.current.get(sid);
+    if (!current || causalKey !== current.key) return;
+    const settled = settleTerminalHistoryRepairAttempt(current);
+    if (!settled) return;
+    terminalHistoryRepairRef.current.set(sid, settled);
+    // The matching History reducer runs in the same inbound-message batch.
+    // This local epoch gives the repair effect an explicit response boundary,
+    // including when the reducer correctly rejects an older build_seq page.
+    setTerminalHistoryRepairEpoch((value) => value + 1);
+  }, []);
   const cancelPendingNotificationTarget = useCallback(() => {
     setPendingNotificationTarget(null);
     notificationListRequestRef.current = null;
@@ -608,12 +748,12 @@ export default function App() {
   const shortcutRef = useRef<{
     artifact: typeof state.artifact;
     btwSid: string | null;
-    rightView: "diff" | "btw";
+    rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
-    closeBtw: () => void;
+    collapseBtw: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
-    getDiff: () => {}, openBtw: () => {}, closeBtw: () => {} });
+    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -641,7 +781,6 @@ export default function App() {
     pendingBtwByParentRef.current.clear();
     activeBtwByParentRef.current.clear();
     btwRequestParentsRef.current.clear();
-    discardedBtwSidsRef.current.clear();
     setBtwOpeningByParentSid({});
     setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
@@ -657,6 +796,7 @@ export default function App() {
     preferredSurfaceFocusRef.current = null;
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
+    setRestoringSurfaceScope(null);
     sessionActivityPendingRef.current.clear();
     skillCatalogsRef.current = {};
     skillCatalogRequestsRef.current?.reset();
@@ -702,11 +842,79 @@ export default function App() {
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
-  const visibleParentSid = state.newChat ? null : focusedSid;
-  const activeBtw = visibleParentSid ? state.btwByParentSid[visibleParentSid] : undefined;
+  const visibleParentSid = state.newChat || previousMachineRef.current !== machineId
+    ? null : focusedSid;
+  const btwPanelKey = visibleParentSid
+    ? btwPanelScopeKey(machineId, space, engine, visibleParentSid) : null;
+  const btwPanelVisible = !!btwPanelKey && btwPanelScopes.includes(btwPanelKey);
+  const btwPanelVisibleRef = useRef(btwPanelVisible);
+  btwPanelVisibleRef.current = btwPanelVisible;
+  const activeBtwGroup = visibleParentSid
+    ? state.btwByParentSid[visibleParentSid] : undefined;
+  const activeBtw = activeBtwGroup?.chats.find(
+    (chat) => chat.sid === activeBtwGroup.activeSid);
   const activeBtwSid = activeBtw?.sid ?? null;
   const btwOpening = visibleParentSid
     ? !!btwOpeningByParentSid[visibleParentSid] : false;
+  // The rendered slot owns desktop split space, never retained chat data.
+  // A hidden BTW can keep running; an empty/opening visible BTW still needs room.
+  const btwShowing = btwPanelVisible && !!visibleParentSid;
+  const viewerKey = visibleParentSid
+    ? viewerScopeKey({ machineId, space, engine, sid: visibleParentSid }) : null;
+  const viewerShowing = !!viewerKey && Object.hasOwn(viewerSelections, viewerKey);
+  const closeViewer = useCallback(() => {
+    if (!viewerKey) return;
+    setViewerSelections((current) => {
+      const next = { ...current };
+      delete next[viewerKey];
+      return next;
+    });
+    setViewerUrl(null);
+  }, [viewerKey]);
+  const openViewer = useCallback((href?: string) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey, href ? null : current[viewerKey] ?? null));
+    setViewerUrl(href ? { key: viewerKey, href, openId: uuid() } : null);
+  }, [viewerKey, confirmArtifactDiscard]);
+  const openViewerLink = useRemoteViewerLinks(
+    authed && state.connState === "connected" ? viewerKey : null, openViewer);
+  const openViewerPage = useCallback((page: ViewerPage) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerUrl(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey,
+      { machine_id: page.machine_id, site_id: page.site_id, entry: page.entry }));
+  }, [viewerKey, confirmArtifactDiscard]);
+  const selectViewer = (selection: ViewerSelection | null) => {
+    if (viewerKey) setViewerSelections((current) => setViewerSelection(current, viewerKey, selection));
+  };
+  const visibleRightPanel = viewerShowing ? "viewer" : agentPanel ? "agent"
+    : rightView === "btw" && btwShowing ? "btw"
+      : state.artifact ? "diff" : btwShowing ? "btw" : null;
+  // Questions, hydration and completion receipts must agree with the rendered
+  // slot, including when an agent or artifact covers a retained side chat.
+  const visibleBtwSid = visibleRightPanel === "btw" ? activeBtwSid : null;
+  const visibleBtwSidRef = useRef(visibleBtwSid);
+  visibleBtwSidRef.current = visibleBtwSid;
+  const activeBtwQuestionVisible = !!(
+    visibleBtwSid && state.runtimes[visibleBtwSid]?.pendingQuestion
+  );
+  useEffect(() => {
+    if (!visibleBtwSid
+        || state.connState !== "connected" || !state.wrapperOnline) {
+      btwHydrationKeyRef.current = "";
+      return;
+    }
+    if (btwHydrationKeyRef.current === visibleBtwSid) return;
+    if (wsRef.current?.sendSyncBtw(visibleBtwSid)) {
+      btwHydrationKeyRef.current = visibleBtwSid;
+    }
+  }, [
+    visibleBtwSid,
+    state.connState,
+    state.wrapperOnline,
+  ]);
   const completionBadgeSids = new Set([
     ...Object.keys(completionReceipts),
     ...state.sessions.filter(
@@ -744,9 +952,16 @@ export default function App() {
     : null;
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const newChatCwd = state.newChat?.cwd ?? null;
+  const knownClaudeProfileIds = new Set(
+    state.claudeProfiles.map((profile) => profile.id));
   const knownCodexProfileIds = new Set(
     state.codexProfiles.map((profile) => profile.id));
-  const requestedNewChatProfileId = engine === "codex"
+  const requestedNewChatClaudeProfileId = engine === "claude"
+    ? state.newChat?.claudeProfileId
+      ?? state.claudeProfileByScope[activeScopeKey]
+      ?? state.defaultClaudeProfileId
+    : null;
+  const requestedNewChatCodexProfileId = engine === "codex"
     ? state.newChat?.codexProfileId
       ?? state.codexProfileByScope[activeScopeKey]
       ?? state.defaultCodexProfileId
@@ -754,8 +969,15 @@ export default function App() {
   // Preserve an explicitly selected id even if a later registry refresh drops
   // it. Silently replacing a drafted Work turn with the default account would
   // cross the user's billing and conversation boundary.
+  const newChatClaudeProfileId = engine === "claude"
+    ? requestedNewChatClaudeProfileId
+      ?? state.claudeProfiles.find(
+        (profile) => profile.id === state.defaultClaudeProfileId)?.id
+      ?? state.claudeProfiles[0]?.id
+      ?? null
+    : null;
   const newChatCodexProfileId = engine === "codex"
-    ? requestedNewChatProfileId
+    ? requestedNewChatCodexProfileId
       ?? state.codexProfiles.find(
         (profile) => profile.id === state.defaultCodexProfileId)?.id
       ?? state.codexProfiles[0]?.id
@@ -764,10 +986,15 @@ export default function App() {
   const newChatCodexProfileMissing = engine === "codex"
     && !!newChatCodexProfileId
     && !knownCodexProfileIds.has(newChatCodexProfileId);
+  const newChatClaudeProfileMissing = engine === "claude"
+    && !!newChatClaudeProfileId
+    && !knownClaudeProfileIds.has(newChatClaudeProfileId);
+  const newChatProfileId = engine === "codex"
+    ? newChatCodexProfileId : newChatClaudeProfileId;
   const newChatCatalogScopeKey = modelCatalogScopeKey(
-    engine, newChatCodexProfileId);
+    engine, newChatProfileId);
   const newChatCatalog = catalogForEngineProfile(
-    state.catalog, engine, newChatCodexProfileId);
+    state.catalog, engine, newChatProfileId);
   const newChatDefaults = resolveNewChatLocalDefaults(
     engine,
     space,
@@ -787,25 +1014,67 @@ export default function App() {
   );
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
+  const archivedBrowse = focusedSession?.tag === "archived";
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  useEffect(() => {
+    if (!focusedSid || state.newChat) {
+      archivedBrowseRef.current = null;
+      return;
+    }
+    const focusedSpace = focusedSession?.space === "work" ? "work" : space;
+    if (focusedSession?.tag === "archived") {
+      archivedBrowseRef.current = focusedSid;
+      return;
+    }
+    const archivedBrowse = archivedBrowseRef.current;
+    if (archivedBrowse !== focusedSid) return;
+    if (state.connState !== "connected" || !state.wrapperOnline) return;
+    archivedBrowseRef.current = null;
+    wsRef.current?.sendSwitchSession(
+      focusedSid, focusedEngine, focusedSpace);
+  }, [
+    focusedEngine,
+    focusedSession?.space,
+    focusedSession?.tag,
+    focusedSid,
+    space,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
+  useEffect(() => {
+    setAgentPanel(null);
+  }, [activeScopeKey, focusedSid, focusedEngine, space, rt.historyRevision]);
   const focusedCodexProfileId = focusedEngine === "codex"
     ? focusedSession?.codex_profile_id
       ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
     : null;
+  const focusedClaudeProfileId = focusedEngine === "claude"
+    ? focusedSession?.claude_profile_id
+      ?? claudeProfileIdForSession(focusedSid, state.defaultClaudeProfileId)
+    : null;
+  const focusedAccountProfileId = focusedEngine === "codex"
+    ? focusedCodexProfileId : focusedClaudeProfileId;
   const focusedWorkProfile = space === "work" && !state.newChat
-    && focusedEngine === "codex" && focusedSession?.codex_profile_id
-    ? codexProfilePresentation(
-      state.codexProfiles,
-      state.defaultCodexProfileId,
-      focusedSession.codex_profile_id,
-    )
+    && focusedAccountProfileId
+    ? (focusedEngine === "codex"
+      ? codexProfilePresentation(
+        state.codexProfiles,
+        state.defaultCodexProfileId,
+        focusedAccountProfileId,
+      )
+      : claudeProfilePresentation(
+        state.claudeProfiles,
+        state.defaultClaudeProfileId,
+        focusedAccountProfileId,
+      ))
     : null;
   const focusedNativeSessionId = focusedSession?.native_session_id
-    ?? (focusedEngine === "codex" && rt.ccSessionId
-      ? nativeCodexSessionId(rt.ccSessionId)
+    ?? (rt.ccSessionId
+      ? nativeProfileSessionId(rt.ccSessionId)
       : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
-    state.catalog, focusedEngine, focusedCodexProfileId);
+    state.catalog, focusedEngine, focusedAccountProfileId);
   const completedGoalRetired = completedGoalHasNewerUserTurn(
     rt.goal, rt.turns,
   ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
@@ -846,13 +1115,14 @@ export default function App() {
   );
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
-    focusedCodexProfileId);
+    focusedCodexProfileId, focusedClaudeProfileId);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
     space,
     cwd: capabilityCwd,
     skillsOnly: true,
+    claudeProfileId: focusedClaudeProfileId,
     codexProfileId: focusedCodexProfileId,
   };
   const activeBtwDraftKey = composerDraftKey(
@@ -894,6 +1164,15 @@ export default function App() {
         }
       : undefined)
     : undefined;
+  const focusedCompletion = newestCompletionProjection(
+    rt.completion,
+    catalogCompletionProjection(focusedSession),
+  );
+  const terminalRepairState = mergeSessionActivityState(
+    focusedSession?.state,
+    rt.state,
+    rt.mirroredRunning,
+  );
 
   useEffect(() => {
     setQueuedQueryEditor((current) => (
@@ -907,6 +1186,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authed || !focusedSid || !focusedGoalScopeKey || state.newChat
+        || archivedBrowse
         || state.connState !== "connected" || !state.wrapperOnline) {
       return;
     }
@@ -937,6 +1217,7 @@ export default function App() {
     });
   }, [
     authed,
+    archivedBrowse,
     focusedGoalScopeKey,
     focusedSid,
     state.connState,
@@ -945,12 +1226,79 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    // Request/build ordering is scoped to one wrapper connection. Keep each
+    // sid's bounded attempts across ordinary focus changes so a legacy receipt
+    // outside the newest page cannot rescan a multi-megabyte transcript every
+    // time the user returns to the session.
+    terminalHistoryRepairRef.current.clear();
+  }, [machineId, state.connState]);
+
+  useEffect(() => {
+    const completionId = focusedCompletion?.id ?? null;
+    if (!focusedSid || state.newChat
+        || historyView.browsing || state.connState !== "connected"
+        || !state.wrapperOnline || !rt.syncReady
+        || terminalRepairState !== "idle" || rt.acceptancePending) return;
+    const completionMissing = completionNeedsHistoryRepair(
+      historyView.turns, completionId);
+    const idleTailMissing = idleTurnNeedsHistoryRepair(historyView.turns);
+    if (!completionMissing && !idleTailMissing) {
+      terminalHistoryRepairRef.current.delete(focusedSid);
+      return;
+    }
+    const latest = historyView.turns[historyView.turns.length - 1];
+    // A successful completion receipt is the strongest post-TurnEnd causal
+    // key. Failed/interrupted turns have no unread receipt, so bind their
+    // fallback to the exact idle generation/lifecycle and newest display row.
+    const repairKey = completionMissing && completionId
+      ? completionId
+      : [
+          "idle",
+          wsRef.current?.generationFor(focusedSid) ?? "",
+          rt.lastLifecycleSeq,
+          latest?.clientMsgId ?? latest?.historyTurnId ?? latest?.id ?? "",
+        ].join("\0");
+    const attempt = nextTerminalHistoryRepairAttempt(
+      terminalHistoryRepairRef.current.get(focusedSid),
+      repairKey,
+      MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS,
+    );
+    if (!attempt) return;
+    const accepted = requestHistory(
+      focusedSid,
+      undefined,
+      HISTORY_INITIAL_PAGE,
+      wsRef.current?.generationFor(focusedSid),
+      undefined,
+      undefined,
+      { supersedePending: true, causalKey: repairKey },
+    );
+    if (accepted) {
+      terminalHistoryRepairRef.current.set(focusedSid, attempt);
+    }
+  }, [
+    focusedCompletion?.id,
+    focusedSid,
+    historyView.browsing,
+    historyView.turns,
+    requestHistory,
+    rt.acceptancePending,
+    rt.lastLifecycleSeq,
+    rt.syncReady,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+    terminalHistoryRepairEpoch,
+    terminalRepairState,
+  ]);
+
+  useEffect(() => {
     const acknowledgeVisible = () => {
       if (document.hidden) return;
       const current = stateRef.current;
       const parentSid = current.newChat ? null : current.focusedSid;
       if (!parentSid) return;
-      const binding = current.btwByParentSid[parentSid];
+      const btwSid = visibleBtwSidRef.current;
       const completion = newestCompletionProjection(
         current.runtimes[parentSid]?.completion,
         catalogCompletionProjection(current.sessions.find(
@@ -964,10 +1312,9 @@ export default function App() {
       setCompletionReceipts((receipts) => {
         let next = acknowledgeCompletion(
           receipts, parentSid, { main: mainAcknowledgementQueued });
-        if (binding
-            && (rightViewRef.current === "btw" || !current.artifact)) {
+        if (btwSid) {
           next = acknowledgeCompletion(
-            next, parentSid, { btwSid: binding.sid });
+            next, parentSid, { btwSid });
         }
         return next;
       });
@@ -978,9 +1325,7 @@ export default function App() {
       "visibilitychange", acknowledgeVisible);
   }, [
     visibleParentSid,
-    activeBtwSid,
-    rightView,
-    state.artifact,
+    visibleBtwSid,
     rt.completion?.id,
     rt.completion?.unread,
     focusedSession?.completion_id,
@@ -1045,7 +1390,7 @@ export default function App() {
     const current = stateRef.current;
     const focusedSid = current.newChat ? null : current.focusedSid;
     const activeBtwSid = focusedSid
-      ? current.btwByParentSid[focusedSid]?.sid ?? null : null;
+      ? current.btwByParentSid[focusedSid]?.activeSid ?? null : null;
     if (!ws || (focusedSid !== sid && activeBtwSid !== sid)) return false;
     const cache = inlineImageAssetsRef.current;
     const assetKey = stablePreviewId ?? path;
@@ -1250,6 +1595,12 @@ export default function App() {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        BTW_PANEL_SCOPES_KEY, JSON.stringify(btwPanelScopes));
+    } catch { /* storage is best-effort in private browsing */ }
+  }, [btwPanelScopes]);
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
 
   // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
@@ -1416,15 +1767,20 @@ export default function App() {
   }, [engine, space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
-        || !state.wrapperOnline || newChatCodexProfileMissing) return;
+        || !state.wrapperOnline || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing) return;
     const request = newChatCatalogRequest(
-      engine, space, newChatCwd, newChatCodexProfileId);
+      engine, space, newChatCwd,
+      newChatCodexProfileId, newChatClaudeProfileId);
     if (!request) return;
     wsRef.current?.sendGetModels(
-      request.engine, request.cwd, request.codexProfileId);
+      request.engine, request.cwd,
+      request.codexProfileId, request.claudeProfileId);
   }, [
     engine,
     newChatCwd,
+    newChatClaudeProfileId,
+    newChatClaudeProfileMissing,
     newChatCodexProfileId,
     newChatCodexProfileMissing,
     space,
@@ -1450,12 +1806,17 @@ export default function App() {
     state.newChat,
   ]);
   useEffect(() => {
-    if (state.newChat || focusedEngine !== "codex"
-        || !focusedCodexProfileId
+    if (state.newChat || !focusedAccountProfileId
         || state.connState !== "connected" || !state.wrapperOnline) return;
     wsRef.current?.sendGetModels(
-      "codex", undefined, focusedCodexProfileId);
+      focusedEngine,
+      focusedEngine === "claude" ? capabilityCwd : undefined,
+      focusedCodexProfileId,
+      focusedClaudeProfileId);
   }, [
+    capabilityCwd,
+    focusedAccountProfileId,
+    focusedClaudeProfileId,
     focusedCodexProfileId,
     focusedEngine,
     state.connState,
@@ -1494,32 +1855,53 @@ export default function App() {
     if (!preserveAuthority) {
       authoritativeSurfaceListsRef.current.delete(surfaceKey);
     }
+    const cachedSessions = sessionListsBySurfaceRef.current[surfaceKey] ?? [];
     dispatch({
       type: "restore_session_list",
-      sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
+      sessions: cachedSessions,
     });
     const remembered = lastFocusBySurfaceRef.current[focusScopeKey];
+    const immediate = preserveAuthority
+      ? null : selectSurfaceSession(cachedSessions, remembered);
     preferredSurfaceFocusRef.current = preserveAuthority
       ? null
       : remembered ? { key: focusScopeKey, sid: remembered } : null;
     didInitFocusRef.current = preserveAuthority;
-    wsRef.current?.setSurface(nextEngine, nextSpace);
-    wsRef.current?.setFocusedSid(null);
-    // Keep the previous surface's transcript out of view while its accepted
-    // list is restored. The focus effect below exits this temporary new page as
-    // soon as the remembered (or latest valid) session is available.
-    const current = stateRef.current;
-    dispatch({
-      type: "enter_new_chat",
-      cwd: "~",
-      cwdSource: "default",
-      codexProfileId: nextEngine === "codex"
-        ? current.codexProfileByScope[focusScopeKey]
-          ?? current.defaultCodexProfileId
-        : null,
-    });
+    const ws = wsRef.current;
+    ws?.setSurface(nextEngine, nextSpace);
+    if (immediate) {
+      // The cached list is scoped to this machine+engine+space. Paint its exact
+      // remembered row synchronously; the accepted list still validates it and
+      // clears/falls back if another client deleted it meanwhile.
+      dispatch({ type: "exit_new_chat" });
+      dispatch({ type: "focus_session", sid: immediate.session_id });
+      ws?.setFocusedSid(immediate.session_id, nextEngine, nextSpace);
+      requestHistory(
+        immediate.session_id, undefined, HISTORY_INITIAL_PAGE);
+      resumeListedSession(immediate, nextEngine, nextSpace, ws);
+      if (nextSpace === "work") {
+        ws?.sendGetWorkArtifacts(nextEngine, immediate.session_id);
+      }
+      setRestoringSurfaceScope(null);
+    } else {
+      // Do not expose a sendable home-directory draft while the target
+      // catalog is still unknown. The accepted list either restores a session
+      // or, only after confirming it is empty, creates the scoped default
+      // draft in the initial-focus effect below.
+      ws?.setFocusedSid(null);
+      dispatch({ type: "exit_new_chat" });
+      setRestoringSurfaceScope(focusScopeKey);
+    }
     setNewChatAutoFocus(false);
-  }, [clearForkFocusLease, engine, machineId, rememberSurfaceFocus, space]);
+  }, [
+    clearForkFocusLease,
+    engine,
+    machineId,
+    rememberSurfaceFocus,
+    requestHistory,
+    resumeListedSession,
+    space,
+  ]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
@@ -1529,6 +1911,14 @@ export default function App() {
       || selected.space === "code"
       ? selected.space : spaceRef.current;
     const id = selected.session_id;
+    const focusScopeKey = sessionScopeKey(
+      machineId, selectedEngine, selectedSpace);
+    // The click is newer than any surface-restore intent already in flight.
+    // Claim the target synchronously because a SessionList can arrive before
+    // React commits the focus_session dispatch below.
+    didInitFocusRef.current = true;
+    preferredSurfaceFocusRef.current = null;
+    lastFocusBySurfaceRef.current[focusScopeKey] = id;
     if (forkFocusLeaseRef.current?.childSessionId !== id) {
       clearForkFocusLease(false);
     }
@@ -1539,14 +1929,15 @@ export default function App() {
     setWorkArtifactsOpen(false);
     dispatch({ type: "exit_new_chat" });
     dispatch({ type: "focus_session", sid: id });
+    setRestoringSurfaceScope(null);
     wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
     requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
-    wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
+    resumeListedSession(selected, selectedEngine, selectedSpace);
     if (selectedSpace === "work") {
       wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
     }
     if (isMobile()) setSidebarOpen(false);
-  }, [clearForkFocusLease, requestHistory]);
+  }, [clearForkFocusLease, machineId, requestHistory, resumeListedSession]);
 
   useEffect(() => {
     const target = pendingNotificationTarget;
@@ -1600,6 +1991,7 @@ export default function App() {
             }
           : null;
         didInitFocusRef.current = false;
+        setRestoringSurfaceScope(null);
         setEngine(origin.engine);
         setSpace(origin.space);
         setMachineId(origin.machineId);
@@ -1688,6 +2080,9 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const historyRequests = historyRequestsRef.current;
+    const contextRequestLaunches = contextRequestLaunchesRef.current;
+    const contextDeferredRetryAttempts =
+      contextDeferredRetryAttemptsRef.current;
     const lifecycleEpoch = ++wsLifecycleEpochRef.current;
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
@@ -1696,6 +2091,43 @@ export default function App() {
     let effectWs: RelayWs | null = null;
     const acceptsLifecycle = () => !cancelled
       && wsLifecycleEpochRef.current === lifecycleEpoch;
+    const deferredContextRetryTimers = new Set<string>();
+    const scheduleDeferredClaudeContextRefresh = (
+      sid: string,
+      engineHint?: Engine,
+      afterBusy = false,
+    ) => {
+      if (engineHint && engineHint !== "claude") return;
+      let delayMs = 0;
+      if (afterBusy) {
+        const attempt = contextDeferredRetryAttempts.get(sid) ?? 0;
+        const delays = [100, 300, 750] as const;
+        if (attempt >= delays.length) return;
+        contextDeferredRetryAttempts.set(sid, attempt + 1);
+        delayMs = delays[attempt];
+      } else {
+        // A real idle boundary starts a fresh bounded catch-up window.
+        contextDeferredRetryAttempts.delete(sid);
+      }
+      if (deferredContextRetryTimers.has(sid)) return;
+      deferredContextRetryTimers.add(sid);
+      window.setTimeout(() => {
+        deferredContextRetryTimers.delete(sid);
+        if (!acceptsLifecycle()) return;
+        const current = stateRef.current;
+        const runtime = current.runtimes[sid];
+        if (!runtime?.contextRefreshDeferred
+            || runtime.contextRequestId
+            || runtime.state !== "idle") return;
+        const session = current.sessions.find(
+          (candidate) => candidate.session_id === sid);
+        const eventEngine = engineHint
+          ?? session?.engine
+          ?? (current.focusedSid === sid ? engineRef.current : undefined);
+        if (eventEngine !== "claude") return;
+        sendContextRequestTo(sid, true, effectWs);
+      }, delayMs);
+    };
     goalRecoveryRequestsRef.current.clear();
     goalRequestScopeByIdRef.current.clear();
     const recoverableReads = new RecoverableReadCoordinator(
@@ -1708,6 +2140,14 @@ export default function App() {
     // history replay of every resident session (that flood wedged reconnect).
     function handleSnapshot(e: Snapshot, ownership?: EventOwnership) {
       dispatch({ type: "event", event: e, ownership });
+      const sid = e.sid ?? e.cc_session_id;
+      if (sid && e.state === "idle") {
+        // A replacement Wrapper normally restores a resident session with a
+        // Snapshot rather than another direct State(idle). Preserve an explicit
+        // refresh intent across that generation boundary instead of leaving the
+        // popover waiting forever.
+        scheduleDeferredClaudeContextRefresh(sid, ownership?.engine);
+      }
     }
 
     (async () => {
@@ -1719,6 +2159,24 @@ export default function App() {
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
+          const settlesContextRequest = !!(
+            (msg.type === "context_report"
+                || (msg.type === "error" && msg.code !== "wrapper_offline"))
+              && msg.sid
+              && msg.request_id
+              && (
+                contextRequestLaunchesRef.current.get(msg.sid)
+                  === msg.request_id
+                || stateRef.current.runtimes[msg.sid]?.contextRequestId
+                  === msg.request_id
+              )
+          );
+          if (settlesContextRequest && msg.sid) {
+            contextRequestLaunchesRef.current.delete(msg.sid);
+            if (msg.type !== "error" || msg.code !== "busy") {
+              contextDeferredRetryAttempts.delete(msg.sid);
+            }
+          }
           if (msg.type === "history_invalidated") {
             const session = stateRef.current.sessions.find(
               (candidate) => candidate.session_id === msg.session_id);
@@ -1770,6 +2228,9 @@ export default function App() {
               const legacyDismissed = !!localGoalIdentity
                 && localPreference?.hiddenGoal === localGoalIdentity;
               const authoritativeDismissed = msg.dismissed === true;
+              const goalSessionArchived = stateRef.current.sessions.find(
+                (session) => session.session_id === msg.sid,
+              )?.tag === "archived";
               const migrationKey = msg.goal_id
                 ? `${machineId}\0${msg.sid}\0${msg.goal_id}` : null;
               if (migrationKey && authoritativeDismissed) {
@@ -1781,6 +2242,7 @@ export default function App() {
                   }
                 }
               } else if (migrationKey && legacyDismissed
+                  && !goalSessionArchived
                   && !goalDismissMigrationsRef.current.has(migrationKey)) {
                 const requestId = ws.sendDismissGoalTo(
                   msg.sid, msg.goal_id!);
@@ -1893,7 +2355,11 @@ export default function App() {
                 };
               });
               recoverableReads.retry(["goal", key].join("\u0000"), () => {
-                if (cancelled || stateRef.current.focusedSid !== sid) return;
+                const current = stateRef.current;
+                if (cancelled || current.focusedSid !== sid
+                    || current.sessions.find(
+                      (session) => session.session_id === sid,
+                    )?.tag === "archived") return;
                 const requestId = ws.sendGetGoalTo(sid);
                 if (!requestId) return;
                 goalRequestScopeByIdRef.current.set(
@@ -1949,6 +2415,10 @@ export default function App() {
           if (msg.type === "history_image"
               && historyImageAssetsRef.current.accept(msg)) {
             bumpHistoryImageRevision();
+            if (msg.error && msg.session_id === stateRef.current.focusedSid
+                && msg.revision !== stateRef.current.runtimes[msg.session_id]?.historyRevision) {
+              requestHistory(msg.session_id, undefined, HISTORY_INITIAL_PAGE);
+            }
           }
           if (msg.type === "queued_query_detail") {
             setQueuedQueryEditor((current) => (
@@ -2017,7 +2487,7 @@ export default function App() {
           if (msg.type === "turn_end" && msg.sid && !msg.result.is_error) {
             const current = stateRef.current;
             const btwOwner = Object.entries(current.btwByParentSid).find(
-              ([, binding]) => binding.sid === msg.sid,
+              ([, group]) => group.chats.some((chat) => chat.sid === msg.sid),
             );
             const isBtw = !!btwOwner;
             // A closed/stale fork can still drain one final terminal frame.
@@ -2027,17 +2497,19 @@ export default function App() {
               const sameVisibleParent = !document.hidden
                 && !current.newChat
                 && current.focusedSid === parentSid;
-              const btwPanelVisible = isBtw
+              const isBtwPanelVisible = isBtw
                 && sameVisibleParent
-                && (rightViewRef.current === "btw" || !current.artifact);
-              const alreadySeen = isBtw ? btwPanelVisible : sameVisibleParent;
+                && visibleBtwSidRef.current === msg.sid;
+              const alreadySeen = isBtw
+                ? isBtwPanelVisible : sameVisibleParent;
               if (!alreadySeen) {
                 setCompletionReceipts((receipts) => markCompletionUnread(
                   receipts,
                   parentSid,
                   msg.sid!,
                   isBtw ? "btw" : "main",
-                  isBtw ? null : msg.turn_id ?? null,
+                  isBtw ? null
+                    : msg.checkpoint_id ?? msg.turn_id ?? null,
                   isBtw ? null : msg.seq ?? null,
                   isBtw ? null : ws.generationFor(msg.sid!),
                 ));
@@ -2108,6 +2580,7 @@ export default function App() {
               );
             }
           } else if (msg.type === "replay_start" && msg.sid
+              && !msg.sid.startsWith("btw-")
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
             clearHistoryDetailRequests();
@@ -2168,9 +2641,11 @@ export default function App() {
                 module.allowSessionCache(msg.session_id));
             }
           }
+          let settledHistoryCausalKey: string | undefined;
           if (msg.type === "history") {
             const completedHistory =
               historyRequestsRef.current.complete(msg);
+            settledHistoryCausalKey = completedHistory.settledCausalKey;
             const browseWaiters = completedHistory.matched;
             for (const browse of completedHistory.stale) {
               dispatch({
@@ -2268,9 +2743,40 @@ export default function App() {
               "detail", msg.session_id, msg.revision, msg.turn_id,
               msg.before ?? "",
             ].join("\u0000");
-            if (msg.authoritative === false) {
+            const activeDetailTargets = (
+              targets: readonly HistoryDetailRequestContext[],
+              retrying = false,
+            ) => {
+              const current = stateRef.current;
+              return targets.filter((detailTarget) => {
+                if (detailTarget.target === "browse") {
+                  const browse = current.historyBrowse;
+                  return !!browse
+                    && current.focusedSid === detailTarget.sid
+                    && browse.sid === detailTarget.sid
+                    && browse.scopeKey === detailTarget.scopeKey
+                    && browse.viewId === detailTarget.viewId
+                    && browse.revision === detailTarget.revision
+                    && browse.turns.some((turn) =>
+                      canonicalTurnId(turn) === detailTarget.turnId
+                      || turn.id === detailTarget.turnId);
+                }
+                const runtime = current.runtimes[detailTarget.sid];
+                const turn = runtime?.turns.find(
+                  (item) => canonicalTurnId(item) === detailTarget.turnId
+                    || item.id === detailTarget.turnId);
+                return current.focusedSid === detailTarget.sid
+                  && !!turn
+                  && (!retrying
+                    || !!detailTarget.before || !turn.detailLoaded)
+                  && runtime?.historyRevision === detailTarget.revision;
+              });
+            };
+            const releaseDetailFailure = (
+              targets: readonly HistoryDetailRequestContext[],
+            ) => {
               let runtimeReleased = false;
-              for (const detailTarget of detailTargets) {
+              for (const detailTarget of targets) {
                 if (detailTarget.target === "browse") {
                   dispatch({
                     type: "history_browse_detail",
@@ -2282,6 +2788,7 @@ export default function App() {
                     turnId: detailTarget.turnId,
                     events: [],
                     error: msg.error,
+                    resetRequired: msg.reset_required,
                     before: detailTarget.before,
                   });
                 } else if (!runtimeReleased) {
@@ -2289,28 +2796,93 @@ export default function App() {
                   runtimeReleased = true;
                 }
               }
+            };
+            if (msg.authoritative === false) {
+              if (msg.reset_required) {
+                recoverableReads.complete(retryKey);
+                const resetKey = [
+                  msg.session_id, msg.revision, msg.turn_id,
+                ].join("\u0000");
+                if (historyDetailResetAttemptsRef.current.has(resetKey)) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                const cancelledTargets =
+                  historyDetailRequestsRef.current.cancelTurn({
+                    sid: msg.session_id,
+                    revision: msg.revision,
+                    turnId: msg.turn_id,
+                  });
+                const activeTargets = activeDetailTargets([
+                  ...detailTargets,
+                  ...cancelledTargets,
+                ]);
+                if (activeTargets.length === 0) return;
+                const resetTargets: HistoryDetailRequestContext[] =
+                  activeTargets.map((target) => ({
+                    ...target,
+                    before: null,
+                  }));
+                const uniqueTargets = new Map<string,
+                  HistoryDetailRequestContext>();
+                for (const target of resetTargets) {
+                  const key = target.target === "browse"
+                    ? [target.target, target.scopeKey, target.viewId,
+                        target.windowEpoch].join("\u0000")
+                    : [target.target, target.scopeKey,
+                        target.autoLoad ? 1 : 0].join("\u0000");
+                  uniqueTargets.set(key, target);
+                }
+                const registrations = [...uniqueTargets.values()].map(
+                  (detailTarget) => ({
+                    detailTarget,
+                    registration:
+                      historyDetailRequestsRef.current.register(detailTarget),
+                  }),
+                ).filter(({ registration }) => registration.accepted);
+                if (registrations.length === 0) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                historyDetailResetAttemptsRef.current.add(resetKey);
+                if (historyDetailResetAttemptsRef.current.size > 256) {
+                  const oldest = historyDetailResetAttemptsRef.current
+                    .values().next().value;
+                  if (oldest) {
+                    historyDetailResetAttemptsRef.current.delete(oldest);
+                  }
+                }
+                if (registrations.some(
+                    ({ registration }) => registration.send)) {
+                  const target = registrations[0].detailTarget;
+                  const sent = ws.sendGetTurnDetail(
+                    msg.session_id, msg.turn_id, target.revision, null);
+                  if (!sent) {
+                    historyDetailResetAttemptsRef.current.delete(resetKey);
+                    for (const { detailTarget } of registrations) {
+                      historyDetailRequestsRef.current.cancel(detailTarget);
+                      dispatch({
+                        type: "history_detail_cancelled",
+                        context: detailTarget,
+                      });
+                    }
+                    return;
+                  }
+                }
+                for (const { detailTarget } of registrations) {
+                  dispatch({
+                    type: "history_detail_reset_requested",
+                    context: detailTarget,
+                  });
+                }
+                return;
+              }
+              releaseDetailFailure(detailTargets);
               recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current;
-                const activeTargets = detailTargets.filter((detailTarget) => {
-                  if (detailTarget.target === "browse") {
-                    const browse = current.historyBrowse;
-                    return !!browse
-                      && browse.scopeKey === detailTarget.scopeKey
-                      && browse.viewId === detailTarget.viewId
-                      && browse.revision === detailTarget.revision
-                      && browse.turns.some((turn) =>
-                        canonicalTurnId(turn) === detailTarget.turnId
-                        || turn.id === detailTarget.turnId);
-                  }
-                  const runtime = current.runtimes[msg.session_id];
-                  const turn = runtime?.turns.find(
-                    (item) => canonicalTurnId(item) === msg.turn_id
-                      || item.id === msg.turn_id);
-                  return !!turn && (!!detailTarget.before || !turn.detailLoaded)
-                    && runtime?.historyRevision === detailTarget.revision;
-                });
+                const activeTargets = activeDetailTargets(
+                  detailTargets, true);
                 if (activeTargets.length === 0) return;
                 const registrations = activeTargets.map((detailTarget) => ({
                   detailTarget,
@@ -2389,39 +2961,75 @@ export default function App() {
               && stateRef.current.focusedSid === msg.session_id) {
             setEditPrompt(msg.prefill_text);
           }
+          if (msg.type === "btw_sync"
+              && msg.revision >= stateRef.current.btwRevision) {
+            const retained = new Set(msg.sessions.map((chat) => chat.btw_sid));
+            const removed = Object.entries(stateRef.current.btwByParentSid)
+              .flatMap(([parentSid, group]) => group.chats
+                .filter((chat) => !retained.has(chat.sid))
+                .map((chat) => [parentSid, chat] as const));
+            for (const [, chat] of removed) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${chat.sid}`,
+                ));
+              }
+            }
+            if (removed.length > 0) {
+              setBtwSendModeBySid((current) => {
+                const next = { ...current };
+                for (const [, chat] of removed) delete next[chat.sid];
+                return next;
+              });
+              setCompletionReceipts((current) => removed.reduce(
+                (next, [parentSid, chat]) => acknowledgeCompletion(
+                  next, parentSid, { btwSid: chat.sid }),
+                current,
+              ));
+            }
+          }
           if (msg.type === "btw_opened") {
+            const knownChat = Object.values(
+              stateRef.current.btwByParentSid).some((group) =>
+              group.chats.some((chat) => chat.sid === msg.btw_sid));
             const requestedParent = btwRequestParentsRef.current.get(
               msg.request_id) ?? null;
             const pendingRequestId = requestedParent
               ? pendingBtwByParentRef.current.get(requestedParent) ?? null
               : null;
+            if (msg.revision < stateRef.current.btwRevision) {
+              // A newer authoritative sync/close already decided this fork's
+              // existence. Settle this exact pending command as well: after a
+              // reload the catalog can restore the fork before its cached open
+              // response arrives, and leaving the spinner behind would disable
+              // creation of every later sibling side chat.
+              if (requestedParent && matchesBtwRequest(
+                pendingRequestId, msg.request_id)) {
+                pendingBtwByParentRef.current.delete(requestedParent);
+                setBtwOpeningFor(requestedParent, false);
+              }
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
+            if (knownChat && !matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
+              // Reliable response replay after BtwSync. The catalog already
+              // owns it, and re-applying the open would steal tab selection.
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
             const activeRequest = activeBtwByParentRef.current.get(
               msg.parent_sid)
               ?? (requestedParent
                 ? activeBtwByParentRef.current.get(requestedParent) : undefined)
               ?? null;
-            const disposition = classifyBtwOpened(
-              pendingRequestId, activeRequest, msg);
-            if (disposition === "duplicate") {
+            if (activeRequest?.requestId === msg.request_id
+                && activeRequest.sid === msg.btw_sid) {
               btwRequestParentsRef.current.delete(msg.request_id);
               return; // cached replay after a lost ACK; the fork is already open
             }
-            if (disposition === "stale") {
-              // The user cancelled, navigated, or started a newer request while
-              // this fork was connecting. Never let the stale response open the
-              // panel, and tear down the now-unowned ephemeral session.
-              const discarded = discardedBtwSidsRef.current;
-              discarded.add(msg.btw_sid);
-              while (discarded.size > 64) {
-                const oldest = discarded.values().next().value as string | undefined;
-                if (!oldest) break;
-                discarded.delete(oldest);
-              }
-              btwRequestParentsRef.current.delete(msg.request_id);
-              ws.sendCloseBtw(msg.btw_sid);
-              return;
-            }
-            if (requestedParent) {
+            if (requestedParent && matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
               pendingBtwByParentRef.current.delete(requestedParent);
               activeBtwByParentRef.current.delete(requestedParent);
               setBtwOpeningFor(requestedParent, false);
@@ -2431,7 +3039,29 @@ export default function App() {
               requestId: msg.request_id,
               sid: msg.btw_sid,
             });
-            setBtwOpeningFor(msg.parent_sid, false);
+          } else if (msg.type === "btw_closed") {
+            const group = stateRef.current.btwByParentSid[msg.parent_sid];
+            const chat = group?.chats.find(
+              (candidate) => candidate.sid === msg.btw_sid);
+            const tracked = activeBtwByParentRef.current.get(msg.parent_sid);
+            if (tracked?.sid === msg.btw_sid) {
+              activeBtwByParentRef.current.delete(msg.parent_sid);
+            }
+            if (chat) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${msg.btw_sid}`,
+                ));
+              }
+            }
+            setBtwSendModeBySid((current) => {
+              if (!(msg.btw_sid in current)) return current;
+              const next = { ...current };
+              delete next[msg.btw_sid];
+              return next;
+            });
+            setCompletionReceipts((current) => acknowledgeCompletion(
+              current, msg.parent_sid, { btwSid: msg.btw_sid }));
           } else if (msg.type === "error" && msg.request_id
               && btwRequestParentsRef.current.has(msg.request_id)) {
             const parentSid = btwRequestParentsRef.current.get(msg.request_id)!;
@@ -2471,13 +3101,21 @@ export default function App() {
             setSpace("code");
             dispatch({ type: "exit_new_chat" });
             dispatch({ type: "focus_session", sid: msg.session_id });
-            const parentProfileId = targetEngine === "codex"
-              ? stateRef.current.sessions.find(
-                (session) => session.session_id === msg.parent_session_id,
-              )?.codex_profile_id
+            const parentSession = stateRef.current.sessions.find(
+              (session) => session.session_id === msg.parent_session_id,
+            );
+            const parentCodexProfileId = targetEngine === "codex"
+              ? parentSession?.codex_profile_id
                 ?? codexProfileIdForSession(
                   msg.parent_session_id,
                   stateRef.current.defaultCodexProfileId,
+                )
+              : undefined;
+            const parentClaudeProfileId = targetEngine === "claude"
+              ? parentSession?.claude_profile_id
+                ?? claudeProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultClaudeProfileId,
                 )
               : undefined;
             startForkFocusLease({
@@ -2489,14 +3127,16 @@ export default function App() {
               machineId,
               cwd: msg.cwd,
               gitBranch: msg.git_branch,
-              codexProfileId: parentProfileId,
+              claudeProfileId: parentClaudeProfileId,
+              codexProfileId: parentCodexProfileId,
               refreshAt: Date.now() + FORK_FOCUS_REFRESH_MS,
             });
             ws.setSessionEngines([{
               session_id: msg.session_id,
               engine: targetEngine,
               space: "code",
-              codex_profile_id: parentProfileId,
+              claude_profile_id: parentClaudeProfileId,
+              codex_profile_id: parentCodexProfileId,
             }]);
             ws.setFocusedSid(msg.session_id, targetEngine, "code");
             ws.sendListSessions(targetEngine, "code");
@@ -2577,7 +3217,6 @@ export default function App() {
             }
           }
           if (msg.type === "snapshot") {
-            if (consumeDiscardedBtwSnapshot(discardedBtwSidsRef.current, msg)) return;
             handleSnapshot(msg, ownership);
             return;
           }
@@ -2629,11 +3268,27 @@ export default function App() {
               if (!targetParentBtw) {
                 activeBtwByParentRef.current.set(
                   msg.session_id, activeParentBtw);
-              } else if (targetParentBtw.sid !== activeParentBtw.sid) {
-                ws.sendCloseBtw(activeParentBtw.sid);
               }
+              // This ref is only a response-replay hint. The reducer's BTW
+              // catalog owns every resident child, so a rekey collision must
+              // not discard either side chat.
             }
             if (ownership) {
+              setViewerSelections((current) => {
+                const old = viewerScopeKey({ ...ownership, sid: msg.old_key });
+                if (!Object.hasOwn(current, old)) return current;
+                const key = viewerScopeKey({ ...ownership, sid: msg.session_id });
+                const next = { ...current, [key]: current[key] ?? current[old] };
+                delete next[old];
+                return next;
+              });
+              setBtwPanelScopes((current) => rekeyBtwPanelScope(
+                current,
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.old_key),
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.session_id),
+              ));
               composerDraftsRef.current.rekey(
                 composerDraftKey(
                   ownership.machineId, ownership.space, ownership.engine,
@@ -2809,9 +3464,19 @@ export default function App() {
               && !shouldAcceptSessionList(engineRef.current, spaceRef.current, msg)) return;
           if (msg.type === "session_list") {
             const currentSid = stateRef.current.focusedSid;
-            if (currentSid && !currentSid.startsWith("tmp-")
+            const listedSpace = msg.space ?? "code";
+            const listedScopeKey = sessionScopeKey(
+              machineId, msg.engine, listedSpace);
+            const scopedCurrentSid = scopedFocusForSessionList(
+              currentSid,
+              stateRef.current.sessions,
+              lastFocusBySurfaceRef.current[listedScopeKey],
+              msg.engine,
+              listedSpace,
+            );
+            if (scopedCurrentSid && !scopedCurrentSid.startsWith("tmp-")
                 && !normalizedListedSessions?.some(
-                  (session) => session.session_id === currentSid)) {
+                  (session) => session.session_id === scopedCurrentSid)) {
               didInitFocusRef.current = false;
               preferredSurfaceFocusRef.current = null;
             }
@@ -2825,12 +3490,33 @@ export default function App() {
               || (msg.type === "error"
                 && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
             );
+          if (msg.type === "agent_detail") {
+            agentDetailListenerRef.current?.(msg);
+            // Requester-scoped details never belong in the conversation
+            // reducer or another browser's side panel.
+            return;
+          }
           if (msg.type === "session_list" && normalizedListedSessions) {
             dispatch({ type: "event", event: {
               ...msg, sessions: normalizedListedSessions,
             }, ownership });
           } else {
             dispatch({ type: "event", event: msg, ownership });
+          }
+          if (msg.type === "history" && !msg.before
+              && msg.authoritative !== false
+              && settledHistoryCausalKey) {
+            settleTerminalHistoryRepair(
+              msg.session_id, settledHistoryCausalKey);
+          }
+          if (settlesContextRequest && msg.type === "error"
+              && msg.code === "busy" && msg.sid) {
+            // The reducer first converts this exact request into a deferred
+            // intent. If the UI already saw idle before the runner finished its
+            // finalizer, there will be no second idle frame to wake it; retry a
+            // few times with backoff instead of polling indefinitely.
+            scheduleDeferredClaudeContextRefresh(
+              msg.sid, ownership?.engine, true);
           }
           if (msg.sid && completesStatusRequest
               && deferredStatusRefreshRef.current.delete(msg.sid)) {
@@ -2866,13 +3552,20 @@ export default function App() {
                 }
               }
             }
+            if (eventEngine === "claude") {
+              // TurnEnd is emitted before the wrapper releases its query lock.
+              // Retry only after the following authoritative idle frame has
+              // reached the reducer; otherwise the refresh can race that
+              // release, receive busy, and wait forever for another TurnEnd.
+              scheduleDeferredClaudeContextRefresh(msg.sid, "claude");
+            }
           }
           if (msg.type === "wrapper_reconnected") {
             skillCatalogsRef.current = {};
             setSkillCatalogs({});
             skillCatalogRequestsRef.current?.resetReads();
             const focusedSkills = focusedSkillScopeRef.current;
-            if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
+            if (focusedSkills?.cwd) {
               requestSkillCatalog(focusedSkills, true);
             }
             ws.sendListSessions(engineRef.current, spaceRef.current);
@@ -2884,9 +3577,14 @@ export default function App() {
             if (currentSid) requestHistory(
               currentSid, undefined, HISTORY_INITIAL_PAGE, msg.generation);
           }
-          // refresh the context ring after each turn (local SDK query, no model tokens)
+          // Refresh from wrapper-owned live/transcript usage. Automatic reads
+          // never issue Claude's optional native control request or use model tokens.
           if (msg.type === "turn_end" && msg.sid) {
-            ws.sendGetContextTo(msg.sid);
+            const runtime = stateRef.current.runtimes[msg.sid];
+            if (!runtime?.contextRequestId
+                && !runtime?.contextRefreshDeferred) {
+              sendContextRequestTo(msg.sid, false, ws);
+            }
             if (sessionActivityPendingRef.current.delete(msg.sid)) {
               const listed = Object.values(sessionListsBySurfaceRef.current)
                 .flat().find((session) => session.session_id === msg.sid);
@@ -2960,7 +3658,6 @@ export default function App() {
           setMigrateError(null);
           activeBtwByParentRef.current.clear();
           btwRequestParentsRef.current.clear();
-          discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
@@ -3008,16 +3705,18 @@ export default function App() {
         },
         onWrapperGenerationChanged: () => {
           if (!acceptsLifecycle()) return;
+          setAgentPanel(null);
+          agentDetailListenerRef.current = null;
           clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
-          discardedBtwSidsRef.current.clear();
           setCompletionReceipts(discardBtwCompletionReceipts);
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
           if (Object.keys(stateRef.current.btwByParentSid).length > 0
+              || stateRef.current.btwRevision > 0
               || pendingBtwByParentRef.current.size > 0
               || activeBtwByParentRef.current.size > 0
               || btwRequestParentsRef.current.size > 0) {
@@ -3057,6 +3756,8 @@ export default function App() {
       historyRequests.clear();
       clearHistoryDetailRequests();
       recoverableReads.clear();
+      contextRequestLaunches.clear();
+      contextDeferredRetryAttempts.clear();
     };
   }, [
     acceptSkillCatalog,
@@ -3069,8 +3770,10 @@ export default function App() {
     persistGoalUiPreferences,
     requestHistory,
     requestSkillCatalog,
+    sendContextRequestTo,
     setBtwOpeningFor,
     settleCancelledHistoryBrowse,
+    settleTerminalHistoryRepair,
     startForkFocusLease,
   ]);
 
@@ -3083,9 +3786,39 @@ export default function App() {
     const focusScopeKey = sessionScopeKey(
       machineId, engineRef.current, spaceRef.current);
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
+    // A directory chosen in New Chat is an explicit user destination. A
+    // reconnect/list refresh may validate the catalog, but it must not navigate
+    // away from that draft. Cold surface restoration clears the old surface's
+    // draft first, so it is deliberately excluded from this guard.
+    if (state.newChat?.cwdSource === "explicit"
+        && restoringSurfaceScope !== focusScopeKey) {
+      preferredSurfaceFocusRef.current = null;
+      didInitFocusRef.current = true;
+      return;
+    }
     if (state.sessions.length === 0) {
       preferredSurfaceFocusRef.current = null;
       didInitFocusRef.current = true;
+      const current = stateRef.current;
+      if (!current.newChat) {
+        const inheritedCwd = current.cwdByScope[focusScopeKey];
+        dispatch({
+          type: "enter_new_chat",
+          cwd: inheritedCwd || "~",
+          cwdSource: inheritedCwd ? "inherited" : "default",
+          claudeProfileId: engineRef.current === "claude"
+            ? current.claudeProfileByScope[focusScopeKey]
+              ?? current.defaultClaudeProfileId
+            : null,
+          codexProfileId: engineRef.current === "codex"
+            ? current.codexProfileByScope[focusScopeKey]
+              ?? current.defaultCodexProfileId
+            : null,
+        });
+      }
+      setRestoringSurfaceScope((scope) => (
+        scope === focusScopeKey ? null : scope
+      ));
       return;
     }
     const preferred = preferredSurfaceFocusRef.current?.key === focusScopeKey
@@ -3096,10 +3829,7 @@ export default function App() {
         ))
       : undefined;
     preferredSurfaceFocusRef.current = null;
-    const latest = preferred ?? [...state.sessions]
-      .filter((s) => s.tag !== "archived")
-      .sort(compareSessionsByActivity)[0]
-      ?? state.sessions[0];
+    const latest = preferred ?? selectSurfaceSession(state.sessions);
     didInitFocusRef.current = true;
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
@@ -3108,14 +3838,21 @@ export default function App() {
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       requestHistory(
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
-      wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
+      resumeListedSession(
+        latest, latestEngine, spaceRef.current, wsRef.current);
     }
+    setRestoringSurfaceScope((scope) => (
+      scope === focusScopeKey ? null : scope
+    ));
   }, [
     machineId,
     pendingNotificationTarget,
+    restoringSurfaceScope,
+    state.newChat,
     state.sessions,
     state.focusedSid,
     requestHistory,
+    resumeListedSession,
   ]);
 
   // Direct sidebar selection and newly-created sessions both update the
@@ -3133,11 +3870,11 @@ export default function App() {
     ] = focusedSid;
   }, [focusedSid, state.newChat, state.sessions, engine, machineId]);
 
-  // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
+  // Warm the cwd/account-scoped Skill catalog when a session becomes usable.
   // Composer completion then reads memory synchronously; an expired entry stays
   // visible while this refresh runs in the background.
   useEffect(() => {
-    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+    if (!authed || !focusedSid || state.newChat
         || !capabilityCwd || state.connState !== "connected"
         || !state.wrapperOnline) return;
     requestSkillCatalog({
@@ -3146,11 +3883,13 @@ export default function App() {
       space,
       cwd: capabilityCwd,
       skillsOnly: true,
+      claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
     });
   }, [
     authed,
     capabilityCwd,
+    focusedClaudeProfileId,
     focusedEngine,
     focusedCodexProfileId,
     focusedSid,
@@ -3175,12 +3914,14 @@ export default function App() {
       space,
       cwd: capabilityCwd,
       skillsOnly: false,
+      claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
     }, true);
   }, [
     authed,
     capabilitiesOpen,
     capabilityCwd,
+    focusedClaudeProfileId,
     focusedEngine,
     focusedCodexProfileId,
     focusedSkillCatalogKey,
@@ -3215,10 +3956,12 @@ export default function App() {
         sid, rt.turns, live, revision,
         wsRef.current?.generationFor(sid),
         rt.control,
+        rt.historyHeadKnown && !rt.hasMore && !rt.historyInvalidated,
       );
     });
   }, [
     focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control,
+    rt.historyHeadKnown, rt.hasMore, rt.historyInvalidated,
     state.historyRecovery,
   ]);
 
@@ -3246,7 +3989,8 @@ export default function App() {
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
           && !historyInvalidationsRef.current.has(sid)
           && cached && Array.isArray(cached.turns)
-          && (cached.turns.length || cached.control);
+          && (cached.turns.length || cached.control
+            || cached.historyAtStart === true);
       if (valid && cached) {
         dispatch({
           type: "hydrate_cache", sid,
@@ -3256,6 +4000,7 @@ export default function App() {
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
+          historyAtStart: cached.historyAtStart === true,
         });
       }
     });
@@ -3286,7 +4031,9 @@ export default function App() {
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
-        if (latest.btwSid && latest.rightView === "btw") latest.closeBtw();
+        if (btwPanelVisibleRef.current && latest.rightView === "btw") {
+          latest.collapseBtw();
+        }
         else latest.openBtw();
       }
     };
@@ -3320,7 +4067,7 @@ export default function App() {
 
   const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
     includeBrowseProjection = true,
   ): boolean => {
     const current = stateRef.current;
@@ -3386,14 +4133,42 @@ export default function App() {
   }, [focusedEngine, historyPageScopeFor, space]);
   const loadHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
   ) => requestHistoryTurnDetail(
     displayTurnId, before, autoLoad, true), [requestHistoryTurnDetail]);
   const loadRuntimeTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
   ) => requestHistoryTurnDetail(
     displayTurnId, before, autoLoad, false), [requestHistoryTurnDetail]);
+  useEffect(() => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime || current.newChat
+        || current.historyBrowse?.sid === sid
+        || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime.syncReady || !runtime.historyHeadKnown
+        || runtime.historyInvalidated || !runtime.historyRevision) return;
+    const request = nextActiveDetailRequest(
+      runtime.turns,
+      runtime.historyNewestId,
+      runtime.state !== "idle" || runtime.mirroredRunning,
+    );
+    if (!request) return;
+    // One newest page establishes the immutable source snapshot. Older pages
+    // stay behind the existing explicit pagination controls while live tail
+    // frames continue merging independently into the same turn.
+    loadRuntimeTurnDetail(request.turnId, request.before, false);
+  }, [
+    loadRuntimeTurnDetail,
+    state.connState,
+    state.focusedSid,
+    state.historyBrowse,
+    state.newChat,
+    state.runtimes,
+    state.wrapperOnline,
+  ]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;
@@ -3428,15 +4203,21 @@ export default function App() {
   // that the replacement wrapper has finished restoring resident sessions.
   useEffect(() => {
     if (!authed || !focusedSid || state.newChat
+        || focusedSession?.tag === "archived"
         || state.connState !== "connected" || !state.wrapperOnline) return;
-    if (stateRef.current.runtimes[focusedSid]?.contextRequestId) return;
-    const requestId = wsRef.current?.sendGetContext();
-    if (requestId) {
-      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
-    }
+    const contextRuntime = stateRef.current.runtimes[focusedSid];
+    if (contextRuntime?.contextRequestId) return;
+    const deferred = contextRuntime?.contextRefreshDeferred === true;
+    if (deferred
+        && (focusedEngine !== "claude"
+          || contextRuntime?.state !== "idle")) return;
+    sendContextRequestTo(focusedSid, deferred);
   }, [
     authed,
+    focusedEngine,
+    focusedSession?.tag,
     focusedSid,
+    sendContextRequestTo,
     state.connState,
     state.newChat,
     state.wrapperOnline,
@@ -3444,20 +4225,52 @@ export default function App() {
 
   const refreshStatus = useCallback(() => {
     if (!focusedSid || focusedEngine !== "codex") return;
-    if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
+    const current = stateRef.current;
+    if (current.sessions.find(
+      (session) => session.session_id === focusedSid)?.tag === "archived") return;
+    if (current.runtimes[focusedSid]?.statusRequestId) return;
     const requestId = wsRef.current?.sendGetStatus();
     if (requestId) {
       dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
     }
   }, [focusedEngine, focusedSid]);
+  const consumeResetCredit = useCallback((creditId?: string | null) => {
+    if (!focusedSid || focusedEngine !== "codex") return false;
+    const current = stateRef.current;
+    const runtime = current.runtimes[focusedSid];
+    const session = current.sessions.find(
+      (candidate) => candidate.session_id === focusedSid);
+    if (
+      current.newChat
+      || session?.tag === "archived"
+      || !runtime
+      || runtime.state !== "idle"
+      || runtime.statusRequestId
+      || runtime.statusError
+      || current.connState !== "connected"
+      || !current.wrapperOnline
+    ) return false;
+    const requestId = wsRef.current?.sendConsumeRateLimitResetCredit(
+      focusedSid, creditId) ?? null;
+    if (requestId) {
+      dispatch({
+        type: "begin_status_request",
+        sid: focusedSid,
+        requestId,
+      });
+    }
+    return requestId !== null;
+  }, [focusedEngine, focusedSid]);
   useEffect(() => {
     if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+        || archivedBrowse
         || rt.state !== "idle"
         || state.connState !== "connected" || !state.wrapperOnline) return;
     if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
     refreshStatus();
   }, [
     authed,
+    archivedBrowse,
     focusedEngine,
     focusedSid,
     refreshStatus,
@@ -3508,13 +4321,18 @@ export default function App() {
     return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
+  const runtimeIsReadOnly = (sid: string): boolean => {
+    const runtime = stateRef.current.runtimes[sid];
+    return runtime?.control
+      ? sessionControlLocksInput(runtime.control) : !!runtime?.external;
+  };
   const sendDeferredQuery = (
     sid: string,
     query: PendingQuery,
     delivery: "queue" | "replace",
   ): boolean => {
     const ws = wsRef.current;
-    if (!ws) return false;
+    if (!ws || runtimeIsReadOnly(sid)) return false;
     const currentState = stateRef.current;
     const unconfirmed = collectUnconfirmedQueries(
       currentState.runtimes,
@@ -3596,7 +4414,7 @@ export default function App() {
 
   const updateQueuedQuery = (prompt: string): boolean => {
     const current = queuedQueryEditor;
-    if (!current || current.saving) return false;
+    if (!current || current.saving || runtimeIsReadOnly(current.sid)) return false;
     if (current.state === "failed") {
       dispatch({
         type: "update_failed_deferred",
@@ -3744,6 +4562,22 @@ export default function App() {
     }
     return true;
   };
+  const replyAsyncQuestion = (
+    sid: string, prompt: string,
+    whenIdle: (text: string) => boolean, whenRunning: (text: string) => boolean,
+  ): boolean => {
+    const current = stateRef.current;
+    const ws = wsRef.current;
+    const runtime = current.runtimes[sid];
+    // The outbox latch updates synchronously, before React can disable sibling
+    // cards. A second answer must not enter the composer's replace-query path.
+    if (!ws || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime || ws.pendingQueryFor(sid) || runtime.acceptancePending
+        || (runtime.control
+          ? sessionControlLocksInput(runtime.control) : runtime.external)) return false;
+    return runtime.state === "running" ? whenRunning(prompt)
+      : runtime.state === "idle" ? whenIdle(prompt) : false;
+  };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
   ): boolean | {
@@ -3835,6 +4669,14 @@ export default function App() {
       pageKey: browse.newerPageKey,
       anchorTurnId: anchorTurnId ?? null,
     };
+    const latestPageKey = `${HISTORY_LATEST_PAGE_KEY}:${frozen.viewId}`;
+    // The synthetic latest page is written to IndexedDB asynchronously. A
+    // quick down-swipe can reach it before that write completes; its stable
+    // page key is already sufficient to return to the authoritative live tail.
+    if (cachedLatestRequiresLiveRuntime(browse, null, latestPageKey)) {
+      dispatch({ type: "return_to_latest", sid: frozen.sid });
+      return true;
+    }
     void (async () => {
       const page = await historyPageCacheRef.current.getPage(
         scope, frozen.pageKey);
@@ -3843,17 +4685,12 @@ export default function App() {
       if (currentState.focusedSid !== frozen.sid
           || !current
           || !acceptsCachedNewerPage(current, frozen)) return;
-      if (page?.isLatest && current.latestDirty) {
-        dispatch({
-          type: "history_browse_newer_settled",
-          sid: frozen.sid,
-          scopeKey: frozen.scopeKey,
-          revision: frozen.revision,
-          generation: frozen.generation,
-          viewId: frozen.viewId,
-          windowEpoch: frozen.windowEpoch,
-          pageKey: frozen.pageKey,
-        });
+      if (cachedLatestRequiresLiveRuntime(current, page, latestPageKey)) {
+        // loadNewerHistoryPage is accepted only from a real downward gesture.
+        // The cached latest page became stale while Claude was still writing,
+        // so honor that gesture by returning to the authoritative live tail—the
+        // same destination as the explicit bottom button.
+        dispatch({ type: "return_to_latest", sid: frozen.sid });
         return;
       }
       if (!page) {
@@ -3920,10 +4757,15 @@ export default function App() {
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
-    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing) {
+    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing
+        || restoringSurfaceScope === activeScopeKey) {
       return false;
     }
-    const { cwd, cwdSource, model, effort } = state.newChat;
+    const {
+      cwd, cwdSource, model, effort,
+      autoCompactMode, autoCompactThresholdTokens,
+    } = state.newChat;
     // Null is meaningful: let the local CLI/app-server use its configured defaults.
     // Only explicit user choices cross the wire; otherwise a stale fallback catalog
     // could silently override the machine's real model or reasoning configuration.
@@ -3943,7 +4785,12 @@ export default function App() {
         : undefined,
       engine === "codex" ? serviceTier : undefined,
       space, space === "work" ? activeWorkProjectId : undefined,
-      engine === "codex" ? newChatCodexProfileId : undefined);
+      engine === "codex" ? newChatCodexProfileId : undefined,
+      engine === "claude" ? {
+        mode: autoCompactMode,
+        thresholdTokens: autoCompactThresholdTokens,
+      } : undefined,
+      engine === "claude" ? newChatClaudeProfileId : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -3981,11 +4828,27 @@ export default function App() {
     if (!state.newChat) return;
     dispatch({ type: "set_new_chat_effort", effort });
   };
+  const pickNewChatAutoCompact = (selection: AutoCompactSelection) => {
+    if (!state.newChat || engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_auto_compact",
+      mode: selection.mode,
+      thresholdTokens: selection.thresholdTokens,
+    });
+  };
   const pickNewChatCodexProfile = (profileId: string) => {
     if (engine !== "codex") return;
     setNewChatPermissionCatalog(null);
     dispatch({
       type: "set_new_chat_codex_profile",
+      scopeKey: activeScopeKey,
+      profileId,
+    });
+  };
+  const pickNewChatClaudeProfile = (profileId: string) => {
+    if (engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_claude_profile",
       scopeKey: activeScopeKey,
       profileId,
     });
@@ -3997,6 +4860,10 @@ export default function App() {
   const setEffort = (effort: string) => {
     wsRef.current?.sendSetEffort(effort);
   };
+  const setAutoCompact = (selection: AutoCompactSelection): boolean => (
+    wsRef.current?.sendSetAutoCompact(
+      selection.mode, selection.thresholdTokens) ?? false
+  );
   // Codex Fast mode is persisted by app-server per thread. The runtime's Fast
   // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
@@ -4043,7 +4910,7 @@ export default function App() {
     ));
   };
   const requestFocusedGoal = () => {
-    if (!focusedSid || !focusedGoalScopeKey) return null;
+    if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return null;
     const requestId = wsRef.current?.sendGetGoalTo(focusedSid) ?? null;
     if (requestId) {
       goalRequestScopeByIdRef.current.set(requestId, {
@@ -4054,7 +4921,7 @@ export default function App() {
     return requestId;
   };
   const runGoal = (args: string) => {
-    if (!focusedSid || !focusedGoalScopeKey) return;
+    if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return;
     const command = parseGoalCommand(args, focusedEngine);
     rememberFocusedGoalUi();
     if (command.kind === "clear") {
@@ -4075,24 +4942,33 @@ export default function App() {
     }
   };
   const openStatus = () => {
-    if (!focusedSid) return;
+    if (!focusedSid || archivedBrowse) return;
     setStatusOpenSid(focusedSid);
     refreshStatus();
   };
   const openUsageActivity = () => {
-    if (engine !== "codex") return;
+    if (engine !== "codex" || archivedBrowse) return;
     setUsageActivityOpen(true);
     refreshStatus();
   };
   const requestContext = () => {
-    if (!focusedSid) return;
-    const requestId = wsRef.current?.sendGetContext();
-    if (requestId) {
-      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
+    if (!focusedSid || archivedBrowseRef.current === focusedSid) return;
+    const runtime = stateRef.current.runtimes[focusedSid];
+    if (runtime?.contextRequestId
+        || contextRequestLaunchesRef.current.has(focusedSid)) return;
+    if (focusedEngine === "claude" && runtime
+        && (runtime.state !== "idle" || runtime.queue.length > 0)) {
+      dispatch({ type: "defer_context_request", sid: focusedSid });
+      return;
     }
+    // Closing and reopening is an explicit retry even if a previous busy
+    // response exhausted its automatic finalizer catch-up attempts.
+    contextDeferredRetryAttemptsRef.current.delete(focusedSid);
+    sendContextRequestTo(focusedSid, true);
   };
   const forkFromTurn = (forkPointId: string) => {
     if (!focusedSid
+        || archivedBrowseRef.current === focusedSid
         || pendingSessionForkRef.current || pendingWorktreeForkRef.current) return;
     const requestId = wsRef.current?.sendForkSession(
       focusedSid, forkPointId) ?? null;
@@ -4162,6 +5038,7 @@ export default function App() {
   };
   const getDiff = (file: string) => {
     if (!confirmArtifactDiscard()) return;
+    closeViewer();
     const requestId = wsRef.current?.sendGetDiff(file, theme) ?? null;
     if (!requestId) return;
     setRightView("diff");
@@ -4169,6 +5046,7 @@ export default function App() {
   };
   const openTurnDiff = (files: string[], diff: string) => {
     if (!diff || !confirmArtifactDiscard()) return;
+    closeViewer();
     setRightView("diff");
     dispatch({ type: "set_artifact", artifact: {
       file: files.length === 1 ? files[0] : `本轮改动 · ${files.length} 个文件`,
@@ -4181,11 +5059,13 @@ export default function App() {
     targetSid: string | null,
     file: string,
     line?: number,
-  ) => {
-    if (!targetSid) return;
-    if (!confirmArtifactDiscard()) return;
+  ): boolean => {
+    if (!targetSid) return false;
+    if (!confirmArtifactDiscard()) return false;
+    closeViewer();
     const requestId = uuid();
-    if (!wsRef.current?.sendGetFilePreview(file, requestId, targetSid)) return;
+    if (!wsRef.current?.sendGetFilePreview(
+      file, requestId, targetSid)) return false;
     setRightView("diff");
     dispatch({
       type: "open_file_loading",
@@ -4195,11 +5075,24 @@ export default function App() {
       kind: isMarkdownPath(file) ? "md" : "file",
       line,
     });
+    return true;
   };
   const previewFile = (file: string, line?: number) =>
     previewFileForSid(focusedSid, file, line);
   const previewBtwFile = (file: string, line?: number) =>
     previewFileForSid(activeBtwSid, file, line);
+
+  const openAgentDetail = (runId: string, title?: string) => {
+    if (!focusedSid || focusedEngine !== "claude" || space !== "code"
+        || !rt.historyRevision) return;
+    closeViewer();
+    setAgentPanel({ sid: focusedSid, revision: rt.historyRevision,
+      runId, title: title || "协作代理" });
+  };
+  const previewAgentFile = (file: string, line?: number) => {
+    if (previewFileForSid(focusedSid, file, line)) setAgentPanel(null);
+  };
+
   const previewArtifactFile = (file: string, line?: number) =>
     previewFileForSid(state.artifact?.sid ?? focusedSid, file, line);
   const previewMarkdown = (file: string) => previewFile(file);
@@ -4263,15 +5156,11 @@ export default function App() {
     dispatch({ type: "start_file_save", requestId, content });
     return requestId;
   };
-  // Each /btw stays pinned to its parent session. Navigation hides it without
-  // destroying the fork; returning to that parent restores it. Other sessions
-  // can open their own independent side conversations.
-  const openBtw = () => {
-    if (!confirmArtifactDiscard()) return;
-    setRightView("btw");
+  // Each side chat stays pinned to its parent. Panel visibility is a pure view
+  // concern; only closeBtw sends the destructive native-fork teardown.
+  const createBtw = () => {
     const parentSid = visibleParentSid;
-    if (!parentSid || activeBtw
-        || pendingBtwByParentRef.current.has(parentSid)) return;
+    if (!parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
     const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
     if (!requestId) {
       setBtwOpeningFor(parentSid, false);
@@ -4287,10 +5176,27 @@ export default function App() {
     }
     setBtwOpeningFor(parentSid, true);
   };
+  const openBtw = () => {
+    if (!confirmArtifactDiscard()) return;
+    if (!btwPanelKey) return;
+    closeViewer();
+    setRightView("btw");
+    setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
+    if (!activeBtwGroup && !btwOpening) createBtw();
+  };
+  const collapseBtw = () => {
+    if (btwPanelKey) setBtwPanelScopes(
+      (current) => setBtwPanelScope(current, btwPanelKey, false));
+  };
+  const selectBtw = (sid: string) => {
+    const parentSid = visibleParentSid;
+    if (!parentSid) return;
+    dispatch({ type: "select_btw", parentSid, btwSid: sid });
+  };
   const sendBtw = (prompt: string): boolean => {
     const sid = activeBtwSid;
     const ws = wsRef.current;
-    if (!sid || !ws) return false;
+    if (!sid || !ws || runtimeIsReadOnly(sid)) return false;
     const runtime = stateRef.current.runtimes[sid];
     const awaitingAcceptance = !!(
       ws.pendingQueryFor(sid) || runtime?.acceptancePending
@@ -4322,7 +5228,7 @@ export default function App() {
   const steerBtw = (prompt: string): boolean => {
     const sid = activeBtwSid;
     const ws = wsRef.current;
-    if (!sid || !ws || activeBtw?.engine !== "codex") return false;
+    if (!sid || !ws || activeBtw?.engine !== "codex" || runtimeIsReadOnly(sid)) return false;
     const runtime = stateRef.current.runtimes[sid];
     if (ws.pendingQueryFor(sid) || runtime?.acceptancePending) return false;
     const msg_id = uuid();
@@ -4333,13 +5239,23 @@ export default function App() {
     return true;
   };
   const interruptBtw = (sid: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendInterruptTo(sid);
   };
   const setBtwModel = (sid: string, model: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetModelTo(sid, model);
   };
   const setBtwEffort = (sid: string, effort: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetEffortTo(sid, effort);
+  };
+  const setBtwAutoCompact = (
+    sid: string, selection: AutoCompactSelection,
+  ): boolean => {
+    if (runtimeIsReadOnly(sid)) return false;
+    return wsRef.current?.sendSetAutoCompactTo(
+      sid, selection.mode, selection.thresholdTokens) ?? false;
   };
   const setBtwSendMode = (
     sid: string, mode: SendMode,
@@ -4348,42 +5264,48 @@ export default function App() {
       current[sid] === mode ? current : { ...current, [sid]: mode }
     ));
   };
-  const closeBtw = () => {
+  const closeBtw = (btwSid = activeBtwSid) => {
     const parentSid = visibleParentSid;
-    if (!parentSid) return;
-    const pendingRequestId = pendingBtwByParentRef.current.get(parentSid);
-    pendingBtwByParentRef.current.delete(parentSid);
-    activeBtwByParentRef.current.delete(parentSid);
-    setBtwOpeningFor(parentSid, false);
-    if (pendingRequestId) {
-      // Keep the request -> parent tombstone. A late success is classified as
-      // stale and its newly-created fork is closed immediately.
-      btwRequestParentsRef.current.set(pendingRequestId, parentSid);
-    }
-    if (activeBtw) {
-      btwDraftsRef.current.delete(activeBtwDraftKey);
-      setBtwSendModeBySid((current) => {
-        if (!(activeBtw.sid in current)) return current;
-        const next = { ...current };
-        delete next[activeBtw.sid];
-        return next;
-      });
-      setCompletionReceipts((receipts) => acknowledgeCompletion(
-        receipts, parentSid, { btwSid: activeBtw.sid }));
-      wsRef.current?.sendCloseBtw(activeBtw.sid);
-      dispatch({ type: "clear_btw", parentSid });
-    }
+    if (!parentSid || !btwSid) return;
+    const target = stateRef.current.runtimes[btwSid];
+    const hasActiveWork = !!target && (
+      target.state !== "idle" || target.mirroredRunning
+      || !!target.acceptancePending || !!target.pendingSend
+      || target.queue.length > 0
+    );
+    if (hasActiveWork && !window.confirm(
+      "这个侧边对话仍在工作或有排队消息，确定关闭并丢弃吗？")) return;
+    if (!wsRef.current?.sendCloseBtw(btwSid)) return;
+    const tracked = activeBtwByParentRef.current.get(parentSid);
+    if (tracked?.sid === btwSid) activeBtwByParentRef.current.delete(parentSid);
+    btwDraftsRef.current.delete(composerDraftKey(
+      machineId, space,
+      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine
+        === "codex" ? "codex" : "claude"),
+      `btw:${btwSid}`,
+    ));
+    setBtwSendModeBySid((current) => {
+      if (!(btwSid in current)) return current;
+      const next = { ...current };
+      delete next[btwSid];
+      return next;
+    });
+    setCompletionReceipts((receipts) => acknowledgeCompletion(
+      receipts, parentSid, { btwSid }));
+    dispatch({ type: "clear_btw", parentSid, btwSid });
   };
   // Header tab switch between the two right-slot views (opening the target lazily).
-  const switchRight = (v: "diff" | "btw") => {
+  const switchRight = (v: RightPanelView) => {
     if (v === "diff") {
       setRightView("diff");
       if (!state.artifact) getDiff("");
-    } else openBtw();
+    } else {
+      openBtw();
+    }
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, closeBtw,
+    getDiff, openBtw, collapseBtw,
   };
   const logout = async () => {
     try {
@@ -4391,6 +5313,7 @@ export default function App() {
         method: "POST", credentials: "same-origin", cache: "no-store",
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      try { localStorage.removeItem(MANUAL_UNREAD_STORAGE); } catch { /* Private browsing. */ }
       await import("./cache").then((module) => module.clearCache());
       await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
@@ -4407,7 +5330,6 @@ export default function App() {
       sessionActivityPendingRef.current.clear();
       activeBtwByParentRef.current.clear();
       btwRequestParentsRef.current.clear();
-      discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
       historyInvalidationGenerationsRef.current.clear();
       historyCacheEpochRef.current.clear();
@@ -4425,6 +5347,7 @@ export default function App() {
       setBtwOpeningByParentSid({});
       setCompletionReceipts({});
       dispatch({ type: "reset" });
+      setRestoringSurfaceScope(null);
       setAuthed(false);
     } catch {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
@@ -4462,20 +5385,35 @@ export default function App() {
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
-  const activeTurnId = exactActiveTurnId(
+  const runtimeActiveOwnerId = displayActiveTurnOwnerId(
+    rt.liveOwner?.turnId, rt.acceptancePending);
+  const displayActiveOwnerId = historyView.recovering
+    ? historyView.activeOwnerId : runtimeActiveOwnerId;
+  const runtimeHasActiveTurn = rt.state !== "idle" || rt.mirroredRunning
+    || !!rt.acceptancePending;
+  const activeTurnCandidates = activeTurnCandidateIds(
     historyView.turns,
-    rt.liveOwner?.turnId,
-    !historyView.browsing && !historyView.recovering
-      && (rt.state !== "idle" || rt.mirroredRunning),
+    displayActiveOwnerId,
+    !historyView.browsing && runtimeHasActiveTurn
+      && (!historyView.recovering || !!historyView.activeOwnerId),
   );
+  const activeTurnId = activeTurnCandidates.length === 1
+    ? activeTurnCandidates[0] : null;
+  const ambiguousActiveTurnIds = activeTurnCandidates.length > 1
+    ? activeTurnCandidates : [];
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
-      <SessionsSidebar
+    <ViewerPagesProvider scope={visibleParentSid && authed
+      ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
+    <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + (visibleRightPanel !== null ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+      <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         engine={engine}
         space={space}
         profileScopeKey={activeScopeKey}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
         onSpaceChange={switchSpace}
@@ -4490,14 +5428,17 @@ export default function App() {
         }))}
         completionBadges={completionBadges}
         activeSessionId={focusedSid}
+        machineId={machineId}
         onSelect={(id) => {
-          if (!confirmArtifactDiscard()) return;
+          if (!confirmArtifactDiscard()) return false;
           cancelPendingNotificationTarget();
           const selected = state.sessions.find((s) => s.session_id === id);
-          if (selected) focusListedSession(selected);
+          if (!selected) return false;
+          focusListedSession(selected);
+          return true;
         }}
-        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(profileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", claudeProfileId: engine === "claude" ? profileId ?? newChatClaudeProfileId : null, codexProfileId: engine === "codex" ? profileId ?? newChatCodexProfileId : null }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", claudeProfileId: newChatClaudeProfileId, codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -4533,6 +5474,7 @@ export default function App() {
           if (focusedSid === id) clearHistoryDetailRequests();
           if (focusedSid === id) dispatch({
             type: "enter_new_chat", cwd: "~", cwdSource: "default",
+            claudeProfileId: newChatClaudeProfileId,
             codexProfileId: newChatCodexProfileId,
           });
           wsRef.current?.sendDeleteSession(
@@ -4540,7 +5482,7 @@ export default function App() {
         }}
         onForkWorktree={openForkWorktree}
         onMigrate={openSessionMigration}
-      />
+      /></Suspense>
       <DirPicker
         open={dirPickerOpen}
         path={state.dirPicker?.path ?? null}
@@ -4578,8 +5520,8 @@ export default function App() {
               </button>
               {focusedWorkProfile && (
                 <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
-                  title={`Codex 账号：${focusedWorkProfile.fullLabel}`}
-                  aria-label={`Codex 账号：${focusedWorkProfile.fullLabel}`}>
+                  title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
+                  aria-label={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}>
                   <i className="profile-tone" />
                   {focusedWorkProfile.name}
                 </span>
@@ -4589,7 +5531,8 @@ export default function App() {
           </div>
           <span className={`hstat ${effectiveState}`}><span className="sd" />
             <span className="hstat-label">{effectiveState}</span></span>
-          {space === "code" && focusedSid && !state.newChat && (
+          {space === "code" && focusedSid && !state.newChat
+              && !archivedBrowse && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -4614,6 +5557,7 @@ export default function App() {
             notificationAvailable={typeof Notification !== "undefined"}
             onNotificationMode={updateNotificationMode}
             onOpenUsageActivity={openUsageActivity}
+            onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onToggleTheme={toggleTheme}
             onLogout={() => void logout()}
           />
@@ -4630,11 +5574,14 @@ export default function App() {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
           }} />
 
-        {state.newChat ? (
+        {restoringSurfaceScope === activeScopeKey ? (
+          <div className="empty" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span className="loading-tx">正在恢复会话</span>
+          </div>
+        ) : state.newChat ? (
           <NewChatView cwd={state.newChat.cwd}
-            controlScopeKey={engine === "codex"
-              ? `${activeScopeKey}\u0000${newChatCodexProfileId ?? "__default__"}`
-              : activeScopeKey}
+            controlScopeKey={`${activeScopeKey}\u0000${newChatProfileId ?? "__default__"}`}
             space={space}
             createError={createError}
             autoFocus={newChatAutoFocus}
@@ -4642,8 +5589,15 @@ export default function App() {
             catalog={newChatCatalog}
             model={state.newChat.model}
             effort={state.newChat.effort}
+            autoCompact={{
+              mode: state.newChat.autoCompactMode,
+              thresholdTokens: state.newChat.autoCompactThresholdTokens,
+            }}
             defaultModel={newChatDefaults.model}
             defaultEffort={newChatDefaults.effort}
+            claudeProfiles={state.claudeProfiles}
+            defaultClaudeProfileId={state.defaultClaudeProfileId}
+            claudeProfileId={newChatClaudeProfileId}
             codexProfiles={state.codexProfiles}
             defaultCodexProfileId={state.defaultCodexProfileId}
             codexProfileId={newChatCodexProfileId}
@@ -4654,6 +5608,8 @@ export default function App() {
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
+            onPickAutoCompact={pickNewChatAutoCompact}
+            onPickClaudeProfile={pickNewChatClaudeProfile}
             onPickCodexProfile={pickNewChatCodexProfile}
             permissionProfiles={
               newChatPermissionCatalog?.machineId === machineId
@@ -4693,6 +5649,20 @@ export default function App() {
                 ? undefined : loadHistoryTurnDetail}
               onEdit={historyView.recovering
                 ? undefined : (prompt) => setEditPrompt(prompt)}
+              asyncReplyMode={rt.state === "running" ? "steer"
+                : rt.state === "idle" ? "query" : undefined}
+              onReplyAsyncQuestion={focusedEngine !== "codex"
+                || historyView.recovering || !state.wrapperOnline
+                || state.connState !== "connected"
+                || focusedSession?.tag === "archived"
+                || (rt.control ? sessionControlLocksInput(rt.control) : rt.external)
+                || rt.acceptancePending || (rt.state !== "idle" && rt.state !== "running")
+                ? undefined : (prompt) => {
+                  const current = stateRef.current;
+                  if (!focusedSid || current.focusedSid !== focusedSid
+                      || previousMachineRef.current !== machineId) return false;
+                  return replyAsyncQuestion(focusedSid, prompt, sendQuery, sendSteer);
+                }}
               onGetDiff={historyView.recovering ? undefined : getDiff}
               onOpenTurnDiff={historyView.recovering
                 ? undefined : openTurnDiff}
@@ -4718,17 +5688,25 @@ export default function App() {
                 turnId: planProgress.turnId,
                 itemId: planProgress.block.item_id,
               } : null}
+              backgroundProcesses={focusedEngine === "claude"
+                ? rt.backgroundProcesses : []}
               activeTurnId={activeTurnId}
-              onFork={!historyView.recovering && space === "code"
+              ambiguousActiveTurnIds={ambiguousActiveTurnIds}
+              onOpenAgent={focusedEngine === "claude" && space === "code"
+                ? openAgentDetail : undefined}
+              onFork={!historyView.recovering && !archivedBrowse
+                  && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <Suspense fallback={((goalUi?.revealed && !completedGoalRetired)
-                || goalUi?.open || planProgress)
+            <Suspense fallback={((!archivedBrowse
+                && ((goalUi?.revealed && !completedGoalRetired)
+                  || goalUi?.open)) || planProgress)
               ? <span className="goal-suspense" role="status"
                   aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
               : null}>
               <GoalPanel engine={focusedEngine} goal={rt.goal}
-                revealed={!!goalUi?.revealed} open={!!goalUi?.open}
+                revealed={!archivedBrowse && !!goalUi?.revealed}
+                open={!archivedBrowse && !!goalUi?.open}
                 loading={!!goalUi?.loading}
                 completedGoalRetired={completedGoalRetired}
                 plan={planProgress}
@@ -4797,6 +5775,7 @@ export default function App() {
           replaceQueueCapacity={replaceQueueCapacity}
           model={rt.model}
           effort={rt.effort}
+          autoCompact={rt.autoCompact}
           perm={rt.perm}
           permissionProfile={rt.permissionProfile}
           permissionProfiles={rt.permissionProfiles}
@@ -4808,6 +5787,7 @@ export default function App() {
           takeoverPending={rt.takeoverPending}
           takeoverMessage={rt.takeoverMessage}
           engine={focusedEngine}
+          archived={focusedSession?.tag === "archived"}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
@@ -4827,6 +5807,7 @@ export default function App() {
           }}
           onSetModel={setModel}
           onSetEffort={setEffort}
+          onSetAutoCompact={setAutoCompact}
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
           onGetPermissionProfiles={getPermissionProfiles}
@@ -4837,6 +5818,7 @@ export default function App() {
             type: "enter_new_chat",
             cwd: space === "work" ? "~" : (currentCwd || "~"),
             cwdSource: space === "work" || !currentCwd ? "default" : "inherited",
+            claudeProfileId: focusedClaudeProfileId ?? newChatClaudeProfileId,
             codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
@@ -4850,7 +5832,9 @@ export default function App() {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
           }}
           onCompact={() => {
-            if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
+            if (focusedSid) {
+              wsRef.current?.sendCompactSession(focusedSid, focusedEngine);
+            }
           }}
           onOpenExtensions={(kind) => {
             setCapabilitiesKind(kind);
@@ -4862,6 +5846,7 @@ export default function App() {
               space,
               cwd: capabilityCwd,
               skillsOnly: false,
+              claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
             }, true);
           }}
@@ -4873,6 +5858,7 @@ export default function App() {
               space,
               cwd: capabilityCwd,
               skillsOnly: true,
+              claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
             });
           }}
@@ -4884,8 +5870,12 @@ export default function App() {
             setWorkArtifactsOpen(true);
           }}
           contextReport={rt.contextReport}
+          contextExactReport={rt.contextExactReport}
+          contextLoading={rt.contextRequestId !== null}
+          contextDeferred={rt.contextRefreshDeferred}
           contextError={rt.contextError}
           statusReport={rt.statusReport}
+          rateLimits={rt.rateLimits}
           statusError={rt.statusError}
           statusLoading={rt.statusRequestId !== null}
         />
@@ -4893,16 +5883,48 @@ export default function App() {
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
-      {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
+      {/* Share the layout's selection: retained hidden chats reserve no space. */}
       {(() => {
-        const btwShowing = !!activeBtw || btwOpening;
-        const view = rightView === "btw" && btwShowing ? "btw"
-          : state.artifact ? "diff" : btwShowing ? "btw" : null;
-        if (view === "btw")
+        if (visibleRightPanel === "viewer" && visibleParentSid && viewerKey) {
+          return <Suspense fallback={<div className="artifact-panel empty" role="status"><p>加载预览…</p></div>}>
+            <RemoteViewerPanel key={`${viewerKey}:${viewerUrl?.key === viewerKey ? viewerUrl.openId : ""}`}
+              scope={{ machineId, sid: visibleParentSid, space, engine }}
+              selection={viewerSelections[viewerKey] ?? null}
+              requestedUrl={viewerUrl?.key === viewerKey ? viewerUrl.href : undefined}
+              devices={remoteDevices} onSelect={selectViewer} onClose={closeViewer} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "agent" && agentPanel) {
+          return <Suspense fallback={null}>
+            <AgentDetailController
+              key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
+              selection={agentPanel} ws={wsRef.current}
+              onListen={setAgentDetailListener}
+              onClose={() => setAgentPanel(null)}
+              onOpenFile={previewAgentFile} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "btw")
           return <Suspense fallback={null}>
             <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
-            engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
-            active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
+            engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
+            chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
+              const runtime = state.runtimes[chat.sid];
+              const prompt = runtime?.turns.find(
+                (turn) => turn.prompt.trim().length > 0)?.prompt.trim();
+              return {
+                ...chat,
+                title: prompt ? prompt.slice(0, 36) : `侧聊 ${index + 1}`,
+                state: runtime?.state ?? "idle",
+                needsAnswer: !!runtime?.pendingQuestion,
+              };
+            })}
+            active="btw" hasArtifact={!!state.artifact}
+            artifactKind={state.artifact?.kind}
+            onTab={switchRight}
+            onNew={createBtw}
+            onSelect={selectBtw}
+            onCloseChat={closeBtw}
             catalog={focusedCatalog}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
             sendMode={activeBtwSendMode}
@@ -4912,6 +5934,13 @@ export default function App() {
             replaceQueueCapacity={btwReplaceQueueCapacity}
             onSend={sendBtw}
             onSteer={steerBtw}
+            onReplyAsyncQuestion={state.connState !== "connected" || !state.wrapperOnline
+              ? undefined : (prompt) => {
+                if (!activeBtwSid || stateRef.current.newChat
+                    || stateRef.current.focusedSid !== visibleParentSid
+                    || previousMachineRef.current !== machineId) return false;
+                return replyAsyncQuestion(activeBtwSid, prompt, sendBtw, steerBtw);
+              }}
             onInterrupt={() => {
               if (activeBtwSid) interruptBtw(activeBtwSid);
             }}
@@ -4938,22 +5967,36 @@ export default function App() {
             onSetEffort={(effort) => {
               if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
             }}
-            onOpenFile={previewBtwFile} onClose={closeBtw}
+            onSetAutoCompact={(selection) => activeBtwSid
+              ? setBtwAutoCompact(activeBtwSid, selection) : false}
+            onOpenFile={previewBtwFile} onCollapse={collapseBtw}
             imageAssets={btwInlineImageAssets}
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
+            onAnswerQuestion={(askId, answer) => {
+              if (!activeBtwSid) return;
+              if (!wsRef.current?.sendAnswerQuestion(
+                activeBtwSid, askId, answer)) return;
+              dispatch({
+                type: "answer_question",
+                sid: activeBtwSid,
+                ask_id: askId,
+              });
+            }}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />
           </Suspense>;
-        if (view === "diff" && state.artifact)
+        if (visibleRightPanel === "diff" && state.artifact)
           return <Suspense fallback={
             <div className="artifact-panel empty" role="status">
               <div className="spinner" aria-hidden="true" />
               <p className="loading-tx">加载预览…</p>
             </div>
           }>
-            <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
+            <ArtifactPanel artifact={state.artifact} active="diff"
+              hasBtw={!!activeBtwGroup}
+              theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
               onAuthorizePreview={authorizePreview}
@@ -4972,7 +6015,7 @@ export default function App() {
         }}
         onSave={updateQueuedQuery}
         onRetry={retryQueuedQuery} />
-      {rt.pendingQuestion && (
+      {rt.pendingQuestion && !activeBtwQuestionVisible && (
         <QuestionSheet
           key={rt.pendingQuestion.ask_id}
           header={rt.pendingQuestion.header}
@@ -4994,31 +6037,54 @@ export default function App() {
           }}
         />
       )}
-      <StatusSheet open={shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)} report={rt.statusReport}
-        notices={rt.notices}
-        error={rt.statusError}
-        onClose={() => setStatusOpenSid(null)}
-        onRefresh={openStatus}
-        onDismissNotice={(noticeId) => {
-          if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
-        }} />
-      <UsageActivitySheet
-        open={usageActivityOpen && engine === "codex"}
-        report={rt.statusReport}
-        error={rt.statusError}
-        loading={rt.statusRequestId !== null}
-        hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
-        onClose={() => setUsageActivityOpen(false)}
-        onRefresh={refreshStatus}
-      />
-      <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
-        creating={forkWorktreeCreating} error={forkWorktreeError}
-        onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
+      {shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)
+        && <Suspense fallback={null}>
+          <StatusSheet open report={rt.statusReport}
+            notices={rt.notices}
+            error={rt.statusError}
+            resetCreditLoading={rt.statusRequestId !== null}
+            resetCreditResult={rt.resetCreditResult}
+            resetCreditDisabled={
+              rt.state !== "idle"
+              || rt.statusRequestId !== null
+              || !!rt.statusError
+              || state.connState !== "connected"
+              || !state.wrapperOnline
+            }
+            onClose={() => setStatusOpenSid(null)}
+            onRefresh={openStatus}
+            onConsumeResetCredit={consumeResetCredit}
+            onDismissNotice={(noticeId) => {
+              if (focusedSid) dispatch({
+                type: "dismiss_notice", sid: focusedSid, noticeId,
+              });
+            }} />
+        </Suspense>}
+      {usageActivityOpen && engine === "codex" && <Suspense fallback={null}>
+        <UsageActivitySheet
+          open
+          report={rt.statusReport}
+          error={rt.statusError}
+          loading={rt.statusRequestId !== null}
+          hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
+          onClose={() => setUsageActivityOpen(false)}
+          onRefresh={refreshStatus}
+        />
+      </Suspense>}
+      {forkWorktreeSession !== null && <Suspense fallback={null}>
+        <ForkWorktreeSheet open session={forkWorktreeSession}
+          creating={forkWorktreeCreating} error={forkWorktreeError}
+          onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
+      </Suspense>}
       <WorkDashboardSheet
         key={sessionScopeKey(machineId, engine, "work")}
         open={workManagerOpen && space === "work"}
         scopeKey={sessionScopeKey(machineId, engine, "work")}
         dashboard={activeWorkDashboard}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
+        claudeProfileId={state.newChat
+          ? newChatClaudeProfileId : focusedClaudeProfileId}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
         codexProfileId={state.newChat
@@ -5031,17 +6097,23 @@ export default function App() {
         onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(engine, projectId, kind, title, uri, file)}
         onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(engine, sourceId)}
         onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId,
-          codexProfileId) => !!wsRef.current?.sendCreateWorkSchedule(
+          profileId) => !!wsRef.current?.sendCreateWorkSchedule(
           engine, title, prompt, nextRunAt, repeatSeconds, projectId,
-          codexProfileId)}
+          engine === "codex" ? profileId : undefined,
+          engine === "claude" ? profileId : undefined)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
         onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
-      <WorkArtifactsSheet open={workArtifactsOpen && space === "work"
-          && !state.newChat && currentWorkArtifacts.length > 0}
-        artifacts={currentWorkArtifacts}
-        onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
-        onClose={() => setWorkArtifactsOpen(false)} />
+      {workArtifactsOpen && space === "work" && !state.newChat
+        && currentWorkArtifacts.length > 0 && <Suspense fallback={null}>
+          <WorkArtifactsSheet open artifacts={currentWorkArtifacts}
+            onOpen={(path) => {
+              setWorkArtifactsOpen(false);
+              previewFile(path);
+            }}
+            onClose={() => setWorkArtifactsOpen(false)} />
+        </Suspense>}
+      <Suspense fallback={null}>
       <CapabilitiesSheet open={capabilitiesOpen}
         engine={focusedEngine}
         activeKind={capabilitiesKind}
@@ -5057,6 +6129,7 @@ export default function App() {
             space,
             cwd: capabilityCwd,
             skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           }, true);
         }}
@@ -5066,10 +6139,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEnginePlugin(
             focusedEngine, space, action, item.id,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5079,10 +6153,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, action, { skillId: item.id },
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5090,10 +6165,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
             focusedEngine, space, "create", draft,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5102,10 +6178,11 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "remove", { hookId: item.id },
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
@@ -5113,14 +6190,16 @@ export default function App() {
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
             focusedEngine, space, "create", draft,
-            capabilityCwd, focusedCodexProfileId);
+            capabilityCwd, focusedCodexProfileId, focusedClaudeProfileId);
           trackCapabilityMutation(requestId, {
             key: focusedSkillCatalogKey, engine: focusedEngine, space,
             cwd: capabilityCwd, skillsOnly: false,
+            claudeProfileId: focusedClaudeProfileId,
             codexProfileId: focusedCodexProfileId,
           });
         }}
         onClose={() => setCapabilitiesOpen(false)} />
+      </Suspense>
       <DeviceSheet open={deviceSheetOpen}
         currentId={machineId}
         devices={remoteDevices}
@@ -5136,5 +6215,7 @@ export default function App() {
         }}
         onClose={() => setDeviceSheetOpen(false)} />
     </div>
+    </RemoteViewerContext.Provider>
+    </ViewerPagesProvider>
   );
 }

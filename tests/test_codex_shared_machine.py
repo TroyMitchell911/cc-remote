@@ -10,12 +10,18 @@ from cc_remote.codex_daemon_restart import (
     CodexDaemonRestartState,
     write_restart_state,
 )
+from cc_remote.wrapper import machine as machine_module
 from cc_remote.protocol import (
     Delta, Effort, Error, GetStatus, Model, Query, SessionActivity,
     SessionControl, StateEvent, StatusReport, Takeover, TurnBinding, TurnEnd,
     UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
+from cc_remote.wrapper.codex_handle import (
+    CodexDaemonProxyClosed,
+    CodexTurnStartDisconnected,
+    CodexTurnStartReconciliation,
+)
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -110,6 +116,293 @@ class _InterruptedSharedSdk(_SharedSdk):
         self.live = True
 
 
+class _ChangedProcessGenerationSdk(_InterruptedSharedSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.live = True
+        self.process_generation_current = False
+
+    @property
+    def daemon_process_generation_current(self) -> bool:
+        return self.process_generation_current
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        await super().force_reconnect(*_args, **_kwargs)
+        self.process_generation_current = True
+
+    async def receive_response(self):
+        yield {
+            "method": "item/completed",
+            "params": {
+                "threadId": "sid",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "answer-1",
+                    "type": "agentMessage",
+                    "text": "completed after reconnect",
+                    "phase": "final_answer",
+                },
+            },
+        }
+        async for message in super().receive_response():
+            yield message
+
+
+class _TurnStartDisconnectSdk(_InterruptedSharedSdk):
+    def __init__(self, *, accepted: bool) -> None:
+        super().__init__()
+        self.live = True
+        self.accepted = accepted
+
+    @property
+    def daemon_process_generation_current(self) -> bool:
+        return True
+
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> str:
+        self.queries.append((prompt, images))
+        self.live = False
+        raise CodexTurnStartDisconnected(
+            "0.150.0",
+            7,
+            accepted=self.accepted,
+            client_message_id=client_user_message_id,
+            native_turn_id="native-task" if self.accepted else None,
+            native_message_id="native-user" if self.accepted else None,
+        )
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        return CodexTurnStartReconciliation(
+            thread_active=False,
+            active_turn_id=None,
+            matched_turn_id=None,
+            matched_turn_active=False,
+        )
+
+
+class _ActiveTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=True)
+        self.machine = None
+        self.ctx = None
+        self.finish = asyncio.Event()
+        self.recovered_stream_turn_ids = None
+        self.interrupt_states = []
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        await super().force_reconnect(*_args, **_kwargs)
+        assert self.machine is not None and self.ctx is not None
+        await self.machine._on_codex_turn_lifecycle(
+            self.ctx, "started", "control-turn")
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        assert native_turn_id == "native-task"
+        assert native_message_id == "native-user"
+        return CodexTurnStartReconciliation(
+            thread_active=True,
+            active_turn_id="control-turn",
+            matched_turn_id="control-turn",
+            matched_turn_active=True,
+        )
+
+    async def recover_owned_turn(
+        self, turn_id: str, *, stream_turn_ids=(),
+    ) -> bool:
+        assert turn_id == "control-turn"
+        self.recovered_stream_turn_ids = tuple(stream_turn_ids)
+        assert self.machine is not None and self.ctx is not None
+        await self.machine._on_codex_turn_lifecycle(
+            self.ctx, "started", turn_id)
+        return True
+
+    async def interrupt(self) -> None:
+        self.interrupt_states.append(self.live)
+        if self.live:
+            self.finish.set()
+
+    async def receive_spontaneous_response(self, turn_id: str):
+        assert turn_id == "control-turn"
+        await self.finish.wait()
+        yield {
+            "method": "item/completed",
+            "params": {
+                "threadId": "sid",
+                "turnId": turn_id,
+                "item": {
+                    "id": "answer-after-reconnect",
+                    "type": "agentMessage",
+                    "text": "finished after reconnect",
+                    "phase": "final_answer",
+                },
+            },
+        }
+        yield {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "sid",
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        }
+
+
+class _InterruptRacingActiveTurnStartDisconnectSdk(
+    _ActiveTurnStartDisconnectSdk,
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reconnect_started = asyncio.Event()
+        self.release_reconnect = asyncio.Event()
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        self.reconnect_started.set()
+        await self.release_reconnect.wait()
+        self.live = True
+        assert self.machine is not None and self.ctx is not None
+        await self.machine._on_codex_turn_lifecycle(
+            self.ctx, "started", "control-turn")
+
+
+class _FollowedTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=True)
+        self.settled = asyncio.Event()
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        active = not self.settled.is_set()
+        return CodexTurnStartReconciliation(
+            thread_active=active,
+            active_turn_id="automatic-turn" if active else None,
+            matched_turn_id="completed-control-turn",
+            matched_turn_active=False,
+        )
+
+
+class _CompletedSuccessorTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=True)
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        return CodexTurnStartReconciliation(
+            thread_active=False,
+            active_turn_id=None,
+            matched_turn_id="completed-control-turn",
+            matched_turn_active=False,
+            latest_turn_id="completed-successor",
+            matched_turn_is_latest=False,
+            newer_turns_present=True,
+        )
+
+
+class _DisplacedTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=True)
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        return CodexTurnStartReconciliation(
+            thread_active=False,
+            active_turn_id=None,
+            matched_turn_id=None,
+            matched_turn_active=False,
+            latest_turn_id="newer-0",
+            page_truncated=True,
+        )
+
+
+class _UnmatchedActiveTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=False)
+        self.first_probe = asyncio.Event()
+        self.settled = asyncio.Event()
+
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id=None,
+        native_message_id=None,
+    ) -> CodexTurnStartReconciliation:
+        assert client_message_id == "browser-submit"
+        self.first_probe.set()
+        active = not self.settled.is_set()
+        return CodexTurnStartReconciliation(
+            thread_active=active,
+            active_turn_id="unmatched-turn" if active else None,
+            matched_turn_id=None,
+            matched_turn_active=False,
+        )
+
+
+class _UnavailableTurnStartDisconnectSdk(_TurnStartDisconnectSdk):
+    def __init__(self) -> None:
+        super().__init__(accepted=False)
+        self.interrupts = 0
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        raise ConnectionError("replacement daemon unavailable")
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+
+
+class _RecordingCheckpoint:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def begin_turn(self, turn_id: str) -> None:
+        self.calls.append(("begin", turn_id))
+
+    def accept_turn(self, turn_id: str) -> None:
+        self.calls.append(("accept", turn_id))
+
+    def finish_turn(self, turn_id: str):
+        self.calls.append(("finish", turn_id))
+        return None
+
+    def abort_turn(self, turn_id: str) -> None:
+        self.calls.append(("abort", turn_id))
+
+    def cleanup(self, *, force: bool = False) -> None:
+        self.calls.append(("cleanup", force))
+
+
 class _EvictedDuringReconnectSdk(_InterruptedSharedSdk):
     def __init__(self) -> None:
         super().__init__()
@@ -153,6 +446,50 @@ class _EvictedDuringEffortPublishSdk(_InterruptedSharedSdk):
     async def disconnect(self) -> None:
         self.disconnects += 1
         self.live = False
+
+
+class _UnexpectedProxyCloseSdk(_SharedSdk):
+    shared_daemon_affinity = True
+
+    def __init__(
+        self,
+        *,
+        replacement_version: str,
+        close_kind: str = "eof",
+    ) -> None:
+        super().__init__()
+        self.live = True
+        self.app_server_version = "0.149.0"
+        self.replacement_version = replacement_version
+        self.close_kind = close_kind
+        self._generation = 3
+        self._thread_settings_revision = 1
+        self._cwd = "/tmp/cc-remote-test-cwd"
+        self.thread_id = "sid"
+
+    @property
+    def using_daemon_proxy(self) -> bool:
+        return self.live
+
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> str:
+        self.queries.append((prompt, images))
+        return "turn-before-proxy-close"
+
+    async def receive_response(self):
+        self.live = False
+        yield CodexDaemonProxyClosed(
+            self.app_server_version,
+            self._generation,
+            close_kind=self.close_kind,
+        )
+
+    async def force_reconnect(self, *_args, **_kwargs) -> None:
+        self.reconnects += 1
+        self._generation += 1
+        self.app_server_version = self.replacement_version
+        self.live = True
 
 
 class _AccountSwitchSharedSdk(_SharedSdk):
@@ -227,6 +564,28 @@ class _AccountSwitchSharedSdk(_SharedSdk):
 
     async def get_goal(self):
         return None
+
+
+class _MarkerThenProxyCloseSdk(_AccountSwitchSharedSdk):
+    async def receive_response(self):
+        if self.readers == 0:
+            self.readers += 1
+            assert self.restart_path is not None
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="restarting",
+            )
+            write_restart_state(
+                self.restart_path,
+                epoch="9" * 32,
+                phase="ready",
+            )
+            yield CodexDaemonProxyClosed(
+                "0.149.0", 1, close_kind="eof")
+            return
+        async for message in super().receive_response():
+            yield message
 
 
 class _GoalAccountSwitchSharedSdk(_AccountSwitchSharedSdk):
@@ -1855,6 +2214,42 @@ def test_same_restart_epoch_does_not_reconnect_live_proxy(monkeypatch):
     asyncio.run(go())
 
 
+def test_unmarked_process_generation_swap_reconnects_before_query():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _ChangedProcessGenerationSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-first-send"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "send after updater swap"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.process_generation_current is True
+        assert ctx.sdk.queries == [("send after updater swap", [])]
+        assert ctx.state == "idle"
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        assert len([event for event in transport.sent
+                    if isinstance(event, TurnEnd)]) == 1
+
+        # Once attached to the replacement generation, ordinary preflights are
+        # idempotent and do not reconnect again.
+        assert await machine._ensure_codex_daemon_generation(
+            ctx, reason="second final query preflight",
+        )
+        assert ctx.sdk.reconnects == 1
+
+    asyncio.run(go())
+
+
 def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
     async def go() -> None:
         machine, transport = _mk_machine()
@@ -1905,6 +2300,472 @@ def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
         assert ctx.announced_effort == "medium"
         assert transport.sent[-1].to == "browser"
         assert transport.sent[-1].request_id == "usage-refresh"
+
+    asyncio.run(go())
+
+
+def test_turn_start_disconnect_recovers_channel_without_replaying_prompt():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _TurnStartDisconnectSdk(accepted=False)
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do one non-idempotent task"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.queries == [("do one non-idempotent task", [])]
+        assert ctx.sdk.reconnects == 1
+        assert ctx.state == "idle"
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].msg_id == "browser-submit"
+        assert errors[0].message == (
+            "Codex 提交确认时连接中断，无法证明该消息是否执行。"
+            "为避免重复操作，本次"
+            "没有自动重发，请先检查历史后再决定是否重试。"
+        )
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+
+    asyncio.run(go())
+
+
+def test_turn_start_disconnect_reattaches_exact_turn_and_quarantines_checkpoint():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _ActiveTurnStartDisconnectSdk()
+        sdk.machine = machine
+        sdk.ctx = ctx
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        checkpoint = _RecordingCheckpoint()
+        ctx.codex_checkpoint = checkpoint
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        turn = asyncio.create_task(
+            machine._run_turn(ctx, "do one non-idempotent task"))
+        ctx.turn_task = turn
+        while ctx.codex_spontaneous_task is None:
+            await asyncio.sleep(0)
+
+        assert ctx.state == "running"
+        assert not ctx.interrupt_event.is_set()
+        assert ctx.codex_spontaneous_turn_id == "control-turn"
+        assert sdk.recovered_stream_turn_ids == ("native-task",)
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert len([
+            event for event in transport.sent if isinstance(event, UserMsg)
+        ]) == 1
+        assert not [
+            event for event in transport.sent if isinstance(event, Error)
+        ]
+
+        sdk.finish.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+
+        assert ctx.state == "idle"
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert not [call for call in checkpoint.calls if call[0] == "abort"]
+        assert len([
+            event for event in transport.sent if isinstance(event, TurnEnd)
+        ]) == 1
+
+    asyncio.run(go())
+
+
+def test_interrupt_racing_turn_start_recovery_reaches_reattached_turn():
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _InterruptRacingActiveTurnStartDisconnectSdk()
+        sdk.machine = machine
+        sdk.ctx = ctx
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        turn = asyncio.create_task(
+            machine._run_turn(ctx, "do one non-idempotent task"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(sdk.reconnect_started.wait(), timeout=1.0)
+
+        await machine._handle_interrupt(SimpleNamespace(
+            sid="sid",
+            cmd_id="interrupt-recovery",
+            client_id="browser",
+        ))
+        assert ctx.state == "interrupting"
+        assert sdk.interrupt_states == [False]
+
+        sdk.release_reconnect.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+
+        assert sdk.interrupt_states == [False, True]
+        assert ctx.state == "idle"
+
+    asyncio.run(go())
+
+
+def test_completed_lost_start_retires_checkpoint_before_following_turn():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _FollowedTurnStartDisconnectSdk()
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        checkpoint = _RecordingCheckpoint()
+        ctx.codex_checkpoint = checkpoint
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        turn = asyncio.create_task(
+            machine._run_turn(ctx, "do one non-idempotent task"))
+        ctx.turn_task = turn
+        for _ in range(100):
+            if ("cleanup", True) in checkpoint.calls:
+                break
+            await asyncio.sleep(0)
+
+        assert turn.done() is False
+        assert ctx.state == "running"
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert not [call for call in checkpoint.calls if call[0] == "finish"]
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+
+        sdk.settled.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+
+        assert ctx.state == "idle"
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+
+    asyncio.run(go())
+
+
+def test_completed_successor_cannot_be_folded_into_interrupted_checkpoint():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _CompletedSuccessorTurnStartDisconnectSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        checkpoint = _RecordingCheckpoint()
+        ctx.codex_checkpoint = checkpoint
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do one non-idempotent task"),
+            timeout=1.0,
+        )
+
+        assert ctx.state == "idle"
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert not [call for call in checkpoint.calls if call[0] == "finish"]
+        assert len([event for event in transport.sent
+                    if isinstance(event, UserMsg)]) == 1
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+
+    asyncio.run(go())
+
+
+def test_displaced_accepted_turn_quarantines_checkpoint_without_replay():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _DisplacedTurnStartDisconnectSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        checkpoint = _RecordingCheckpoint()
+        ctx.codex_checkpoint = checkpoint
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do one non-idempotent task"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.queries == [("do one non-idempotent task", [])]
+        assert ctx.state == "idle"
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert len([event for event in transport.sent
+                    if isinstance(event, UserMsg)]) == 1
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+
+    asyncio.run(go())
+
+
+def test_unknown_turn_start_stays_locked_until_authoritative_thread_idle():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _UnmatchedActiveTurnStartDisconnectSdk()
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        checkpoint = _RecordingCheckpoint()
+        ctx.codex_checkpoint = checkpoint
+        machine.sessions[ctx.key] = ctx
+        machine._schedule_history_refresh = lambda *_args, **_kwargs: None
+
+        turn = asyncio.create_task(
+            machine._run_turn(ctx, "do one non-idempotent task"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(sdk.first_probe.wait(), timeout=1.0)
+
+        assert turn.done() is False
+        assert ctx.state == "running"
+        assert sdk.queries == [("do one non-idempotent task", [])]
+        assert checkpoint.calls == [
+            ("begin", "browser-submit"),
+            ("cleanup", True),
+        ]
+        assert not [
+            event for event in transport.sent if isinstance(event, Error)
+        ]
+
+        sdk.settled.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+
+        assert ctx.state == "idle"
+        errors = [
+            event for event in transport.sent if isinstance(event, Error)
+        ]
+        assert len(errors) == 1
+        assert errors[0].msg_id == "browser-submit"
+        assert not [call for call in checkpoint.calls if call[0] == "abort"]
+
+    asyncio.run(go())
+
+
+def test_turn_start_lifecycle_during_checkpoint_quarantine_cannot_unlock():
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _TurnStartDisconnectSdk(accepted=False)
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+        quarantine_started = asyncio.Event()
+        release_quarantine = asyncio.Event()
+
+        async def delayed_quarantine(*_args, **_kwargs):
+            quarantine_started.set()
+            await release_quarantine.wait()
+
+        machine._retire_codex_checkpoint = delayed_quarantine
+        turn = asyncio.create_task(
+            machine._run_turn(ctx, "do one non-idempotent task"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(quarantine_started.wait(), timeout=1.0)
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "started", "successor-turn")
+        release_quarantine.set()
+        await asyncio.sleep(0.05)
+
+        assert turn.done() is False
+        assert ctx.state == "running"
+        assert ctx.codex_turn_start_reconciling is True
+        assert ctx.codex_deferred_turn_start_id == "successor-turn"
+        assert sdk.queries == [("do one non-idempotent task", [])]
+
+        await machine._on_codex_turn_lifecycle(
+            ctx, "completed", "successor-turn")
+        await asyncio.wait_for(turn, timeout=1.0)
+        assert ctx.state == "idle"
+        assert sdk.queries == [("do one non-idempotent task", [])]
+
+    asyncio.run(go())
+
+
+def test_turn_start_reconnect_failures_back_off_then_freeze_non_writable(
+    monkeypatch,
+):
+    async def go() -> None:
+        monkeypatch.setattr(
+            machine_module,
+            "CODEX_TURN_START_RECONCILE_DEADLINE_SECONDS",
+            0.04,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS",
+            0.002,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "CODEX_TURN_START_RECONNECT_BACKOFF_MAX_SECONDS",
+            0.01,
+        )
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _UnavailableTurnStartDisconnectSdk()
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-submit"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "one exactly-once task"),
+            timeout=1.0,
+        )
+
+        assert sdk.queries == [("one exactly-once task", [])]
+        assert 2 <= sdk.reconnects <= 8
+        assert ctx.state == "running"
+        assert ctx.write_state == "input_busy"
+        assert ctx.codex_turn_start_reconciling is True
+        assert ctx.active_msg_id == "browser-submit"
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert "没有重发" in errors[0].message
+        assert "重启本机 Wrapper" in errors[0].message
+
+        # Stop remains a safe escape hatch, but it cannot make the uncertain
+        # submission writable or cause a second model input.
+        await machine._handle_interrupt(SimpleNamespace(
+            sid="sid",
+            cmd_id="stop-frozen-recovery",
+            client_id="browser",
+        ))
+        assert sdk.interrupts == 1
+        assert sdk.queries == [("one exactly-once task", [])]
+        assert ctx.write_state == "input_busy"
+
+    asyncio.run(go())
+
+
+def test_unmarked_proxy_eof_after_daemon_upgrade_safe_stops_without_replay():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _UnexpectedProxyCloseSdk(
+            replacement_version="0.150.1")
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-upgrade-turn"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "unmarked"
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do one non-idempotent task"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.queries == [("do one non-idempotent task", [])]
+        assert ctx.state == "idle"
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].msg_id == "browser-upgrade-turn"
+        assert errors[0].message == (
+            "Codex 已自动更新，当前回合在更新时中断；为避免重复执行工具，"
+            "本次任务未自动重试。请确认已有结果后重新发送。"
+        )
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert ctx.sdk.effort == "high"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(go())
+
+
+def test_unmarked_proxy_close_without_version_change_reports_connection_loss():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _UnexpectedProxyCloseSdk(
+            replacement_version="0.149.0")
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-connection-turn"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "unmarked"
+        machine.sessions[ctx.key] = ctx
+
+        await asyncio.wait_for(
+            machine._run_turn(ctx, "do not replay me"),
+            timeout=1.0,
+        )
+
+        assert ctx.sdk.reconnects == 1
+        assert ctx.sdk.queries == [("do not replay me", [])]
+        errors = [event for event in transport.sent
+                  if isinstance(event, Error)]
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "Codex 共享通道意外断开；为避免重复执行工具，本次任务未自动重试。"
+            "请确认已有结果后重新发送。"
+        )
+        assert not [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
 
     asyncio.run(go())
 
@@ -2394,6 +3255,38 @@ def test_account_switch_continues_running_turn_before_queue_can_drain():
         )
 
     asyncio.run(asyncio.wait_for(go(), timeout=15.0))
+
+
+def test_account_switch_marker_wins_same_tick_proxy_close():
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _MarkerThenProxyCloseSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "logical-turn-a"
+        ctx.codex_checkpoint = False
+        machine.sessions[ctx.key] = ctx
+        ctx.sdk.restart_path = machine._codex_daemon_restart_path
+        await machine._stamp_codex_daemon_epoch(ctx)
+
+        turn = asyncio.create_task(machine._run_turn(ctx, "task A"))
+        await asyncio.wait_for(ctx.sdk.continuation_started.wait(), timeout=2.0)
+
+        assert ctx.sdk.reconnects == 1
+        assert len(ctx.sdk.queries) == 2
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+
+        ctx.sdk.finish_continuation.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.subtype == "success"
+
+    asyncio.run(asyncio.wait_for(go(), timeout=5.0))
 
 
 def test_account_switch_resumes_usage_limited_goal_without_competing_query():

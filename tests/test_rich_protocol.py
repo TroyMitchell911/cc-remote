@@ -21,20 +21,32 @@ from cc_remote.protocol import (
 
 
 @pytest.mark.parametrize("event", [
-    AssistantMsgStart(message_id="comment-1", channel="commentary"),
-    Delta(message_id="comment-1", channel="commentary", text="正在检查。"),
-    AssistantMsgEnd(message_id="comment-1", channel="commentary"),
+    AssistantMsgStart(
+        message_id="comment-1", turn_id="turn-1",
+        background=True, channel="commentary"),
+    Delta(
+        message_id="comment-1", turn_id="turn-1",
+        background=True, channel="commentary", text="正在检查。"),
+    AssistantMsgEnd(
+        message_id="comment-1", turn_id="turn-1",
+        background=True, channel="commentary"),
     ToolUse(
         message_id="comment-1",
         tool_use_id="command-1",
+        turn_id="turn-1",
+        background=True,
         tool="commandExecution",
         input={"command": "pytest -q"},
         category="command",
         title="运行测试",
     ),
-    ToolDelta(tool_use_id="command-1", stream="output", delta="ok\n"),
+    ToolDelta(
+        tool_use_id="command-1", turn_id="turn-1",
+        background=True, stream="output", delta="ok\n"),
     ToolResult(
         tool_use_id="command-1",
+        turn_id="turn-1",
+        background=True,
         content="ok\n",
         is_error=False,
         status="succeeded",

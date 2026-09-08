@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import resource
 import signal
 import shutil
 import stat
@@ -24,6 +25,8 @@ from typing import Any, Mapping, Optional
 from cc_remote.log import logger
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
+    ProcessIdentity,
+    process_identity,
     process_owner_uid,
 )
 
@@ -37,6 +40,12 @@ _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
 _DAEMON_UPGRADE_SETTLE_TIMEOUT = 5.0
 _DAEMON_UPGRADE_POLL_INTERVAL = 0.1
+_DAEMON_NOFILE_SOFT_LIMIT = 4096
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
+_PROC_ROOT = Path("/proc")
+_HIGH_NOFILE_DAEMON_OPERATIONS = frozenset({
+    "bootstrap", "enable-remote-control", "restart", "start",
+})
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -57,6 +66,21 @@ def codex_daemon_mode(value: Optional[str] = None) -> str:
 class CodexDaemonInfo:
     socket_path: Optional[str]
     verified_remote_control: bool = False
+    nofile_verified: bool = False
+
+
+@dataclass(frozen=True)
+class CodexSocketIdentity:
+    """A profile-scoped standalone listener generation, not a daemon PID."""
+
+    codex_home: str
+    socket_path: str
+    device: int
+    inode: int
+    created_ns: int
+
+
+CodexServerIdentity = ProcessIdentity | CodexSocketIdentity
 
 
 class CodexDaemonUpgradeRequired(RuntimeError):
@@ -78,9 +102,25 @@ def _run_command(
     argv: tuple[str, ...], env: Mapping[str, str], timeout: float,
 ) -> _CommandResult:
     """Blocking subprocess boundary, kept separate for deterministic tests."""
+    command_argv = argv
+    if os.name == "posix" and any(
+        argv[index:index + 2] == ("app-server", "daemon")
+        and argv[index + 2] in _HIGH_NOFILE_DAEMON_OPERATIONS
+        for index in range(max(0, len(argv) - 2))
+    ):
+        # The official lifecycle command launches the durable daemon.  Its
+        # resource limits are inherited at that boundary, so raising only this
+        # short-lived child also raises the managed daemon without changing the
+        # wrapper or unrelated user processes.
+        command_argv = (
+            sys.executable,
+            _RLIMIT_EXEC,
+            str(_DAEMON_NOFILE_SOFT_LIMIT),
+            *argv,
+        )
     try:
         result = subprocess.run(
-            argv,
+            command_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -283,7 +323,8 @@ def _managed_pid(path: Path) -> Optional[int]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
@@ -301,6 +342,145 @@ def _managed_pid(path: Path) -> Optional[int]:
     payload = _json_object(data)
     pid = payload.get("pid") if payload is not None else None
     return pid if isinstance(pid, int) and pid > 1 else None
+
+
+def _managed_daemon_process_identity(
+    codex_home: str | Path,
+) -> Optional[ProcessIdentity]:
+    """Return the exact same-user app-server generation from official state.
+
+    The durable updater keeps running while replacing its app-server child.
+    A per-client proxy can therefore remain superficially alive after the
+    socket generation it joined has gone away.  Pair the official bounded PID
+    record with the kernel process start token so PID reuse cannot make an old
+    proxy look current.
+    """
+    home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
+    pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return None
+    return process_identity(pid)
+
+
+def _standalone_socket_identity(
+    codex_home: str, socket_path: str,
+) -> Optional[CodexSocketIdentity]:
+    """Observe a private native listener without connecting or scanning PIDs.
+
+    A standalone app-server has no managed PID record. Its Unix listener is
+    replaced on restart, so inode/ctime changes fence old proxies just as a
+    PID/start-token change does for a managed daemon. Never substitute another
+    account's socket, follow a socket symlink, or accept a shared-writable path.
+    The proxy handshake still proves that the observed listener speaks Codex.
+    """
+    try:
+        home = Path(codex_home).resolve()
+        path = Path(socket_path)
+        if not path.is_absolute():
+            return None
+        parent = path.parent.resolve()
+        parent.relative_to(home)
+        parent_stat = parent.stat()
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != os.getuid()
+            or parent_stat.st_mode & 0o022
+            or not stat.S_ISSOCK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            return None
+        return CodexSocketIdentity(
+            str(home), str(parent / path.name),
+            info.st_dev, info.st_ino, info.st_ctime_ns,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _linux_process_start_ticks(pid: int) -> Optional[int]:
+    """Return one stable Linux process-generation token."""
+    try:
+        raw = (_PROC_ROOT / str(pid) / "stat").read_bytes()
+        end = raw.rfind(b") ")
+        if end < 0:
+            return None
+        fields = raw[end + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ensure_managed_daemon_nofile(
+    codex_bin: str,
+    env: Mapping[str, str],
+    lifecycle: Mapping[str, Any],
+) -> Optional[bool]:
+    """Raise and verify the actual managed Linux daemon's file limit.
+
+    The official lifecycle client can hand the detached process to the user's
+    systemd manager, which may replace the caller's inherited soft limit. A
+    high-limit launcher alone is therefore not evidence on Linux. Resolve the
+    exact same-user PID record, validate its executable/argv and process
+    generation, apply ``prlimit`` to that PID, then read it back.
+
+    ``None`` means this platform has no supported cross-process verification;
+    lifecycle commands still run through ``rlimit_exec`` so Darwin descendants
+    inherit the requested limit. ``False`` is a Linux verification failure and
+    callers must not advertise the managed daemon as ready.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    prlimit = getattr(resource, "prlimit", None)
+    if prlimit is None:
+        return False
+    codex_home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    daemon_root = Path(os.path.realpath(os.path.expanduser(codex_home))) / (
+        "app-server-daemon"
+    )
+    pid = _managed_pid(daemon_root / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return False
+    proc_root = _PROC_ROOT / str(pid)
+    before = _linux_process_start_ticks(pid)
+    if before is None:
+        return False
+    expected_path = _text(lifecycle.get("managedCodexPath")) or codex_bin
+    try:
+        executable = os.path.realpath(os.readlink(proc_root / "exe"))
+        expected_executable = os.path.realpath(expected_path)
+        raw_cmdline = (proc_root / "cmdline").read_bytes()
+    except OSError:
+        return False
+    argv = tuple(value for value in raw_cmdline.split(b"\0") if value)
+    if (
+        executable != expected_executable
+        or b"app-server" not in argv
+        or b"--remote-control" not in argv
+    ):
+        return False
+    try:
+        soft, hard = prlimit(pid, resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < _DAEMON_NOFILE_SOFT_LIMIT:
+            return False
+        if soft != resource.RLIM_INFINITY and soft < _DAEMON_NOFILE_SOFT_LIMIT:
+            prlimit(
+                pid,
+                resource.RLIMIT_NOFILE,
+                (_DAEMON_NOFILE_SOFT_LIMIT, hard),
+            )
+        verified_soft, _verified_hard = prlimit(pid, resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return False
+    after = _linux_process_start_ticks(pid)
+    return bool(
+        after == before
+        and (
+            verified_soft == resource.RLIM_INFINITY
+            or verified_soft >= _DAEMON_NOFILE_SOFT_LIMIT
+        )
+    )
 
 
 def _darwin_process_state(pid: int) -> Optional[str]:
@@ -514,6 +694,9 @@ class CodexDaemonManager:
         self._capable = False
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
+        self._ready_codex_home: Optional[str] = None
+        self._standalone_socket_path: Optional[str] = None
+        self._managed_identity_required = False
 
     @property
     def info(self) -> Optional[CodexDaemonInfo]:
@@ -534,6 +717,36 @@ class CodexDaemonManager:
         """Forget liveness after unexpected proxy EOF; keep help capability."""
         self._ready_identity = None
         self._ready = None
+        # Keep the profile-scoped home after the first verified connection so
+        # other resident handles can still compare their process generation.
+        # Clearing it here would make one proxy EOF look like a daemon swap to
+        # every healthy sibling handle and cause a reconnect cascade.
+
+    def current_process_identity(self) -> Optional[CodexServerIdentity]:
+        """Observe the discovered server generation (PID or native listener).
+
+        Keep this historical method name for handle/test manager compatibility.
+        Once a managed PID is observed, missing/unreadable PID state is an
+        outage, never permission to downgrade to standalone socket tracking.
+        invalidate() must preserve this barrier for healthy sibling handles.
+        """
+        home = self._ready_codex_home
+        if home is None:
+            return None
+        identity = _managed_daemon_process_identity(home)
+        if identity is not None:
+            self._managed_identity_required = True
+        if self._managed_identity_required or self._standalone_socket_path is None:
+            return identity
+        # Only a genuinely absent PID file permits the standalone identity.
+        # Broken symlinks, corrupt records and permission errors fail closed.
+        try:
+            (Path(home) / "app-server-daemon" / "app-server.pid").lstat()
+        except FileNotFoundError:
+            return _standalone_socket_identity(home, self._standalone_socket_path)
+        except OSError:
+            pass
+        return None
 
     async def _run(
         self, codex_bin: str, env: Mapping[str, str], *args: str,
@@ -674,6 +887,9 @@ class CodexDaemonManager:
         """Start and remotely enable the daemon, or return ``None`` for stdio."""
         if self.mode == "off":
             return None
+        codex_home = os.path.realpath(os.path.expanduser(
+            env.get("CODEX_HOME") or "~/.codex"
+        ))
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._ready_identity and self._ready is not None:
             return self._ready
@@ -743,6 +959,12 @@ class CodexDaemonManager:
                 log.info("using existing official Codex app-server candidate")
                 self._ready_identity = identity
                 self._ready = existing
+                self._ready_codex_home = codex_home
+                self._standalone_socket_path = (
+                    existing.socket_path
+                    if self.socket_path in {None, existing.socket_path}
+                    else None
+                )
                 return existing
 
             # Only a successful enable proves that this is the official managed
@@ -781,8 +1003,32 @@ class CodexDaemonManager:
                 log.warning(
                     "Codex daemon did not confirm remote control; using stdio")
                 return None
+            nofile_verified = await asyncio.to_thread(
+                _ensure_managed_daemon_nofile,
+                codex_bin,
+                env,
+                verified,
+            )
+            if nofile_verified is False:
+                self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon file limit could not be "
+                        "verified"
+                    )
+                log.warning(
+                    "Codex daemon file limit unavailable; using stdio")
+                return None
+            info = CodexDaemonInfo(
+                socket_path=info.socket_path,
+                verified_remote_control=info.verified_remote_control,
+                nofile_verified=nofile_verified is True,
+            )
             self._ready_identity = identity
             self._ready = info
+            self._ready_codex_home = codex_home
+            self._managed_identity_required = True
+            self._standalone_socket_path = None
             return info
 
     async def proxy_args(

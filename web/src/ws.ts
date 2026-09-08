@@ -8,7 +8,8 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
+  AutoCompactMode, DiffTheme, GoalStatus, QueryFile,
+  QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
 import {
   compareSessionControl,
@@ -19,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   sessionControlTargetsSid,
 } from "./protocol.ts";
+import { validAutoCompactThreshold } from "./auto-compact.ts";
 import {
   CommandOutbox,
   QueryAcceptanceLatch,
@@ -37,6 +39,7 @@ export interface EventOwnership {
   machineId: string;
   engine: "claude" | "codex";
   space: Space;
+  claudeProfileId?: string | null;
   codexProfileId?: string | null;
   surfaceEpoch: number;
   connectionGeneration: number;
@@ -79,6 +82,16 @@ const MAX_REPLAY_SESSIONS = 128;
 const PROTOCOL_RELOAD_KEY = "cc-remote:protocol-reload";
 const PROTOCOL_RECOVERY_POLL_MS = 1000;
 const PROTOCOL_RECOVERY_TIMEOUT_MS = 120000;
+let pageClientId: string | null = null;
+
+/** A page-lifetime connection identity. Durable BTW ownership is derived from
+ * authenticated relay claims, so duplicated tabs must never reuse this id and
+ * replace one another's WebSocket generation.
+ */
+export function stableTabClientId(): string {
+  pageClientId ??= uuid();
+  return pageClientId;
+}
 
 function readProtocolReloadMarker(): string | null | undefined {
   try {
@@ -157,6 +170,7 @@ export class RelayWs {
   private replayOrder: string[] = [];
   private engineBySession: Record<string, "claude" | "codex"> = {};
   private spaceBySession: Record<string, Space> = {};
+  private claudeProfileBySession: Record<string, string> = {};
   private codexProfileBySession: Record<string, string> = {};
   private focusedSid: string | null = null;
   private activeEngine: "claude" | "codex" = "claude";
@@ -204,11 +218,13 @@ export class RelayWs {
   private pingSeq = 0;
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
+  private readonly knownBtwSids = new Set<string>();
+  private readonly previewReadAttempts = new Map<string, { authorizationId: string; commandId: string }>();
 
   constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
     this.machineId = machineId;
-    this.clientId = uuid();
+    this.clientId = stableTabClientId();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = new URL(`${proto}//${window.location.host}/ws`);
     if (machineId !== "default") url.searchParams.set("machine", machineId);
@@ -302,6 +318,7 @@ export class RelayWs {
   }
 
   private dropBtwReplayState(): void {
+    this.knownBtwSids.clear();
     for (const knownSid of Object.keys(this.generationBySession)) {
       if (!knownSid.startsWith("btw-")) continue;
       delete this.generationBySession[knownSid];
@@ -480,6 +497,7 @@ export class RelayWs {
     session_id: string;
     engine?: string | null;
     space?: Space | null;
+    claude_profile_id?: string | null;
     codex_profile_id?: string | null;
   }>): void {
     for (const session of sessions) {
@@ -493,12 +511,17 @@ export class RelayWs {
         this.codexProfileBySession[session.session_id] =
           session.codex_profile_id;
       }
+      if (session.claude_profile_id) {
+        this.claudeProfileBySession[session.session_id] =
+          session.claude_profile_id;
+      }
     }
   }
 
   private ownershipSnapshot(
     engine = this.activeEngine, space = this.activeSpace,
     codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): EventOwnership {
     const scopeKey = sessionScopeKey(this.machineId, engine, space);
     return {
@@ -506,6 +529,7 @@ export class RelayWs {
       machineId: this.machineId,
       engine,
       space,
+      claudeProfileId: engine === "claude" ? (claudeProfileId ?? null) : null,
       codexProfileId: engine === "codex" ? (codexProfileId ?? null) : null,
       surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
       connectionGeneration: this.connectionGeneration,
@@ -574,8 +598,23 @@ export class RelayWs {
     });
     return queued ? requestId : null;
   }
-  sendCloseBtw(btwSid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
+  sendCloseBtw(btwSid: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs(),
+    });
+  }
+
+  sendSyncBtw(btwSid: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "sync_btw",
+      sid: btwSid,
+      cursor: this.lastSeqFor(btwSid),
+      ts: nowTs(),
+    };
+    const generation = this.generationFor(btwSid);
+    if (generation) command.generation = generation;
+    return this.send(command);
   }
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
@@ -741,6 +780,42 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
+  sendSetAutoCompact(
+    mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+      ...this.sidObj(),
+    });
+  }
+
+  sendSetAutoCompactTo(
+    sid: string, mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      sid,
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+    });
+  }
+
   sendSetServiceTier(service_tier: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj() });
   }
@@ -786,14 +861,17 @@ export class RelayWs {
     });
   }
 
-  sendGetContext(): string | null {
+  sendGetContext(refresh = false): string | null {
     return this.sendTracked({
-      v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
+      v: PROTOCOL_VERSION, type: "get_context", refresh,
+      ts: nowTs(), ...this.sidObj(),
     });
   }
 
-  sendGetContextTo(sid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
+  sendGetContextTo(sid: string, refresh = false): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_context", sid, refresh, ts: nowTs(),
+    });
   }
 
   sendGetDiff(file: string, theme: DiffTheme): string | null {
@@ -851,7 +929,15 @@ export class RelayWs {
     decision: "allow" | "deny",
     targetSid?: string | null,
   ): string | null {
-    return this.sendTracked({
+    const key = JSON.stringify([this.sidObj(targetSid).sid ?? null, requestId]);
+    const previous = this.previewReadAttempts.get(key);
+    // Automatic read handshakes must not loop if a producer keeps atomically
+    // replacing the file. Same challenge is idempotent; a changed challenge
+    // requires a fresh read request (e.g. the existing Refresh action).
+    if (decision === "allow" && previous) {
+      return previous.authorizationId === authorizationId ? previous.commandId : null;
+    }
+    const commandId = this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "authorize_preview",
       authorization_id: authorizationId,
@@ -860,6 +946,13 @@ export class RelayWs {
       ts: nowTs(),
       ...this.sidObj(targetSid),
     });
+    if (commandId && decision === "allow") {
+      this.previewReadAttempts.set(key, { authorizationId, commandId });
+      if (this.previewReadAttempts.size > 256) {
+        this.previewReadAttempts.delete(this.previewReadAttempts.keys().next().value!);
+      }
+    }
+    return commandId;
   }
 
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains
@@ -894,6 +987,22 @@ export class RelayWs {
     return this.send(frame);
   }
 
+  sendGetAgentDetail(
+    sessionId: string, runId: string, revision?: string | null,
+    detailRevision?: string | null, before?: string | null, limit = 192,
+    requestId = uuid(),
+  ): string | null {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_agent_detail",
+      session_id: sessionId, run_id: runId, request_id: requestId,
+      client_id: this.clientId, limit, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    if (detailRevision) frame.detail_revision = detailRevision;
+    if (before) frame.before = before;
+    return this.send(frame) ? requestId : null;
+  }
+
   sendGetHistoryImage(
     sessionId: string,
     turnId: string,
@@ -917,6 +1026,7 @@ export class RelayWs {
     engine: "cc" | "claude" | "codex",
     cwd?: string | null,
     codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): void {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_models", engine,
@@ -926,13 +1036,17 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
     }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     this.send(frame);
   }
 
   sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
                             cwd?: string | null,
                             skillsOnly = false,
-                            codexProfileId?: string | null): string | null {
+                            codexProfileId?: string | null,
+                            claudeProfileId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
       client_id: this.clientId, skills_only: skillsOnly, ts: nowTs(),
@@ -941,13 +1055,17 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
     }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
   sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
                          action: "install" | "uninstall", pluginId: string,
                          cwd?: string | null,
-                         codexProfileId?: string | null): string | null {
+                         codexProfileId?: string | null,
+                         claudeProfileId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
       action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
@@ -955,6 +1073,9 @@ export class RelayWs {
     if (cwd) frame.cwd = cwd;
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
     }
     return this.sendTracked(frame);
   }
@@ -968,6 +1089,7 @@ export class RelayWs {
     },
     cwd?: string | null,
     codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
@@ -982,6 +1104,9 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
     }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
@@ -994,6 +1119,7 @@ export class RelayWs {
     },
     cwd?: string | null,
     codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
@@ -1008,6 +1134,9 @@ export class RelayWs {
     if (cwd) frame.cwd = cwd;
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
     }
     return this.sendTracked(frame);
   }
@@ -1061,6 +1190,20 @@ export class RelayWs {
     return this.sendTracked({
       v: PROTOCOL_VERSION, type: "get_status", sid,
       client_id: this.clientId, ts: nowTs(),
+    });
+  }
+
+  sendConsumeRateLimitResetCredit(
+    sid: string,
+    creditId?: string | null,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "consume_rate_limit_reset_credit",
+      sid,
+      client_id: this.clientId,
+      ...(creditId ? { credit_id: creditId } : {}),
+      ts: nowTs(),
     });
   }
 
@@ -1187,6 +1330,10 @@ export class RelayWs {
         ? this.codexProfileBySession[sessionId]
           ?? this.ownershipBySession[sessionId]?.codexProfileId
         : null,
+      targetEngine === "claude"
+        ? this.claudeProfileBySession[sessionId]
+          ?? this.ownershipBySession[sessionId]?.claudeProfileId
+        : null,
     );
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
@@ -1205,15 +1352,26 @@ export class RelayWs {
                  webSearch?: "cached" | "live",
                  serviceTier?: "default" | "fast",
                  space: Space = "code", projectId?: string | null,
-                 codexProfileId?: string | null): boolean {
+                 codexProfileId?: string | null,
+                 autoCompact?: {
+                   mode: AutoCompactMode;
+                   thresholdTokens?: number | null;
+                 },
+                 claudeProfileId?: string | null): boolean {
+    const targetEngine = engine ?? "claude";
+    if (targetEngine === "claude" && autoCompact?.mode === "custom"
+        && !validAutoCompactThreshold(autoCompact.thresholdTokens)) {
+      return false;
+    }
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
-    this.newSessionEngine = engine ?? "claude";
+    this.newSessionEngine = targetEngine;
     this.newSessionSpace = space;
     const ownership = this.ownershipSnapshot(
       this.newSessionEngine,
       this.newSessionSpace,
       this.newSessionEngine === "codex" ? codexProfileId : null,
+      this.newSessionEngine === "claude" ? claudeProfileId : null,
     );
     this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
@@ -1224,10 +1382,19 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       obj.codex_profile_id = codexProfileId;
     }
+    if (targetEngine === "claude" && claudeProfileId) {
+      obj.claude_profile_id = claudeProfileId;
+    }
     if (space !== "code") obj.space = space;
     if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
     if (effort) obj.effort = effort;
+    if (targetEngine === "claude" && autoCompact) {
+      obj.auto_compact_mode = autoCompact.mode;
+      if (autoCompact.mode === "custom") {
+        obj.auto_compact_threshold_tokens = autoCompact.thresholdTokens;
+      }
+    }
     if (engine === "codex" && collaborationMode) {
       obj.collaboration_mode = collaborationMode;
     }
@@ -1316,10 +1483,10 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendCompactSession(sessionId: string): boolean {
+  sendCompactSession(sessionId: string, engine: "claude" | "codex"): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,
-      engine: "codex", space: "code", ts: nowTs(),
+      engine, space: "code", ts: nowTs(),
     });
   }
 
@@ -1393,7 +1560,8 @@ export class RelayWs {
   sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
                          prompt: string, nextRunAt: number,
                          repeatSeconds?: number, projectId?: string,
-                         codexProfileId?: string): boolean {
+                         codexProfileId?: string,
+                         claudeProfileId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
       title, prompt, next_run_at: nextRunAt, ts: nowTs(),
@@ -1402,6 +1570,9 @@ export class RelayWs {
     if (projectId) command.project_id = projectId;
     if (engine === "codex" && codexProfileId) {
       command.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      command.claude_profile_id = claudeProfileId;
     }
     return this.send(command);
   }
@@ -1522,6 +1693,30 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        // A BtwSync can be the first proof of a replacement Wrapper when this
+        // browser slept through wrapper_reconnected. Invalidate the old
+        // generation before installing the new catalog; doing this afterward
+        // would immediately clear the ids below and drop their SyncBtw replay.
+        if (msg.type === "btw_sync") {
+          this.noteWrapperGeneration(msg.generation);
+        }
+        // The lightweight owner catalog establishes which private routing keys
+        // this account may consume. A live BTW frame can race ahead of Hello's
+        // catalog response; drop it without advancing its cursor so SyncBtw can
+        // recover that exact suffix after the catalog arrives.
+        if (msg.type === "btw_sync") {
+          this.knownBtwSids.clear();
+          for (const session of msg.sessions) {
+            this.knownBtwSids.add(session.btw_sid);
+          }
+        } else if (msg.type === "btw_opened") {
+          this.knownBtwSids.add(msg.btw_sid);
+        } else if (msg.type === "btw_closed") {
+          this.knownBtwSids.delete(msg.btw_sid);
+        } else if (msg.sid?.startsWith("btw-")
+            && !this.knownBtwSids.has(msg.sid)) {
+          return;
+        }
         if (msg.type === "session_list_invalidated") {
           this.refreshInvalidatedSessionList(
             msg.engine, msg.space ?? "code", socketGeneration);
@@ -1614,6 +1809,11 @@ export class RelayWs {
             for (const session of msg.sessions) {
               const sessionOwnership: EventOwnership = {
                 ...listedOwnership,
+                claudeProfileId: msg.engine === "claude"
+                  ? session.claude_profile_id
+                    ?? msg.default_claude_profile_id
+                    ?? null
+                  : null,
                 codexProfileId: msg.engine === "codex"
                   ? session.codex_profile_id
                     ?? msg.default_codex_profile_id
@@ -1625,6 +1825,10 @@ export class RelayWs {
               if (session.codex_profile_id) {
                 this.codexProfileBySession[session.session_id] =
                   session.codex_profile_id;
+              }
+              if (session.claude_profile_id) {
+                this.claudeProfileBySession[session.session_id] =
+                  session.claude_profile_id;
               }
               this.ownershipBySession[session.session_id] = sessionOwnership;
             }
@@ -1675,6 +1879,10 @@ export class RelayWs {
             this.codexProfileBySession[msg.session_id] =
               ownership.codexProfileId;
           }
+          if (ownership?.claudeProfileId) {
+            this.claudeProfileBySession[msg.session_id] =
+              ownership.claudeProfileId;
+          }
           if (ownership) this.ownershipBySession[msg.session_id] = ownership;
           this.touchReplay(msg.session_id);
           this.cb.onEvent(
@@ -1716,6 +1924,12 @@ export class RelayWs {
               this.spaceBySession[session_id] = this.spaceBySession[old_key];
             }
             delete this.spaceBySession[old_key];
+            if (this.claudeProfileBySession[old_key]
+                && !this.claudeProfileBySession[session_id]) {
+              this.claudeProfileBySession[session_id] =
+                this.claudeProfileBySession[old_key];
+            }
+            delete this.claudeProfileBySession[old_key];
             if (this.codexProfileBySession[old_key]
                 && !this.codexProfileBySession[session_id]) {
               this.codexProfileBySession[session_id] =

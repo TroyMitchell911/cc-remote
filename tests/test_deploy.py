@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import re
 import sqlite3
+import stat
 import subprocess
 
 import pytest
@@ -30,6 +31,7 @@ from deploy.work_registry_snapshot import (
     WorkRegistrySnapshotError,
     create_snapshot,
     resolve_work_roots,
+    resolve_wrapper_state_dir,
     restore_snapshot,
     verify_profile_migration,
 )
@@ -87,6 +89,22 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
             assert not _contains_asyncio_run(node), (
                 f"{path.name} starts a live run while being imported"
             )
+
+
+def test_repository_deployment_contract_is_the_agent_entrypoint():
+    agents = (ROOT / "AGENTS.md").read_text()
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
+    normalized = " ".join(deploy_readme.split())
+
+    assert "[`deploy/README.md`](deploy/README.md)" in agents
+    assert "out-of-tree instructions" in agents
+    assert "## Deployment contract for automation" in deploy_readme
+    assert "never guess them" in normalized
+    assert "Freeze those tested bytes once" in normalized
+    assert "unknown result" in normalized
+    assert "Never start a second installer" in normalized
+    assert "must not be its own only deployment controller" in normalized
+    assert "stable PIDs without restart loops" in normalized
 
 
 def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
@@ -210,7 +228,8 @@ def test_insecure_caddy_template_is_explicit_http_without_tls_headers():
     assert "ws://cc-remote.example.com" in source
     assert "reverse_proxy 127.0.0.1:8765" in source
     assert "Strict-Transport-Security" not in source
-    assert "https://" not in source
+    # HTTPS-only remote images do not make the application site use TLS.
+    assert "https://cc-remote.example.com" not in source
 
 
 def test_deploy_examples_configure_insecure_flag_on_both_sides():
@@ -297,27 +316,122 @@ def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
     assert not Path(f"{codex_database}-shm").exists()
 
 
-def test_work_registry_migration_verifier_rejects_unowned_codex_rows(tmp_path):
+def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
     roots = {
         "claude": tmp_path / "claude-work",
         "codex": tmp_path / "codex-work",
     }
-    roots["codex"].mkdir()
-    database_path = roots["codex"] / "registry.sqlite3"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    original = b'{"version":2,"sessions":{}}\n'
+    controls.write_bytes(original)
+    controls.chmod(0o600)
+
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    controls.write_bytes(b'{"version":3,"sessions":{"new":{}}}\n')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert controls.read_bytes() == original
+    assert stat.S_IMODE(controls.stat().st_mode) == 0o600
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    assert manifest["version"] == 3
+    assert manifest["wrapper_state"]["files"][controls.name]["exists"] is True
+
+
+def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert not controls.exists()
+
+
+def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o644)
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="private bounded file",
+    ):
+        create_snapshot(
+            tmp_path / "snapshot", roots, state_dir=state_dir)
+
+
+def test_release_snapshot_rejects_boolean_manifest_version(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = True
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="unsupported wrapper data snapshot",
+    ):
+        restore_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_work_registry_migration_verifier_rejects_unowned_profile_rows(
+    tmp_path, engine,
+):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    for candidate, root in roots.items():
+        root.mkdir()
+        profile_column = f"{candidate}_profile_id"
+        with sqlite3.connect(root / "registry.sqlite3") as database:
+            database.executescript(
+                f"""
+                CREATE TABLE work_sessions (
+                    engine TEXT NOT NULL,
+                    {profile_column} TEXT
+                );
+                CREATE TABLE work_schedules ({profile_column} TEXT);
+                CREATE TABLE work_schedule_runs ({profile_column} TEXT);
+                INSERT INTO work_sessions VALUES ('{candidate}', 'primary');
+                INSERT INTO work_schedules VALUES ('primary');
+                INSERT INTO work_schedule_runs VALUES ('primary');
+                """
+            )
+    database_path = roots[engine] / "registry.sqlite3"
+    profile_column = f"{engine}_profile_id"
     with sqlite3.connect(database_path) as database:
-        database.executescript(
-            """
-            CREATE TABLE work_sessions (
-                engine TEXT NOT NULL,
-                codex_profile_id TEXT
-            );
-            CREATE TABLE work_schedules (codex_profile_id TEXT);
-            CREATE TABLE work_schedule_runs (codex_profile_id TEXT);
-            INSERT INTO work_sessions VALUES ('codex', NULL);
-            INSERT INTO work_schedules VALUES (NULL);
-            INSERT INTO work_schedule_runs VALUES (NULL);
-            """
-        )
+        database.execute(
+            f"UPDATE work_sessions SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedules SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedule_runs SET {profile_column} = NULL")
     snapshot = tmp_path / "snapshot"
     create_snapshot(snapshot, roots)
 
@@ -329,13 +443,13 @@ def test_work_registry_migration_verifier_rejects_unowned_codex_rows(tmp_path):
 
     with sqlite3.connect(database_path) as database:
         database.execute(
-            "UPDATE work_sessions SET codex_profile_id = 'primary'"
+            f"UPDATE work_sessions SET {profile_column} = 'primary'"
         )
         database.execute(
-            "UPDATE work_schedules SET codex_profile_id = 'primary'"
+            f"UPDATE work_schedules SET {profile_column} = 'primary'"
         )
         database.execute(
-            "UPDATE work_schedule_runs SET codex_profile_id = 'primary'"
+            f"UPDATE work_schedule_runs SET {profile_column} = 'primary'"
         )
     verify_profile_migration(snapshot)
 
@@ -347,11 +461,13 @@ def test_work_registry_roots_are_read_without_executing_service_config(tmp_path)
     env_file.write_text(
         f'CLAUDE_WORK_ROOT="{tmp_path / "Claude Work"}"\n'
         f"CODEX_WORK_ROOT={tmp_path / 'codex-env'}\n"
+        f"CC_REMOTE_STATE_DIR={tmp_path / 'state-env'}\n"
     )
     plist = tmp_path / "wrapper.plist"
     plist.write_bytes(plistlib.dumps({
         "EnvironmentVariables": {
             "CODEX_WORK_ROOT": str(tmp_path / "Codex Work"),
+            "CC_REMOTE_STATE_DIR": str(tmp_path / "State Dir"),
         },
     }))
 
@@ -361,6 +477,9 @@ def test_work_registry_roots_are_read_without_executing_service_config(tmp_path)
         "claude": (tmp_path / "Claude Work").resolve(),
         "codex": (tmp_path / "Codex Work").resolve(),
     }
+    assert resolve_wrapper_state_dir(
+        home, env_file=env_file, plist=plist,
+    ) == (tmp_path / "State Dir").resolve()
 
 
 @pytest.mark.parametrize("destination_exists", [False, True])
@@ -661,7 +780,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v35_layout():
+def test_release_docs_and_examples_describe_one_atomic_v55_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -674,11 +793,12 @@ def test_release_docs_and_examples_describe_one_atomic_v35_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v35" in deploy_readme
-    assert "v34 Codex ownership backfill" in deploy_readme
+    assert "Protocol v55" in deploy_readme
+    assert "both engines' Work ownership backfills" in deploy_readme
+    assert "Snapshot format v3" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v35" in document
+        assert "v55" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -689,11 +809,15 @@ def test_release_docs_and_examples_describe_one_atomic_v35_layout():
     assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
     assert "CC_REMOTE_CODEX_PROFILES_JSON" in wrapper_env
     assert "CC_REMOTE_CODEX_PROFILES_FILE" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_JSON" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_FILE" in wrapper_env
     assert "Codex Work uses only that default" not in wrapper_env
     assert "Work 只使用默认项" not in readme
     assert "Work uses only the default" not in readme_en
     assert "<key>CC_REMOTE_CODEX_PROFILES_FILE</key>" in wrapper_plist
     assert "__HOME__/.cc-remote/codex-profiles.json" in wrapper_plist
+    assert "<key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>" in wrapper_plist
+    assert "__HOME__/.cc-remote/claude-profiles.json" in wrapper_plist
     assert "<key>CLAUDE_WORK_ROOT</key>" in wrapper_plist
     assert "<string>__CLAUDE_WORK_ROOT__</string>" in wrapper_plist
     assert "<key>CODEX_WORK_ROOT</key>" in wrapper_plist
@@ -710,12 +834,15 @@ def test_release_docs_and_examples_describe_one_atomic_v35_layout():
     restart = wrapper_installer.index("if ! restart_after_rollback")
     assert snapshot < activate
     assert restore < restart
-    assert "Codex Work profile migration did not become ready" in wrapper_installer
+    assert (
+        "Claude/Codex Work profile migrations did not become ready"
+        in wrapper_installer
+    )
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
-    assert "claude-agent-sdk==0.2.128" in claude
-    assert "protocol v35" in claude
+    assert "claude-agent-sdk==0.2.151" in claude
+    assert "protocol v55" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 
@@ -897,6 +1024,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
         "not path /html-preview-runner.html /html-preview-runner.js"
         in source
     )
+    assert "not path /html-preview-runner.html /html-preview-runner.js /__cc_viewer/bridge/*" in source
     assert (
         "@html_preview path /html-preview-runner.html /html-preview-runner.js"
         in source
@@ -938,3 +1066,39 @@ def test_caddy_image_policy_allows_only_image_blob_urls(template):
         for name, sources in directives.items()
         if name != "img-src"
     )
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_caddy_github_image_allowlist_does_not_relax_other_capabilities(template):
+    source = (ROOT / "deploy" / template).read_text()
+    policies = re.findall(r'Content-Security-Policy "([^"]+)"', source)
+    assert len(policies) == 2
+    application, preview = (
+        {
+            parts[0]: set(parts[1:])
+            for directive in policy.split(";")
+            if (parts := directive.strip().split())
+        }
+        for policy in policies
+    )
+    github_images = {
+        "https://github.com/user-attachments/assets/",
+        "https://raw.githubusercontent.com",
+        "https://user-images.githubusercontent.com",
+        "https://private-user-images.githubusercontent.com",
+        "https://camo.githubusercontent.com",
+        "https://avatars.githubusercontent.com",
+        "https://github-production-user-asset-6210df.s3.amazonaws.com",
+    }
+    assert application["img-src"] == {"'self'", "data:", "blob:"} | github_images
+    for directive, sources in application.items():
+        if directive != "img-src":
+            assert sources.isdisjoint(github_images)
+    assert application["script-src"] == {"'self'"}
+    ws_scheme = "ws" if template.endswith(".insecure") else "wss"
+    assert application["connect-src"] == {
+        "'self'", f"{ws_scheme}://cc-remote.example.com",
+    }
+    assert application["frame-src"] == {"'self'"}
+    assert preview["img-src"] == {"data:", "blob:"}
+    assert preview["connect-src"] == {"'none'"}

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Any, Iterable, Optional
 
 from cc_remote.log import logger
@@ -45,6 +46,9 @@ _LIST_MAX_PAGES = 20
 _THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
 _STATE_DB = re.compile(r"^state_(\d+)\.sqlite$")
 CODEX_EXACT_CATALOG_MAX_IDS = 512
+CODEX_THREAD_PARENT_SCAN_MAX_ROWS = 10_000
+CODEX_THREAD_PARENT_MAX_IDS = 4_096
+CODEX_THREAD_SOURCE_MAX_BYTES = 64 * 1024
 _EXACT_CATALOG_COLUMNS = (
     "id",
     "cwd",
@@ -115,9 +119,9 @@ async def list_codex_sessions(
     for archived in (False, True):
         cursor: Optional[str] = None
         seen_cursors: set[str] = set()
-        received = 0
+        accepted_ids: set[str] = set()
         for _ in range(_LIST_MAX_PAGES):
-            remaining = per_state_limit - received
+            remaining = per_state_limit - len(accepted_ids)
             if remaining <= 0:
                 break
             params: dict[str, Any] = {
@@ -142,11 +146,11 @@ async def list_codex_sessions(
             if not isinstance(response, dict) or not isinstance(response.get("data"), list):
                 raise RuntimeError("codex thread/list returned an invalid response")
             page = response["data"][:remaining]
-            received += len(page)
             for thread in page:
                 normalized = _normalize_thread(thread, archived=archived)
                 if normalized is not None:
                     by_id[normalized["session_id"]] = normalized
+                    accepted_ids.add(normalized["session_id"])
 
             next_cursor = response.get("nextCursor")
             if not isinstance(next_cursor, str) or not next_cursor:
@@ -164,6 +168,11 @@ async def list_codex_sessions(
 
 def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]]:
     if not isinstance(thread, dict):
+        return None
+    # Ephemeral threads are native scratch state (including cc-remote /btw and
+    # Codex subagent work), not resumable user sessions. Never project them into
+    # the public catalog even if a shared app-server briefly lists them.
+    if thread.get("ephemeral") is True:
         return None
     session_id = thread.get("id")
     if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(session_id):
@@ -293,6 +302,53 @@ def _state_db_path(
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def codex_thread_rollout_record(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[tuple[str, bool]]:
+    """Read one exact catalog rollout path and archived bit.
+
+    ``None`` preserves uncertainty: callers must not guess that a missing or
+    unreadable row is profile-local.  In particular, copied ``CODEX_HOME``
+    databases can retain absolute rollout paths into their former home.
+    """
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(
+        session_id
+    ):
+        return None
+    db_path = _state_db_path(codex_home)
+    if db_path is None:
+        return None
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            schema = {
+                row[1]
+                for row in connection.execute('PRAGMA table_info("threads")')
+                if isinstance(row[1], str)
+            }
+            if not {"id", "rollout_path", "archived"}.issubset(schema):
+                return None
+            row = connection.execute(
+                'SELECT "rollout_path", "archived" FROM "threads" '
+                'WHERE "id"=? LIMIT 1',
+                (session_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if (
+        row is None
+        or not isinstance(row[0], str)
+        or not row[0]
+        or len(os.fsencode(row[0])) > 16 * 1024
+        or not isinstance(row[1], int)
+        or row[1] not in (0, 1)
+    ):
+        return None
+    return row[0], bool(row[1])
+
+
 def codex_session_presence(
     session_id: str,
     *,
@@ -320,6 +376,299 @@ def codex_session_presence(
     except (OSError, sqlite3.Error):
         return None
     return row is not None
+
+
+def codex_thread_archive_states(
+    session_ids: Iterable[str],
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[dict[str, bool]]:
+    """Read exact archived bits inside one already-selected account home.
+
+    Unlike sidebar rows, commit reconciliation must not filter by the current
+    model provider: a historical thread can retain its original provider while
+    still being owned and mutated by this exact ``CODEX_HOME`` app-server.
+    Missing ids are omitted; ``None`` means the database could not prove state.
+    """
+    unique_ids: list[str] = []
+    seen: set[str] = set()
+    for value in session_ids:
+        if not isinstance(value, str) or not _SAFE_SESSION_ID.fullmatch(value):
+            return None
+        if value in seen:
+            continue
+        seen.add(value)
+        unique_ids.append(value)
+        # Exact-state callers use this read as a commit boundary.  Silently
+        # truncating a larger tree would make an unverified descendant look as
+        # though it did not exist, so fail closed instead.
+        if len(unique_ids) > CODEX_EXACT_CATALOG_MAX_IDS:
+            return None
+    if not unique_ids:
+        return {}
+    db_path = _state_db_path(codex_home)
+    if db_path is None:
+        return None
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            schema = {
+                row[1]
+                for row in connection.execute('PRAGMA table_info("threads")')
+                if isinstance(row[1], str)
+            }
+            if not {"id", "archived"}.issubset(schema):
+                return None
+            placeholders = ",".join("?" for _ in unique_ids)
+            records = connection.execute(
+                f'SELECT "id", "archived" FROM "threads" '
+                f'WHERE "id" IN ({placeholders})',
+                unique_ids,
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+    states: dict[str, bool] = {}
+    for session_id, archived in records:
+        if (
+            isinstance(session_id, str)
+            and session_id in seen
+            and isinstance(archived, int)
+            and archived in (0, 1)
+        ):
+            states[session_id] = bool(archived)
+    return states
+
+
+def _catalog_rollout_fork_parent(
+    thread_id: str,
+    rollout_path: object,
+    archived: object,
+    *,
+    codex_home: str | os.PathLike[str] | None,
+) -> tuple[bool, str | None]:
+    """Read one immutable parent edge from a profile-local catalog rollout.
+
+    The catalog path, archive bit, regular-file identity, first JSONL record,
+    and embedded thread id must all agree. ``False`` preserves uncertainty so
+    destructive tree callers fail closed instead of silently dropping an edge.
+    """
+    if (
+        not isinstance(rollout_path, str)
+        or not rollout_path
+        or len(os.fsencode(rollout_path)) > 16 * 1024
+        or not isinstance(archived, int)
+        or archived not in (0, 1)
+    ):
+        return False, None
+    expanded = os.path.expanduser(rollout_path)
+    if not os.path.isabs(expanded):
+        return False, None
+    expected_root = os.path.realpath(_session_roots(codex_home)[archived])
+    resolved = os.path.realpath(expanded)
+    try:
+        if os.path.commonpath((expected_root, resolved)) != expected_root:
+            return False, None
+        before = os.lstat(expanded)
+    except (OSError, ValueError):
+        return False, None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        return False, None
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(expanded, flags)
+    except OSError:
+        return False, None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            return False, None
+        chunks: list[bytes] = []
+        received = 0
+        newline = False
+        while received <= MAX_META_RECORD_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_META_RECORD_BYTES + 1 - received),
+            )
+            if not chunk:
+                break
+            marker = chunk.find(b"\n")
+            if marker >= 0:
+                chunks.append(chunk[:marker + 1])
+                received += marker + 1
+                newline = True
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+        try:
+            current = os.lstat(expanded)
+        except OSError:
+            return False, None
+        if (
+            (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            or not newline
+            or received > MAX_META_RECORD_BYTES
+        ):
+            return False, None
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        return False, None
+    if not isinstance(record, dict):
+        return False, None
+    payload = record.get("payload")
+    if record.get("type") != "session_meta" or not isinstance(payload, dict):
+        return False, None
+    if payload.get("id") != thread_id:
+        return False, None
+    # Recent multi-agent rollouts use ``session_id`` as the shared tree/session
+    # identity while ``id`` remains the exact native thread identity.  It is
+    # therefore validated as a bounded id, but must not be equated to the row.
+    session_id = payload.get("session_id")
+    if session_id is not None and (
+        not isinstance(session_id, str)
+        or not _SAFE_SESSION_ID.fullmatch(session_id)
+    ):
+        return False, None
+    parent_id = payload.get("forked_from_id")
+    if parent_id is None:
+        return True, None
+    if (
+        not isinstance(parent_id, str)
+        or not _SAFE_SESSION_ID.fullmatch(parent_id)
+        or parent_id == thread_id
+    ):
+        return False, None
+    return True, parent_id
+
+
+def codex_thread_parent_maps(
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[tuple[dict[str, str], dict[str, str]]]:
+    """Return ``(all parents, ordinary fork parents)`` for one account.
+
+    ``thread/list`` and ``thread/read`` can omit fork ancestry. Background
+    subagents persist it in the app-server ``source`` JSON, while ordinary
+    forks persist ``forked_from_id`` in the profile-local rollout's immutable
+    session metadata. Callers combine both sources; ``None`` means the local
+    catalog could not prove a complete bounded projection.
+    """
+    db_path = _state_db_path(codex_home)
+    if db_path is None:
+        return None
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            schema = {
+                row[1]
+                for row in connection.execute('PRAGMA table_info("threads")')
+                if isinstance(row[1], str)
+            }
+            if not {"id", "source", "rollout_path", "archived"}.issubset(
+                schema
+            ):
+                return None
+            records = connection.execute(
+                'SELECT "id", length(CAST("source" AS BLOB)), '
+                'CASE WHEN length(CAST("source" AS BLOB)) <= ? '
+                'THEN "source" ELSE NULL END, "rollout_path", "archived" '
+                'FROM "threads" LIMIT ?',
+                (
+                    CODEX_THREAD_SOURCE_MAX_BYTES,
+                    CODEX_THREAD_PARENT_SCAN_MAX_ROWS + 1,
+                ),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+    if len(records) > CODEX_THREAD_PARENT_SCAN_MAX_ROWS:
+        return None
+
+    parents: dict[str, str] = {}
+    fork_parents: dict[str, str] = {}
+    for thread_id, source_size, source, rollout_path, archived in records:
+        if (
+            not isinstance(thread_id, str)
+            or not _SAFE_SESSION_ID.fullmatch(thread_id)
+            or not isinstance(source_size, int)
+            or source_size < 0
+            or source_size > CODEX_THREAD_SOURCE_MAX_BYTES
+            or not isinstance(source, str)
+        ):
+            return None
+        source_parent: str | None = None
+        stripped = source.lstrip()
+        if not stripped.startswith(("{", "[")):
+            decoded = None
+        else:
+            try:
+                decoded = json.loads(source)
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(decoded, dict):
+                return None
+        if isinstance(decoded, dict):
+            subagent = decoded.get("subagent")
+            if isinstance(subagent, dict) and "thread_spawn" in subagent:
+                spawn = subagent["thread_spawn"]
+                if not isinstance(spawn, dict):
+                    return None
+                source_parent = spawn.get("parent_thread_id")
+                if (
+                    not isinstance(source_parent, str)
+                    or not _SAFE_SESSION_ID.fullmatch(source_parent)
+                    or source_parent == thread_id
+                ):
+                    return None
+
+        rollout_ok, rollout_parent = _catalog_rollout_fork_parent(
+            thread_id,
+            rollout_path,
+            archived,
+            codex_home=codex_home,
+        )
+        if not rollout_ok:
+            return None
+        if (
+            source_parent is not None
+            and rollout_parent is not None
+            and source_parent != rollout_parent
+        ):
+            return None
+        parent_id = rollout_parent or source_parent
+        if parent_id is None:
+            continue
+        parents[thread_id] = parent_id
+        # A subagent can persist the same edge in both source JSON and rollout
+        # metadata. Only a rollout-only edge is an ordinary user-visible fork;
+        # source-backed hidden agents remain eligible for native recursive
+        # cleanup after the usual activity/queue protections.
+        if rollout_parent is not None and source_parent is None:
+            fork_parents[thread_id] = rollout_parent
+        if len(parents) > CODEX_THREAD_PARENT_MAX_IDS:
+            return None
+    return parents, fork_parents
+
+
+def codex_thread_spawn_parent_map(
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[dict[str, str]]:
+    """Compatibility projection containing every proven parent edge."""
+    projection = codex_thread_parent_maps(codex_home=codex_home)
+    return None if projection is None else projection[0]
 
 
 def codex_exact_catalog_rows(

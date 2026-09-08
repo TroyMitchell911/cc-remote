@@ -23,11 +23,16 @@ class SlowClientError(RuntimeError):
 
 
 class ClientConn:
-    def __init__(self, ws, cap: int, client_id: str, byte_cap: int = 16 * 1024 * 1024):
+    def __init__(self, ws, cap: int, client_id: str,
+                 byte_cap: int = 16 * 1024 * 1024,
+                 owner_id: str | None = None):
         self.ws = ws
         self.cap = max(1, cap)
         self.byte_cap = max(1024, byte_cap)
         self.client_id = client_id
+        # A connection id is page-lifetime. BTW ownership is instead bound to
+        # the authenticated relay account and can span reloads and tabs.
+        self.owner_id = owner_id or client_id
         self.route_id = uuid.uuid4().hex
         self.queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue(maxsize=self.cap)
         self._queued_bytes = 0

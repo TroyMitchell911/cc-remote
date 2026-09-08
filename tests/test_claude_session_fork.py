@@ -135,6 +135,35 @@ def test_claude_handler_passes_exact_sdk_boundary_then_renames_and_lists(monkeyp
     asyncio.run(run())
 
 
+def test_archived_claude_parent_rejects_fork_before_sdk(monkeypatch):
+    async def run():
+        machine, _ = _resident_machine(monkeypatch)
+        archived = _info()
+        archived.tag = "archived"
+
+        def fork(*_args, **_kwargs):
+            raise AssertionError("archived parent must not reach SDK fork")
+
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _session_id, directory=None: archived,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "fork_session",
+            fork,
+        )
+
+        result = await machine._handle_fork_session(_command())
+
+        assert result.type == "error" and result.code == "auth"
+        assert "已归档" in result.message
+        assert machine._claude_forks.get("request-1") is None
+
+    asyncio.run(run())
+
+
 def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
     async def run():
         machine, _ = _resident_machine(monkeypatch)
@@ -142,6 +171,8 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
             model="claude-opus-5",
             effort="max",
             permission_mode="acceptEdits",
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=250_000,
         )
         visible_title = {"value": claude_fork_marker("request-1")}
 
@@ -165,14 +196,19 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
         command = _command()
         await machine._handle_fork_session(command)
         inherited = machine._claude_controls.get(CHILD)
-        assert inherited.model == "claude-opus-5"
+        assert inherited.model == "claude-opus-5[1m]"
         assert inherited.effort == "max"
         assert inherited.permission_mode == "acceptEdits"
+        assert inherited.auto_compact_mode == "custom"
+        assert inherited.auto_compact_threshold_tokens == 250_000
         assert machine._claude_forks.entries[
             "request-1"]["controls"] == {
-                "model": "claude-opus-5",
+                "model": "claude-opus-5[1m]",
                 "effort": "max",
                 "permission_mode": "acceptEdits",
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 250_000,
+                "applied_auto_compact_mode": "inherit",
             }
 
         machine._claude_controls.update(
@@ -180,11 +216,14 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
             model="claude-sonnet-5",
             effort=None,
             permission_mode="plan",
+            auto_compact_mode="auto",
         )
         await machine._handle_fork_session(command)
         child_choice = machine._claude_controls.get(CHILD)
         assert child_choice.model == "claude-sonnet-5"
         assert child_choice.permission_mode == "plan"
+        assert child_choice.auto_compact_mode == "auto"
+        assert machine.sessions[PARENT].sdk.auto_compact_mode == "custom"
 
     asyncio.run(run())
 

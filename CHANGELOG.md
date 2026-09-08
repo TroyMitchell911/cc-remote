@@ -4,6 +4,129 @@
 
 ## Unreleased
 
+- Fix home-directory page discovery (protocol v55): explicitly referenced HTML
+  and verified, user-owned Python static-server links become private session
+  previews without per-project registration. Preserve manual publications,
+  cloud links, no-follow file checks and the separate binary channel. Never
+  crawl home or populate the global catalog with automatic pages. Support
+  exact/longest-prefix import maps used by local Three.js addons.
+- Add session-scoped page associations (protocol v54), persisted on the parent
+  Wrapper. Confirm explicitly referenced/written HTML against existing source
+  publications, surface compact "View page" actions outside process details,
+  and make the global catalog an explicit secondary association picker. Keep
+  cloud links native, preserve source-device identity, and never widen paths.
+- Add registered static remote Viewer previews (protocol v53): default opaque
+  Bridge frames reuse HTTPS or explicitly allowed HTTP/IP origins without extra
+  DNS/TLS; optional Isolated mode keeps per-preview origins. Explicit device-local
+  resource publications and separate pull-driven
+  binary channel, desktop side panels and mobile full-screen viewing. Directory
+  traversal, symlinks and unregistered resources fail closed. No browser engine,
+  model call or arbitrary LAN HTTP proxy is introduced. See `docs/remote-viewer.md`.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v52. Codex native
+  async questions retain their bounded structured metadata in live events and
+  history, and render as nonblocking inline forms. Replies use the existing
+  session-scoped query/steer outbox; they never masquerade as approval requests
+  or mark a running turn complete. Rebuild older Codex history projections.
+- Scope the BTW panel's open preference by device, surface, engine and parent,
+  preserving background chats without opening empty panels on unrelated
+  sessions. The legacy unscoped visibility flag is ignored; retained chats are
+  untouched. Restore safe Markdown details/summary disclosures, and preserve
+  native Mac drag-selection auto-scrolling through deferred layout updates.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v51. `/btw` now
+  behaves as a resident side-chat workspace: the shortcut collapses instead of
+  destroying it, each parent may own several explicitly closable chats, and an
+  relay-authenticated owner catalog plus bounded ring replay restores them
+  after reload or reconnect in any tab or device signed in as that owner.
+  Page-scoped connection ids keep duplicated tabs independent. Codex side chats
+  also use the Codex presentation path, hiding successful hook plumbing while
+  retaining actionable failures. New side chats start at `xhigh` reasoning
+  (clamped to the selected model's capabilities), and the compact Goal/Plan
+  monitor yields while a mobile input method is open, then returns unchanged.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v49 and split the
+  experimental Codex managed-browser/Computer Use stack into its own feature
+  branch. The Claude runtime line no longer ships Playwright, browser control
+  frames, dynamic browser tools, or the `/browser` UI; artifact image, PDF,
+  GIF, SVG, Markdown, and HTML previews remain available.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v48. Codex
+  ChatGPT accounts now expose earned rate-limit reset credits through the
+  existing sanitized status surface and can redeem one with the official
+  app-server API. Redemption is idle-only, explicitly confirmed, requester-
+  scoped, and uses the reliable command id as the native idempotency key;
+  paid credit balances and spend controls remain private.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v47. Managed
+  Claude sessions delegate the default autocompact window to Claude Code so it
+  follows the selected model, account, gateway, and native settings; v3 control
+  records created with cc-remote's short-lived forced 500K default migrate back
+  to that native behavior. Explicit reductions still compact and verify a
+  native boundary before reconnecting, while crash-safe desired/applied state
+  prevents restarts and forks from applying a smaller window early. Delayed SDK
+  title metadata no longer triggers a false external reload, and genuine
+  transcript reloads preserve the selected long-context model. cc-remote no
+  longer intercepts or rewrites Claude's native
+  image/PDF `Read` tools; model context limits, media handling, and automatic
+  compaction stay owned by Claude Code.
+- Expose the Codex Fast service tier in Work for both new and resident
+  sessions while keeping Claude Work on its engine-neutral command surface.
+- Upgrade the verified Claude Agent SDK pin to `0.2.151` (bundled Claude Code
+  `2.1.258`) and replace the curated Fable 5 and Mythos 5 model cards with the
+  official `claude-fable-5-1` and `claude-mythos-5-1` releases. Managed Code
+  sessions select these through Claude Code's native `[1m]` context marker
+  (which is stripped before provider routing); legacy unsuffixed curated aliases
+  retain their family/version and are normalized to that marker, while other
+  recorded model identities remain unchanged. The wrapper now rejects daily
+  Claude Code releases older than `2.1.258` instead of silently launching
+  without the native runtime controls this integration depends on.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v44 and add
+  Claude account profiles. Each user-defined profile owns one explicit
+  `CLAUDE_CONFIG_DIR`; Code, Work, schedules, models, Skills, extensions,
+  history, external ownership, and forks remain bound to that account. Empty
+  configuration preserves the original single-account IDs and UI. Profile
+  topology changes migrate local ownership by resolved config-directory path,
+  fail closed on ambiguity, and are covered by the same rollback-aware Work
+  deployment transaction as Codex profiles. Claude's authoritative background
+  task level now restores a native-style detached Bash/Agent monitor on every
+  client Hello without reopening an idle session; task-completion follow-ups
+  retain their source-time boundary, and real compact boundaries use the
+  existing context-compaction process presentation.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v42. Pending
+  Claude and Codex questions are now authoritative session state restored on
+  every client Hello, independent of the replay ring. Fresh clients retain a
+  compacted live suffix when a long active turn has evicted its opening marker,
+  install one bounded canonical-detail head while older process pages remain
+  explicitly pageable, and cannot publish a queued question after an interrupt
+  boundary. Late Claude resume bookkeeping no longer moves a completed answer's
+  terminal clock; affected server and browser projections rebuild once.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v41. Automatic
+  Claude context reads no longer issue a blocking native control request;
+  explicit `/context` reads prefer the exact native breakdown and otherwise
+  retain a visibly labelled cached or recent-turn token total when that
+  optional control plane times out.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v40. Codex
+  heavyweight turn-detail pagination now binds every cursor to an immutable,
+  source-scoped snapshot, so an actively growing multi-hundred-MiB rollout
+  cannot invalidate the next page or silently substitute a different window.
+  If that bounded snapshot is later evicted, Web keeps the expanded content
+  mounted and performs one fresh-head reset instead of retrying the stale
+  cursor, duplicating rows, or jumping the reader's position.
+- Treat an unexpected shared Codex daemon replacement as an incomplete control
+  boundary: reconnect once without replaying the prompt or inventing a terminal,
+  and retain an explicit reasoning effort only for the same thread, model, and
+  working directory when the replacement resume reports a nullable value.
+- Upgrade Claude Agent SDK to `0.2.142`; the wrapper remains pinned to this
+  exact verified patch and continues to launch the user's configured Claude
+  Code executable.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v39. Claude
+  subagent detail, detached background-process ownership, paged turn detail,
+  sanitized Claude quota events, and per-session automatic-compaction controls
+  now cross an explicit compatibility boundary. Code, Work, BTW, new sessions,
+  and forks can inherit Claude's setting, use automatic mode, or select a
+  bounded `100K–1M` token threshold; busy changes wait for a proven terminal
+  boundary. Ambiguous Codex steer owners can no longer revive an idle spark.
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v36. Conversation
+  summaries now distinguish exact visible process, exact direct answers, and
+  opaque native detail; truncated content keeps its own disclosure, and Codex
+  process timing starts at the first visible process event instead of the user
+  message timestamp.
 - Add an official container deploy for the Relay: a multi-stage
   `deploy/Dockerfile` builds `web/dist` from source and installs the
   hash-locked wheels as a non-root `ccremote` user, with `docker-compose.yml`,

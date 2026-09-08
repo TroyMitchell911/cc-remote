@@ -47,6 +47,31 @@ def test_journal_persists_claim_uncertain_and_complete(tmp_path):
         fresh.complete("request-1", "child-1")
 
 
+def test_profile_migration_revision_prevents_swap_replay(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-1", "a@parent", "message-1", "/repo")
+    assert journal.claim_submission("request-1") is True
+    journal.complete("request-1", "a@child")
+
+    def swap(value: str) -> str:
+        profile, native = value.split("@", 1)
+        return f"{'b' if profile == 'a' else 'a'}@{native}"
+
+    assert journal.migrate_profile_sessions(
+        swap, profile_revision=2) == 2
+    assert journal.entries["request-1"]["parent_session_id"] == "b@parent"
+    assert journal.entries["request-1"]["session_id"] == "b@child"
+
+    # Simulate a wrapper crash after this journal committed but before the
+    # topology transaction completed. Replaying revision 2 must be a no-op,
+    # even though applying the swap transform twice would reverse ownership.
+    reloaded = ClaudeForkJournal(tmp_path)
+    assert reloaded.migrate_profile_sessions(
+        swap, profile_revision=2) == 0
+    assert reloaded.entries["request-1"]["parent_session_id"] == "b@parent"
+    assert reloaded.entries["request-1"]["session_id"] == "b@child"
+
+
 def test_same_unresolved_identity_aliases_to_canonical_marker(tmp_path):
     journal = ClaudeForkJournal(tmp_path)
     original = _begin(journal, "request-old")
@@ -71,6 +96,62 @@ def test_same_unresolved_identity_aliases_to_canonical_marker(tmp_path):
     later = _begin(ClaudeForkJournal(tmp_path), "request-later")
     assert later["status"] == "intent"
     assert later["marker"] == claude_fork_marker("request-later")
+
+
+def test_begin_rejects_invalid_controls_without_mutating_the_journal(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+
+    with pytest.raises(
+        ClaudeForkJournalError,
+        match="invalid Claude fork autocompact threshold",
+    ):
+        journal.begin(
+            "request-invalid",
+            "parent",
+            "message-1",
+            "/repo",
+            {
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 99_999,
+            },
+        )
+
+    assert journal.entries == {}
+    assert not journal.path.exists()
+
+
+def test_fork_journal_preserves_pending_autocompact_transaction(tmp_path):
+    journal = ClaudeForkJournal(tmp_path)
+    controls = {
+        "auto_compact_mode": "custom",
+        "auto_compact_threshold_tokens": 300_000,
+        "applied_auto_compact_mode": "custom",
+        "applied_auto_compact_threshold_tokens": 800_000,
+    }
+
+    entry = journal.begin(
+        "request-pending", "parent", "message-1", "/repo", controls)
+
+    assert entry["controls"] == controls
+    assert ClaudeForkJournal(tmp_path).get(
+        "request-pending")["controls"] == controls
+
+    with pytest.raises(
+        ClaudeForkJournalError,
+        match="invalid Claude fork applied autocompact threshold",
+    ):
+        journal.begin(
+            "request-invalid-applied",
+            "parent",
+            "message-2",
+            "/repo",
+            {
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 300_000,
+                "applied_auto_compact_mode": "custom",
+                "applied_auto_compact_threshold_tokens": 99_999,
+            },
+        )
 
 
 def test_get_canonical_follows_alias_and_returns_an_independent_copy(tmp_path):

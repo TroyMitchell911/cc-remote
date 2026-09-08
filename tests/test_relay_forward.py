@@ -122,6 +122,41 @@ def test_connection_routed_replay_never_crosses_client_replacement():
     asyncio.run(run())
 
 
+def test_owner_scoped_frames_reach_same_account_tabs_only():
+    async def run():
+        cfg = SimpleNamespace(client_queue_cap=8, client_queue_bytes=4096)
+        hub = RelayHub(cfg)
+        first_ws, second_ws, other_ws = ScriptedWs(), ScriptedWs(), ScriptedWs()
+        first = ClientConn(first_ws, 8, "tab-a", 4096, "account-a")
+        second = ClientConn(second_ws, 8, "tab-b", 4096, "account-a")
+        other = ClientConn(other_ws, 8, "tab-c", 4096, "account-b")
+        for conn in (first, second, other):
+            conn.start()
+            hub._clients[conn.client_id] = conn
+
+        await hub._on_wrapper_msg(Delta(
+            message_id="private", text="same account", owner_id="account-a"))
+        await asyncio.sleep(0)
+
+        assert json.loads(first_ws.sent[-1])["message_id"] == "private"
+        assert json.loads(second_ws.sent[-1])["message_id"] == "private"
+        assert other_ws.sent == []
+
+        # An exact route is still constrained by its authenticated owner. A
+        # stale/malicious wrapper envelope cannot route private data to a tab
+        # belonging to a different account.
+        await hub._on_wrapper_msg(Delta(
+            message_id="mismatch", text="drop",
+            to="tab-c", owner_id="account-a"))
+        await asyncio.sleep(0)
+        assert other_ws.sent == []
+
+        for conn in (first, second, other):
+            await conn.stop()
+
+    asyncio.run(run())
+
+
 def test_only_live_turn_end_triggers_relay_event_hook():
     async def run():
         notified: list[tuple[str, object]] = []
@@ -178,12 +213,15 @@ def test_relay_overwrites_untrusted_client_hello_route_id():
         hub._wrapper_ws = wrapper
         ws = ScriptedWs()
         await ws.incoming.put(serialize(Hello(
-            role="client", client_id="same", route_id="attacker-chosen")))
-        task = asyncio.create_task(hub.serve_client(ws))
+            role="client", client_id="same", route_id="attacker-chosen",
+            owner_id="attacker-owner")))
+        task = asyncio.create_task(hub.serve_client(
+            ws, owner_id="authenticated-owner"))
         await asyncio.wait_for(wrapper.received.wait(), 1)
 
         assert wrapper.message["route_id"] != "attacker-chosen"
         assert wrapper.message["route_id"] == hub._clients["same"].route_id
+        assert wrapper.message["owner_id"] == "authenticated-owner"
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 

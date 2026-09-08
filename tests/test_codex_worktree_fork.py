@@ -46,6 +46,13 @@ def _profile_model_catalog(monkeypatch):
     monkeypatch.setattr(machine_module, "codex_catalog", catalog)
     monkeypatch.setattr(
         machine_module, "codex_current_provider", lambda **_kwargs: "")
+    async def active_session(*_args, **_kwargs):
+        return False
+    monkeypatch.setattr(
+        machine_module.WrapperMachine,
+        "_native_session_archived_state",
+        active_session,
+    )
 
 
 def _ctx(state: str = "idle"):
@@ -455,6 +462,77 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
             "request-1", "parent", "turn-2", "/repo/component")
         assert entry["status"] == "complete"
         assert entry["session_id"] == "forked-thread"
+
+    asyncio.run(run())
+
+
+def test_archived_codex_parent_rejects_new_fork_before_rpc(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+
+        async def is_codex(_sid):
+            return True
+
+        async def archived(*_args, **_kwargs):
+            return True
+
+        async def rpc(*_args, **_kwargs):
+            raise AssertionError("archived parent must not reach thread/fork")
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine, "_native_session_archived_state", archived)
+        monkeypatch.setattr(machine, "_codex_rpc_for_wire", rpc)
+
+        result = await machine._handle_fork_session(
+            _command(last_turn_id="turn-2"))
+
+        assert result.type == "error" and result.code == "auth"
+        assert "已归档" in result.message
+        assert machine._codex_forks.entries[
+            "request-1"]["status"] == "rejected"
+
+    asyncio.run(run())
+
+
+def test_completed_codex_fork_replays_after_parent_is_archived(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+        calls = 0
+        archived_state = {"value": False}
+
+        async def is_codex(_sid):
+            return True
+
+        async def archived(*_args, **_kwargs):
+            return archived_state["value"]
+
+        async def rpc(_wire_sid, method, _params, **_kwargs):
+            nonlocal calls
+            assert method == "thread/fork"
+            calls += 1
+            return {"thread": {"id": "forked-thread"}}
+
+        async def list_sessions(_cmd):
+            return None
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine, "_native_session_archived_state", archived)
+        monkeypatch.setattr(machine, "_codex_rpc_for_wire", rpc)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(
+            machine_module, "find_rollout_fork", lambda *_args: None)
+        command = _command(last_turn_id="turn-2")
+
+        first = await machine._handle_fork_session(command)
+        archived_state["value"] = True
+        replay = await machine._handle_fork_session(command)
+
+        assert first.session_id == replay.session_id == "forked-thread"
+        assert calls == 1
 
     asyncio.run(run())
 
@@ -1032,6 +1110,33 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
             "forked-thread").approval_policy == "never"
         assert machine._codex_controls.get(
             "forked-thread").web_search == "cached"
+
+    asyncio.run(run())
+
+
+def test_archived_codex_parent_rejects_worktree_fork_before_git(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.sessions = {"parent": _ctx()}
+
+        async def is_codex(_sid):
+            return True
+
+        async def archived(*_args, **_kwargs):
+            return True
+
+        def prepare(*_args, **_kwargs):
+            raise AssertionError("archived parent must not create a worktree")
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(
+            machine, "_native_session_archived_state", archived)
+        monkeypatch.setattr(machine_module, "prepare_worktree", prepare)
+
+        result = await machine._handle_fork_session_worktree(_command())
+
+        assert result.type == "error" and result.code == "auth"
+        assert "已归档" in result.message
 
     asyncio.run(run())
 
