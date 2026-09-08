@@ -5808,6 +5808,7 @@ test("the compact Goal monitor yields while the mobile keyboard is open", async 
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(60_000);
   test.skip(isMobileWebKitProject(testInfo.project.name),
     "the configured WebKit project is a touch phone; this is a desktop mouse path");
   await page.goto("/tests/history-browser.html?large=120");
@@ -5833,19 +5834,31 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
     viewportBox.y + viewportBox.height - 2,
     { steps: 20 },
   );
-  for (let step = 0; step < 12; step += 1) {
+  await expect(viewport).toHaveAttribute("data-text-selection-dragging", "true");
+  // Native edge auto-scroll has platform-dependent acceleration. In Linux
+  // WebKit the same 12 wheel/move pairs only advance ~150px, while macOS moves
+  // much farther. Drive a real held-pointer gesture until it crosses the same
+  // virtual-row distance, not for a fixed number of ~45ms frames. Never assign
+  // scrollTop or replace the native selection to make this regression pass.
+  let step = 0;
+  await expect.poll(async () => {
     await page.mouse.wheel(0, 220);
     await page.mouse.move(
-      viewportBox.x + viewportBox.width - 48 + (step % 2),
+      viewportBox.x + viewportBox.width - 48 + (step++ % 2),
       viewportBox.y + viewportBox.height - 2,
     );
-    await page.waitForTimeout(45);
-  }
+    return await viewport.evaluate((node) => node.scrollTop) - startScrollTop;
+  }, {
+    timeout: 12_000,
+    intervals: [75],
+    message: "native edge-drag must scroll across virtual turns while held",
+  }).toBeGreaterThan(800);
 
   const draggedScrollTop = await viewport.evaluate((node) => node.scrollTop);
   const draggingSelection = await nativeSelectionSnapshot(page);
   expect(draggedScrollTop - startScrollTop).toBeGreaterThan(800);
   expect(draggingSelection.anchorTurnId).toBe(startTurnId);
+  expect(draggingSelection.focusTurnId).not.toBe(startTurnId);
   expect(draggingSelection.anchorConnected).toBe(true);
   expect(draggingSelection.text).toContain(startTurnId);
   await expect(page.locator(
@@ -6416,7 +6429,8 @@ test("dragging a process header outside cannot leave output following locked", a
   )).toBeLessThan(2);
 });
 
-test("dragging nested process thinking outside cannot leave output following locked", async ({
+for (const kind of ["thinking", "activity"] as const) {
+test(`dragging nested process ${kind} outside cannot leave output following locked`, async ({
   page,
 }) => {
   await page.goto(
@@ -6427,21 +6441,57 @@ test("dragging nested process thinking outside cannot leave output following loc
   const timeline = page.locator('[data-turn-id="timeline"]');
   await timeline.locator(".turn-process-head").click();
   await waitForScrollIdle(page);
-  const summary = timeline.locator(".process-reasoning > summary");
+  const disclosure = timeline.locator(kind === "thinking"
+    ? "details.process-reasoning" : "details.process-activity");
+  const summary = disclosure.locator(":scope > summary");
   const box = await summary.boundingBox();
-  if (!box) throw new Error("nested reasoning summary has no bounds");
+  const labelBox = await summary.locator(kind === "thinking"
+    ? ":scope > span" : ".process-item-title").boundingBox();
+  if (!box || !labelBox) throw new Error("nested process summary has no bounds");
 
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  // Start on the label, not empty summary padding: WebKit can otherwise
+  // alternate between a control drag and an accidental native text selection.
+  await page.mouse.move(
+    labelBox.x + labelBox.width / 2, labelBox.y + labelBox.height / 2,
+  );
   await page.mouse.down();
   await page.mouse.move(box.x + box.width + 80, box.y + box.height + 80);
   await page.mouse.up();
-  await expect(timeline.locator("details.process-reasoning"))
-    .not.toHaveAttribute("open", "");
+  await expect(disclosure).not.toHaveAttribute("open", "");
+  await expect(viewport).toHaveAttribute("data-text-selection-retained", "false");
 
   await page.getByTestId("grow-stream").click();
   await expect.poll(() => viewport.evaluate((node) =>
     node.scrollHeight - node.scrollTop - node.clientHeight,
   )).toBeLessThan(2);
+});
+}
+
+test("nested process disclosures preserve keyboard activation and body selection", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?interactive-timeline=1&engine=claude");
+  const timeline = page.locator('[data-turn-id="timeline"]');
+  await timeline.locator(".turn-process-head").click();
+  const disclosure = timeline.locator("details.process-reasoning");
+  const summary = disclosure.locator(":scope > summary");
+  await summary.press("Enter");
+  await expect(disclosure).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+  await summary.press("Space");
+  await expect(disclosure).not.toHaveAttribute("open", "");
+  await summary.click();
+  await expect(disclosure).toHaveAttribute("open", "");
+
+  const body = disclosure.locator(".process-reasoning-body .prose p").first();
+  await body.scrollIntoViewIfNeeded();
+  await waitForScrollIdle(page);
+  const start = await textSelectionPoint(body);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + 60, start.y, { steps: 8 });
+  await page.mouse.up();
+  await expect(page.locator(".thread"))
+    .toHaveAttribute("data-text-selection-retained", "true");
+  expect((await nativeSelectionSnapshot(page)).text).not.toBe("");
 });
 
 test("iOS pointercancel releases process interactions and output following", async ({

@@ -131,6 +131,13 @@ function ProcessDisclosure({ className, summary, children, openOverride,
     <details className={className} open={open}>
       <summary
         onPointerDown={(event) => {
+          if (event.pointerType === "mouse" && event.button === 0) {
+            // WebKit can start a range in the next selectable paragraph even
+            // when this control has user-select:none. Suppress only the mouse
+            // selection default, preserving focus, clicks and native touch pan.
+            event.preventDefault();
+            event.currentTarget.focus({ preventScroll: true });
+          }
           tapGuard.current.pointerDown(
             event.pointerId, event.clientX, event.clientY,
           );

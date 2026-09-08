@@ -662,6 +662,10 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .process-reasoning > summary,.process-activity > summary,.process-activity:not(details){
   display:flex; align-items:center; gap:8px; min-height:35px; padding:5px 8px; border-radius:9px;
   list-style:none; color:var(--dim); font-size:12.5px; }
+/* Disclosure labels are controls; their bodies remain selectable. Otherwise a
+   WebKit control drag can select the label and pause live output following. */
+.process-reasoning > summary,.process-activity > summary{
+  user-select:none; -webkit-user-select:none; }
 .process-reasoning > summary::-webkit-details-marker,.process-activity > summary::-webkit-details-marker{ display:none; }
 .process-reasoning > summary svg:last-child,.process-item-chev{ margin-left:auto; color:var(--faint); transition:transform .18s; }
 .process-reasoning[open] > summary svg:last-child,.process-activity[open] .process-item-chev{ transform:rotate(180deg); }
