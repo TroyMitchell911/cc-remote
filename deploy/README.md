@@ -136,9 +136,9 @@ deployment.
   hosts that already run nginx instead of the managed Caddy. Loopback-only
   requirement is documented in the file header.
 - `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
-  through SQLite's backup API plus the bounded private Claude control store,
-  restores the matching pre-release data before an older wrapper is restarted,
-  and verifies the v34 Codex ownership backfill.
+  through SQLite's backup API plus the complete private Claude/Codex profile
+  migration transaction, restores matching pre-release data before an older
+  wrapper is restarted, and verifies both engines' Work ownership backfills.
 
 Protocol v55 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
@@ -151,8 +151,9 @@ as part of the release
 transaction. It stops the existing service, writes a private snapshot below
 the install root's `rollback-data/`, starts the new release, and refuses the
 activation unless the Claude and Codex Work schemas and all legacy profile
-ownership rows are ready. On failure it stops the new process, restores both SQLite images, then
-restores and starts the previous code. If data restoration fails, it leaves the
+ownership rows are ready. On failure it stops the new process, restores both
+SQLite images and the matching private profile state, then restores and starts
+the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
@@ -164,6 +165,22 @@ also restores pre-release Work metadata: sessions, projects, or schedule state
 created after activation will no longer be registered (their private files are
 not deleted). Use this for immediate failed activation; after normal use,
 prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
+
+Snapshot format v3 includes an explicit allowlist of Claude/Codex controls,
+turn leases, pins, aliases, fork/BTW records, plans, presentation receipts,
+Viewer associations, and both pending/completed profile journals. An absent
+file is recorded too and removed on rollback if activation created it. Codex
+checkpoint journals include their directory layout and local object data:
+profile migration renames those directories, so manifest-only backup is not
+sufficient. This private archive rejects symlinks and special files and is
+bounded to 65,536 entries / 8 GiB of payload; exceeding a limit aborts before
+activation, not with a partial usable snapshot. Restoring checkpoints retains
+the displaced tree in `.checkpoint-displaced-*` under the private state
+directory for recovery. Account configuration, credentials, native transcripts,
+and project files are not part of this snapshot. Retain snapshots locally;
+never publish them as release artifacts. Legacy v1/v2 snapshots remain
+restorable only within their original, narrower scope; they cannot provide
+complete rollback for a new profile migration.
 
 ## Container deploy (Docker) and the nginx alternative
 

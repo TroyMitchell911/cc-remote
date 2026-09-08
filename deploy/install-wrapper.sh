@@ -255,8 +255,8 @@ cleanup() {
     rollback_ready=1
     if [ "$snapshot_created" -eq 1 ]; then
       # Never start old code against data migrated by the failed new release.
-      # Stop the new process first, then restore the complete SQLite images and
-      # the matching bounded private wrapper-control snapshot.
+      # Stop the new process first, then restore the SQLite images and every
+      # participant in the matching private profile-migration transaction.
       if ! stop_wrapper_service; then
         rollback_ready=0
         echo "ERROR: new wrapper could not be stopped; data was not restored" >&2

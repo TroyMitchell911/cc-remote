@@ -338,8 +338,8 @@ def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
     assert controls.read_bytes() == original
     assert stat.S_IMODE(controls.stat().st_mode) == 0o600
     manifest = json.loads((snapshot / "manifest.json").read_text())
-    assert manifest["version"] == 2
-    assert manifest["wrapper_state"]["exists"] is True
+    assert manifest["version"] == 3
+    assert manifest["wrapper_state"]["files"][controls.name]["exists"] is True
 
 
 def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
@@ -794,7 +794,8 @@ def test_release_docs_and_examples_describe_one_atomic_v55_layout():
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
     assert "Protocol v55" in deploy_readme
-    assert "v34 Codex ownership backfill" in deploy_readme
+    assert "both engines' Work ownership backfills" in deploy_readme
+    assert "Snapshot format v3" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
         assert "v55" in document
