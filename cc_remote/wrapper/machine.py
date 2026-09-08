@@ -7851,7 +7851,7 @@ class WrapperMachine:
             claude_root = self._claude_config_root(profile)
             if claude_root is not None:
                 claude_handle_kwargs["claude_config_dir"] = claude_root
-            if self._claude_profiles.is_multi_profile:
+            if self._claude_profiles_explicit:
                 claude_handle_kwargs["isolate_account_env"] = True
             sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
             permission, model, effort = self._copy_claude_runtime_options(
@@ -18161,7 +18161,7 @@ class WrapperMachine:
                 managed_env_model_set = True
                 managed_env_model = candidate
 
-        # Managed policy cannot be overridden. Explicit multi-account sessions
+        # Managed policy cannot be overridden. Explicit account profiles
         # load only the selected user source, so their displayed/spawned default
         # must not resurrect a project/local or ambient model that the Claude
         # child itself will reject. In legacy single-account mode Claude applies
@@ -18194,7 +18194,7 @@ class WrapperMachine:
             self._claude_configured_model,
             target_cwd,
             config_dir=self._claude_config_root(profile),
-            isolate_account_env=self._claude_profiles.is_multi_profile,
+            isolate_account_env=self._claude_profiles_explicit,
         )
         # Claude Code uses ``[1m]`` as its native context-qualification marker
         # and strips it before calling a third-party provider. Pin only models
@@ -18371,7 +18371,7 @@ class WrapperMachine:
                 if claude_root is not None:
                     discover_kwargs["claude_config_root"] = claude_root
                     discover_kwargs["isolate_claude_account_env"] = (
-                        self._claude_profiles.is_multi_profile
+                        self._claude_profiles_explicit
                     )
             items, errors, notes = await engine_capabilities(
                 engine, target_cwd, space, self.cfg.claude_bin,
@@ -18485,7 +18485,7 @@ class WrapperMachine:
                 if claude_root is not None:
                     mutation_kwargs["claude_config_root"] = claude_root
                     mutation_kwargs["isolate_claude_account_env"] = (
-                        self._claude_profiles.is_multi_profile
+                        self._claude_profiles_explicit
                     )
             await manage_engine_plugin(
                 cmd.engine,
@@ -18552,7 +18552,7 @@ class WrapperMachine:
                 if claude_root is not None:
                     hook_kwargs["claude_config_root"] = claude_root
                     hook_kwargs["isolate_claude_account_env"] = (
-                        self._claude_profiles.is_multi_profile
+                        self._claude_profiles_explicit
                     )
             await manage_engine_hook(
                 cmd.engine,
@@ -34538,7 +34538,7 @@ class WrapperMachine:
                 claude_handle_kwargs = {}
                 if claude_root is not None:
                     claude_handle_kwargs["claude_config_dir"] = claude_root
-                if self._claude_profiles.is_multi_profile:
+                if self._claude_profiles_explicit:
                     claude_handle_kwargs["isolate_account_env"] = True
                 sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
         desired_auto_compact: tuple[str, int | None] | None = None
@@ -35353,7 +35353,7 @@ class WrapperMachine:
             claude_root = self._claude_config_root(claude_profile)
             if claude_root is not None:
                 claude_handle_kwargs["claude_config_dir"] = claude_root
-            if self._claude_profiles.is_multi_profile:
+            if self._claude_profiles_explicit:
                 claude_handle_kwargs["isolate_account_env"] = True
             sdk = SdkHandle(self.cfg, **claude_handle_kwargs)
         if engine != "codex" and parent_space == "work":
