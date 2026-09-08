@@ -73,7 +73,9 @@ export class ViewerBridge {
       const ws = new WebSocket(url);
       this.ws = ws;
       ws.binaryType = "arraybuffer";
-      ws.onopen = () => ws.send(JSON.stringify({ type: "bind", v: PROTOCOL_VERSION, id: grant.id }));
+      ws.onopen = () => {
+        if (!this.disposed) ws.send(JSON.stringify({ type: "bind", v: PROTOCOL_VERSION, id: grant.id }));
+      };
       ws.onmessage = (event) => this.receive(event.data);
       ws.onerror = () => this.fail("预览资源连接中断，请重新连接。", false);
       ws.onclose = () => this.fail("预览资源连接已断开，请重新连接。", false);

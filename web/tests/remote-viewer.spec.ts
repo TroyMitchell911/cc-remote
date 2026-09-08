@@ -247,16 +247,46 @@ test("remote Viewer uses one desktop side panel and fills the mobile viewport", 
 });
 
 test("remote Viewer reacquires authorization after a cached page is restored", async ({ page }) => {
+  const bindings: string[] = [];
+  page.on("websocket", (socket) => {
+    if (!socket.url().endsWith("/ws/viewer-client")) return;
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const message = JSON.parse(payload);
+      if (message.type === "bind") bindings.push(message.id);
+    });
+  });
   await page.getByRole("button", { name: "打开远程预览" }).click();
   await page.getByRole("button", { name: /^机器人结构/ }).click();
   await expect(page.frameLocator("iframe").locator("#status")).toContainText("模型已加载", { timeout: 30000 });
   const source = await page.locator("iframe").getAttribute("src");
-  await page.evaluate(() => {
-    window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
-    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+  const oldBindings = [...bindings];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/viewers/open", async (route) => {
+    await held;
+    await route.fallback();
   });
-  await expect(page.locator("iframe")).not.toHaveAttribute("src", source!);
+  const opening = page.waitForRequest((request) => request.url().endsWith("/api/viewers/open"));
+  const opened = page.waitForResponse((response) => response.url().endsWith("/api/viewers/open"));
+  try {
+    await page.evaluate(() => {
+      window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    });
+    await opening;
+    // The catalog is back, but the replacement lease is not. Do not remount
+    // the revoked frame in this gap or let its 403 retire the new lease.
+    await expect(page.locator("iframe")).toHaveCount(0);
+    expect(bindings).toEqual(oldBindings);
+  } finally { release(); }
+  const replacement = await (await opened).json();
   await expect(page.frameLocator("iframe").locator("#status")).toContainText("模型已加载", { timeout: 30000 });
+  await expect(page.locator("iframe")).not.toHaveAttribute("src", source!);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  if (replacement.mode === "bridge") expect(bindings).toEqual([...oldBindings, replacement.id]);
+  await page.frameLocator("iframe").getByRole("button", { name: "旋转模型" }).click();
+  await expect(page.frameLocator("iframe").locator("#status")).toHaveText("已旋转 1 次");
 });
 
 test("session page discovery is explicit, durable and leaves cloud links alone", async ({ page, isMobile }) => {

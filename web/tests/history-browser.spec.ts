@@ -6210,16 +6210,15 @@ test("desktop wheel scrolling remains available after text selection", async ({
   await waitForScrollIdle(page);
   const startTurnId = (await readingAnchor(page)).id;
   const text = page.locator(`[data-turn-id="${startTurnId}"] p`).first();
-  const box = await text.boundingBox();
-  if (!box) throw new Error("selection fixture has no geometry");
+  const point = await textSelectionPoint(text);
 
-  await page.mouse.move(box.x + 4, box.y + box.height / 2);
+  await page.mouse.move(point.x, point.y);
   await page.mouse.down();
   await page.mouse.move(
-    Math.min(box.x + box.width - 4, box.x + 180),
-    box.y + box.height / 2,
+    point.x + 100, point.y,
     { steps: 12 },
   );
+  await expect(viewport).toHaveAttribute("data-text-selection-dragging", "true");
   await page.mouse.up();
   await expect(viewport).toHaveAttribute(
     "data-text-selection-retained", "true",

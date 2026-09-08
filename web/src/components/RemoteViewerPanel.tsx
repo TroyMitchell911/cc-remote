@@ -41,6 +41,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [grant, setGrant] = useState<Grant | null>(null);
+  const activeGrant = useRef<Grant | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [retry, setRetry] = useState(0);
@@ -134,13 +135,16 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
   }, [selection, site, selected, pageContext]);
 
   useEffect(() => {
+    // A catalog refresh must retire the old frame before its replacement can
+    // mount. Otherwise a revoked grant can briefly reconnect while open waits.
+    activeGrant.current = null;
+    setGrant(null);
     if (!selectionMachineId || !selectionSiteId || !enabled || loading || !selectedEntry || !selectedId) return;
     const controller = new AbortController();
     let disposed = false;
     let opened: Grant | null = null;
     let activating = false;
     let activated = false;
-    setGrant(null);
     setError(null);
     setLoaded(false);
     setOpenedContent(initialContent.current);
@@ -197,6 +201,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
         revoke(value.id);
         throw new Error("预览来源配置无效。");
       }
+      activeGrant.current = value;
       setGrant(value);
     }).catch((reason: unknown) => {
       if (!disposed) setError(reason instanceof Error ? reason.message : "无法打开预览。");
@@ -218,6 +223,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
     }, 15000);
     return () => {
       disposed = true;
+      activeGrant.current = null;
       invalidate.current = null;
       controller.abort();
       window.clearInterval(health);
@@ -242,6 +248,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
   useEffect(() => {
     const resume = () => {
       if (document.visibilityState === "visible" && grant && Date.now() / 1000 >= grant.expires_at) {
+        setGrant(null);
         setLoading(true);
         setRetry((value) => value + 1);
       }
@@ -317,8 +324,11 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
       : !selected ? <div className="viewer-empty"><p>设备已离线，或该预览已移除。</p>
         <button className="viewer-action" onClick={() => onSelect(null)}>选择其他预览</button></div>
       : grant ? <>{grant.mode === "bridge"
-        ? <BridgeFrame key={grant.id} grant={grant} title={selected.label} onReady={() => setLoaded(true)}
+        ? <BridgeFrame key={grant.id} grant={grant} title={selected.label}
+            onReady={() => { if (activeGrant.current === grant) setLoaded(true); }}
             onError={(message, clear) => {
+              // A retired frame must never invalidate its successor's grant.
+              if (activeGrant.current !== grant) return;
               setError(message);
               if (clear) { invalidate.current?.(); setGrant(null); }
             }} />
