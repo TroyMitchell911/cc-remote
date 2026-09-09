@@ -486,6 +486,9 @@ def _codex_terminal_status(message: dict) -> str:
     params = message.get("params")
     turn = params.get("turn") if isinstance(params, dict) else None
     status = turn.get("status") if isinstance(turn, dict) else None
+    if isinstance(turn, dict) and turn.get("error") is not None:
+        if not status or status == "completed":
+            return "failed"
     return status if isinstance(status, str) and status else "completed"
 
 
