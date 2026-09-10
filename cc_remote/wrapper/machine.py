@@ -29927,6 +29927,18 @@ class WrapperMachine:
             ):
                 return False
             proc = getattr(ctx.sdk, "proc", None)
+
+            def shared_probe_stale() -> bool:
+                # A proxy exit is not proof that the shared daemon lost its
+                # thread. Keep exact-absence evidence bound to this live proxy
+                # through the final retirement boundary.
+                return self._codex_shared_affinity(ctx) and (
+                    proc is None or proc.returncode is not None
+                    or getattr(ctx.sdk, "proc", None) is not proc
+                )
+
+            if shared_probe_stale():
+                return False
             if proc is not None and proc.returncode is None:
                 # An idle native thread may not have materialized a rollout
                 # yet. A live handle must affirm exact absence, not merely
@@ -29946,6 +29958,7 @@ class WrapperMachine:
                 else:
                     return False
             if (self._session_delete_busy(ctx)
+                    or shared_probe_stale()
                     or not await asyncio.to_thread(
                         codex_session_confirmed_missing,
                         native_sid, codex_home=home,
@@ -29958,7 +29971,8 @@ class WrapperMachine:
             async with ctx.emit_lock:
                 async with ctx.queued_query_lock:
                     if (not self._is_resident_context(ctx)
-                            or self._session_delete_busy(ctx)):
+                            or self._session_delete_busy(ctx)
+                            or shared_probe_stale()):
                         return False
                     try:
                         intent = await asyncio.to_thread(
@@ -29967,7 +29981,8 @@ class WrapperMachine:
                         return False
                     # A native client can become active during journal I/O.
                     if (not self._is_resident_context(ctx)
-                            or self._session_delete_busy(ctx)):
+                            or self._session_delete_busy(ctx)
+                            or shared_probe_stale()):
                         if intent == "delete_pending":
                             try:
                                 await asyncio.to_thread(

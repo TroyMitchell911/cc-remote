@@ -150,6 +150,7 @@ async def test_loaded_or_uncertain_native_thread_is_retained(
 @pytest.mark.asyncio
 async def test_live_handle_must_confirm_exact_missing_identity(monkeypatch):
     machine, _, ctx = _resident(monkeypatch)
+    ctx.sdk.shared_daemon_affinity = True
     ctx.sdk.proc = SimpleNamespace(returncode=None)
     ctx.sdk.read_thread_parent.side_effect = CodexAppServerError({
         "code": -32600, "message": f"no rollout found for thread id {SID}",
@@ -283,3 +284,70 @@ async def test_native_activity_during_retirement_preserves_fork_replay(monkeypat
     assert machine.sessions[SID] is ctx
     abort.assert_awaited_once_with(SID)
     ctx.sdk.disconnect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proxy", [None, "exited"])
+async def test_shared_session_survives_proxy_reconnect_gap(monkeypatch, proxy):
+    machine, _, ctx = _resident(monkeypatch)
+    ctx.sdk.shared_daemon_affinity = True
+    ctx.sdk.proc = None if proxy is None else SimpleNamespace(returncode=1)
+    machine._notification_titles[SID] = "keep shared session"
+    assert not await machine._prune_missing_codex_context(ctx)
+    assert machine.sessions[SID] is ctx
+    assert machine.focused_sid == SID
+    assert machine._notification_titles[SID] == "keep shared session"
+    ctx.sdk.disconnect.assert_not_awaited()
+    ctx.sdk.read_thread_parent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["probe", "scan", "journal"])
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_shared_proxy_change_invalidates_orphan_retirement(
+    monkeypatch, boundary, replacement,
+):
+    machine, _, ctx = _resident(monkeypatch)
+    ctx.sdk.shared_daemon_affinity = True
+    ctx.sdk.proc = SimpleNamespace(returncode=None)
+    original_to_thread = asyncio.to_thread
+    missing = machine_module.codex_session_confirmed_missing
+    begin = machine._codex_forks.begin_delete
+    abort = machine._codex_forks.abort_delete = AsyncMock()
+    scans = 0
+
+    def restart_proxy():
+        if replacement:
+            ctx.sdk.proc = SimpleNamespace(returncode=None)
+        else:
+            ctx.sdk.proc.returncode = 1
+
+    async def read_thread(thread_id):
+        if boundary == "probe":
+            restart_proxy()
+        raise CodexAppServerError({
+            "code": -32600, "message": f"thread not found: {thread_id}",
+        })
+
+    async def restart_at_boundary(function, *args, **kwargs):
+        nonlocal scans
+        if function is missing:
+            scans += 1
+            if boundary == "scan" and scans == 2:
+                restart_proxy()
+        if function == begin and boundary == "journal":
+            restart_proxy()
+            return "delete_pending"
+        if function is abort:
+            return await abort(*args, **kwargs)
+        return await original_to_thread(function, *args, **kwargs)
+
+    ctx.sdk.read_thread_parent.side_effect = read_thread
+    monkeypatch.setattr(machine_module.asyncio, "to_thread", restart_at_boundary)
+    assert not await machine._prune_missing_codex_context(ctx)
+    assert machine.sessions[SID] is ctx
+    ctx.sdk.disconnect.assert_not_awaited()
+    if boundary == "journal":
+        abort.assert_awaited_once_with(SID)
+    else:
+        abort.assert_not_awaited()
