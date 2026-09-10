@@ -29951,12 +29951,33 @@ class WrapperMachine:
                         native_sid, codex_home=home,
                     )):
                 return False
-            try:
-                intent = await asyncio.to_thread(
-                    self._codex_forks.begin_delete, sid)
-            except ForkJournalError:
-                return False
-            self.sessions.pop(ctx.key, None)
+            # Queue submissions use emit_lock -> queued_query_lock, not
+            # query_lock. Let them run during the scans, then atomically either
+            # preserve accepted work or retire the context before a new submit
+            # can pass its residency check. Keep journal I/O in this boundary.
+            async with ctx.emit_lock:
+                async with ctx.queued_query_lock:
+                    if (not self._is_resident_context(ctx)
+                            or self._session_delete_busy(ctx)):
+                        return False
+                    try:
+                        intent = await asyncio.to_thread(
+                            self._codex_forks.begin_delete, sid)
+                    except ForkJournalError:
+                        return False
+                    # A native client can become active during journal I/O.
+                    if (not self._is_resident_context(ctx)
+                            or self._session_delete_busy(ctx)):
+                        if intent == "delete_pending":
+                            try:
+                                await asyncio.to_thread(
+                                    self._codex_forks.abort_delete, sid)
+                            except ForkJournalError:
+                                log.warning(
+                                    "orphan Codex tombstone rollback failed",
+                                    session_id=sid)
+                        return False
+                    self.sessions.pop(ctx.key, None)
             if self.focused_sid in {ctx.key, sid}:
                 self.focused_sid = None
             self._watch.pop(sid, None)

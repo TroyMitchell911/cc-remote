@@ -1,13 +1,16 @@
 """Missing catalog rows must not resurrect idle wrapper-only sessions."""
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from cc_remote.protocol import DeleteSession, SessionListInvalidated
+from cc_remote.protocol import (
+    CommandAck, DeleteSession, Error, Query, SessionListInvalidated,
+)
 from cc_remote.wrapper import codex_sessions, machine as machine_module
 from cc_remote.wrapper.codex_handle import CodexAppServerError
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -180,3 +183,103 @@ async def test_refresh_does_not_overlay_deleted_resident(monkeypatch):
     assert all(row["native_session_id"] != SID for row in rows)
     assert SID not in machine.sessions
     ctx.sdk.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["scan", "journal"])
+@pytest.mark.parametrize("delivery", ["queue", "replace"])
+async def test_queue_submission_and_orphan_retirement_are_atomic(
+    monkeypatch, boundary, delivery,
+):
+    machine, transport, ctx = _resident(monkeypatch)
+    paused, resume, submitting = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event())
+    to_thread = asyncio.to_thread
+    missing = machine_module.codex_session_confirmed_missing
+    scans = 0
+
+    async def pause_retirement(function, *args, **kwargs):
+        nonlocal scans
+        if function is missing:
+            scans += 1
+        if ((boundary == "scan" and function is missing and scans == 2)
+                or (boundary == "journal"
+                    and function == machine._codex_forks.begin_delete)):
+            paused.set()
+            await resume.wait()
+        return await to_thread(function, *args, **kwargs)
+
+    enqueue = machine._enqueue_deferred_query
+
+    async def submit(candidate, command):
+        submitting.set()
+        return await enqueue(candidate, command)
+
+    # Exercise the real command ACK, queue locks and drain worker; only the
+    # native engine boundary is unavailable. Accepted work must stay retained.
+    machine._handle_immediate_query = AsyncMock(return_value=Error(
+        code="not_running", message="test engine unavailable"))
+    monkeypatch.setattr(machine_module.asyncio, "to_thread", pause_retirement)
+    monkeypatch.setattr(machine, "_enqueue_deferred_query", submit)
+    pruning = asyncio.create_task(machine._prune_missing_codex_context(ctx))
+    submission = None
+    try:
+        await asyncio.wait_for(paused.wait(), 2)
+        command = Query(
+            sid=SID, prompt="keep this queued prompt", msg_id="queued-race",
+            delivery=delivery, cmd_id="queue-command", client_id="browser-a",
+        )
+        submission = asyncio.create_task(machine._process_command(command))
+        await asyncio.wait_for(submitting.wait(), 2)
+        if boundary == "scan":
+            # The expensive absence scan must not block queue acceptance.
+            await asyncio.wait_for(asyncio.shield(submission), 2)
+        resume.set()
+        removed = await asyncio.wait_for(pruning, 2)
+        await asyncio.wait_for(submission, 2)
+        if boundary == "scan":
+            assert not removed
+            assert machine.sessions[SID] is ctx
+            assert [q.msg_id for q in ctx.queued_queries] == [command.msg_id]
+            assert machine._queued_query_count == 1
+            assert any(isinstance(e, CommandAck)
+                       and e.cmd_id == command.cmd_id for e in transport.sent)
+            ctx.sdk.disconnect.assert_not_awaited()
+        else:
+            assert removed and SID not in machine.sessions
+            assert ctx.queued_queries == []
+            assert machine._queued_query_count == 0
+            assert any(isinstance(e, Error) and e.code == "not_running"
+                       and e.msg_id == command.msg_id for e in transport.sent)
+            machine._handle_immediate_query.assert_not_awaited()
+    finally:
+        resume.set()
+        tasks = [task for task in (
+            pruning, submission, ctx.queued_query_drain_task,
+        ) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_activity_during_retirement_preserves_fork_replay(monkeypatch):
+    machine, _, ctx = _resident(monkeypatch)
+    original_to_thread = asyncio.to_thread
+    begin = machine._codex_forks.begin_delete
+    abort = machine._codex_forks.abort_delete = AsyncMock()
+
+    async def native_activity(function, *args, **kwargs):
+        if function == begin:
+            ctx.sdk.turn_active = True
+            return "delete_pending"
+        if function is abort:
+            return await abort(*args, **kwargs)
+        return await original_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(machine_module.asyncio, "to_thread", native_activity)
+    assert not await machine._prune_missing_codex_context(ctx)
+    assert machine.sessions[SID] is ctx
+    abort.assert_awaited_once_with(SID)
+    ctx.sdk.disconnect.assert_not_awaited()
