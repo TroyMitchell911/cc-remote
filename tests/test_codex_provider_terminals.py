@@ -1,11 +1,16 @@
 """Provider refusals stay failed across live, history, and ownership replay."""
 import json
+import sqlite3
 
 import pytest
 
 from cc_remote.protocol import Error, TurnEnd
 from cc_remote.wrapper.codex_external import parse_turn_markers
 from cc_remote.wrapper.machine import _codex_terminal_status
+from cc_remote.wrapper.history_store import (
+    HistoryIndexStore, HistorySourceFingerprint, MaterializedHistoryPage,
+    _historical_turn_failure, materialize_history_turns,
+)
 from cc_remote.wrapper.codex_stream import (
     CodexStreamTranslator,
     _provider_failure_message,
@@ -55,6 +60,9 @@ def test_failed_task_complete_history_and_fence_agree(tmp_path, visible, error):
     assert "private provider text" not in errors[0].message
     if "codex_error_info" in error:
         assert "cyber_policy" in errors[0].message
+    summaries = materialize_history_turns([
+        event.model_dump(mode="json") for event in events])
+    assert summaries[0]["error"] == errors[0].message
     markers = parse_turn_markers(raw.encode())
     assert markers.terminals[0].status == "failed"
 
@@ -98,3 +106,47 @@ def test_null_task_complete_error_remains_successful(tmp_path):
     events, _ = codex_translate_history(str(path), 8000)
     assert all(not e.result.is_error for e in events if isinstance(e, TurnEnd))
     assert parse_turn_markers(raw.encode()).terminals[0].status == "completed"
+
+
+def test_policy_summary_accepts_only_the_reviewed_product_copy():
+    message = _provider_failure_message({"codexErrorInfo": "cyberPolicy"})
+    assert _historical_turn_failure(message) == message
+    for raw in ("cyber_policy private provider text", message + " secret-token"):
+        assert _historical_turn_failure(raw) == "该轮未正常结束"
+
+
+def test_cached_policy_failure_is_rebuilt_once_without_changing_rollout(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    raw = "".join(json.dumps(row) + "\n" for row in [
+        _record("task_started"), _record("user_message", message="inspect code"),
+        _record("task_complete", error={"codex_error_info": "cyber_policy"}),
+    ])
+    path.write_text(raw)
+    source = HistorySourceFingerprint.capture(path)
+    events, _ = codex_translate_history(str(path), 8000)
+    wire = tuple(event.model_dump(mode="json") for event in events)
+    repaired = materialize_history_turns(wire)
+    stale = dict(repaired[0], error="该轮未正常结束")
+    page = MaterializedHistoryPage(
+        events=wire, turns=(stale,), has_more=False,
+        oldest_id=stale["id"], newest_id=stale["id"],
+    )
+    state = tmp_path / "state"
+    store = HistoryIndexStore(state)
+    assert store.put_page("session", "codex", source,
+                          before=None, limit=4, page=page)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=31")
+    migrated = HistoryIndexStore(state)
+    assert migrated.get_page("session", "codex", source,
+                             before=None, limit=4) is None
+    rebuilt = MaterializedHistoryPage(
+        events=wire, turns=repaired, has_more=False,
+        oldest_id=stale["id"], newest_id=stale["id"],
+    )
+    assert migrated.put_page("session", "codex", source,
+                             before=None, limit=4, page=rebuilt)
+    assert HistoryIndexStore(state).get_page(
+        "session", "codex", source, before=None, limit=4) == rebuilt
+    assert "cyber_policy" in repaired[0]["error"]
+    assert path.read_text() == raw
