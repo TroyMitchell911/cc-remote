@@ -10,7 +10,9 @@
   reconnect and cold resume. A model id merely *observed* in transcript or
   `/context` metadata still cannot replace an explicit selection, so a
   gateway's raw upstream name never masquerades as the model the user chose.
-  Official `claude-*` selections and native takeover are unchanged.
+  Claude-branded observations keep working, including Vertex/enterprise forms
+  such as `claude-sonnet-4-5@20250929`. Official `claude-*` selections and
+  native takeover are unchanged.
 - Backport shared improvements from the DSH branch without adding a third
   engine (protocol v66): rounded Claude/Codex Goal dialogs with native save
   confirmation and mobile keyboard recovery; directory links open `/open`, and

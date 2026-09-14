@@ -192,6 +192,34 @@ def test_claude_context_observation_does_not_promote_native_base_model():
     assert handle.model == "claude-fable-5-1"
 
 
+def test_claude_context_report_never_leaks_a_proxy_upstream_id():
+    """The chip must not show a gateway's raw id when nothing selected it.
+
+    ``_claude_context_model``'s contract is "a user-facing Claude alias, never
+    a proxy upstream id". With no Remote-owned selection in force, the /context
+    reading is an *observation* and may not supply one; a session that selected
+    the id itself still reports it.
+    """
+    import cc_remote.wrapper.machine as machine_module
+
+    def context_model(sdk_model, announced, usage_model):
+        ctx = SimpleNamespace(sdk=SimpleNamespace(model=sdk_model),
+                              announced_model=announced)
+        return machine_module.WrapperMachine._claude_context_model(
+            ctx, {"model": usage_model})
+
+    # No selection anywhere: the upstream name must not become the answer.
+    assert context_model(None, None, "glm-5.2") is None
+    assert context_model(None, None, "openai/gpt-5") is None
+    # A Remote-owned selection is a real answer, provider-native or not.
+    assert context_model("glm-5.2", None, "glm-5.2") == "glm-5.2"
+    assert context_model(None, "glm-5.2", "glm-5.2") == "glm-5.2"
+    # A Claude-branded observation is still adopted, including Vertex forms.
+    assert context_model(None, None, "claude-opus-4-6") == "claude-opus-4-6"
+    assert context_model(None, None, "claude-sonnet-4-5@20250929") == (
+        "claude-sonnet-4-5@20250929")
+
+
 def test_claude_context_upstream_id_never_overwrites_explicit_selection():
     """Requirement: transcript/context metadata cannot replace a selection.
 

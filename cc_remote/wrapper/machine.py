@@ -165,6 +165,7 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControls,
     last_completed_assistant_controls,
     claude_auto_compact_cli_value,
+    valid_claude_alias,
     valid_claude_auto_compact,
     valid_claude_model,
     valid_claude_permission,
@@ -20524,12 +20525,17 @@ class WrapperMachine:
     ) -> Optional[str]:
         """Return only a user-facing Claude alias, never a proxy upstream id."""
         usage_model = usage.get("model") if isinstance(usage, dict) else None
-        for candidate in (
-            getattr(ctx.sdk, "model", None),
-            ctx.announced_model,
-            usage_model,
+        # The first two candidates are Remote-owned *selections*, which may name
+        # any provider -- a gateway's native id is a real answer for them. The
+        # third is an *observation* from the /context reading, which describes
+        # the provider rather than this session's selection, so it may only
+        # contribute a Claude-branded alias and never the raw upstream name.
+        for candidate, validator in (
+            (getattr(ctx.sdk, "model", None), valid_claude_model),
+            (ctx.announced_model, valid_claude_model),
+            (usage_model, valid_claude_alias),
         ):
-            model = valid_claude_model(candidate)
+            model = validator(candidate)
             if model is not None:
                 return model
         return None
