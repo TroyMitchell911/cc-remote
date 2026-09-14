@@ -7,13 +7,20 @@ import {
 } from "react";
 import { Icon } from "../icons";
 import {
-  effortsFor, modelsFor, parseSlash, type Catalog, type Effort, type Model,
+  modelsFor, parseSlash, type Catalog, type Effort, type Model,
 } from "../data";
-import { attachmentBytes, pickFiles } from "../img";
+import { attachmentBytes, snapshotAttachmentFiles } from "../img";
+import {
+  readClipboardImport, resolveClipboardImport, insertClipboardText,
+  type ClipboardImport,
+} from "../clipboard-import";
 import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
+import { CenteredSheet } from "./CenteredSheet";
+import { ChoicePicker } from "./ChoicePicker";
+import { AttachmentPicker } from "./AttachmentPicker";
 import { permissionProfileLabel } from "../data";
 import { codexProfilePresentation } from "../codex-profile-presentation";
 import {
@@ -33,114 +40,9 @@ import {
 const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
 
 type Engine = "claude" | "codex";
-
-export interface NewChatCatalogRequest {
-  engine: Engine;
-  cwd?: string;
-  claudeProfileId?: string;
-  codexProfileId?: string;
-}
-
-/** Catalog reads are scoped like the session they describe. Work owns its own
- * private cwd, so it must never probe Claude settings through the Code cwd. */
-export function newChatCatalogRequest(
-  engine: Engine, space: Space, cwd: string,
-  codexProfileId?: string | null,
-  claudeProfileId?: string | null,
-): NewChatCatalogRequest | null {
-  if (engine === "codex") {
-    return {
-      engine,
-      ...(codexProfileId ? { codexProfileId } : {}),
-    };
-  }
-  return space === "code" ? {
-    engine,
-    cwd,
-    ...(claudeProfileId ? { claudeProfileId } : {}),
-  } : null;
-}
-
-export interface NewChatLocalDefaults {
-  model: string | null;
-  effort: string | null;
-}
-
-/** Cwd-aware Claude defaults are presentation metadata for that exact Code
- * directory only. Codex defaults are machine-wide and may be shown in either
- * surface. The selected overrides themselves remain null until the user picks. */
-export function resolveNewChatLocalDefaults(
-  engine: Engine,
-  space: Space,
-  cwd: string,
-  modelDefaults: Record<string, string>,
-  effortDefaults: Record<string, string>,
-  defaultCwds: Record<string, string>,
-  catalogScopeKey: string = engine,
-): NewChatLocalDefaults {
-  if (engine === "claude"
-      && (space !== "code" || defaultCwds[catalogScopeKey] !== cwd)) {
-    return { model: null, effort: null };
-  }
-  return {
-    model: modelDefaults[catalogScopeKey] ?? null,
-    effort: effortDefaults[catalogScopeKey] ?? null,
-  };
-}
-
-/** Keep a user's explicit effort only when the newly selected model supports
- * it. Unknown/default targets fail safe to null; we never invent a highest
- * effort on the user's behalf. */
-export function compatibleNewChatEffort(
-  engine: Engine,
-  nextModel: string | null,
-  currentEffort: string | null,
-  catalog: Catalog,
-  localDefaultModel: string | null,
-): string | null {
-  if (!currentEffort) return null;
-  const effectiveModel = nextModel ?? localDefaultModel;
-  if (!effectiveModel) return null;
-  if (!modelsFor(engine, catalog).some(
-    (candidate) => candidate.id === effectiveModel,
-  )) return null;
-  return effortsFor(engine, effectiveModel, catalog).some(
-    (candidate) => candidate.id === currentEffort,
-  ) ? currentEffort : null;
-}
-
-export function reconcileNewChatSelection(
-  engine: Engine,
-  model: string | null,
-  effort: string | null,
-  catalog: Catalog,
-  localDefaultModel: string | null,
-): { model: string | null; effort: string | null } {
-  if (model && !modelsFor(engine, catalog).some(
-    (candidate) => candidate.id === model,
-  )) {
-    // A fallback model can disappear when the authoritative, entitlement-
-    // filtered catalog arrives. Clear both overrides instead of submitting a
-    // now-inaccessible model with a stale effort.
-    return { model: null, effort: null };
-  }
-  return {
-    model,
-    effort: compatibleNewChatEffort(
-      engine, model, effort, catalog, localDefaultModel),
-  };
-}
-
-export function newChatEfforts(
-  engine: Engine,
-  effectiveModel: string | null,
-  catalog: Catalog,
-): Effort[] {
-  // Without an authoritative Codex default there is no model against which an
-  // explicit effort can be validated. Keep only the null/default choice.
-  if (engine === "codex" && !effectiveModel) return [];
-  return effortsFor(engine, effectiveModel, catalog);
-}
+import { newChatEfforts } from "../new-chat-selection";
+export { compatibleNewChatEffort, newChatCatalogRequest, resolveNewChatLocalDefaults,
+  reconcileNewChatSelection, newChatEfforts } from "../new-chat-selection";
 
 interface Props {
   cwd: string;
@@ -219,12 +121,7 @@ function NewChatSelectorSheet({
 }) {
   const title = kind === "models" ? "选择模型" : "选择思考强度";
   return (
-    <>
-      <div className={"scrim" + (open ? " show" : "")} onClick={onClose} />
-      <div className={"sheet" + (open ? " show" : "")}
-        role="dialog" aria-label={title}>
-        <div className="sheet-grip" />
-        <div className="sheet-title">{title}</div>
+    <CenteredSheet open={open} label={title} onClose={onClose}>
         <div className="sheet-scroll">
           {options.map((option) => (
             <button key={option.id ?? "__local_default__"}
@@ -241,8 +138,7 @@ function NewChatSelectorSheet({
             </button>
           ))}
         </div>
-      </div>
-    </>
+    </CenteredSheet>
   );
 }
 
@@ -277,6 +173,7 @@ export function NewChatView({ cwd, controlScopeKey,
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [pastes, setPastes] = useState<ComposerPaste[]>([]);
   const [importing, setImporting] = useState(false);
+  const importingRef = useRef(false);
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] =
     useState<"models" | "efforts" | null>(null);
@@ -286,8 +183,6 @@ export function NewChatView({ cwd, controlScopeKey,
     useState<NewChatExecutionControls>(
       () => defaultExecutionControls(controlScopeKey));
   const [permissionsOpen, setPermissionsOpen] = useState(false);
-  const photoRef = useRef<HTMLInputElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
@@ -404,43 +299,53 @@ export function NewChatView({ cwd, controlScopeKey,
     icon: candidate.ic,
   }))];
 
-  const onPick = async (fl: FileList | File[] | null) => {
-    if (importing) return;
+  const onPick = async (fl: FileList | File[] | null, clipboard?: ClipboardImport) => {
+    if (importingRef.current) return;
+    importingRef.current = true;
     setImporting(true);
     try {
+      const [{ pickFiles }, imported] = await Promise.all([
+        import("../attachment-import"),
+        clipboard ? resolveClipboardImport(clipboard)
+          : Promise.resolve(snapshotAttachmentFiles(fl, images.length + files.length)),
+      ]);
       const batch = await pickFiles(
-        fl, images.length + files.length, attachmentBytes(images, files));
+        imported.files, images.length + files.length, attachmentBytes(images, files));
       if (batch.images.length) setImages((previous) => [...previous, ...batch.images]);
       if (batch.files.length) setFiles((previous) => [...previous, ...batch.files]);
-      if (batch.errors.length) window.alert(batch.errors.join("；"));
+      const errors = [...imported.errors, ...batch.errors];
+      if (errors.length) window.alert(errors.join("；"));
+    } catch {
+      window.alert("附件导入失败，请重新添加；已输入的文字会保留。");
     } finally {
+      importingRef.current = false;
       setImporting(false);
     }
   };
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const fs: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it.kind === "file") { const f = it.getAsFile(); if (f) fs.push(f); }
-    }
-    if (fs.length) { e.preventDefault(); void onPick(fs); return; }
-    const pastedText = e.clipboardData.getData("text/plain");
-    if (pastedText.length <= LONG_PASTE_THRESHOLD) return;
+    const clipboard = readClipboardImport(e.clipboardData, images.length + files.length);
+    const pastedText = clipboard.text;
+    const attachments = clipboard.files.length || clipboard.images.length
+      || clipboard.errors.length;
+    if (!attachments && pastedText.length <= LONG_PASTE_THRESHOLD) return;
     e.preventDefault();
-    setPastes((current) => [
-      ...current,
-      makeComposerPaste(pastedText, uuid()),
-    ]);
+    if (pastedText.length > LONG_PASTE_THRESHOLD) {
+      setPastes((current) => [...current, makeComposerPaste(pastedText, uuid())]);
+    } else if (pastedText) insertClipboardText(e.currentTarget, pastedText, setText);
+    if (attachments) void onPick(null, clipboard);
   };
 
   const send = (value = taRef.current?.value ?? text) => {
     const command = parseSlash(value.trim());
+    if (command?.slash === "open") {
+      onPickCwd();
+      setText("");
+      return;
+    }
     if (command?.slash === "autocompact") {
       if (engine !== "claude") {
-        setAutoCompactNotice("自动压缩阈值仅适用于 Claude 会话。");
+        setAutoCompactNotice("创建 Codex 会话后，可单独设置压缩阈值。");
         setText("");
         return;
       }
@@ -513,27 +418,23 @@ export function NewChatView({ cwd, controlScopeKey,
   const pickAccountProfile = engine === "codex"
     ? onPickCodexProfile : onPickClaudeProfile;
   const profileSelector = showProfileSelector ? (
-    <label className="newchat-profile">
-      <span>账号</span>
-      <select value={accountProfileId ?? ""}
-        onChange={(event) => pickAccountProfile?.(event.target.value)}
-        disabled={creating || importing || !pickAccountProfile}
-        aria-label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
-        {selectedProfileMissing && accountProfileId && (
-          <option value={accountProfileId} disabled>已移除账号</option>
-        )}
-        {accountProfiles.map((profile) => (
-          <option key={profile.id} value={profile.id}>
-            {codexProfilePresentation(
-              accountProfiles,
-              defaultAccountProfileId,
-              profile.id,
-            )?.fullLabel ?? profile.label}
-            {profile.error ? " · 目录暂不可用" : ""}
-          </option>
-        ))}
-      </select>
-    </label>
+    <ChoicePicker key={`${controlScopeKey}:account`} className="newchat-profile"
+      label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}
+      value={accountProfileId ?? ""} onChange={value => pickAccountProfile?.(value)}
+      disabled={creating || importing || !pickAccountProfile}
+      options={[
+        ...(selectedProfileMissing && accountProfileId
+          ? [{ value: accountProfileId, label: "已移除账号", disabled: true }] : []),
+        ...accountProfiles.map(profile => ({ value: profile.id,
+          label: codexProfilePresentation(accountProfiles, defaultAccountProfileId, profile.id)?.fullLabel ?? profile.label,
+          description: profile.error ? "目录暂不可用" : undefined, icon: "user",
+        })),
+      ]}>
+      <Icon name="user" size={14} /><span>账号</span>
+      <b>{selectedProfileMissing ? "已移除账号" : codexProfilePresentation(
+        accountProfiles, defaultAccountProfileId, accountProfileId,
+      )?.fullLabel ?? "选择账号"}</b>
+    </ChoicePicker>
   ) : null;
   const profileWarning = selectedProfileWarning ? (
     <div className="newchat-profile-error" role="status">
@@ -646,19 +547,9 @@ export function NewChatView({ cwd, controlScopeKey,
 
         <div className="newchat-foot">
           <div className="newchat-ctls">
-            <button type="button" className="cmdbtn"
-              onClick={() => (space === "work"
-                ? fileRef.current : photoRef.current)?.click()}
-              aria-label={space === "work" ? "添加资料" : "添加照片"}
-              title={space === "work" ? "添加资料" : "添加照片"}
-              disabled={creating || importing}>
-              <Icon name="plus" size={18} />
-            </button>
-            <input ref={photoRef} type="file" accept="image/*" multiple
-              aria-label="添加照片" hidden
-              onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
-            <input ref={fileRef} type="file" multiple aria-label="添加文件" hidden
-              onChange={(e) => { void onPick(e.target.files); e.target.value = ""; }} />
+            <AttachmentPicker key={controlScopeKey} onPick={onPick}
+              label={space === "work" ? "添加资料" : "添加附件"}
+              disabled={creating || importing} />
             <button type="button" className="hint-ctl"
               onClick={() => setSheetKind("models")}
               title="选择模型" disabled={creating || importing || !onPickModel}>
@@ -727,14 +618,8 @@ export function NewChatView({ cwd, controlScopeKey,
           setSheetKind(null);
         }}
       />
-      <>
-        <div className={"scrim" + (autoCompactOpen ? " show" : "")}
-          onClick={() => setAutoCompactOpen(false)} />
-        <div className={"sheet auto-compact-sheet"
-          + (autoCompactOpen ? " show" : "")}
-          role="dialog" aria-label="新会话自动压缩">
-          <div className="sheet-grip" />
-          <div className="sheet-title">新会话自动压缩</div>
+      <CenteredSheet open={autoCompactOpen} label="新会话自动压缩"
+        className="auto-compact-sheet" onClose={() => setAutoCompactOpen(false)}>
           <div className="sheet-scroll">
             <Suspense fallback={
               <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
@@ -749,8 +634,7 @@ export function NewChatView({ cwd, controlScopeKey,
                 }} />
             </Suspense>
           </div>
-        </div>
-      </>
+      </CenteredSheet>
       <CommandSheet
         open={permissionsOpen}
         kind="perms"
