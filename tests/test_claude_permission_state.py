@@ -200,8 +200,6 @@ def test_claude_context_report_never_leaks_a_proxy_upstream_id():
     reading is an *observation* and may not supply one; a session that selected
     the id itself still reports it.
     """
-    import cc_remote.wrapper.machine as machine_module
-
     def context_model(sdk_model, announced, usage_model):
         ctx = SimpleNamespace(sdk=SimpleNamespace(model=sdk_model),
                               announced_model=announced)
@@ -218,6 +216,39 @@ def test_claude_context_report_never_leaks_a_proxy_upstream_id():
     assert context_model(None, None, "claude-opus-4-6") == "claude-opus-4-6"
     assert context_model(None, None, "claude-sonnet-4-5@20250929") == (
         "claude-sonnet-4-5@20250929")
+
+
+def test_same_claude_model_selection_compares_through_the_pins():
+    """Agreement is decided on normalized ids, and "no selection" agrees with
+    nothing -- so a reading can never be mistaken for an established choice.
+
+    Both reconciliation sites share this predicate; comparing raw strings would
+    call a curated id and its pinned ``[1m]`` form different when they are the
+    same selection.
+    """
+    same = sdk_module.same_claude_model_selection
+
+    # A curated id and its pinned spelling are one selection.
+    assert same("claude-fable-5-1", "claude-fable-5-1[1m]")
+    assert same("claude-fable-5-1[1m]", "claude-fable-5-1")
+    # Surrounding space is never part of the identity.
+    assert same("  claude-fable-5-1  ", "claude-fable-5-1[1m]")
+    # Case folds through the pin table, which is keyed lowercase.
+    assert same("opus", CLAUDE_DEFAULT_MODEL)
+    assert same("OPUS", CLAUDE_DEFAULT_MODEL)
+    assert same("CLAUDE-FABLE-5-1", "claude-fable-5-1[1m]")
+    # An unpinned id keeps its casing -- only the pin lookup folds. A mixed-case
+    # selection therefore reads as *disagreeing* with a lowercase observation of
+    # the same id, which is the conservative direction: the selection is kept.
+    assert not same("Claude-Opus-4-6", "claude-opus-4-6")
+    # Genuinely different selections, including provider-native ids.
+    assert not same("claude-opus-4-6", "claude-3-7-sonnet@20250219")
+    assert not same("glm-5.2", "claude-opus-4-6")
+    assert not same("glm-5.2", "openai/gpt-5")
+    # Nothing established: never agreement, whichever side is missing.
+    assert not same(None, "claude-opus-4-6")
+    assert not same("claude-opus-4-6", None)
+    assert not same(None, None)
 
 
 def test_claude_context_upstream_id_never_overwrites_explicit_selection():

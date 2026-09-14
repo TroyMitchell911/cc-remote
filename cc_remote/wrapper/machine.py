@@ -223,6 +223,7 @@ from cc_remote.wrapper.sdk import (
     ClaudeAutonomousFollowupPending,
     SdkHandle,
     normalize_claude_model_selection,
+    same_claude_model_selection,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
 from cc_remote.wrapper.rollback_commands import (
@@ -7826,8 +7827,8 @@ class WrapperMachine:
         reported_model = valid_claude_model(getattr(ctx.sdk, "model", None))
         reconciled_model = valid_claude_model(model)
         if (reported_model is not None and reconciled_model is not None
-                and normalize_claude_model_selection(reported_model)
-                != normalize_claude_model_selection(reconciled_model)):
+                and not same_claude_model_selection(
+                    reported_model, reconciled_model)):
             # A custom provider can expose its upstream id through context
             # usage even though the selected Claude alias was applied. That
             # reading describes the provider, not this session's selection, so
