@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Accept provider-native Claude model ids (e.g. `glm-5.2` behind a custom
+  `ANTHROPIC_BASE_URL` gateway) as explicit model selections: they are handed
+  to Claude Code, persisted in the private session store, and restored across
+  reconnect and cold resume. A model id merely *observed* in transcript or
+  `/context` metadata still cannot replace an explicit selection, so a
+  gateway's raw upstream name never masquerades as the model the user chose.
+  Claude-branded observations keep working, including Vertex/enterprise forms
+  such as `claude-sonnet-4-5@20250929`. Official `claude-*` selections and
+  native takeover are unchanged.
 - Backport shared improvements from the DSH branch without adding a third
   engine (protocol v66): rounded Claude/Codex Goal dialogs with native save
   confirmation and mobile keyboard recovery; directory links open `/open`, and

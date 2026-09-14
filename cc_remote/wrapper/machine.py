@@ -165,6 +165,7 @@ from cc_remote.wrapper.claude_controls import (
     ClaudeControls,
     last_completed_assistant_controls,
     claude_auto_compact_cli_value,
+    valid_claude_alias,
     valid_claude_auto_compact,
     valid_claude_model,
     valid_claude_permission,
@@ -222,6 +223,7 @@ from cc_remote.wrapper.sdk import (
     ClaudeAutonomousFollowupPending,
     SdkHandle,
     normalize_claude_model_selection,
+    same_claude_model_selection,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
 from cc_remote.wrapper.rollback_commands import (
@@ -7822,14 +7824,20 @@ class WrapperMachine:
             return error
 
         ctx.needs_reload = False
-        applied_model = valid_claude_model(
-            getattr(ctx.sdk, "model", None)) or model
+        reported_model = valid_claude_model(getattr(ctx.sdk, "model", None))
+        reconciled_model = valid_claude_model(model)
+        if (reported_model is not None and reconciled_model is not None
+                and not same_claude_model_selection(
+                    reported_model, reconciled_model)):
+            # A custom provider can expose its upstream id through context
+            # usage even though the selected Claude alias was applied. That
+            # reading describes the provider, not this session's selection, so
+            # the reconciled selection wins: never leak the upstream name back
+            # into Remote's model chip or its private session store.
+            reported_model = None
+        applied_model = reported_model or model
         applied_effort = getattr(ctx.sdk, "effort", None) or effort
         if applied_model:
-            # A custom provider can expose its upstream id through context
-            # usage even though the selected Claude alias was applied. Never
-            # leak that implementation detail back into Remote's model chip or
-            # its private session store.
             ctx.sdk.model = applied_model
         if applied_model and applied_model != ctx.announced_model:
             ctx.announced_model = applied_model
@@ -20518,12 +20526,17 @@ class WrapperMachine:
     ) -> Optional[str]:
         """Return only a user-facing Claude alias, never a proxy upstream id."""
         usage_model = usage.get("model") if isinstance(usage, dict) else None
-        for candidate in (
-            getattr(ctx.sdk, "model", None),
-            ctx.announced_model,
-            usage_model,
+        # The first two candidates are Remote-owned *selections*, which may name
+        # any provider -- a gateway's native id is a real answer for them. The
+        # third is an *observation* from the /context reading, which describes
+        # the provider rather than this session's selection, so it may only
+        # contribute a Claude-branded alias and never the raw upstream name.
+        for candidate, validator in (
+            (getattr(ctx.sdk, "model", None), valid_claude_model),
+            (ctx.announced_model, valid_claude_model),
+            (usage_model, valid_claude_alias),
         ):
-            model = valid_claude_model(candidate)
+            model = validator(candidate)
             if model is not None:
                 return model
         return None
