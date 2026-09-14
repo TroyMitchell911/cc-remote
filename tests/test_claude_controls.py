@@ -612,25 +612,25 @@ def test_handoff_observes_only_claude_branded_model_aliases():
     # *selection* that the broker would accept.
     for rejected in [
         "glm-5.2", "openai/gpt-5", "model+plus",
-        "claude", "Claude-opus-4-6", "@leading/at",
+        "claude", "claude-", "claude--bad", "Claude-opus-4-6", "@leading/at",
     ]:
         assert controls_module.valid_claude_alias(rejected) is None
 
 
-def test_observation_class_stays_within_the_broker_class():
-    """The alias grammar is the selection grammar plus a ``claude-`` prefix.
+def test_observation_class_stays_within_the_selection_class():
+    """Observed aliases are a strict subset of valid model selections."""
+    max_model = "a" * 256
+    too_long_model = max_model + "a"
+    max_alias = "claude-" + "a" * (256 - len("claude-"))
+    too_long_alias = max_alias + "a"
 
-    Both are built from one body, so the broker can never accept an id the
-    private store's observation path would reject (or vice versa) without this
-    failing.
-    """
-    assert controls_module._MODEL_ALIAS.pattern == (
-        f"^claude-{controls_module._MODEL_BODY}$")
-    assert controls_module._MODEL_ID.pattern == (
-        f"^{controls_module._MODEL_BODY}$")
-    # A 255-char id fits; one more does not.
-    assert controls_module.valid_claude_model("a" * 255) is not None
-    assert controls_module.valid_claude_model("a" * 256) is None
+    assert controls_module.valid_claude_model(max_model) == max_model
+    assert controls_module.valid_claude_model(too_long_model) is None
+    assert len(max_alias) == 256
+    assert controls_module.valid_claude_alias(max_alias) == max_alias
+    assert controls_module.valid_claude_model(max_alias) == max_alias
+    assert controls_module.valid_claude_alias(too_long_alias) is None
+    assert controls_module.valid_claude_model(too_long_alias) is None
 
 
 def test_selection_accepts_provider_native_ids_a_broker_could_send():

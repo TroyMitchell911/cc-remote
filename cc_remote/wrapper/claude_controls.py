@@ -35,22 +35,18 @@ _V3_FORCED_AUTO_COMPACT_TOKENS = 500_000
 _NATIVE_AUTO_COMPACT_POLICY = "native"
 
 # The body of any model id the local broker accepts -- same character class as
-# ``claude_broker/session.py``'s ``_MODEL_VALUE_RE``, bounded to 255. A model
+# ``claude_broker/session.py``'s ``_MODEL_VALUE_RE``, bounded to 256. A model
 # *selection* may name any provider: a gateway is free to expose ids such as
 # ``glm-5.2`` or ``openai/gpt-5``.
-_MODEL_BODY = r"[A-Za-z0-9][A-Za-z0-9._:+/@\[\]-]{0,254}"
+_MODEL_BODY = r"[A-Za-z0-9][A-Za-z0-9._:+/@\[\]-]{0,255}"
 _MODEL_ID = re.compile(rf"^{_MODEL_BODY}$")
 # An *observation* is a transcript/context row. Those describe whatever the
 # provider answered with, which is not evidence of a Remote-owned selection.
 # Only a Claude-branded alias may be adopted from them, so a gateway's raw
 # upstream name (``glm-5.2``) can never masquerade as the model the user picked.
-#
-# Built from the same body so the pair cannot drift: an observation is exactly a
-# selection carrying a mandatory ``claude-`` prefix, which keeps every id the
-# alias form accepts inside the broker's class. Vertex/enterprise aliases such
-# as ``claude-sonnet-4-5@20250929`` are real catalog entries, so the body must
-# stay as wide here as it is for a selection.
-_MODEL_ALIAS = re.compile(rf"^claude-{_MODEL_BODY}$")
+# ``valid_claude_alias`` first validates the complete id as a selection, which
+# keeps observation ids inside the broker's 256-byte selection boundary.
+_MODEL_ALIAS_PREFIX = re.compile(r"^claude-[A-Za-z0-9]")
 _MAX_ENTRIES = 4096
 _MAX_FILE_BYTES = 1024 * 1024
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
@@ -227,10 +223,10 @@ def valid_claude_model(value: object) -> str | None:
 
 def valid_claude_alias(value: object) -> str | None:
     """Validate a model *observation* from transcript or context metadata."""
-    if not isinstance(value, str):
+    candidate = valid_claude_model(value)
+    if candidate is None or _MODEL_ALIAS_PREFIX.match(candidate) is None:
         return None
-    value = value.strip()
-    return value if _MODEL_ALIAS.fullmatch(value) else None
+    return candidate
 
 
 def valid_claude_effort(value: object) -> str | None:
