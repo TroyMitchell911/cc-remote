@@ -54,7 +54,9 @@ def test_missing_session_record_delegates_autocompact_to_claude(
     assert saved.applied_auto_compact_threshold_tokens is None
 
 
-def test_remote_control_store_drops_untrusted_values(tmp_path):
+def test_remote_control_store_keeps_provider_native_model_and_drops_bad_controls(
+    tmp_path,
+):
     store = ClaudeControlStore(tmp_path)
     saved = store.update(
         SESSION_ID,
@@ -63,7 +65,10 @@ def test_remote_control_store_drops_untrusted_values(tmp_path):
         permission_mode="owner",
     )
 
+    # A provider-native selection is a real, Remote-owned choice and must
+    # survive; only the unrecognized effort/permission values are dropped.
     assert saved.as_dict() == {
+        "model": "glm-5.2",
         "auto_compact_mode": "inherit",
         "applied_auto_compact_mode": "inherit",
     }
@@ -566,3 +571,28 @@ def test_handoff_never_falls_back_to_older_model_for_proxy_upstream(
 
     assert controls.model is None
     assert controls.effort == "max"
+
+
+def test_handoff_observes_only_claude_branded_model_aliases():
+    """A transcript row may assert a Claude alias, never a provider id."""
+    assert controls_module.valid_claude_alias("claude-opus-4-6[1m]") == (
+        "claude-opus-4-6[1m]")
+    for observed in ["glm-5.2", "openai/gpt-5", "claude", "Claude-opus-4-6"]:
+        assert controls_module.valid_claude_alias(observed) is None
+
+
+def test_selection_accepts_provider_native_ids_a_broker_could_send():
+    """A selection is wider than an observation, and matches the broker."""
+    for selected in [
+        "glm-5.2", "openai/gpt-5", "claude-opus-4-6[1m]",
+        "model+plus", "claude-sonnet-4-5@20250929",
+    ]:
+        assert controls_module.valid_claude_model(selected) == selected
+    # Surrounding whitespace is stripped, not rejected.
+    assert controls_module.valid_claude_model("  glm-5.2  ") == "glm-5.2"
+    for rejected in ["", "   ", "@cf/meta/llama-3-8b", "-leading-dash"]:
+        # A leading ``@`` or ``-`` and a blank value are not ids in any
+        # provider; nor are non-string values.
+        assert controls_module.valid_claude_model(rejected) is None
+    for non_string in [None, True, 5, b"glm-5.2"]:
+        assert controls_module.valid_claude_model(non_string) is None

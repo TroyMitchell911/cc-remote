@@ -7718,14 +7718,20 @@ class WrapperMachine:
             return error
 
         ctx.needs_reload = False
-        applied_model = valid_claude_model(
-            getattr(ctx.sdk, "model", None)) or model
+        reported_model = valid_claude_model(getattr(ctx.sdk, "model", None))
+        reconciled_model = valid_claude_model(model)
+        if (reported_model is not None and reconciled_model is not None
+                and normalize_claude_model_selection(reported_model)
+                != normalize_claude_model_selection(reconciled_model)):
+            # A custom provider can expose its upstream id through context
+            # usage even though the selected Claude alias was applied. That
+            # reading describes the provider, not this session's selection, so
+            # the reconciled selection wins: never leak the upstream name back
+            # into Remote's model chip or its private session store.
+            reported_model = None
+        applied_model = reported_model or model
         applied_effort = getattr(ctx.sdk, "effort", None) or effort
         if applied_model:
-            # A custom provider can expose its upstream id through context
-            # usage even though the selected Claude alias was applied. Never
-            # leak that implementation detail back into Remote's model chip or
-            # its private session store.
             ctx.sdk.model = applied_model
         if applied_model and applied_model != ctx.announced_model:
             ctx.announced_model = applied_model

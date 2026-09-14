@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Accept provider-native Claude model ids (e.g. `glm-5.2` behind a custom
+  `ANTHROPIC_BASE_URL` gateway) as explicit model selections: they are handed
+  to Claude Code, persisted in the private session store, and restored across
+  reconnect and cold resume. A model id merely *observed* in transcript or
+  `/context` metadata still cannot replace an explicit selection, so a
+  gateway's raw upstream name never masquerades as the model the user chose.
+  Official `claude-*` selections and native takeover are unchanged.
 - Fix home-directory page discovery (protocol v55): explicitly referenced HTML
   and verified, user-owned Python static-server links become private session
   previews without per-project registration. Preserve manual publications,

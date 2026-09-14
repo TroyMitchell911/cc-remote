@@ -719,12 +719,21 @@ class SdkHandle:
                 # promote a merely observed native/Work base model: Code owns
                 # explicit model selection while Work keeps Claude's policy.
                 current_model = valid_claude_model(self.model)
-                if (
+                same_selection = (
                     current_model is not None
-                    and current_model.lower().endswith("[1m]")
                     and normalize_claude_model_selection(current_model)
                         == normalize_claude_model_selection(selected_model)
-                ):
+                )
+                if current_model is not None and not same_selection:
+                    # A gateway reports its own upstream id here (e.g.
+                    # ``glm-5.2``) while the user selected a Claude alias. That
+                    # reading describes the provider, not this session's
+                    # selection, so it must not replace one. A session with no
+                    # selection yet still adopts the reading below, which is
+                    # how a fresh session learns its provider-selected model.
+                    pass
+                elif current_model is not None and current_model.lower(
+                        ).endswith("[1m]"):
                     self.model = normalize_claude_model_selection(current_model)
                 else:
                     self.model = selected_model
