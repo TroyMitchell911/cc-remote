@@ -4,6 +4,28 @@ const url = "/tests/history-browser.html?background-tasks=1";
 const trigger = (page: Page) => page.getByRole("button", { name: /后台任务，\d+ 项进行中/ });
 const dialog = (page: Page) => page.getByRole("dialog", { name: "后台任务", exact: true });
 
+for (const engine of ["claude", "codex"]) {
+  test(`${engine} agent return only adds a link to the existing continuation row`, async ({ page }, info) => {
+    await page.goto(url + `&engine=${engine}&agent-returns=1`);
+    const initialProcessCount = await page.locator(".turn-process-head").count();
+    const initialExpanded = await page.locator(".turn-process-head").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-expanded")));
+    await page.getByRole("button", { name: "代理回执", exact: true }).click();
+    await expect(page.locator(".background-followup")).toHaveCount(0);
+    await expect(page.locator(".agent-return-link")).toHaveCount(0);
+    await expect(page.locator(".turn-process-head")).toHaveCount(initialProcessCount);
+    expect(await page.locator(".turn-process-head").evaluateAll(nodes => nodes.map(node => node.getAttribute("aria-expanded")))).toEqual(initialExpanded);
+    await page.getByRole("button", { name: "回复结束", exact: true }).click();
+    await page.getByRole("button", { name: "后台继续", exact: true }).click();
+    await expect(page.locator(".background-followup-boundary")).toHaveCount(1);
+    const link = page.locator(".background-followup-boundary .agent-return-link");
+    await expect(link).toHaveText("代理返回 · 核对构建产物");
+    await expect(page.locator(".thread")).not.toContainText("任务返回");
+    await link.click();
+    await expect(page.getByTestId("background-opened")).toHaveText("native-child");
+    await page.screenshot({ path: info.outputPath(`${engine}-inline-return.png`), animations: "disabled" });
+  });
+}
+
 test("Codex background tasks show an independent dock and a native continuation label", async ({ page }, testInfo) => {
   await page.goto(url + "&engine=codex&theme=light");
   await page.getByRole("button", { name: "回复结束", exact: true }).click();

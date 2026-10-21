@@ -27,6 +27,7 @@ import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { useMarkdownExtras } from "../use-markdown-extras";
+import { rehypeMessageBreaks } from "../markdown-breaks";
 
 // Keep the parser behind its own memo boundary. MessageBlock still receives
 // fresh callbacks/assets through context, but an unchanged displayed string
@@ -578,6 +579,7 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   ], [extras.citation, math.plugins?.remarkPlugins]);
   const rehypePlugins = useMemo(() => [
     ...(extras.details ? [extras.details] : []),
+    rehypeMessageBreaks,
     ...(math.plugins?.rehypePlugins ?? []),
   ], [extras.details, math.plugins?.rehypePlugins]);
   const parts = useMemo(

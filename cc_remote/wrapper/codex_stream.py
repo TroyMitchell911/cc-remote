@@ -4071,6 +4071,8 @@ def _subagent_event(item: dict, turn_id: str | None, completed: bool):
             "interrupted": "协作代理已中断",
         }.get(kind, "协作代理"),
         summary=path or None,
+        server="cc_remote" if kind in {"completed", "interrupted"} and completed else None,
+        tool="agent_return" if kind in {"completed", "interrupted"} and completed else None,
         input={"agent_run_id": f"codex-agent:{item['agentThreadId']}"}
         if isinstance(item.get("agentThreadId"), str) else None,
     )

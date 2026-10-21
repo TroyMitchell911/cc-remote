@@ -53,17 +53,23 @@ export function AgentDetailController({ selection, ws, onListen, onClose,
     const run = current.runs[runId];
     const requestId = uuid();
     clearDeadline(runId);
+    // Register correlation before sending. A fast native response can arrive
+    // before React commits the loading state, especially on a mobile renderer.
+    const currentRun = run ?? emptyAgentRun(runId, title);
+    const pending = { ...current, runs: { ...current.runs, [runId]: {
+      ...currentRun, title: title || currentRun.title,
+      loading: true, error: null, requestId,
+    } } };
+    panelRef.current = pending;
+    setPanel(pending);
     const sent = ws?.sendGetAgentDetail(
       current.sid, runId, before ? current.revision : undefined,
       before ? run?.detailRevision : undefined, before, 192, requestId,
     );
-    setPanel((value) => {
-      const currentRun = value.runs[runId] ?? emptyAgentRun(runId, title);
-      return { ...value, runs: { ...value.runs, [runId]: {
-        ...currentRun, title: title || currentRun.title,
-        loading: !!sent, error: sent ? null : "连接未就绪，请重试读取协作代理", requestId: sent ? requestId : null,
-      } } };
-    });
+    if (!sent) setPanel(value => ({ ...value, runs: { ...value.runs, [runId]: {
+      ...value.runs[runId]!, loading: false, requestId: null,
+      error: "连接未就绪，请重试读取协作代理",
+    } } }));
     if (sent) deadlines.current.set(runId, setTimeout(() => {
       deadlines.current.delete(runId);
       setPanel((value) => {

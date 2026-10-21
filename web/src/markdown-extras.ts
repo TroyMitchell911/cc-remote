@@ -2,10 +2,10 @@ import type { Nodes, Root } from "hast";
 import type { VFile } from "vfile";
 import rehypeRaw from "rehype-raw";
 
-const DISCLOSURE_TAG = /(<\/?(?:details|summary)\s*>|<details\s+open\s*>)/gi;
-const SAFE_TAG = /^<\/?(?:details|summary)\s*>$|^<details\s+open\s*>$/i;
+const DISCLOSURE_TAG = /(<\/?(?:details|summary)\s*>|<details\s+open\s*>|<br[\t\n\r ]*\/?>)/gi;
+const SAFE_TAG = /^<\/?(?:details|summary)\s*>$|^<details\s+open\s*>$|^<br[\t\n\r ]*\/?>$/i;
 
-/** Recognize only native disclosures, not arbitrary model-provided HTML.
+/** Recognize only native disclosures and bare breaks, not arbitrary HTML.
  * Everything else remains visible text as in react-markdown's default mode.
  * The existing HTML parser owns nesting/streaming repair. Boolean `open` is the
  * only allowed attribute: raw URLs, event handlers and styles stay inert.

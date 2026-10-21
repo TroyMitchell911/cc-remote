@@ -49,6 +49,7 @@ export function BackgroundTasksFixture() {
   const [opened, setOpened] = useState("");
   const [restoredDetail, setRestoredDetail] = useState(false);
   const compact = new URLSearchParams(location.search).has("compact");
+  const agentReturns = new URLSearchParams(location.search).has("agent-returns");
   const drafts = useRef(new ComposerDraftStore());
   const runtime = state.runtimes[sid];
   useEffect(() => {
@@ -70,6 +71,21 @@ export function BackgroundTasksFixture() {
       }}>回复结束</button>
       <button onClick={() => complete("build", "task")}>构建完成</button>
       <button onClick={() => complete("agent", "agent")}>代理完成</button>
+      {agentReturns && <>
+        <button onClick={() => emit({ type: "process", item_id: "return-child", kind: "agent",
+          phase: "end", status: "succeeded", turn_id: "parent", title: "核对构建产物",
+          server: "cc_remote", tool: "agent_return", background: true,
+          input: { agent_run_id: "native-child" } })}>代理回执</button>
+        <button onClick={() => {
+          if (engine === "codex") emit({ type: "process", item_id: "native-callback", kind: "task",
+            phase: "end", status: "succeeded", turn_id: "parent", title: "后台消息",
+            server: "cc_remote_tasks", tool: "task_result" });
+          emit({ type: "assistant_msg_start", message_id: "agent-continued", turn_id: "parent", channel: "final", background: true });
+          emit({ type: "delta", message_id: "agent-continued", turn_id: "parent", channel: "final", background: true,
+            text: "已核对后台代理的审查结果。" });
+          emit({ type: "assistant_msg_end", message_id: "agent-continued", turn_id: "parent", channel: "final", background: true });
+        }}>后台继续</button>
+      </>}
       {engine === "codex" && <button onClick={() => {
         emit({ type: "background_process_sync", items: [] });
         emit({ type: "turn_binding", msg_id: "callback-turn", turn_id: "callback-turn" });

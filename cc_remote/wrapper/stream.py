@@ -1422,15 +1422,19 @@ class StreamTranslator:
                 background=True,
             )]
         if isinstance(msg, TaskNotificationMessage):
+            from cc_remote.wrapper.agent_returns import return_receipt
+
             status = _task_status(msg.status)
-            return [ProcessEvent(
+            event = ProcessEvent(
                 item_id=item_id, kind=kind, phase="end",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
                 command=command,
                 background=True,
-            )]
+            )
+            return [event, return_receipt(event, f"claude:{task_id}",
+                                         item_id if kind == "agent" and parent else None)]
         return []
 
     def _feed_background_tasks_changed(
@@ -3212,6 +3216,10 @@ def translate_history(
                     if t is not None:
                         event.ts = t
                     events.append(event)
+                    from cc_remote.wrapper.agent_returns import return_receipt
+
+                    events.append(return_receipt(event, f"claude:{internal_event.item_id}",
+                        event.item_id if event.kind == "agent" and event.parent_id else None))
                     turn_open = True
                 elif _is_meta_user_text(content):
                     continue

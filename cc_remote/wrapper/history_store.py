@@ -79,9 +79,9 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v46 restores native commands, source clocks and closed segment envelopes.
 # v47 preserves native cross-thread provenance and outgoing message receipts.
 # v48 retains Codex async task receipt boundaries in compact summaries.
-# Unified messaging introduces new transcript envelopes/tool names only; old
-# projections stay valid and do not need a cache migration.
-_SCHEMA_VERSION = 48
+# v49 retains native Claude/Codex child/task return identities.
+# v50 keeps return-link metadata out of process counts and timing.
+_SCHEMA_VERSION = 50
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -670,19 +670,22 @@ def materialize_history_turns(
                          or event.get("message_id"))
             if isinstance(source_id, str):
                 source_order.setdefault(source_id, event_index)
-            if (event_type == "process" and event.get("kind") == "task"
-                    and event.get("server") == "cc_remote_tasks"
-                    and event.get("tool") == "task_result"
+            if (event_type == "process"
+                    and ((event.get("server") == "cc_remote_tasks"
+                          and event.get("tool") == "task_result" and event.get("kind") == "task")
+                         or (event.get("server") == "cc_remote"
+                             and event.get("tool") in {"agent_return", "task_return"}))
                     and event.get("phase") == "end"
                     and isinstance(event.get("item_id"), str)):
                 # This compact boundary is narrative, not a heavy tool body.
                 # Retain it alongside the answer, even before detail is opened.
                 task_receipts[event["item_id"]] = {
                     "kind": "process", "item_id": event["item_id"],
-                    "processKind": "task", "phase": "end", "done": True,
+                    "processKind": event.get("kind"), "phase": "end", "done": True,
                     "turn_id": event.get("turn_id"),
                     "status": event.get("status") or "unknown",
-                    "server": "cc_remote_tasks", "tool": "task_result",
+                    "server": event.get("server"), "tool": event.get("tool"),
+                    "input": {"agent_run_id": (event.get("input") or {}).get("agent_run_id")},
                     "title": short(event.get("title")) or "后台任务",
                     "summary": short(event.get("summary")),
                     "startedTs": _event_ms(event.get("ts")),
@@ -690,6 +693,11 @@ def materialize_history_turns(
                 if len(task_receipts) > 16:
                     task_receipts.pop(next(iter(task_receipts)))
                     receipts_truncated = True
+                if (event.get("server") == "cc_remote"
+                        and event["item_id"].startswith("return-")):
+                    # Link metadata is already in the summary. It must not add
+                    # a process disclosure, count or duration to the parent.
+                    continue
             if (event_type == "process" and event.get("kind") == "model"
                     and event.get("tool") == "model_refusal_fallback"
                     and isinstance(event.get("item_id"), str)):
@@ -1540,7 +1548,7 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47):
+            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49):
                 # The independent v22-v44 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
@@ -1729,6 +1737,12 @@ class HistoryIndexStore:
                 # native sources, other engines and binary assets stay valid.
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if 0 < current < 50:
+                # Return links retain native IDs without becoming process work.
+                # Only rebuild chat projections; preserve binary/image assets,
+                # child detail and the raw Claude compact ancestry index.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine IN ('claude', 'codex')")
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:

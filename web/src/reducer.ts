@@ -1,3 +1,4 @@
+import { isSyntheticReturnReceipt } from "./agent-returns";
 // Turn/block state model for the chat UI.
 //
 // Multi-session: AppState holds a `runtimes` map keyed by session id (or a
@@ -2081,6 +2082,7 @@ function claimClaudeContinuation(
 const MAX_LIVE_DETAIL_TURN_IDS = 128;
 
 function isStateVisibleProcessBlock(block: Block): boolean {
+  if (isSyntheticReturnReceipt(block)) return false;
   if (block.kind === "tool") return true;
   if (block.kind === "text") {
     return block.channel === "commentary" && block.text.length > 0;

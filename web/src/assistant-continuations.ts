@@ -1,10 +1,12 @@
-import type { Block, TextBlock } from "./domain/conversation";
+import type { Block, ProcessBlock, TextBlock } from "./domain/conversation";
 import { finalTextBlocks } from "./process-blocks";
+import { isReturnReceipt, isSyntheticReturnReceipt, returnedAgents, hasParentContinuation } from "./agent-returns.ts";
 
 export interface AssistantContinuation {
   id: string;
   blocks: Block[];
   answers: TextBlock[];
+  returns: ProcessBlock[];
   startedTs?: number;
   doneTs?: number;
 }
@@ -19,6 +21,7 @@ export function assistantContinuations(blocks: Block[], answers: TextBlock[], en
   let current: AssistantContinuation | undefined;
   let answered = false;
   for (const block of blocks) {
+    if (isSyntheticReturnReceipt(block)) continue;
     let begins: boolean;
     if (codex) {
       const receipt = block.kind === "process" && block.processKind === "task"
@@ -50,7 +53,7 @@ export function assistantContinuations(blocks: Block[], answers: TextBlock[], en
       current = {
         id: block.kind === "text" ? block.message_id
           : block.kind === "tool" ? block.tool_use_id : block.item_id,
-        blocks: [], answers: [], startedTs: block.startedTs,
+        blocks: [], answers: [], returns: [], startedTs: block.startedTs,
       };
       continuations.push(current);
     }
@@ -64,6 +67,22 @@ export function assistantContinuations(blocks: Block[], answers: TextBlock[], en
         current.answers.push(answer);
         visibleAnswers.delete(block.message_id);
       }
+    }
+  }
+  // Decorate existing native continuations only. Receipt arrival cannot change
+  // their IDs, ordering, clocks, process blocks or disclosure state. In-flight
+  // foreground output consumes the receipt without adding a visible boundary.
+  const firstParentBlocks = new Map(continuations.flatMap(segment => {
+    const first = segment.blocks.find(block => hasParentContinuation([block]));
+    return first ? [[first, segment] as const] : [];
+  }));
+  let pending: Block[] = [];
+  for (const block of blocks) {
+    if (isReturnReceipt(block)) pending.push(block);
+    if (hasParentContinuation([block])) {
+      const segment = firstParentBlocks.get(block);
+      if (segment) segment.returns = returnedAgents(pending);
+      pending = [];
     }
   }
   return {

@@ -50,7 +50,7 @@ import type { QueuedQueryEditor } from "./components/QueuedQueryDialog";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
 import { presentCommandProblem } from "./problem-presentation";
-import { LoginForm } from "./components/LoginForm";
+const LoginForm = lazy(() => import("./components/LoginForm").then(m => ({ default: m.LoginForm })));
 import {
   compatibleNewChatEffort,
   newChatCatalogRequest,
@@ -4586,7 +4586,9 @@ export default function App() {
   }
 
   if (!authed) {
-    return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
+    return <Suspense fallback={null}><LoginForm
+      onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }}
+      theme={theme} onToggleTheme={toggleTheme} /></Suspense>;
   }
 
   const runtimeIsReadOnly = (sid: string): boolean => {
