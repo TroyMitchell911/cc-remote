@@ -574,6 +574,33 @@ try {
     "/src/components/MessageBlock.tsx");
   const { preloadMarkdownExtras } = await harness.ssrLoadModule(
     "/src/use-markdown-extras.ts");
+  // Bare breaks work on the first render, before lazy disclosure parsers load.
+  for (const tag of ["<br>", "<br/>", "<br />", "<BR>"]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `| 项 | 结果 |\n| --- | --- |\n| 唤醒后下指令 | 先向前${tag}再向右 |`, done: true,
+    }));
+    assert.match(markup, /<td>先向前<br\/>再向右<\/td>/);
+    assert.doesNotMatch(markup, /&lt;br/i);
+    const leading = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `${tag}好，这段正文不会多一行。`, done: true,
+    }));
+    assert.match(leading, /<p>好，这段正文不会多一行。<\/p>/);
+    assert.doesNotMatch(leading, /<br\/>/);
+  }
+  for (const done of [false, true]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: "<br>\n<br />\n\n正文第一行<br>第二行<br><br>第四行\n\n下一段<br>仍然换行", done,
+    }));
+    assert.match(markup, /<p>正文第一行<br\/>第二行<br\/><br\/>第四行<\/p>/);
+    assert.match(markup, /<p>下一段<br\/>仍然换行<\/p>/);
+    assert.doesNotMatch(markup, /<p>\s*<br/);
+  }
+  const literalBreaks = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "`<br>` 与 \\<br> 以及 &lt;br&gt;\n\n```html\n<br>\n```\n\n<br onclick=alert(1)>\n\n<script>alert(2)</script>", done: true,
+  }));
+  assert.doesNotMatch(literalBreaks, /<br\b|<script\b/);
+  assert.match(literalBreaks, /&lt;br&gt;/);
+  assert.match(literalBreaks, /&lt;br onclick=/);
   await preloadMarkdownExtras();
   const disclosureMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "Before\n\n<details>\n<summary>文件清单</summary>\n\n"
@@ -588,6 +615,10 @@ try {
   assert.match(disclosureMarkup, /message-file-link/);
   assert.match(disclosureMarkup, /<details class="message-disclosure" open="">\s*<summary>Nested<\/summary>/);
   assert.match(disclosureMarkup, /<p>After<\/p>/);
+  const disclosureBreaks = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "<details><summary>摘要<br>第二行</summary>内容<br/>下一行</details>", done: true,
+  }));
+  assert.match(disclosureBreaks, /<summary>摘要<br\/>第二行<\/summary>内容<br\/>下一行/);
   const unsafeDisclosure = renderToStaticMarkup(createElement(MessageBlock, {
     text: '<details>\n<summary>Safe</summary>\n\n'
       + '<script>alert(1)</script><img src=x onerror="alert(2)">\n\n'

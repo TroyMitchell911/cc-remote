@@ -20,13 +20,14 @@ import {
   useVirtualizer,
 } from "@tanstack/react-virtual";
 import type {
-  TextBlock, Turn,
+  ProcessBlock, TextBlock, Turn,
 } from "../domain/conversation";
 import type { Space } from "../protocol";
 import type { LoadTurnFilePage } from "../turn-file-pages";
 import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
 import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
+import { returnRunId } from "../agent-returns";
 import { TimedMessageTag } from "./TimedMessageTag";
 import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
 import { canForkTurn } from "../session-worktree";
@@ -1794,6 +1795,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       window.clearTimeout(userScrollIntentTimerRef.current);
       userScrollIntentTimerRef.current = null;
     }
+    const reachedLatestIntentionally = userScrollIntentRef.current
+      && userScrollDirectionRef.current === "latest";
     userScrollIntentRef.current = false;
     userScrollDirectionRef.current = null;
     flushHistoryViewportLease();
@@ -1809,6 +1812,17 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       return;
     }
     const controller = controllerRef.current;
+    const el = scrollRef.current;
+    // At the physical edge, a final downward gesture may produce no scroll
+    // event (clamping, coalescing, or short content). Settle that explicit
+    // intent here; layout alone must never resume a paused history reader.
+    if (reachedLatestIntentionally && !browseMode && !historyRequestRef.current
+        && !scrollCoordinatorRef.current.isInteractionLocked()
+        && !textSelectionRef.current?.dragging && el && controller
+        && measureBottom(readScrollMetrics(el)).atBottom) {
+      syncScrollState(controller.resume(readScrollMetrics(el)));
+      setMeasurementBoundary(null);
+    }
     // A tap or a pull beyond the latest edge can leave follow enabled while
     // suppressing a queued resize correction. Catch up only after the native
     // gesture has settled; a history reader keeps their paused state.
@@ -2748,6 +2762,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
             const generatedImages = generatedOutputImages(timelineBlocks);
             const modelNotices = modelFallbackNotices(timelineBlocks);
             const narrative = assistantContinuations(timelineBlocks, finalBlocks, engine);
+            const renderAgentReturn = (receipt: ProcessBlock) => {
+              const runId = returnRunId(receipt);
+              return runId && onOpenAgent ? <button key={receipt.item_id} type="button" className="agent-return-link"
+                onClick={() => onOpenAgent(runId, receipt.summary || receipt.title)}>
+                <span>代理返回 · {receipt.summary || receipt.title}</span><Icon name="chev" size={13} />
+              </button> : null;
+            };
             const lastContinuation = narrative.continuations.at(-1);
             const originalProcessItems = presentableProcessBlocks(
               narrative.original, engine);
@@ -3093,8 +3114,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 {narrative.continuations.map((segment) => (
                   <div key={segment.id} className="background-followup">
                     <div className="background-followup-boundary">
-                      <span>{engine === "codex"
-                        ? "Codex 收到后台消息，继续处理" : "Claude 继续处理"}</span>
+                      {segment.returns.map(renderAgentReturn)}
+                      <span>{engine === "codex" ? "Codex 收到后台消息，继续处理" : "Claude 继续处理"}</span>
                       {segment.startedTs != null && <time>{formatTime(segment.startedTs)}</time>}
                     </div>
                     {renderProcess(segment)}

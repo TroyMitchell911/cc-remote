@@ -5,6 +5,18 @@ import { createServer } from "vite";
 import type { Block, ProcessBlock, TextBlock } from "../src/domain/conversation.ts";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
 import { mergeDetailWithLiveTail } from "../src/history-merge.ts";
+import { projectAgentEvents } from "../src/agent-detail.ts";
+
+const childText = projectAgentEvents([
+  { v: PROTOCOL_VERSION, ts: 1, type: "assistant_msg_start", message_id: "child", channel: "final" },
+  { v: PROTOCOL_VERSION, ts: 2, type: "delta", message_id: "child", text: "partial" },
+  { v: PROTOCOL_VERSION, ts: 3, type: "delta", message_id: "child", text: "complete", replace: true },
+  { v: PROTOCOL_VERSION, ts: 4, type: "delta", message_id: "child", text: " answer" },
+  { v: PROTOCOL_VERSION, ts: 5, type: "assistant_msg_end", message_id: "child" },
+]);
+assert.equal(childText.length, 1);
+assert.equal(childText[0].kind === "text" && childText[0].text, "complete answer",
+  "agent snapshots replace their previous prefix before later deltas append");
 
 const harness = await createServer({ root: process.cwd(), appType: "custom",
   logLevel: "silent", server: { middlewareMode: true, watch: null } });
@@ -55,6 +67,19 @@ try {
   const { default: BackgroundTaskControl } = await harness.ssrLoadModule(
     "/src/components/BackgroundTaskControl.tsx");
   const { initialState, createRuntime, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
+  const receiptState = { ...initialState, focusedSid: "receipt-only", runtimes: {
+    "receipt-only": { ...createRuntime(), turns: [{ id: "parent", prompt: "Review",
+      blocks: [before], done: false, processDetailState: "none", detailEventCount: 0 }] },
+  } };
+  const received = reduce(receiptState, { type: "event", event: {
+    v: PROTOCOL_VERSION, ts: 1, type: "process", sid: "receipt-only", turn_id: "parent",
+    item_id: "return-native-child", kind: "agent", phase: "end", status: "succeeded",
+    title: "Review", server: "cc_remote", tool: "agent_return", background: true,
+    input: { agent_run_id: "native-child" },
+  } });
+  assert.equal(received.runtimes["receipt-only"].turns[0].processDetailState, "none",
+    "a live return receipt must not create an empty process disclosure");
+  assert.equal(received.runtimes["receipt-only"].turns[0].detailEventCount, 0);
   const renderChat = (items: Block[]) => renderToStaticMarkup(createElement(ChatView, {
     sid: "codex-session", engine: "codex", turns: [{ id: "turn", prompt: "Run check",
       done: true, blocks: items, processDetailState: "present", detailEventCount: 3 }],
@@ -67,6 +92,39 @@ try {
   const restored = renderChat([before, receipt("callback-1"), after]);
   assert.match(restored, /Before callback\.[\s\S]*Codex 收到后台消息，继续处理[\s\S]*After callback\./,
     "compact history shows the source label before process details load");
+
+  for (const engine of ["claude", "codex"] as const) {
+    const agent: ProcessBlock = { ...receipt("return-native-child"), processKind: "agent",
+      server: "cc_remote", tool: "agent_return", title: "界面审查", summary: undefined,
+      input: { agent_run_id: "native-child" } };
+    const render = (items: Block[]) => renderToStaticMarkup(createElement(ChatView, {
+      sid: "parent", engine, onOpenAgent: () => {}, turns: [{ id: "turn", prompt: "Review",
+        done: true, blocks: items, processDetailState: "present", detailEventCount: 3 }],
+    }));
+    assert.doesNotMatch(render([before, agent]), /agent-return-link|继续处理/,
+      "a child return alone cannot create a parent continuation row");
+    assert.doesNotMatch(render([before, agent, after]), /agent-return-link|继续处理/,
+      "a return during foreground work cannot segment or collapse that work");
+    const resumedAnswer = { ...after, background: true };
+    const nativeBoundary: Block[] = engine === "codex" ? [receipt("native-callback")] : [];
+    const baseline = assistantContinuations([before, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    const enhanced = assistantContinuations([before, agent, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    assert.deepEqual(enhanced, { ...baseline,
+      continuations: baseline.continuations.map(segment => ({ ...segment, returns: [agent] })) },
+      "only the link metadata changes; native segment IDs, clocks, blocks and answers remain identical");
+    assert.match(render([before, agent, ...nativeBoundary, resumedAnswer]),
+      /代理返回 · 界面审查[\s\S]*继续处理[\s\S]*After callback/);
+    const task = { ...agent, processKind: "task" as const, tool: "task_return", input: undefined };
+    assert.deepEqual(assistantContinuations([before, task, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine), baseline);
+    assert.doesNotMatch(render([before, task, ...nativeBoundary, resumedAnswer]), /任务返回|agent-return-link/);
+    const second = { ...agent, item_id: "return-second", input: { agent_run_id: "other-child" } };
+    const grouped = assistantContinuations([before, agent, second, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    assert.equal(grouped.continuations.length, 1);
+    assert.deepEqual(grouped.continuations[0]?.returns, [agent, second]);
+    const consumed = assistantContinuations([before, agent, after, ...nativeBoundary, resumedAnswer], [before, after], engine);
+    assert.equal(consumed.continuations[0]?.returns.length, 0,
+      "an in-flight result cannot be attributed to a later unrelated continuation");
+  }
 
   const sid = "codex-session", otherSid = "another-account-session";
   let state = { ...initialState, focusedSid: sid, runtimes: {

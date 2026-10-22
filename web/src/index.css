@@ -331,6 +331,12 @@ body{
 .background-followup-boundary{ display:flex; align-items:center; flex-wrap:wrap; gap:7px; margin:14px 0 8px;
   padding-top:10px; border-top:1px solid var(--line); color:var(--muted); font-size:11px; line-height:1.4; }
 .background-followup-boundary time{ color:var(--dim); font-variant-numeric:tabular-nums; }
+.agent-return-link{ display:inline-flex; align-items:center; gap:3px; max-width:100%; padding:0;
+  color:var(--accent-ink); font:inherit; cursor:pointer; }
+.agent-return-link span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.agent-return-link svg{ flex:none; }
+.agent-return-link:hover span{ text-decoration:underline; }
+.agent-return-link:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
 .thread{ flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; overflow-anchor:none; -webkit-overflow-scrolling:touch; padding:0; position:relative; z-index:1;
   color-scheme:light; scrollbar-width:thin;
   scrollbar-color:color-mix(in srgb,var(--faint) 78%,transparent) transparent; }

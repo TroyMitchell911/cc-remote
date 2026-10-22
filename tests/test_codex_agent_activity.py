@@ -106,6 +106,31 @@ def test_foreign_catalog_path_and_changed_identity_never_report_live(tmp_path):
     assert reader.read(home, {"parent"})["parent"][0].status == "unknown"
 
 
+def test_stale_catalog_without_child_source_does_not_create_a_background_task(tmp_path):
+    catalog(tmp_path, "parent")
+    child = catalog(tmp_path, "child", "parent", rows=[boundary("child"), task("own")])
+    contents = child.read_bytes()
+    child.unlink()
+    reader = CodexAgentActivity()
+    assert reader.read(tmp_path, {"parent"})["parent"] == []
+    assert reader.read(tmp_path, {"parent"})["parent"] == []
+    # A delayed native writer can still materialize a genuinely active child.
+    child.write_bytes(contents)
+    assert reader.read(tmp_path, {"parent"})["parent"][0].status == "running"
+    child.unlink()
+    assert reader.read(tmp_path, {"parent"})["parent"][0].status == "unknown"
+
+
+def test_settled_child_removed_from_disk_does_not_reappear_as_unknown(tmp_path):
+    catalog(tmp_path, "parent")
+    child = catalog(tmp_path, "child", "parent", rows=[
+        boundary("child"), task("own"), terminal("own")])
+    reader = CodexAgentActivity()
+    assert reader.read(tmp_path, {"parent"})["parent"] == []
+    child.unlink()
+    assert reader.read(tmp_path, {"parent"})["parent"] == []
+
+
 def test_partial_record_missing_source_and_catalog_failure_are_not_completion(tmp_path):
     catalog(tmp_path, "parent")
     child = catalog(tmp_path, "child", "parent", rows=[boundary("child"), task("own")])

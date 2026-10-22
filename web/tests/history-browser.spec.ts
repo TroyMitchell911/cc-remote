@@ -8,6 +8,42 @@ import {
   MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README,
 } from "./fixtures/markdown-html";
 
+test("turn regressions manual small scroll back to bottom hides the return button", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?turn-regressions=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator(".turn-working")).toBeVisible();
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  for (const distance of [8, 60]) {
+    await viewport.evaluate((node, delta) => {
+      node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -delta }));
+      node.scrollTop -= delta;
+      node.dispatchEvent(new Event("scroll"));
+    }, distance);
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    await viewport.evaluate(node => {
+      node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 100 }));
+      node.scrollTop = node.scrollHeight;
+      node.dispatchEvent(new Event("scroll"));
+    });
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  }
+  // A coalesced/clamped scroll may reach the edge before the final downward
+  // gesture. At that point the browser has no further scroll event to emit.
+  for (const gesture of ["wheel", "touch"]) {
+    await viewport.evaluate(node => {
+      node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -8 }));
+      node.scrollTop -= 8;
+      node.dispatchEvent(new Event("scroll"));
+      node.scrollTop = node.scrollHeight;
+      node.dispatchEvent(new Event("scroll"));
+    });
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    if (gesture === "wheel") await viewport.dispatchEvent("wheel", { deltaY: 30 });
+    else await dispatchTouchGesture(page, -30);
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  }
+});
+
 async function scrollRegressionToMiddle(page: import("@playwright/test").Page, projectName: string) {
   await scrollThreadToEdge(page, "start", projectName);
   if (isMobileWebKitProject(projectName)) await dispatchTouchGesture(page, -60);
@@ -2093,6 +2129,20 @@ for (const extension of ["mmd", "MERMAID"]) {
     await expect(panel.locator(".artifact-body")).toContainText("flowchart TD");
     await panel.getByRole("button", { name: "预览", exact: true }).click();
     await expect(panel.locator(".mermaid-svg svg")).toBeVisible();
+  });
+}
+
+for (const engine of ["claude", "codex"]) {
+  test(`${engine} agent detail accepts an immediate correlated response`, async ({ page }) => {
+    await page.clock.install();
+    await page.goto(`/tests/history-browser.html?agent-detail-timing=1&engine=${engine}`);
+    const panel = page.getByRole("complementary", { name: "协作代理详情" });
+    await expect(panel).toContainText("即时详情已返回");
+    await expect(panel.locator(".agent-detail-status")).toHaveText("已完成");
+    await expect(panel).not.toContainText("正在读取协作代理过程");
+    await page.clock.fastForward(31_000);
+    await expect(panel.getByRole("alert")).toHaveCount(0);
+    await expect(page.getByTestId("agent-detail-requests")).toHaveText("1");
   });
 }
 
@@ -10046,6 +10096,32 @@ test("Markdown disclosures retain native keyboard controls and reduced-motion su
   expect(await summary.evaluate((node) => getComputedStyle(node, "::before").transitionDuration)).toBe("0s");
   await summary.press("Space");
   await expect(disclosure).not.toHaveAttribute("open", "");
+});
+
+test("Markdown breaks render table rows without adding a leading answer gap", async ({ page }, info) => {
+  await page.goto("/tests/history-browser.html?markdown-breaks=1");
+  const answer = page.getByTestId("break-answer");
+  await expect(answer.locator("br")).toHaveCount(0);
+  await expect(answer.locator("p")).toHaveText("正文第一行");
+  const plainBox = await page.getByTestId("plain-answer").boundingBox();
+  const breakBox = await answer.boundingBox();
+  expect(breakBox!.height).toBeCloseTo(plainBox!.height, 0);
+  const table = page.getByTestId("table-breaks");
+  await expect(table.locator("td br")).toHaveCount(2);
+  const rows = await table.locator("td").last().evaluate(cell => {
+    const texts = Array.from(cell.childNodes).filter(node => node.nodeType === Node.TEXT_NODE);
+    return texts.map(node => { const range = document.createRange(); range.selectNodeContents(node); return range.getBoundingClientRect().top; });
+  });
+  expect(rows).toHaveLength(3);
+  expect(rows[1]).toBeGreaterThan(rows[0]);
+  expect(rows[2]).toBeGreaterThan(rows[1]);
+  await expect(table.locator("code").first()).toHaveText("<br>");
+  await expect(table.locator("pre code")).toHaveText("<br>\n");
+  await page.getByRole("button", { name: "Finish break stream", exact: true }).click();
+  await expect(table.locator("p").last()).toHaveText("流式内容完成");
+  await expect(table.locator("p").last().locator("br")).toHaveCount(1);
+  await expect(table.locator("td br")).toHaveCount(2);
+  await page.screenshot({ path: info.outputPath("markdown-breaks.png"), animations: "disabled" });
 });
 
 test("Markdown disclosures render safely and stay open across streaming updates", async ({ page }) => {

@@ -10,6 +10,7 @@ import {
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 import { generatedImageIdentity, generatedOutputImages } from "./process-blocks.ts";
 import { codexTransportInterruption } from "./problem-presentation.ts";
+import { isSyntheticReturnReceipt } from "./agent-returns.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
@@ -56,6 +57,7 @@ type ProcessDetailState = NonNullable<Turn["processDetailState"]>;
 type TurnDetailReason = NonNullable<Turn["detailReasons"]>[number];
 
 function isPresentableProcessBlock(block: Block): boolean {
+  if (isSyntheticReturnReceipt(block)) return false;
   if (block.kind === "tool") return true;
   if (block.kind === "text") {
     return block.channel === "commentary" && block.text.length > 0;

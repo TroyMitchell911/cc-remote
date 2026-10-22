@@ -1,4 +1,5 @@
 import type { Block, ProcessBlock, TextBlock, Turn } from "./domain/conversation";
+import { isSyntheticReturnReceipt } from "./agent-returns.ts";
 
 export function generatedImageIdentity(block: ProcessBlock): string {
   const ref = block.input?.history_image as { image_id?: unknown } | undefined;
@@ -71,6 +72,7 @@ export function processBlocks(blocks: Block[]): Block[] {
       ? [block.parent_id] : []
   )));
   return blocks.filter((block) => {
+    if (isSyntheticReturnReceipt(block)) return false;
     if (block.kind === "process" && block.tool === "model_refusal_fallback") return false;
     if (block.kind === "text") {
       return block.text.length > 0

@@ -589,7 +589,9 @@ def test_background_bash_task_is_not_presented_as_collaborating_agent():
         summary="checks passed", uuid="bash-end", session_id="s1",
         tool_use_id="bash-tool",
     ))
-    assert len(completed) == 1
+    assert len(completed) == 2
+    assert completed[1].tool == "task_return" and completed[1].kind == "task"
+    assert completed[1].input is None
     assert completed[0].item_id == "bash-task"
     assert completed[0].kind == "task"
     assert completed[0].turn_id == "bash-turn"

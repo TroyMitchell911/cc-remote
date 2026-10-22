@@ -2,6 +2,14 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Render bare Markdown `<br>` breaks in answers and tables without adding a leading blank line; keep code examples and other HTML literal.
+- Hide the return-to-bottom button after an intentional downward gesture reaches the latest content, including clamped wheel and touch gestures.
+- Ignore stale Codex child catalog entries whose source is missing, while retaining previously observed activity during temporary source failures.
+- Register agent-detail requests before sending them and honor replacement text updates to avoid lost fast responses and duplicated content.
+- Add clickable agent-return links to existing Claude/Codex continuation rows without splitting active answers or changing process disclosure state. Rebuild derived chat history to retain return links; preserve native transcripts and image assets. Wire protocol remains v79.
+
 ## v4.0.29
 
 Refresh the new-chat composer and make Claude/Codex controls usable before the first message. Wire protocol advances to v79. See the bilingual [release notes](docs/releases/v4.0.29.md).

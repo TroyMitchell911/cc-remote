@@ -186,8 +186,10 @@ class CodexAgentActivity:
             run_id = f"codex-agent:{sid}"
             old = self._previous.get(parent, {}).get(run_id)
             status, title = "unknown", old.title if old else "协作代理"
+            child_read = False
             try:
                 cursor = self._read(home, sid, path, parent, budget)
+                child_read = True
                 title = cursor.title
                 if cursor.complete:
                     if cursor.boundary:
@@ -202,9 +204,14 @@ class CodexAgentActivity:
                             ancestor = self._read(home, parent, parent_path, None, budget)
                             if ancestor.complete and cursor.turn_id not in ancestor.turns:
                                 status = cursor.status
-            except (OSError, ValueError, TypeError, RecursionError):
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 # Keep other agents/tasks live when one rollout is being rewritten.
                 self._cursors.pop(sid, None)
+                if isinstance(exc, FileNotFoundError) and not child_read and old is None:
+                    # Native catalogs can retain deleted/archived child paths for
+                    # months. A stale row alone cannot introduce a live task.
+                    # Previously observed activity still remains unknown below.
+                    continue
             if status == "terminal":
                 continue
             result[parent][run_id] = BackgroundProcessItem(

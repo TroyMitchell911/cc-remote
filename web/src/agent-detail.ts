@@ -66,7 +66,7 @@ export function projectAgentEvents(events: readonly ServerEvent[]): Block[] {
         texts.set(event.message_id, block);
         blocks.push(block);
       }
-      block.text += event.text;
+      block.text = event.replace ? event.text : block.text + event.text;
       if (event.channel) block.channel = event.channel;
       continue;
     }
