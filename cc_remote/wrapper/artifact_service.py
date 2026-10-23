@@ -77,10 +77,6 @@ class ArtifactService:
         machine = self.machine
         if not cmd.sid:
             raise ValueError("请先打开一个会话")
-        if cmd.engine == "dsh":
-            await machine._dsh.connection()
-            ctx = await machine._dsh.ctx(cmd.sid)
-            return ctx.key, ctx.cwd, self.context_scope(ctx)
         scope, cwd = await machine._viewer_page_scope(PageScope(
             sid=cmd.sid, engine=cmd.engine, space=cmd.space))
         if not cwd:
@@ -95,7 +91,8 @@ class ArtifactService:
             response.sid = sid
             if cmd.scan_history:
                 ctx = machine._ctx_for(sid)
-                if ctx is None or not ctx.btw:
+                private_dsh = cmd.engine == "dsh" and sid in machine._dsh.sidechats.check()
+                if not private_dsh and (ctx is None or not ctx.btw):
                     request = GetHistory(session_id=sid, before=cmd.history_before, limit=12, detail="summary", cwd=cwd)
                     history = (await machine._dsh.handle_get_history(request, publish=False) if cmd.engine == "dsh"
                                else await machine._history_page_singleflight(request, sid))

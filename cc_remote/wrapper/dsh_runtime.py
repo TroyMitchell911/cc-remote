@@ -40,12 +40,13 @@ from cc_remote.wrapper.dsh_changes import DshChanges
 from cc_remote.wrapper.dsh_sidechats import DshSidechats
 from cc_remote.wrapper.dsh_mutations import DshMutationJournal, digest
 
+_ARTIFACT_READS = frozenset({"get_session_artifacts", "get_session_artifact_preview"})
 _COMMON = frozenset({
     "hello", "ping", "list_dir", "get_file_preview", "browse_files", "save_markdown",
     "get_preview_asset", "authorize_preview", "get_diff", "get_turn_file_changes",
     "answer_question", "acknowledge_completion", "cancel_queued_query",
     "get_queued_query", "update_queued_query", "reorder_queued_queries", "query",
-    "get_session_artifacts", "get_session_artifact_preview",
+    *_ARTIFACT_READS,
 })
 log = logger("dsh_runtime")
 
@@ -243,7 +244,8 @@ class DshRuntime:
                 await self.machine.transport.send(response)
                 return response
         if cmd.type in _COMMON:
-            if sid in self.sidechats.check() and sid not in self.machine.sessions:
+            if (cmd.type not in _ARTIFACT_READS
+                    and sid in self.sidechats.check() and sid not in self.machine.sessions):
                 try:
                     await self.connection()
                     await self.ctx(sid)
@@ -315,6 +317,20 @@ class DshRuntime:
         async with self.context_lock:
             return await self._ctx(sid)
 
+    async def session_cwd(self, sid):
+        """Resolve native metadata without occupying a resident slot or watching."""
+        native = native_session_id(sid)
+        ctx = self.machine.sessions.get(sid)
+        if ctx is not None:
+            if ctx.engine != "dsh" or ctx.space != "code":
+                raise DshError("invalid_session", "会话与引擎不匹配。")
+            return ctx.cwd
+        row = next((item for item in await self.client.list_sessions() if item["sessionId"] == native), None)
+        cwd = row.get("cwd") if row else None
+        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+            raise DshError("invalid_cwd", "DSH 会话目录不可读取，请刷新会话目录。")
+        return cwd
+
     async def _ctx(self, sid) -> SessionContext:
         if sid is None:
             ctx = self.machine._focused_ctx()
@@ -332,10 +348,7 @@ class DshRuntime:
         # A successful read proves reachability without activating an Agent.
         # Explicit controls (e.g. resume goal) may establish follow afterwards.
         handle.state.connected = True
-        row = next((item for item in await self.client.list_sessions() if item["sessionId"] == native), None)
-        cwd = row.get("cwd") if row else None
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
-            raise DshError("invalid_cwd", "DSH 会话目录不可读取，请刷新会话目录。")
+        cwd = await self.session_cwd(sid)
         # Validate cold metadata before releasing an eligible resident of any
         # engine. Active work and focused/private contexts keep their slots.
         await self.ensure_capacity()
@@ -1394,8 +1407,13 @@ class DshRuntime:
                                 continuation=projection.continuation))
                         for message in projection.baseline(frame.get("assistantStream") or {}):
                             await self.emit(ctx, message)
-                        ctx.state = "running" if projection.running else "idle"
-                        await self.machine._emit(ctx, StateEvent(state=ctx.state))
+                        if not projection.running:
+                            ctx.active_msg_id = None
+                            ctx.active_turn_binding = None
+                        # A reconnect may have missed turn/end. Publish the
+                        # restored state and wake the wrapper-owned queue only
+                        # after the canonical history and baseline are ready.
+                        await self.machine._set_state(ctx, "running" if projection.running else "idle")
                         handle.ready.set()
                         await self.refresh_goal(ctx)
                         delay = 0.5
@@ -1407,15 +1425,12 @@ class DshRuntime:
                                 if reference[0] == frame["event"]["seq"]:
                                     self.changes.schedule(ctx, owner, reference)
                         if frame["event"]["type"] == "turn/start":
-                            ctx.state = "running"
-                            await self.machine._emit(ctx, StateEvent(state="running"))
+                            await self.machine._set_state(ctx, "running")
                         if frame["event"]["type"] == "turn/end":
                             self.cache_forks(ctx.key, handle.projection)
-                            ctx.state = "idle"
                             ctx.active_msg_id = None
                             ctx.active_turn_binding = None
-                            ctx.queued_query_wakeup.set()
-                            await self.machine._emit(ctx, StateEvent(state="idle"))
+                            await self.machine._set_state(ctx, "idle")
                     elif kind == "assistant-stream":
                         for message in handle.projection.frame(frame["frame"]):
                             await self.emit(ctx, message)

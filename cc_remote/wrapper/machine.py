@@ -24902,8 +24902,8 @@ class WrapperMachine:
             if scope.space != "code":
                 raise ValueError("DSH has no Work session")
             await self._dsh.connection()
-            ctx = await self._dsh.ctx(sid)
-            return scope.model_copy(update={"sid": ctx.key}), ctx.cwd
+            cwd = await self._dsh.session_cwd(sid)
+            return scope.model_copy(update={"sid": sid}), cwd
         # History-only/cold sessions remain browsable without creating an engine.
         # A transcript proves identity, not Code/Work ownership. In particular,
         # callers must not relabel a cold Work session to obtain Code file grants.
