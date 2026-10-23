@@ -134,6 +134,9 @@ class DshRuntime:
         # IDs are scoped to the native authority and the authenticated owner.
         # Legacy untracked callers have no recovery identity to replay.
         request = (getattr(cmd, "msg_id", None) if kind == "command" else None)
+        if kind == "fork":
+            # A business retry can change cmd_id while retaining this identity.
+            request = cmd.request_id
         request = request or getattr(cmd, "cmd_id", None) or getattr(cmd, "request_id", None) or str(uuid4())
         owner = getattr(cmd, "owner_id", None) or getattr(cmd, "client_id", None)
         identity = digest([self.client.connection.origin, owner, kind, request])
@@ -1062,6 +1065,49 @@ class DshRuntime:
         return await self.select_model(ctx, ctx.sdk.model or self.default_model, cmd.effort)
 
     async def handle_fork_session(self, cmd):
+        identity, fresh, receipt = await self.mutation_intent(cmd, "fork", {
+            "parent": cmd.session_id, "turn": cmd.last_turn_id})
+        if receipt["result"] is not None:
+            saved = json.loads(receipt["result"])
+            if "error" in saved:
+                raise DshError(**saved["error"])
+            result = SessionForked.model_validate(saved["reply"])
+            result.to = cmd.client_id
+        else:
+            sid = receipt["sid"]
+            if fresh:
+                try:
+                    sid = await self.create_fork(cmd)
+                except DshError as exc:
+                    await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                        "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+                    raise
+                # A subsequent read, delivery or process failure must only
+                # reconcile this child, never call session/fork again.
+                await asyncio.to_thread(self.mutations.created, identity, sid)
+            elif not sid:
+                raise self.uncertain_mutation()
+            try:
+                await self.client.history_snapshot(sid, max_messages=1)
+                rows = await self.client.list_sessions()
+                cwd = next((row.get("cwd") for row in rows
+                            if row["sessionId"] == native_session_id(sid)), None)
+                if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                    raise DshError("invalid_cwd", "DSH 分支会话目录尚不可读取。")
+                result = SessionForked(parent_session_id=cmd.session_id, session_id=sid,
+                    cwd=cwd, target="same_cwd", last_turn_id=cmd.last_turn_id,
+                    request_id=cmd.request_id, to=cmd.client_id)
+                await asyncio.to_thread(self.mutations.finish, identity, {
+                    "reply": result.model_dump(exclude={"v", "ts", "to"})})
+            except DshError as exc:
+                # Do not cache/ACK a transient recovery read as a business
+                # rejection. The reliable retry resumes from the durable sid.
+                raise RuntimeError("DSH fork is awaiting read-only recovery") from exc
+        await self.machine.transport.send(result)
+        await self.invalidate()
+        return result
+
+    async def create_fork(self, cmd):
         native = native_session_id(cmd.session_id)
         request = {"sessionId": native}
         turn_id = getattr(cmd, "last_turn_id", None)
@@ -1080,14 +1126,7 @@ class DshRuntime:
                 raise DshError("invalid_turn", "该分支点尚未完成或已不在当前历史页，请刷新。")
             request["atSeq"] = end
         value = await self.client.rpc("session/fork", {"request": request})
-        sid = wire_session_id(value["sessionId"])
-        snapshot = await self.client.history_snapshot(sid, max_messages=1)
-        result = SessionForked(parent_session_id=cmd.session_id, session_id=sid,
-                              cwd=next((row.get("cwd") for row in await self.client.list_sessions() if row["sessionId"] == native), None) or self.machine.cfg.cc_cwd, target="same_cwd",
-                              last_turn_id=turn_id, request_id=cmd.request_id, to=cmd.client_id)
-        await self.machine.transport.send(result)
-        await self.invalidate()
-        return result
+        return wire_session_id(value["sessionId"])
 
     async def invalidate(self):
         await self.machine.transport.send(SessionListInvalidated(engine="dsh"))
