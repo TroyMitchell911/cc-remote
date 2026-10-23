@@ -904,8 +904,14 @@ class DshRuntime:
     async def select_model(self, ctx, selected, effort=None):
         await self.ensure_unarchived(ctx.key)
         await self.read_catalog()
-        self.validate_model(selected, effort)
+        if selected is not None:
+            self.validate_model(selected, effort)
         await self.activate(ctx)
+        if selected is None:
+            # Follow may refresh a stale cold projection. Effort-only changes
+            # must use that current model, not the pre-activation selection.
+            selected = ctx.sdk.model or self.default_model
+            self.validate_model(selected, effort)
         provider, model = model_parts(selected)
         value = await self.client.rpc("session/selectModel", {"request": {
             "sessionId": ctx.sdk.native_id, "provider": provider, "model": model,
@@ -914,19 +920,40 @@ class DshRuntime:
         await self.projections(ctx, {"modelSelection": {"next": chosen}})
 
     async def handle_set_model(self, cmd):
-        ctx = await self.ctx(getattr(cmd, "sid", None))
-        await self.select_model(ctx, cmd.model)
+        return await self.change_model(cmd, selected=cmd.model)
+
+    async def change_model(self, cmd, *, selected=None, effort=None):
+        # Bind the requested change, not the current model used to resolve an
+        # effort-only change. A replay must not overwrite a newer native choice.
+        sid = cmd.sid or self.machine.focused_sid
+        identity, fresh, receipt = await self.mutation_intent(cmd, "model_selection", {
+            "sid": sid, "model": selected, "effort": effort})
+        if not fresh:
+            if receipt["result"] is None:
+                raise self.uncertain_mutation()
+            result = json.loads(receipt["result"])
+            if "error" in result:
+                raise DshError(**result["error"])
+            return None
+        try:
+            ctx = await self.ctx(sid)
+            await self.select_model(ctx, selected, effort)
+        except DshError as exc:
+            await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+            raise
+        await asyncio.to_thread(self.mutations.finish, identity, {"status": "success"})
 
     async def handle_set_dsh_control(self, cmd):
         if cmd.kind in {"job_stop", "plugin_enable", "plugin_disable", "manage", "terminal"}:
             return await self.features.control(cmd)
+        if cmd.kind == "effort":
+            return await self.change_model(cmd, effort=cmd.value)
         if cmd.kind == "command":
             self.validate_input(cmd, allow_empty=True)
         ctx = await self.ctx(cmd.sid)
         await self.ensure_unarchived(ctx.key)
         await self.activate(ctx)
-        if cmd.kind == "effort":
-            return await self.select_model(ctx, ctx.sdk.model or self.default_model, cmd.value)
         if cmd.kind == "permission":
             if cmd.value == "custom" or cmd.value not in {p.value for p in ctx.sdk.state.permissions}:
                 raise DshError("invalid_permission", "请选择 DSH 提供的权限预设。")
@@ -1120,8 +1147,7 @@ class DshRuntime:
         return await self.sidechats.release(cmd)
 
     async def handle_set_effort(self, cmd):
-        ctx = await self.ctx(cmd.sid)
-        return await self.select_model(ctx, ctx.sdk.model or self.default_model, cmd.effort)
+        return await self.change_model(cmd, effort=cmd.effort)
 
     async def handle_fork_session(self, cmd):
         identity, fresh, receipt = await self.mutation_intent(cmd, "fork", {
@@ -1535,10 +1561,12 @@ class DshRuntime:
         # with a cold read; do not focus it, activate it or promote a subagent.
         items = {item["sessionId"]: item for item in await self.client.list_sessions()}
         native = native_session_id(sid)
-        for _ in range(8):
-            item = items.get(native)
-            if item is None:
-                return None
+        visited = set()
+        # Depth is a native runtime setting. Visit each catalog entry at most
+        # once, including the ordinary root after the last subagent edge.
+        while native in items and native not in visited:
+            visited.add(native)
+            item = items[native]
             if item.get("origin") != "subagent":
                 ctx = await self.ctx(wire_session_id(native))
                 if item.get("running") and (ctx.sdk.watch is None or ctx.sdk.watch.done()):

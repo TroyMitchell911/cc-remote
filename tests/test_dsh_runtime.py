@@ -622,14 +622,17 @@ async def test_follow_recovers_running_native_turn_without_false_idle_or_read_on
         await runtime.close()
 
 
-@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize("depth", [0, 1, 7, 8, 9, 32])
+@pytest.mark.parametrize("approval", [False, True])
 @pytest.mark.asyncio
-async def test_pending_question_restores_cold_owner_without_focus_or_activation(delegated):
+async def test_pending_question_restores_cold_owner_without_focus_or_activation(depth, approval):
     machine, _, runtime, client = setup_runtime()
     machine.focused_sid = "other-session"
     async def catalog():
-        return [{"sessionId": "root", "running": True, "cwd": "/tmp"},
-                {"sessionId": "child", "origin": "subagent", "parentSessionId": "root", "running": True}]
+        return [{"sessionId": "root", "running": True, "cwd": "/tmp"}, *[
+            {"sessionId": f"child-{i}", "origin": "subagent", "running": True,
+             "parentSessionId": f"child-{i - 1}" if i > 1 else "root"}
+            for i in range(1, depth + 1)]]
     client.list_sessions = catalog
     async def follow(ctx):
         await asyncio.Future()
@@ -637,20 +640,41 @@ async def test_pending_question_restores_cold_owner_without_focus_or_activation(
     captured = []
     async def ask(ctx, question, options, **fields):
         captured.append((ctx.key, question))
-        return ["Yes"]
+        return ["允许一次" if approval else "Yes"]
     machine._on_ask_locked = ask
     runtime.event_client = "listener"
-    await runtime._question({"eventId": "pending", "event": "user-questions/request",
-        "agentId": "child" if delegated else "root", "request": {"questions": [
-            {"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
-        ]}}, runtime.event_client)
-    assert captured == [("dsh@root", "Continue?")]
+    request = ({"toolName": "Bash", "reason": "Continue?"} if approval else {"questions": [
+        {"id": "choice", "question": "Continue?", "options": [{"label": "Yes"}, {"label": "No"}]},
+    ]})
+    await asyncio.wait_for(runtime._question({"eventId": "pending",
+        "event": "approval/request" if approval else "user-questions/request",
+        "agentId": f"child-{depth}" if depth else "root", "request": request}, runtime.event_client), 2)
+    assert captured == [("dsh@root", "DSH 请求使用工具：Bash\nContinue?" if approval else "Continue?")]
     assert machine.focused_sid == "other-session" and list(machine.sessions) == ["dsh@root"]
     assert machine.sessions["dsh@root"].sdk.watch is not None
     assert [call[0] for call in client.calls] == ["snapshot", "$events/result"]
-    assert client.calls[-1][1]["outcome"] == {"kind": "result", "value": {"answers": [
-        {"id": "choice", "selected": ["Yes"]},
-    ]}}
+    assert client.calls[-1][1]["outcome"] == {"kind": "result", "value": "allowed-once" if approval else {
+        "answers": [{"id": "choice", "selected": ["Yes"]}],
+    }}
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parents", [{}, {"child": None}, {"child": "missing"},
+                                    {"child": "child"}, {"child": "other", "other": "child"}])
+async def test_question_ancestry_stops_at_missing_entries_and_cycles(parents):
+    machine, _, runtime, client = setup_runtime()
+    machine.focused_sid = "unrelated"
+
+    async def catalog():
+        return [{"sessionId": "unrelated", "cwd": "/tmp"}, *[
+            {"sessionId": child, "origin": "subagent", "parentSessionId": parent}
+            for child, parent in parents.items()]]
+
+    client.list_sessions = catalog
+    assert await asyncio.wait_for(runtime.question_ctx("dsh@child"), 1) is None
+    assert not machine.sessions and not client.calls
+    assert machine.focused_sid == "unrelated"
     await runtime.close()
 
 

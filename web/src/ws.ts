@@ -790,10 +790,19 @@ export class RelayWs {
   }
 
   sendSetModel(model: string): void {
+    if (this.focusedSid) {
+      this.sendSetModelTo(this.focusedSid, model);
+      return;
+    }
+    if (this.activeEngine === "dsh") return;
     this.send({ v: PROTOCOL_VERSION, type: "set_model", model, ts: nowTs(), ...this.sidObj() });
   }
 
   sendSetModelTo(sid: string, model: string): void {
+    if (sid.startsWith("dsh@") || this.engineBySession[sid] === "dsh") {
+      this.sendDshMutation({ type: "set_model", sid, model });
+      return;
+    }
     this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
   }
 
@@ -830,10 +839,19 @@ export class RelayWs {
   }
 
   sendSetEffort(effort: string): void {
+    if (this.focusedSid) {
+      this.sendSetEffortTo(this.focusedSid, effort);
+      return;
+    }
+    if (this.activeEngine === "dsh") return;
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
   }
 
   sendSetEffortTo(sid: string, effort: string): void {
+    if (sid.startsWith("dsh@") || this.engineBySession[sid] === "dsh") {
+      this.sendDshMutation({ type: "set_effort", sid, effort });
+      return;
+    }
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
