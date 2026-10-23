@@ -11781,9 +11781,9 @@ class WrapperMachine:
         if cmd.type == "list_sessions":
             self._start_session_list_command(cmd)
             return
-        # Export packaging can take minutes. Use the independent read tasks so
-        # focus/create commands and the export's own cancel can still run.
-        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes", "download_dsh"}
+        # DSH streams/export packaging can wait on native I/O. Independent read
+        # tasks keep focus/create commands and export cancellation responsive.
+        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes", "read_dsh", "download_dsh"}
                 or (cmd.type == "get_diff" and getattr(cmd, "turn_id", None))):
             self._start_history_command(cmd)
             return

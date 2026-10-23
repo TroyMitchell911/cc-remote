@@ -168,6 +168,8 @@ class DshFeatures:
                 for preset in inventory.get("agentPresets", [])[:30]:
                     response.items.append(DshItem(id="preset-" + preset["id"], title=str(preset.get("name") or preset["id"])[:2048],
                         state="failed" if preset.get("broken") else "active", detail="预设配置不可用" if preset.get("broken") else "预设可用"))
+        except TimeoutError:
+            response.error, response.available = "读取 DSH 数据超时，请稍后重试。", False
         except DshError as exc:
             response.error, response.available = str(exc)[:512], False
         except (KeyError, TypeError, ValueError):
