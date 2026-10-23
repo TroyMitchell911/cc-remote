@@ -11781,7 +11781,9 @@ class WrapperMachine:
         if cmd.type == "list_sessions":
             self._start_session_list_command(cmd)
             return
-        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes"}
+        # Export packaging can take minutes. Use the independent read tasks so
+        # focus/create commands and the export's own cancel can still run.
+        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes", "download_dsh"}
                 or (cmd.type == "get_diff" and getattr(cmd, "turn_id", None))):
             self._start_history_command(cmd)
             return
@@ -11884,7 +11886,7 @@ class WrapperMachine:
         task.add_done_callback(self._session_list_command_tasks.discard)
 
     def _start_history_command(self, cmd) -> None:
-        """Read one history page without blocking query/interrupt intake."""
+        """Read history or export chunks without blocking command intake."""
         client_id = getattr(cmd, "client_id", None) or ""
         cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
         key = (client_id, cmd_id)
