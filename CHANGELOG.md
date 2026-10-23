@@ -13,12 +13,16 @@
 - Restore touch scrolling through DSH terminal history; incoming output preserves the reading position and swipes never send shell input.
 - Create native DSH schedules directly from a form. Keep the DSH side-chat implementation dormant until the official API supports session deletion: disable menu, shortcut and `/btw` entry points, block stale clients from creating forks, and preserve existing records. Claude/Codex side chats remain available.
 
-- Add DSH 0.2.1-rc.2 on the current cc-remote UI, with a separate white/blue default palette. Wire protocol v81 requires Relay, Wrapper and Web to upgrade together. See [DSH integration](docs/dsh-integration.md).
+- Add DSH 0.2.1-rc.2 on the current cc-remote UI, with a separate white/blue default palette. Wire protocol v82 requires Relay, Wrapper and Web to upgrade together. See [DSH integration](docs/dsh-integration.md).
 - Reuse the background-task dock and process side panel for DSH, with nested child navigation, folded reasoning and native PTC tool hierarchy. History reads never activate an agent.
 - Preserve clickable native agent-return receipts for Claude, Codex and DSH. Show parent continuation only after actual parent activity resumes.
 - Add DSH workflow, trajectory, automation, preset, runtime settings, plugin package and native terminal panels. Closing a terminal view retains its process, and reconnect never resends keyboard input.
 - Align DSH session cards, mode descriptions, permissions and appearance controls; hide setup-only commands and empty older-history pages from new sessions.
 - Render bare Markdown `<br>` breaks in answers and tables without adding a leading blank line; keep code examples and other HTML literal.
+
+- Hide the return-to-bottom button after an intentional downward gesture reaches the latest content, including clamped wheel and touch gestures.
+- Ignore stale Codex child catalog entries whose source is missing, while retaining previously observed activity during temporary source failures.
+- Register agent-detail requests before sending them and honor replacement text updates to avoid lost fast responses and duplicated content.
 
 ## v4.0.29
 

@@ -5,6 +5,18 @@ import { createServer } from "vite";
 import type { Block, ProcessBlock, TextBlock } from "../src/domain/conversation.ts";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
 import { mergeDetailWithLiveTail } from "../src/history-merge.ts";
+import { projectAgentEvents } from "../src/agent-detail.ts";
+
+const childText = projectAgentEvents([
+  { v: PROTOCOL_VERSION, ts: 1, type: "assistant_msg_start", message_id: "child", channel: "final" },
+  { v: PROTOCOL_VERSION, ts: 2, type: "delta", message_id: "child", text: "partial" },
+  { v: PROTOCOL_VERSION, ts: 3, type: "delta", message_id: "child", text: "complete", replace: true },
+  { v: PROTOCOL_VERSION, ts: 4, type: "delta", message_id: "child", text: " answer" },
+  { v: PROTOCOL_VERSION, ts: 5, type: "assistant_msg_end", message_id: "child" },
+]);
+assert.equal(childText.length, 1);
+assert.equal(childText[0].kind === "text" && childText[0].text, "complete answer",
+  "agent snapshots replace their previous prefix before later deltas append");
 
 const harness = await createServer({ root: process.cwd(), appType: "custom",
   logLevel: "silent", server: { middlewareMode: true, watch: null } });
@@ -55,6 +67,19 @@ try {
   const { default: BackgroundTaskControl } = await harness.ssrLoadModule(
     "/src/components/BackgroundTaskControl.tsx");
   const { initialState, createRuntime, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
+  const receiptState = { ...initialState, focusedSid: "receipt-only", runtimes: {
+    "receipt-only": { ...createRuntime(), turns: [{ id: "parent", prompt: "Review",
+      blocks: [before], done: false, processDetailState: "none", detailEventCount: 0 }] },
+  } };
+  const received = reduce(receiptState, { type: "event", event: {
+    v: PROTOCOL_VERSION, ts: 1, type: "process", sid: "receipt-only", turn_id: "parent",
+    item_id: "return-native-child", kind: "agent", phase: "end", status: "succeeded",
+    title: "Review", server: "cc_remote", tool: "agent_return", background: true,
+    input: { agent_run_id: "native-child" },
+  } });
+  assert.equal(received.runtimes["receipt-only"].turns[0].processDetailState, "none",
+    "a live return receipt must not create an empty process disclosure");
+  assert.equal(received.runtimes["receipt-only"].turns[0].detailEventCount, 0);
   const renderChat = (items: Block[]) => renderToStaticMarkup(createElement(ChatView, {
     sid: "codex-session", engine: "codex", turns: [{ id: "turn", prompt: "Run check",
       done: true, blocks: items, processDetailState: "present", detailEventCount: 3 }],

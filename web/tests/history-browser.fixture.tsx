@@ -42,6 +42,9 @@ import {
   ChatView,
 } from "../src/components/ChatView";
 import { MessageBlock } from "../src/components/MessageBlock";
+import { AgentDetailController } from "../src/components/AgentDetailController";
+import type { AgentDetail } from "../src/protocol";
+import type { RelayWs } from "../src/ws";
 import {
   historyImageAssetKey,
   type HistoryImageAsset,
@@ -3118,6 +3121,38 @@ function CodexVisualizationFixture() {
   </main>;
 }
 
+function AgentDetailTimingFixture() {
+  const receive = useRef<((message: AgentDetail) => void) | null>(null);
+  const [requests, setRequests] = useState(0);
+  const engine = new URLSearchParams(location.search).get("engine") === "codex" ? "codex" : "claude";
+  const onListen = useCallback((listener: ((message: AgentDetail) => void) | null) => {
+    receive.current = listener;
+  }, []);
+  const ws = useMemo(() => ({
+    sendGetAgentDetail(sid, runId, _revision, _detailRevision, _before, _limit, requestId) {
+      setRequests(count => count + 1);
+      // Reply before React can commit the request's loading state.
+      receive.current?.({
+        v: PROTOCOL_VERSION, ts: 1, type: "agent_detail", sid, session_id: sid,
+        run_id: runId, request_id: requestId, revision: "timing-history",
+        detail_revision: "child-source", authoritative: true, title: "即时响应的子代理",
+        status: "succeeded", through_seq: 0, events: [
+          { v: PROTOCOL_VERSION, ts: 1, type: "assistant_msg_start", message_id: "reply", channel: "final" },
+          { v: PROTOCOL_VERSION, ts: 1, type: "delta", message_id: "reply", text: "即时详情已返回" },
+          { v: PROTOCOL_VERSION, ts: 1, type: "assistant_msg_end", message_id: "reply" },
+        ],
+      });
+      return requestId;
+    },
+  } satisfies Pick<RelayWs, "sendGetAgentDetail">), []);
+  return <main>
+    <output data-testid="agent-detail-requests">{requests}</output>
+    <AgentDetailController selection={{ sid: "timing-parent", runId: "timing-child",
+      revision: "timing-history", engine }} ws={ws as RelayWs}
+      onListen={onListen} onClose={() => {}} />
+  </main>;
+}
+
 function MarkdownBreakFixture() {
   const [finished, setFinished] = useState(false);
   return <main style={{ minHeight: "100dvh", padding: 24 }}>
@@ -3231,6 +3266,8 @@ createRoot(document.getElementById("root")!).render(
     ? <CodexVisualizationFixture />
     : rootParams.has("codex-file-citation")
     ? <CodexFileCitationFixture />
+    : rootParams.has("agent-detail-timing")
+    ? <AgentDetailTimingFixture />
     : rootParams.has("markdown-breaks")
     ? <MarkdownBreakFixture />
     : rootParams.has("markdown-disclosure")

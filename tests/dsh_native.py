@@ -210,7 +210,8 @@ async def exercise(installation, root):
                     client_id="native-test",
                 )
             )
-            assert result is None, result
+            assert len(result) == 1 and result[0].type == "session_focus", result
+            assert result[0].request_id == "runtime-create"
             ctx = machine._focused_ctx()
             assert ctx and ctx.engine == "dsh"
 
@@ -458,9 +459,12 @@ async def exercise(installation, root):
                 assert result is None, result
                 assert (ctx.sdk.native_id in runtime.archived) == archived
             print("PASS archive and unarchive", flush=True)
-            first_command = await machine._handle(NewSession(
+            first_result = await machine._handle(NewSession(
                 engine="dsh", cwd=str(root), dsh_agent_preset="standard", prompt="/plan",
                 msg_id="first-command", request_id="create-command", client_id="native-test"))
+            assert len(first_result) == 2 and first_result[0].type == "session_focus", first_result
+            assert first_result[0].request_id == "create-command"
+            first_command = first_result[1]
             assert first_command.type == "dsh_command_result" and first_command.status == "success", first_command
             assert first_command.request_id == "create-command"
             command_ctx = machine._focused_ctx()

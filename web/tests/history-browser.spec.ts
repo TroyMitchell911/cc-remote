@@ -2349,6 +2349,20 @@ for (const extension of ["mmd", "MERMAID"]) {
   });
 }
 
+for (const engine of ["claude", "codex"]) {
+  test(`${engine} agent detail accepts an immediate correlated response`, async ({ page }) => {
+    await page.clock.install();
+    await page.goto(`/tests/history-browser.html?agent-detail-timing=1&engine=${engine}`);
+    const panel = page.getByRole("complementary", { name: "协作代理详情" });
+    await expect(panel).toContainText("即时详情已返回");
+    await expect(panel.locator(".agent-detail-status")).toHaveText("已完成");
+    await expect(panel).not.toContainText("正在读取协作代理过程");
+    await page.clock.fastForward(31_000);
+    await expect(panel.getByRole("alert")).toHaveCount(0);
+    await expect(page.getByTestId("agent-detail-requests")).toHaveText("1");
+  });
+}
+
 test("Claude agent detail stops waiting on a lost response and retries", async ({ page }) => {
   await page.clock.install();
   const relay = await mockRightPanelRelay(page, { engine: "claude" });
