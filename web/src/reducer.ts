@@ -5142,13 +5142,13 @@ function reduceEvent(
           requestId: e.request_id ?? null,
         },
       };
-    // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
-    // what we have (data.ts's static table) rather than blanking the pickers.
     case "dsh_command_result":
       return patch(state, e.sid, (rt) => { rt.dshCommandResult = e; });
     case "dsh_state":
       return patch(state, e.sid, (rt) => { rt.dsh = e; });
     case "models": {
+      // DSH catalogs are authoritative, including empty responses. Other engines
+      // retain their existing catalog on a failed/empty read.
       const cacheKey = modelCatalogScopeKey(
         e.engine,
         e.engine === "codex"
@@ -5169,9 +5169,9 @@ function reduceEvent(
       let catalogDefault = state.catalogDefault;
       let catalogDefaultEffort = state.catalogDefaultEffort;
       let catalogDefaultCwd = state.catalogDefaultCwd;
-      if (e.cwd) {
-        // A Claude response is authoritative even when probing failed and the
-        // value is null: clear an older cwd's value instead of showing stale data.
+      if (e.cwd || e.engine === "dsh") {
+        // Cwd-aware Claude and all DSH responses replace defaults even when
+        // absent: do not reuse a prior directory's or removed provider's values.
         catalogDefault = { ...catalogDefault };
         catalogDefaultEffort = { ...catalogDefaultEffort };
         if (e.default_model) {
@@ -5184,9 +5184,11 @@ function reduceEvent(
         } else {
           delete catalogDefaultEffort[cacheKey];
         }
-        catalogDefaultCwd = {
-          ...catalogDefaultCwd, [cacheKey]: e.cwd,
-        };
+        if (e.cwd) {
+          catalogDefaultCwd = {
+            ...catalogDefaultCwd, [cacheKey]: e.cwd,
+          };
+        }
       } else {
         if (e.default_model) {
           catalogDefault = { ...catalogDefault,

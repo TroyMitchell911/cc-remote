@@ -6,7 +6,7 @@ import type { Turn } from "../src/reducer.ts";
 const harness = await createServer({ root: process.cwd(), appType: "custom",
   logLevel: "silent", server: { middlewareMode: true, watch: null } });
 try {
-  const { routeComposerInput, commandsFor } = await harness.ssrLoadModule("/src/data.ts");
+  const { routeComposerInput, commandsFor, defaultModelFor } = await harness.ssrLoadModule("/src/data.ts");
   const { dshCommandMatches } = await harness.ssrLoadModule("/src/dsh-commands.ts");
   for (const input of ["/btw", "/btw question", " /BTW question "]) {
     assert.equal(routeComposerInput(input, "dsh").kind, "blocked");
@@ -129,6 +129,43 @@ try {
   emit({ type: "models", engine: "dsh", models: [{ id: "native-model", display_name: "Native" }], dsh_presets: [] });
   emit({ type: "models", engine: "dsh", models: [], dsh_presets: [], error: "未连接" });
   assert.deepEqual(state.catalog.dsh, []);
+
+  // Replacing the native catalog also replaces its defaults, including absence.
+  const nextModel = { id: "replacement", display_name: "Replacement", efforts: [] };
+  const preferredModel = { id: "preferred", display_name: "Preferred", efforts: ["high"] };
+  const otherDefaults = { claude: "custom-alias", codex: "gpt-model" };
+  const otherEfforts = { claude: "high", codex: "medium" };
+  for (const replacement of [
+    { models: [nextModel] },
+    { models: [nextModel], default_model: null, default_effort: null },
+    { models: [], error: "未连接" },
+    { models: [nextModel], default_model: nextModel.id },
+    { models: [nextModel, preferredModel], default_model: preferredModel.id, default_effort: "high" },
+  ]) {
+    state = { ...initialState, catalogDefault: otherDefaults, catalogDefaultEffort: otherEfforts };
+    emit({ type: "models", engine: "dsh", models: [
+      { id: "removed", display_name: "Removed", efforts: ["max"] },
+    ], default_model: "removed", default_effort: "max" });
+    assert.equal(defaultModelFor("dsh", state.catalog, state.catalogDefault), "removed");
+    emit({ type: "models", engine: "dsh", ...replacement });
+    assert.deepEqual(state.catalogDefault, { ...otherDefaults,
+      ...(replacement.default_model ? { dsh: replacement.default_model } : {}),
+    });
+    assert.deepEqual(state.catalogDefaultEffort, { ...otherEfforts,
+      ...(replacement.default_effort ? { dsh: replacement.default_effort } : {}),
+    });
+    assert.equal(defaultModelFor("dsh", state.catalog, state.catalogDefault),
+      replacement.default_model ?? replacement.models[0]?.id ?? "",
+      "new sessions must not select the removed native model");
+    assert.deepEqual(state.catalogDefaultCwd, initialState.catalogDefaultCwd);
+  }
+  // The legacy no-cwd behavior for the other engines remains unchanged.
+  for (const engine of ["claude", "codex"]) {
+    state = { ...initialState, catalogDefault: otherDefaults, catalogDefaultEffort: otherEfforts };
+    emit({ type: "models", engine, models: [] });
+    assert.deepEqual(state.catalogDefault, otherDefaults);
+    assert.deepEqual(state.catalogDefaultEffort, otherEfforts);
+  }
 
   state = { ...initialState, engine: "dsh", focusedSid: sid, sessions: [
     { session_id: sid, engine: "dsh", space: "code", state: "running", last_modified: "1" },

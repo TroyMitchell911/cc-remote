@@ -75,6 +75,10 @@ async def test_follow_reconnect_drains_queue_only_after_native_idle(restored_run
                                     delivery="queue", cmd_id="enqueue", client_id="browser"))
         await asyncio.wait_for(wakeup.waiting.wait(), 2)
         assert len(ctx.queued_queries) == 1 and not writes
+        # The worker clears the context's task slot when it finishes. Capture
+        # its identity before recovery can wake and complete it.
+        drain_task = ctx.queued_query_drain_task
+        assert drain_task is not None and not drain_task.done()
         # Recovery has no browser callback or explicit queue wakeup.
         disconnected.set()
         await asyncio.wait_for(restored.wait(), 3)
@@ -82,7 +86,8 @@ async def test_follow_reconnect_drains_queue_only_after_native_idle(restored_run
             assert ctx.state == "running" and len(ctx.queued_queries) == 1 and not writes
             finish.set()
         await asyncio.wait_for(prompted.wait(), 2)
-        await asyncio.wait_for(ctx.queued_query_drain_task, 2)
+        await asyncio.wait_for(drain_task, 2)
+        assert ctx.queued_query_drain_task is None
         assert len(writes) == 1 and writes[0]["requestId"] == "queued"
         assert writes[0]["content"] == [{"type": "text", "text": "queued work"}]
         assert not ctx.queued_queries and ctx.state == "running"
