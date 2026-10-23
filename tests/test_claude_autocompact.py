@@ -2123,10 +2123,14 @@ def test_unrelated_result_cannot_retire_an_autonomous_followup():
 
 
 @pytest.mark.parametrize("stale_owner", [None, "previous-human-turn"])
-def test_autonomous_followup_streams_text_and_tools_without_duplicate_turn_end(stale_owner):
+@pytest.mark.parametrize("terminal_owner", ["autonomous", "managed", "other-task"])
+def test_autonomous_followup_completion_is_exact_and_does_not_complete_human_work(stale_owner, terminal_owner):
     async def run():
         machine, transport, ctx = _machine_with_sdk(_AutoCompactSdk())
-        origin = {"kind": "task-notification"}
+        origin = {"kind": "task-notification", "taskId": "task-1"}
+        if terminal_owner == "managed":
+            ctx.turn_task = asyncio.current_task()
+            ctx.state = "running"
         assistant_id = "77777777-7777-4777-8777-777777777777"
         # Idle task/status messages may have constructed this translator long
         # before the current human prompt. Its text owner must be rebound.
@@ -2196,7 +2200,8 @@ def test_autonomous_followup_streams_text_and_tools_without_duplicate_turn_end(s
                 is_error=False,
                 num_turns=1,
                 session_id=SESSION_ID,
-                origin=origin,
+                origin=origin if terminal_owner != "other-task" else {
+                    "kind": "task-notification", "taskId": "unrelated-task"},
             ),
             "origin-turn",
         )
@@ -2215,7 +2220,20 @@ def test_autonomous_followup_streams_text_and_tools_without_duplicate_turn_end(s
             and item.tool_use_id == "background-read"
             for item in transport.sent
         )
-        assert not any(isinstance(item, TurnEnd) for item in transport.sent)
+        terminals = [item for item in transport.sent if isinstance(item, TurnEnd)]
+        receipts = [item for item in transport.sent if item.type == "completion_state"]
+        if terminal_owner == "autonomous":
+            assert len(terminals) == 1
+            assert terminals[0].turn_id == assistant_id
+            assert terminals[0].checkpoint_id is None
+            assert terminals[0].notification_context.engine == "claude"
+            assert receipts[-1].completion_id == assistant_id
+            assert receipts[-1].unread
+        else:
+            assert not terminals and not receipts
+        replay = ctx.buffer.replay_from(0, cc_session_id=ctx.session_id, state=ctx.state)
+        assert all(item.notification_context is None for item in replay
+                   if isinstance(item, TurnEnd))
         narrative = [
             item for item in transport.sent
             if isinstance(item, (Delta, ToolUse, ToolResult))
@@ -2224,8 +2242,8 @@ def test_autonomous_followup_streams_text_and_tools_without_duplicate_turn_end(s
         assert all(item.turn_id == "origin-turn" for item in narrative)
         assert all(item.background is True for item in narrative)
         assert ctx.claude_background_translator is None
-        assert ctx.claude_background_followup_pending is False
-        assert ctx.state == "idle"
+        assert ctx.claude_background_followup_pending is (terminal_owner == "other-task")
+        assert ctx.state == ("idle" if terminal_owner == "autonomous" else "running")
 
     asyncio.run(run())
 

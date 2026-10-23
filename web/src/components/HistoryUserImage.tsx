@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import type { Turn } from "../domain/conversation";
 import { UserImageButton } from "./UserImageButton";
+import { mediaViewportOptions } from "../media-viewport";
 import {
   historyImageDisplaySource,
 } from "../turn-image-previews";
@@ -123,7 +124,7 @@ export function HistoryUserImage({
       intersectingRef.current = entries.some((entry) => entry.isIntersecting);
       if (!intersectingRef.current) return;
       if (requestImage()) observer.disconnect();
-    }, { rootMargin: "500px 0px" });
+    }, mediaViewportOptions(node));
     observer.observe(node);
     return () => {
       intersectingRef.current = false;

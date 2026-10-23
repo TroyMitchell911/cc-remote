@@ -571,6 +571,12 @@ body{
 .message-image-loading{ justify-content:center; width:min(100%,320px); min-height:180px;
   color:var(--dim); background:var(--raised); vertical-align:top; }
 .message-image-error{ color:var(--danger); background:var(--danger-weak); }
+.message-image-frame{ display:inline-block; position:relative; max-width:100%; margin:5px 0;
+  vertical-align:top; }
+.message-image-frame>.message-image-trigger,
+.message-image-frame>.message-image-loading,
+.message-image-frame .message-inline-image{ position:absolute; inset:0; width:100%; height:100%;
+  max-width:none; max-height:none; min-height:0; margin:0; box-sizing:border-box; }
 button.message-image-error{ font:inherit; cursor:pointer; }
 .codex-directive-status{ display:flex; align-items:center; gap:7px; width:max-content;
   max-width:100%; margin:7px 0; padding:5px 9px; border:1px solid var(--border);
@@ -597,9 +603,6 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .prose th,.prose td{ border:1px solid var(--border); padding:6px 10px; text-align:left; word-break:break-word; }
 .prose th{ background:var(--raised); font-weight:var(--font-weight-600); }
 @media (max-width:980px){ .prose pre{ white-space:pre-wrap; word-break:break-word; overflow-x:hidden; } .prose table{ touch-action:pan-y; } }
-.cursor{ display:inline-block; width:8px; height:16px; margin-left:1px; background:var(--accent);
-  border-radius:2px; vertical-align:-2px; animation:blink 1.05s steps(2) infinite; }
-@keyframes blink{ 50%{opacity:0} }
 .thinking{ display:inline-flex; align-items:center; gap:4px; margin-left:7px; vertical-align:middle; height:13px; }
 .thinking span{ width:4px; height:4px; border-radius:50%; background:var(--dim); animation:think 1.2s infinite ease-in-out; }
 .thinking span:nth-child(2){ animation-delay:.18s; }
@@ -826,10 +829,14 @@ button.message-image-error{ font:inherit; cursor:pointer; }
   font-size:12.5px; color:var(--dim); border-radius:9px; touch-action:pan-y;
   user-select:none; -webkit-user-select:none; }
 .tool-group-h::-webkit-details-marker{ display:none; }
-.tool-group-nm{ font-weight:var(--font-weight-600); }
-.tool-group-sub{ margin-left:8px; font-family:var(--mono); font-size:11.5px; color:var(--faint); }
+/* Running/result labels have different widths. Keep the summary on one line
+   so every tool completion cannot shrink the live tail by a wrapped line. */
+.tool-group-label{ display:flex; flex:1; align-items:baseline; gap:8px; }
+.tool-group-nm{ flex:none; white-space:nowrap; font-weight:var(--font-weight-600); font-variant-numeric:tabular-nums; }
+.tool-group-sub{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-family:var(--mono); font-size:11.5px; color:var(--faint); }
 .tool-group-err{ color:var(--danger); }
-.tool-group-chev{ margin-left:auto; color:var(--faint); transition:transform .2s; }
+.tool-group-chev{ flex:none; margin-left:auto; color:var(--faint); transition:transform .2s; }
 .tool-group[open] .tool-group-chev{ transform:rotate(90deg); }
 .tool-group-b{ display:flex; flex-direction:column; gap:0; padding:3px 0 3px 12px; border-left:1px solid var(--border); margin:2px 0 5px 4px; }
 .tool-group-b .tool{ margin:0; overflow:visible; border:0; border-radius:0; background:transparent; box-shadow:none; }
@@ -1052,6 +1059,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .note::before,.note::after{ content:""; position:absolute; top:50%; width:calc(50% - 70px); height:1px; background:var(--border); }
 .note::before{ left:0 } .note::after{ right:0 }
 .note.interrupted{ color:var(--danger); }
+.turn-failure-status{ margin:14px 0; color:var(--dim); font-size:13px; }
 .turn-problem{ display:flex; align-items:flex-start; gap:10px; margin:14px 0;
   padding:13px 15px; border:1px solid var(--border); border-radius:var(--r-card);
   background:var(--surface); color:var(--text); font-size:13px; line-height:1.6; }
@@ -2035,12 +2043,10 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   .shell[data-sidebar-motion] > .scrim-side{ pointer-events:auto; }
 }
 @media (min-width:980px){
-  /* Animate two ordinary lengths instead of grid-template-columns. Chromium
-     can strand an interpolated 0px/1fr grid track; a fixed sidebar transform
-     plus a matching pane offset keeps the slide smooth without that failure. */
+  /* Reserve the final reading-column width in one layout, just like the right
+     panel. Interpolating width rewraps long answers on every animation frame. */
   .shell{ display:block; height:var(--app-height,100dvh); }
-  .pane{ width:100%; margin-left:0;
-    transition:margin-left .3s var(--ease),width .3s var(--ease); }
+  .pane{ width:100%; margin-left:0; }
   .shell.sidebar-open .pane{ width:calc(100% - 352px); margin-left:352px; }
   .sessions{ position:fixed; width:352px; height:var(--app-height,100dvh); overflow:hidden; }
   .s-inner{ width:100%; }

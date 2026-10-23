@@ -1,12 +1,9 @@
-import type { MermaidConfig } from "mermaid";
 import {
   removeSvgRootLayoutStyles,
-  sanitizeSvgMarkup,
 } from "./safe-svg.ts";
 
 export const MAX_MERMAID_SOURCE_CHARS = 32 * 1024;
 export const MAX_MERMAID_SOURCE_LINES = 500;
-const MAX_MERMAID_EDGES = 500;
 
 export type MermaidTheme = "light" | "dark";
 
@@ -25,76 +22,19 @@ export function mermaidSourceProblem(source: string): string | null {
   return null;
 }
 
-function configForTheme(theme: MermaidTheme): MermaidConfig {
-  return {
-    startOnLoad: false,
-    securityLevel: "strict",
-    secure: [
-      "secure",
-      "securityLevel",
-      "startOnLoad",
-      "maxTextSize",
-      "maxEdges",
-      "htmlLabels",
-      "dompurifyConfig",
-      "theme",
-      "themeVariables",
-      "themeCSS",
-      "fontFamily",
-      "altFontFamily",
-      "look",
-      "layout",
-      "suppressErrorRendering",
-    ],
-    suppressErrorRendering: true,
-    htmlLabels: false,
-    maxTextSize: MAX_MERMAID_SOURCE_CHARS,
-    maxEdges: MAX_MERMAID_EDGES,
-    theme: theme === "dark" ? "dark" : "neutral",
-    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-    logLevel: "fatal",
-  };
+type Renderer = typeof import("./mermaid-renderer");
+let renderer: Renderer | null = null;
+let rendererPromise: Promise<Renderer> | null = null;
+
+export function cachedMermaidSvg(source: string, id: string, theme: MermaidTheme): string | null {
+  return renderer?.cachedMermaidSvg(source, id, theme) ?? null;
 }
 
-type MermaidModule = typeof import("mermaid");
-type DomPurifyModule = typeof import("dompurify");
-
-let modulesPromise: Promise<{
-  mermaid: MermaidModule["default"];
-  DOMPurify: DomPurifyModule["default"];
-}> | null = null;
-let renderQueue: Promise<void> = Promise.resolve();
-
-function loadModules() {
-  modulesPromise ??= Promise.all([
-    import("mermaid"),
-    import("dompurify"),
-  ]).then(([mermaidModule, domPurifyModule]) => ({
-    mermaid: mermaidModule.default,
-    DOMPurify: domPurifyModule.default,
-  }));
-  return modulesPromise;
-}
-
-function enqueueRender<T>(task: () => Promise<T>): Promise<T> {
-  const result = renderQueue.then(task, task);
-  renderQueue = result.then(() => undefined, () => undefined);
-  return result;
-}
-
-export async function renderMermaidSvg(
-  source: string,
-  id: string,
-  theme: MermaidTheme,
-): Promise<string> {
+export async function renderMermaidSvg(source: string, id: string, theme: MermaidTheme): Promise<string> {
   const problem = mermaidSourceProblem(source);
   if (problem) throw new Error(problem);
-  return enqueueRender(async () => {
-    const { mermaid, DOMPurify } = await loadModules();
-    mermaid.initialize(configForTheme(theme));
-    const { svg } = await mermaid.render(id, source);
-    return sanitizeSvgMarkup(svg, DOMPurify, { removeRootLayout: true });
-  });
+  rendererPromise ??= import("./mermaid-renderer").then((module) => (renderer = module));
+  return (await rendererPromise).renderMermaidSvg(source, id, theme);
 }
 
 /** Mermaid emits width="100%" SVGs for responsive inline layout. Replaced

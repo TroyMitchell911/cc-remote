@@ -467,7 +467,7 @@ try {
   for (const message of [policyFailure + " secret-token", "cyber_policy private diagnostic"]) {
     assert.equal(presentTurnProblem({ code: "cc_crash", message }),
       "本次回复未完成，请重试。");
-    assert.equal(presentHistoricalTurnProblem(message), "该轮未正常结束");
+    assert.equal(presentHistoricalTurnProblem(message), null);
   }
   assert.equal(presentTurnProblem({ code: "cc_crash", message: hiddenDiagnostic }),
     "本次回复未完成，请重试。");
@@ -497,7 +497,7 @@ try {
     quotaFailure + "官方提示可于 0000-09-15 09:24（设备当地时间）重试。",
   ]) {
     assert.equal(presentTurnProblem({ code: "cc_crash", message: unsafe }), "本次回复未完成，请重试。");
-    assert.equal(presentHistoricalTurnProblem(unsafe), "该轮未正常结束");
+    assert.equal(presentHistoricalTurnProblem(unsafe), null);
   }
   assert.equal(presentCommandProblem({ code: "internal", message: hiddenDiagnostic }),
     "操作未完成，请稍后重试。");
@@ -586,14 +586,14 @@ try {
   assert.doesNotMatch(
     presentCommandProblem({ code: "protocol", message: hiddenDiagnostic }),
     /crash|wrapper|private|protocol/i);
-  assert.equal(presentHistoricalTurnProblem("error"), "该轮未正常结束");
+  assert.equal(presentHistoricalTurnProblem("error"), null);
   assert.equal(presentHistoricalTurnProblem(
     "当前模型繁忙，请稍后重试或切换模型。", true), "当前模型繁忙，这次请求未完成。");
   assert.equal(
     presentHistoricalTurnProblem(
       "provider crash at /private/token; Authorization: Bearer secret",
     ),
-    "该轮未正常结束",
+    null,
   );
   assert.equal(
     presentHistoricalTurnProblem("网络连接异常，请检查网络后重试。"),

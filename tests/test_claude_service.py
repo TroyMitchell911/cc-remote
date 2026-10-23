@@ -617,7 +617,7 @@ def test_overlapping_buffered_background_turns_keep_each_unacknowledged_prefix()
     asyncio.run(go())
 
 
-def test_machine_recovers_background_followup_without_a_new_human_completion():
+def test_machine_recovers_background_followup_completion_without_resubmitting():
     from cc_remote.config import WrapperConfig
     from cc_remote.protocol import Delta, TurnEnd
     from cc_remote.wrapper import claude_service
@@ -653,7 +653,8 @@ def test_machine_recovers_background_followup_without_a_new_human_completion():
                 {"type": "user", "message": {"role": "user", "content": "<task-notification>done</task-notification>"},
                  "parent_tool_use_id": None, "uuid": "autonomous-user-1",
                  "origin": {"kind": "task-notification"}},
-                {"type": "assistant", "message": {"id": "followup", "role": "assistant",
+                {"type": "assistant", "uuid": "77777777-7777-4777-8777-777777777777",
+                 "message": {"id": "followup", "role": "assistant",
                  "model": "test", "content": [{"type": "text", "text": "Background findings"}]},
                  "parent_tool_use_id": None},
                 {**result, "origin": {"kind": "task-notification"}},
@@ -681,7 +682,13 @@ def test_machine_recovers_background_followup_without_a_new_human_completion():
                 assert deltas[0].background
                 assert deltas[0].turn_id == "origin-human"
                 assert deltas[0].replace
-                assert not any(isinstance(item, TurnEnd) for item in transport.sent)
+                terminals = [item for item in transport.sent if isinstance(item, TurnEnd)]
+                assert len(terminals) == 1
+                assert terminals[0].turn_id == rows[2]["uuid"]
+                assert terminals[0].checkpoint_id is None
+                assert terminals[0].notification_context.engine == "claude"
+                receipt = [item for item in transport.sent if item.type == "completion_state"][-1]
+                assert receipt.completion_id == rows[2]["uuid"] and receipt.unread
                 assert native.prompts == ["hello"]
                 assert ctx.state == "idle"
             finally:
@@ -698,7 +705,7 @@ def test_machine_recovers_background_followup_without_a_new_human_completion():
             restored.service_metadata = worker.metadata.copy()
             restored.service_defer_events = True
             await restored.connect(resume_id=SESSION_ID, cwd="/tmp")
-            machine2, _transport2, ctx2 = _machine_with_sdk(restored)
+            machine2, transport2, ctx2 = _machine_with_sdk(restored)
             observed_seed = asyncio.Event()
 
             async def background(message, turn):
@@ -712,6 +719,7 @@ def test_machine_recovers_background_followup_without_a_new_human_completion():
                 await asyncio.wait_for(observed_seed.wait(), timeout=2)
                 assert ctx2.claude_background_followups == {}
                 assert ctx2.state == "idle"
+                assert not any(isinstance(item, TurnEnd) for item in transport2.sent)
                 assert native.prompts == ["hello"]
             finally:
                 await restored.detach_for_shutdown()

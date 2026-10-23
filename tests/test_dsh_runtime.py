@@ -438,6 +438,57 @@ async def long_native_snapshot(client, *, completed=False, steps=64):
     return snapshot
 
 
+@pytest.mark.parametrize("truncated", [False, True])
+@pytest.mark.asyncio
+async def test_history_image_uses_attachment_reader_not_full_content_entry(truncated):
+    import base64
+    import io
+
+    from PIL import Image
+
+    machine, _, runtime, client = setup_runtime()
+    snapshot = await long_native_snapshot(client, completed=True, steps=1)
+    answer = "complete answer" if not truncated else "long answer\n" * 30000
+    snapshot["records"][-2]["event"]["data"]["message"]["content"][0]["text"] = answer
+    raw = io.BytesIO()
+    Image.new("RGB", (2, 3), "blue").save(raw, format="PNG")
+    data = base64.b64encode(raw.getvalue()).decode()
+    snapshot["records"][1]["event"]["data"]["content"].append({
+        "type": "image", "attachment": {"attachmentId": "picture", "mediaType": "image/png",
+            "width": 2, "height": 3, "bytes": len(raw.getvalue())},
+    })
+    async def read(*args, **kwargs):
+        return snapshot
+    async def attachment(endpoint, args):
+        assert endpoint == "session/attachment"
+        assert args == {"request": {"sessionId": "session", "attachmentId": "picture"}}
+        return {"data": data, "attachment": {"mediaType": "image/png"}}
+    client.history_snapshot, client.rpc = read, attachment
+
+    history = await machine._handle(GetHistory(session_id="dsh@session", detail="summary"))
+    row = history.turns[0]
+    # The image already has its own lazy thumbnail/full reader. It cannot
+    # make an otherwise complete answer offer an ineffective detail button.
+    assert row.detailReasons == (["process", "answer_truncated"] if truncated else ["process"])
+    assert len(row.imageRefs) == 1
+    finals = [block["text"] for block in row.blocks if block.get("channel") == "final"]
+    assert (finals == [answer]) is not truncated
+    for variant in ("thumbnail", "full"):
+        image = await machine._handle(GetHistoryImage(session_id="dsh@session", turn_id=row.id,
+            image_id=row.imageRefs[0]["image_id"], variant=variant, request_id=variant,
+            revision=history.revision, client_id="viewer"))
+        assert image.type == "history_image" and not image.error and image.data
+        assert image.width == 2 and image.height == 3 and image.to == "viewer"
+
+    detail = await machine._handle(GetTurnDetail(session_id="dsh@session", turn_id=row.id,
+        revision=history.revision))
+    assert not detail.error and not detail.has_more
+    assert "".join(event["text"] for event in detail.events
+                   if event["type"] == "delta" and event.get("channel") == "final") == answer
+    assert not machine.sessions, "image and detail reads must not activate a native Agent"
+    await runtime.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completed", [False, True])
 @pytest.mark.parametrize("older_turn", [False, True])

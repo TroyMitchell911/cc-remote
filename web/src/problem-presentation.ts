@@ -176,11 +176,11 @@ export function presentCommandProblem(
   }
 }
 
-export function presentHistoricalTurnProblem(message: string, continuing = false): string {
+export function presentHistoricalTurnProblem(message: string, continuing = false): string | null {
   if (continuing && message.trim() === "当前模型繁忙，请稍后重试或切换模型。") {
     return "当前模型繁忙，这次请求未完成。";
   }
-  const normalized = message.trim().toLowerCase();
-  if (!normalized || normalized === "error") return "该轮未正常结束";
-  return safeTurnFailureMessage(message) ?? "该轮未正常结束";
+  // Generic terminal failures add no cause beyond the reply/process outcome.
+  // Keep them in state, but do not manufacture a second warning card.
+  return safeTurnFailureMessage(message);
 }

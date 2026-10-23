@@ -237,6 +237,7 @@ function ProcessImagePreview({
   onPreviewImage,
   onPreviewHistoryImage,
   generated = false,
+  dimensions,
 }: {
   path: string;
   previewId?: string;
@@ -257,6 +258,7 @@ function ProcessImagePreview({
   onPreviewImage?: (src: string, alt: string) => void;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   generated?: boolean;
+  dimensions?: { width: number; height: number };
 }) {
   const liveAsset = !historyRef && previewId ? imageAssets?.[previewId] : undefined;
   const useHistory = !!historyRef;
@@ -293,6 +295,9 @@ function ProcessImagePreview({
   const canLoad = Boolean(
     (historyTurnId && historyRef) || previewId,
   );
+  const width = dimensions?.width ?? asset?.width;
+  const height = dimensions?.height ?? asset?.height;
+  const ratio = width && height && width > 0 && height > 0 ? `${width} / ${height}` : "16 / 9";
   if (!useHistory && liveAsset?.authorization) {
     return <PreviewAuthorizationPrompt
       authorization={liveAsset.authorization}
@@ -320,15 +325,19 @@ function ProcessImagePreview({
           onLoadImage?.(path, previewId);
         }
       }}>
-      {src
+      {generated ? <span className="generated-image-frame" style={{ aspectRatio: ratio }}>
+        {src ? <img src={src} alt="" width={width} height={height} />
+          : <span className="process-image-placeholder">
+              <Icon name="read" size={16} />
+              <span>{asset?.status === "error" ? "图片加载失败 · 点击重试"
+                : !canLoad ? "生成的图片暂不可用" : "正在加载图片…"}</span>
+            </span>}
+      </span> : src
         ? <img src={src} alt="" width={asset?.width} height={asset?.height} />
         : <span className="process-image-placeholder">
             <Icon name="read" size={16} />
           </span>}
-      {(!generated || !src) && <span>{generated
-        ? (asset?.status === "error" ? "图片加载失败 · 点击重试"
-          : !canLoad ? "生成的图片暂不可用" : "正在加载图片…")
-        : path || "查看过的图片"}</span>}
+      {!generated && <span>{path || "查看过的图片"}</span>}
     </button>
   );
 }
@@ -374,7 +383,8 @@ export function GeneratedImagePreview({ block, ...props }: {
         asset={historyAsset}
         onLoad={props.onLoadHistoryImage}
         onPreview={open} />
-    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId} />}
+    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId}
+      dimensions={ref ?? (live?.width && live.height ? { width: live.width, height: live.height } : undefined)} />}
     <figcaption><Icon name="read" size={14} /><span>生成的图片</span>
       {!!dimensions?.width && !!dimensions.height && <span className="generated-image-size">· {dimensions.width} × {dimensions.height}</span>}
       {(history || previewId) && <button type="button" className="generated-image-open" onClick={open}>

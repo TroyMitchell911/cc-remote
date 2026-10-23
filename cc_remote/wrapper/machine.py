@@ -6689,34 +6689,31 @@ class WrapperMachine:
         return cls._store_claude_followup(ctx, key, "active")
 
     @classmethod
-    def _retire_claude_followup(
+    def _claude_followup_result_keys(
         cls, ctx: SessionContext, message: ResultMessage,
-    ) -> bool:
-        """Retire only the autonomous turn closed by this exact Result."""
+    ) -> tuple[str, ...]:
+        """Resolve this Result without releasing ownership during projection."""
         identities = getattr(message, "_cc_background_ends", ())
         if identities:
-            retired = False
-            for identity in identities:
-                retired = ctx.claude_background_followups.pop(identity, None) is not None or retired
-            return retired
+            return tuple(identity for identity in identities
+                         if identity in ctx.claude_background_followups)
         identity = getattr(message, "_cc_background_end", None)
         if identity is not None:
-            return ctx.claude_background_followups.pop(identity, None) is not None
+            return (identity,) if identity in ctx.claude_background_followups else ()
         origin = getattr(message, "origin", None)
         origin_kind = origin.get("kind") if isinstance(origin, dict) else None
         if origin_kind == "human":
             # A human Result can be routed through the idle/background path
             # during recovery, but it never owns an autonomous continuation.
-            return False
+            return ()
         key = cls._claude_followup_origin_key(origin)
         if key is not None:
             if key in ctx.claude_background_followups:
-                ctx.claude_background_followups.pop(key, None)
-                return True
+                return (key,)
             # Once Claude supplies an exact origin identity, a mismatch is
             # authoritative. Falling back to insertion order here could retire
             # a different task whose autonomous turn is still running.
-            return False
+            return ()
 
         candidates = tuple(ctx.claude_background_followups.items())
         if origin_kind == "task-notification":
@@ -6730,9 +6727,18 @@ class WrapperMachine:
                 if pending_phase == phase
             ), None)
             if match is not None:
-                ctx.claude_background_followups.pop(match, None)
-                return True
-        return False
+                return (match,)
+        return ()
+
+    @classmethod
+    def _retire_claude_followup(
+        cls, ctx: SessionContext, message: ResultMessage,
+    ) -> bool:
+        """Retire only the autonomous turn closed by this exact Result."""
+        identities = cls._claude_followup_result_keys(ctx, message)
+        for identity in identities:
+            ctx.claude_background_followups.pop(identity, None)
+        return bool(identities)
 
     @staticmethod
     def _claude_injected_user_boundary(message: object) -> bool:
@@ -22447,9 +22453,9 @@ class WrapperMachine:
         for injected turns even when a browser prompt is already queued behind
         them. Translator state survives from the injected UserMessage through
         its Result so streamed text and assembled tools remain identical to a
-        normal managed turn; only the duplicate TurnEnd is suppressed because
-        the autonomous work extends its origin turn rather than creating a new
-        visible human turn.
+        normal managed turn. A post-turn main response publishes its own real
+        terminal and completion receipt. Shared human terminals arrive as
+        ClaudeBackgroundBoundary and must never be published a second time.
         """
         if isinstance(message, ClaudeBackgroundBoundary):
             for identity in message.identities:
@@ -22527,8 +22533,25 @@ class WrapperMachine:
                             events = []
                     for event in events:
                         if isinstance(event, TurnEnd):
-                            # Persist the real autonomous boundary without
-                            # inventing another visible main-turn completion.
+                            managed = ctx.turn_task
+                            if (is_result and event.turn_id
+                                    and not (managed is not None and not managed.done())
+                                    and any(ctx.claude_background_followups[key] == "active"
+                                            for key in self._claude_followup_result_keys(ctx, message))):
+                                # This is the main Claude response to a consumed
+                                # task input, not the child's completion. Its
+                                # native assistant UUID gives the continuation
+                                # a distinct receipt without a fake user row or
+                                # completing an active managed human query.
+                                if turn_id:
+                                    await self._emit(ctx, TurnBinding(
+                                        msg_id=turn_id, turn_id=event.turn_id,
+                                        ts=event.ts,
+                                    ))
+                                await self._emit(ctx, event)
+                                continue
+                            # Child/task-only or unbound terminals can still pin
+                            # changes, but cannot complete a human response.
                             async with ctx.emit_lock:
                                 change = await asyncio.to_thread(self._archive_turn_change_event, ctx, event)
                                 if change is not None:

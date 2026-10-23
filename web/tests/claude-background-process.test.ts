@@ -334,6 +334,52 @@ try {
   assert.equal(continuationState.runtimes[sid].liveOwner, null);
   assert.equal(isComposerBusy(continuationState.runtimes[sid].state), false);
 
+  // An autonomous main response has a new assistant UUID but belongs to the
+  // already-completed human row. The binding must work even when streamed
+  // envelope IDs differ, and must not touch another row or another engine.
+  for (const engine of ["claude", "codex", "dsh"]) {
+    let completedState = {
+      ...initialState, focusedSid: sid,
+      sessions: [{ session_id: sid, engine }],
+      runtimes: { [sid]: { ...createRuntime(), controlGeneration: "generation-1",
+        turns: [{ id: "parent", prompt: "review", done: true, doneTs: 10_000,
+          forkPointId: "original-answer", checkpointId: "native-human", blocks: [] },
+        { id: "unrelated", prompt: "other", done: true, doneTs: 11_000,
+          forkPointId: "other-answer", blocks: [] }] } },
+    };
+    let seq = 0;
+    const completeSend = (body: Record<string, unknown>) => {
+      completedState = reduce(completedState, {
+        type: "event", event: event({ sid, seq: ++seq, ...body }),
+      });
+    };
+    completeSend({ type: "state", state: "running", msg_id: "parent", continuation: true });
+    completeSend({ type: "delta", turn_id: "parent", message_id: "stream-envelope",
+      channel: "final", text: "Review complete.", background: true, ts: 20 });
+    completeSend({ type: "assistant_msg_end", turn_id: "parent", message_id: "stream-envelope",
+      channel: "final", background: true, ts: 21 });
+    completeSend({ type: "turn_binding", msg_id: "parent", turn_id: "followup-answer", ts: 22 });
+    assert.equal(completedState.runtimes[sid].turns[0].done, true,
+      "binding a continuation must not reopen the original human response");
+    completeSend({ type: "turn_end", turn_id: "followup-answer", ts: 22,
+      result: { subtype: "success", duration_ms: 2_000, is_error: false },
+      notification_context: { engine, space: "code" } });
+    completeSend({ type: "state", state: "idle", ts: 22 });
+    const [parent, unrelated] = completedState.runtimes[sid].turns;
+    assert.equal(completedState.runtimes[sid].turns.length, 2,
+      "a continuation completion never adds a synthetic user row");
+    assert.equal(parent.doneTs, engine === "claude" ? 22_000 : 10_000);
+    assert.equal(parent.forkPointId, engine === "claude" ? "followup-answer" : "original-answer");
+    assert.equal(parent.checkpointId, "native-human");
+    assert.equal(unrelated.doneTs, 11_000);
+    if (engine === "claude") {
+      completeSend({ type: "completion_state", completion_id: "followup-answer",
+        unread: true, revision: 2 });
+      assert.equal(completedState.runtimes[sid].completion.id, "followup-answer");
+      assert.equal(completedState.runtimes[sid].completion.unread, true);
+    }
+  }
+
   // A resident Claude can continue a settled turn after the browser has only
   // loaded its lightweight summary. A subsequent summary omits the Bash item,
   // but must not move that already-observed work behind its own final answer.

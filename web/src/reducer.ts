@@ -567,6 +567,7 @@ export type Action =
   | { type: "focus_session"; sid: string }
   | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null; autoLoad?: boolean }
   | { type: "begin_history_browse"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; basePageKey: string }
+  | { type: "restore_history_browse"; projection: HistoryBrowseProjection }
   | { type: "install_history_browse_page"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "install_history_browse_newer"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "history_browse_newer_settled"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; pageKey: string }
@@ -2889,6 +2890,23 @@ export function reduce(state: AppState, action: Action): AppState {
             }
           : turn);
       }, true);
+    }
+    case "restore_history_browse": {
+      const saved = action.projection;
+      const runtime = state.runtimes[saved.sid];
+      if (state.focusedSid !== saved.sid || !runtime || runtime.historyInvalidated
+          || isHistoryRecoveryPending(state.historyRecovery, saved.sid)
+          || runtime.historyRevision !== saved.revision
+          || runtime.historyGeneration !== saved.generation) return state;
+      // Previous navigation's detail reads were revoked. Restore their content,
+      // never their transient loading indicators or request ownership.
+      const segments = saved.segments.map(segment => ({ ...segment,
+        turns: segment.turns.map(turn => turn.detailLoading
+          ? { ...turn, detailLoading: false } : turn),
+      }));
+      return { ...state, retainedHistoryBrowse: null, historyBrowse: {
+        ...saved, segments, turns: segments.flatMap(segment => segment.turns),
+      } };
     }
     case "begin_history_browse": {
       const runtime = state.runtimes[action.sid];
@@ -6838,6 +6856,23 @@ function reduceEvent(
           t = findBoundLiveTaskOwner(
             rt, turns, e.checkpoint_id, e.seq, false)
             ?? findTurnByEngineId(turns, e.checkpoint_id);
+        }
+        if (!t && !e.checkpoint_id && (ownership?.engine === "claude"
+            || state.sessions.some((session) =>
+              session.session_id === e.sid && session.engine === "claude"))) {
+          // A main Claude continuation retains its completed human row, but
+          // finishes with a different native assistant UUID. The wrapper binds
+          // that exact owner before the real terminal; do not reopen the row or
+          // guess from whichever turn is last/current. Stream envelope IDs can
+          // also differ from the assembled assistant's transcript UUID.
+          const binding = rt.pendingLiveBinding;
+          if (binding && binding.turnId === e.turn_id
+              && binding.generation === runtimeOrderingGeneration(rt)
+              && (typeof e.seq !== "number" || e.seq >= binding.seq)) {
+            const owners = turns.filter((turn) =>
+              turnHasIdentityAlias(turn, binding.msgId));
+            if (owners.length === 1 && owners[0].done) t = owners[0];
+          }
         }
         if (!t) {
           const openTurns = turns.filter((turn) => !turn.done

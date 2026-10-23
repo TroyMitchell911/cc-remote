@@ -16,6 +16,8 @@ import sqlite3
 import sys
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -1335,17 +1337,22 @@ class HistoryIndexStore:
         self._compact_memory_lock = RLock()
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:
             pass
         connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _select_page_row(
         self,

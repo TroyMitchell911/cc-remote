@@ -8,6 +8,73 @@ import {
   MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README,
 } from "./fixtures/markdown-html";
 
+async function navigationReadingAnchor(page: import("@playwright/test").Page) {
+  return page.locator(".thread").evaluate(node => {
+    const top = node.getBoundingClientRect().top;
+    const paragraph = [...node.querySelectorAll<HTMLElement>(".prose p")]
+      .find(p => p.getBoundingClientRect().top >= top
+        && p.getBoundingClientRect().top < top + node.clientHeight);
+    if (!paragraph) throw new Error("No visible reading paragraph");
+    return { text: paragraph.textContent!, offset: paragraph.getBoundingClientRect().top - top };
+  });
+}
+
+async function navigateReadingToMiddle(page: import("@playwright/test").Page) {
+  await page.locator(".thread").evaluate(node => {
+    node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }));
+    node.scrollTop = 1100;
+    node.dispatchEvent(new Event("scroll"));
+  });
+  await waitForScrollIdle(page);
+  return navigationReadingAnchor(page);
+}
+
+for (const older of [false, true]) {
+  test(`navigation reading restores ${older ? "paginated history" : "latest window"} after engine shortcuts and background output`, async ({ page }) => {
+    await page.goto("/tests/history-browser.html?reading-navigation=1");
+    await expect(page.getByTestId("surface")).toHaveText("device-a:code:codex");
+    if (older) {
+      await page.getByRole("button", { name: "Browse", exact: true }).click();
+      await page.getByRole("button", { name: "Older page", exact: true }).click();
+    }
+    const before = await navigateReadingToMiddle(page);
+    if (older) expect(before.text).toContain("older-");
+    for (let round = 0; round < 2; round++) {
+      await page.keyboard.press("Meta+1");
+      await expect(page.getByTestId("surface")).toHaveText("device-a:code:claude");
+      if (round === 0) await page.getByRole("button", { name: "Background output" }).click();
+      await page.keyboard.press("Meta+2");
+      await expect(page.getByTestId("surface")).toHaveText("device-a:code:codex");
+      await expect.poll(() => navigationReadingAnchor(page)).toEqual(before);
+      if (older) await expect(page.getByTestId("browse-id")).not.toHaveText(/^(latest|old-browse)$/);
+      await page.waitForTimeout(300);
+      expect(await navigationReadingAnchor(page)).toEqual(before);
+    }
+  });
+}
+
+test("navigation reading keeps bottom-following sessions at the new tail", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?reading-navigation=1");
+  await expect.poll(() => page.locator(".thread").evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await page.keyboard.press("Meta+1");
+  await page.getByRole("button", { name: "Background output" }).click();
+  await page.keyboard.press("Meta+2");
+  await expect.poll(() => page.locator(".thread").evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await expect(page.locator('.turn[data-turn-id="background-output"]')).toBeVisible();
+});
+
+test("navigation reading isolates identical session ids on different devices", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?reading-navigation=1");
+  const before = await navigateReadingToMiddle(page);
+  await page.getByRole("button", { name: "Switch device" }).click();
+  await expect.poll(() => page.locator(".thread").evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await page.getByRole("button", { name: "Switch device" }).click();
+  await expect.poll(() => navigationReadingAnchor(page)).toEqual(before);
+});
+
 test("turn regressions manual small scroll back to bottom hides the return button", async ({ page }) => {
   await page.goto("/tests/history-browser.html?turn-regressions=1");
   const viewport = page.locator(".thread");
@@ -371,6 +438,109 @@ async function mockRightPanelRelay(
     });
   });
   return { commands, emit: (message: PanelRelayEvent) => emit(message) };
+}
+
+for (const engine of ["claude", "codex"] as const) {
+  for (const pending of [false, true]) {
+    test(`history prefetch ${engine} keeps the reading window stable and shares ${pending ? "pending" : "ready"} pages`, async ({ page, isMobile }) => {
+      const turns = (start: number, count: number) => Array.from({ length: count }, (_, i) => ({
+        id: `prefetch-${start + i}`, prompt: `Question ${start + i}`, done: true,
+        blocks: [{ kind: "text" as const, message_id: `answer-${start + i}`,
+          channel: "final" as const, done: true,
+          text: Array.from({ length: 12 }, (_, p) => `Paragraph ${p}: ${"Reading history should stay in place. ".repeat(5)}`).join("\n\n") }],
+      }));
+      const base = { type: "history" as const, session_id: "layout-parent", sid: "layout-parent",
+        revision: "layout-history", generation: "layout-generation",
+        detail: "summary" as const, events: [], has_more: true };
+      const relay = await mockRightPanelRelay(page, { engine, retained: false,
+        historyReply: command => command.before ? null : {
+          ...base, turns: turns(21, 4), oldest_id: "prefetch-21",
+        },
+      });
+      const olderRequests = () => relay.commands.filter(c => c.type === "get_history" && c.before);
+      await page.goto("/");
+      const thread = page.locator(".pane .thread");
+      const scrollUp = async (ratio: number) => {
+        if (isMobile) {
+          await dispatchTouchPhase(page, "touchstart", 160);
+          await dispatchTouchPhase(page, "touchmove", 220);
+        } else {
+          await thread.dispatchEvent("wheel", { deltaY: -100 });
+        }
+        await thread.evaluate((el, ratio) => {
+          el.scrollTop = (el.scrollHeight - el.clientHeight) * ratio;
+          el.dispatchEvent(new Event("scroll"));
+        }, ratio);
+      };
+      await expect(thread.locator('[data-turn-id="prefetch-24"]')).toBeAttached();
+      await page.evaluate(() => document.fonts.ready);
+      await waitForScrollIdle(page);
+      expect(olderRequests()).toHaveLength(0);
+      // Layout-driven movement alone must not fetch anything.
+      await thread.evaluate(el => {
+        el.scrollTop = (el.scrollHeight - el.clientHeight) * 0.65;
+        el.dispatchEvent(new Event("scroll"));
+      });
+      await waitForScrollIdle(page);
+      expect(olderRequests()).toHaveLength(0);
+      await scrollUp(0.45);
+      if (isMobile) await dispatchTouchPhase(page, "touchend", 220);
+      await expect.poll(() => olderRequests().length).toBe(1);
+      expect(olderRequests()[0]).toMatchObject({ before: "prefetch-21", limit: 12 });
+      await waitForScrollIdle(page);
+      const before = await thread.evaluate(el => ({ top: el.scrollTop, height: el.scrollHeight }));
+      const respond = () => relay.emit({ ...base, before: "prefetch-21",
+        turns: turns(9, 12), oldest_id: "prefetch-9" });
+      if (!pending) respond();
+      await page.waitForTimeout(200);
+      const after = await thread.evaluate(el => ({ top: el.scrollTop, height: el.scrollHeight }));
+      expect(Math.abs(after.top - before.top)).toBeLessThan(2);
+      expect(after.height).toBe(before.height);
+      await expect(thread.locator('[data-turn-id="prefetch-20"]')).toHaveCount(0);
+      await scrollUp(0);
+      const anchorTop = await thread.locator('[data-turn-id="prefetch-21"]').evaluate(el => el.getBoundingClientRect().top);
+      if (pending) { await page.waitForTimeout(150); respond(); }
+      if (isMobile) await dispatchTouchPhase(page, "touchend", 220);
+      await expect(thread.locator('[data-turn-id="prefetch-20"]')).toBeAttached();
+      await waitForScrollIdle(page);
+      expect(olderRequests()).toHaveLength(1);
+      const retainedTop = await thread.locator('[data-turn-id="prefetch-21"]').evaluate(el => el.getBoundingClientRect().top);
+      expect(Math.abs(retainedTop - anchorTop)).toBeLessThan(3);
+      await page.waitForTimeout(400);
+      expect(olderRequests(), "an arriving page must not recursively prefetch history").toHaveLength(1);
+      if (!pending) {
+        await scrollUp(0.45);
+        if (isMobile) await dispatchTouchPhase(page, "touchend", 220);
+        await expect.poll(() => olderRequests().length).toBe(2);
+        expect(olderRequests()[1]).toMatchObject({ before: "prefetch-9", limit: 12 });
+        relay.emit({ ...base, before: "prefetch-9", turns: turns(1, 8),
+          oldest_id: "prefetch-1", has_more: false });
+        await waitForScrollIdle(page);
+        await expect(thread.locator('[data-turn-id="prefetch-8"]')).toHaveCount(0);
+        await scrollUp(0);
+        const secondAnchor = await thread.locator('[data-turn-id="prefetch-9"]')
+          .evaluate(el => el.getBoundingClientRect().top);
+        const beforeGeometry = await thread.evaluate(el => ({
+          top: el.getBoundingClientRect().top, scroll: el.scrollTop,
+          height: el.scrollHeight,
+          row: el.querySelector('[data-turn-id="prefetch-9"]')?.getBoundingClientRect().toJSON(),
+        }));
+        if (isMobile) await dispatchTouchPhase(page, "touchend", 220);
+        await expect(thread.locator('[data-turn-id="prefetch-8"]')).toBeAttached();
+        await waitForScrollIdle(page);
+        const secondTop = await thread.locator('[data-turn-id="prefetch-9"]')
+          .evaluate(el => el.getBoundingClientRect().top);
+        const afterGeometry = await thread.evaluate(el => ({
+          top: el.getBoundingClientRect().top, scroll: el.scrollTop,
+          height: el.scrollHeight,
+          row: el.querySelector('[data-turn-id="prefetch-9"]')?.getBoundingClientRect().toJSON(),
+        }));
+        expect(Math.abs(secondTop - secondAnchor), JSON.stringify({ beforeGeometry, afterGeometry, secondAnchor, secondTop })).toBeLessThan(3);
+        expect(olderRequests()).toHaveLength(2);
+        await expect(thread.getByRole("button", { name: "加载更早的历史", exact: true })).toHaveCount(0);
+      }
+    });
+  }
 }
 
 test("side chat scope restores long Claude history atomically at the bottom with a completion spark", async ({ page }) => {
@@ -1319,6 +1489,53 @@ function otherHarnessList(command: Record<string, unknown>): PanelRelayEvent | u
       session_id: "codex-parent", engine: "codex", space: "code",
       summary: "Codex parent", cwd: "/tmp/codex", state: "idle",
     }] };
+}
+
+for (const older of [false, true]) {
+  test(`session workspace navigation reading preserves ${older ? "older pages" : "current page"} across real harness shortcuts`, async ({ page }) => {
+    const turns = (start: number, count: number) => Array.from({ length: count }, (_, i) => ({
+      id: `reading-${start + i}`, prompt: `Question ${start + i}`, done: true,
+      blocks: [{ kind: "text" as const, message_id: `answer-${start + i}`, done: true,
+        text: Array.from({ length: 18 }, (_, p) => `Answer ${start + i}, paragraph ${p}: ${"Keep the original reading position. ".repeat(4)}`).join("\n\n") }],
+    }));
+    let advanced = false;
+    const reply = (sid: string, before?: string) => ({
+      type: "history" as const, session_id: sid, sid, before,
+      revision: "layout-history", generation: "layout-generation", build_seq: advanced ? 2 : 1,
+      detail: "summary" as const, events: [], authoritative: true,
+      turns: before ? turns(9, 12) : turns(advanced && sid === "codex-parent" ? 22 : 21, 4),
+      has_more: !before, oldest_id: before ? "reading-9" : advanced && sid === "codex-parent" ? "reading-22" : "reading-21",
+    });
+    const relay = await mockRightPanelRelay(page, { engine: "claude", retained: false,
+      listReply: otherHarnessList,
+      historyReply: command => reply(String(command.session_id), command.before as string | undefined),
+    });
+    await page.goto("/");
+    await expect(page.locator('.thread [data-turn-id="reading-24"]')).toBeAttached();
+    await page.keyboard.press("Meta+2");
+    await expect(page.getByText("session codex-pa", { exact: true })).toBeAttached();
+    const thread = page.locator(".pane .thread");
+    if (older) {
+      await thread.evaluate(node => {
+        node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -200 }));
+        node.scrollTop = 0; node.dispatchEvent(new Event("scroll"));
+      });
+      await waitForScrollIdle(page);
+      await expect.poll(() => relay.commands.some(c => c.type === "get_history" && !!c.before)).toBe(true);
+      await expect(thread.locator('[data-turn-id="reading-20"]')).toBeAttached();
+    }
+    const before = await navigateReadingToMiddle(page);
+    await page.keyboard.press("Meta+1");
+    await expect(page.getByRole("button", { name: "切换新会话引擎" })).toContainText("Claude");
+    advanced = true;
+    relay.emit(reply("codex-parent"));
+    await page.keyboard.press("Meta+2");
+    await expect(page.getByText("session codex-pa", { exact: true })).toBeAttached();
+    await expect.poll(() => navigationReadingAnchor(page)).toEqual(before);
+    await page.waitForTimeout(300);
+    expect(await navigationReadingAnchor(page)).toEqual(before);
+    expect(relay.commands.some(c => ["query", "steer", "interrupt", "new_session"].includes(String(c.type)))).toBe(false);
+  });
 }
 
 test("session workspace harness shortcuts preserve centered side chat and composer drafts", async ({ page }) => {
@@ -2289,7 +2506,8 @@ test("turn regressions usage limit history replaces an old generic cache and sur
     blocks: [{ kind: "text", message_id: "finished", channel: "final", text: "检查完成。", done: true }] }];
   await mockRightPanelRelay(page, { seedTurns });
   await page.goto("/");
-  await expect(page.locator(".turn-problem")).toHaveText("该轮未正常结束");
+  await expect(page.locator(".turn-problem")).toHaveCount(0);
+  await expect(page.locator(".turn-failure-status")).toHaveText("回复未完成，请重试。");
   await expect.poll(() => page.evaluate(async () => {
     const cache = await import("/src/cache.ts");
     return (await cache.loadSession("layout-parent"))?.turns.find(turn => turn.id === "limited-history")?.error;
@@ -2298,6 +2516,7 @@ test("turn regressions usage limit history replaces an old generic cache and sur
   for (let iteration = 0; iteration < 2; iteration++) {
     await page.reload();
     await expect(page.locator(".turn-problem")).toHaveText(failure);
+    await expect(page.locator(".turn-failure-status")).toHaveCount(0);
     await expect(page.getByText("检查完成。", { exact: true })).toBeVisible();
     await expect(page.locator(".turn-working, .note.interrupted")).toHaveCount(0);
   }
@@ -6094,6 +6313,33 @@ test("local Markdown file link and webpage previews share one overlay without sh
   await expect(icon).toBeFocused();
 });
 
+test("local Markdown file link preview retries missing images when reopened after cache expiry", async ({ page }) => {
+  let attempts = 0;
+  await page.route("**/api/link-preview", async (route) => {
+    if (route.request().postDataJSON().detail === "icon") return route.fulfill({ json: {} });
+    attempts++;
+    return route.fulfill({ json: { title: "Recoverable preview",
+      ...(attempts > 1 ? { icon: `data:image/png;base64,${TEST_GENERATED_PNG}`,
+        image: `data:image/png;base64,${TEST_GENERATED_PNG}` } : {}) } });
+  });
+  await page.goto("/tests/history-browser.html?local-file-link=1");
+  const trigger = page.getByRole("button", { name: "预览 preview.example", exact: true });
+  const preview = page.getByRole("dialog", { name: "网页预览 preview.example" });
+  await trigger.click();
+  await expect(preview).toContainText("Recoverable preview");
+  await expect(preview.locator(".message-web-preview-cover")).toHaveCount(0);
+  await preview.getByRole("button", { name: "关闭网页预览" }).click();
+  await expect(preview).toHaveCount(0);
+  await page.evaluate(() => {
+    const now = Date.now;
+    Date.now = () => now() + 61_000;
+  });
+  await trigger.click();
+  await expect(preview.locator(".message-web-preview-cover")).toBeVisible();
+  await expect(preview.locator(".message-site-icon")).toBeVisible();
+  expect(attempts).toBe(2);
+});
+
 for (const top of [24, 200, 400]) {
   test(`local Markdown file link preview stays open after loading under a stationary pointer at ${top}px`, async ({ page }) => {
     await page.setViewportSize({ width: 720, height: 540 });
@@ -8117,6 +8363,104 @@ test("iOS pointercancel releases tool disclosures without toggling", async ({
     firstTool.locator(":scope > summary"), 182,
   );
   await expect(firstTool).not.toHaveAttribute("open", "");
+});
+
+test("Mermaid and history images prepare outside a nested scrollport before becoming visible", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?media-layout=1");
+  const diagram = page.locator(".mermaid-block");
+  const scroller = page.getByTestId("media-scrollport");
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  await expect(page.getByTestId("loaded-media")).toHaveText("near");
+  expect(await scroller.evaluate((node) => node.scrollTop)).toBe(0);
+  const bounds = await scroller.boundingBox();
+  const media = await diagram.boundingBox();
+  expect(media!.y).toBeGreaterThan(bounds!.y + bounds!.height);
+});
+
+test("Mermaid cached remount paints the final size and isolates duplicate SVG references", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?media-layout=1");
+  const diagram = page.locator(".mermaid-block");
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  const before = await diagram.boundingBox();
+  await page.getByText("Toggle diagram", { exact: true }).click();
+  await expect(diagram).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as unknown as { insertedStates: string[] }).insertedStates = [];
+    const observer = new MutationObserver(() => {
+      const state = document.querySelector(".mermaid-block")?.getAttribute("data-mermaid-state");
+      if (state) (window as unknown as { insertedStates: string[] }).insertedStates.push(state);
+    });
+    observer.observe(document.querySelector('[data-testid="near-diagram"]')!, { subtree: true, childList: true, attributes: true });
+  });
+  await page.getByText("Toggle diagram", { exact: true }).click();
+  await expect(diagram).toHaveAttribute("data-mermaid-state", "ready");
+  const states = await page.evaluate(() => (window as unknown as { insertedStates: string[] }).insertedStates);
+  expect(states.length).toBeGreaterThan(0);
+  expect(states.every((state) => state === "ready")).toBe(true);
+  const after = await diagram.boundingBox();
+  expect(Math.abs(after!.height - before!.height)).toBeLessThan(1);
+  await page.getByText("Duplicate diagram", { exact: true }).click();
+  await expect(page.locator('.mermaid-block[data-mermaid-state="ready"]')).toHaveCount(2);
+  const references = await page.locator(".mermaid-svg svg").evaluateAll((svgs) => {
+    const allIds = svgs.flatMap((svg) => [svg.id, ...Array.from(svg.querySelectorAll("[id]"), (node) => node.id)]);
+    const missing = svgs.flatMap((svg) => {
+      const ids = new Set([svg.id, ...Array.from(svg.querySelectorAll("[id]"), (node) => node.id)]);
+      return [svg, ...svg.querySelectorAll("*")].flatMap((node) => [...node.attributes].flatMap((attribute) =>
+        Array.from(attribute.value.matchAll(/url\(#([^)]*)\)/g), (match) => match[1]).filter((id) => !ids.has(id))));
+    });
+    return { count: allIds.length, unique: new Set(allIds).size, missing };
+  });
+  expect(references.unique).toBe(references.count);
+  expect(references.missing).toEqual([]);
+});
+
+test("generated image and Markdown image reserve known geometry throughout decoding", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?media-layout=1&geometry=1");
+  const measure = () => page.evaluate(() => ({
+    frames: [...document.querySelectorAll(".message-image-frame,.generated-image-frame")].map((node) => node.getBoundingClientRect().height),
+    text: document.querySelector('[data-testid="below-images"]')!.getBoundingClientRect().top,
+  }));
+  const before = await measure();
+  expect(before.frames).toHaveLength(2);
+  await page.getByText("Resolve images", { exact: true }).click();
+  await expect(page.locator(".message-inline-image,.generated-image-frame img")).toHaveCount(2);
+  await expect.poll(() => page.locator(".message-inline-image").evaluate((node: HTMLImageElement) => node.complete)).toBe(true);
+  const after = await measure();
+  expect(Math.abs(after.text - before.text)).toBeLessThan(1);
+  expect(after.frames).toEqual(before.frames);
+});
+
+test("Mermaid reading anchor survives source replacement without cancelling native scroll movement", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?media-layout=1&geometry=1");
+  const result = await page.evaluate(async () => {
+    const modulePath = "/src/reading-position.ts";
+    const { captureReadingPosition, readingPositionDelta } = await import(modulePath);
+    const viewport = document.createElement("div");
+    viewport.style.cssText = "position:fixed;inset:0 auto auto 0;width:300px;height:160px;overflow:auto;overflow-anchor:none";
+    viewport.innerHTML = '<div data-turn-id="media"><div style="height:300px"></div>'
+      + '<div class="prose"><div class="mermaid-block" style="margin:0;border:0">'
+      + '<pre style="height:400px;margin:0">diagram source</pre></div></div>'
+      + '<div style="height:1000px"></div></div>';
+    document.body.append(viewport);
+    viewport.scrollTop = 350;
+    const frame = viewport.querySelector(".mermaid-block")!;
+    const before = frame.getBoundingClientRect().top;
+    const position = captureReadingPosition(viewport, "media-test");
+    // One layout mutation above the media and replacement of its source node
+    // arrive between native wheel motion and the corresponding scroll event.
+    const growth = document.createElement("div");
+    growth.style.height = "60px";
+    frame.before(growth);
+    frame.innerHTML = '<button style="display:block;height:300px">rendered diagram</button>';
+    viewport.scrollTop -= 25;
+    const delta = readingPositionDelta(viewport, position);
+    if (delta != null) viewport.scrollTop += delta;
+    const after = frame.getBoundingClientRect().top;
+    viewport.remove();
+    return { delta, motion: after - before };
+  });
+  expect(result.delta).toBe(60);
+  expect(result.motion).toBe(25);
 });
 
 test("completed Mermaid fences render isolated sanitized SVGs", async ({
@@ -10407,9 +10751,11 @@ test("nested process disclosures survive virtual row unmounts", async ({
   const activity = timeline.locator("details.process-activity");
   const reasoning = timeline.locator("details.process-reasoning");
   await activity.locator(":scope > summary").click();
+  // Claude thinking starts open; remember an explicit collapse across unmount.
+  await expect(reasoning).toHaveAttribute("open", "");
   await reasoning.locator(":scope > summary").click();
   await expect(activity).toHaveAttribute("open", "");
-  await expect(reasoning).toHaveAttribute("open", "");
+  await expect(reasoning).not.toHaveAttribute("open", "");
 
   await scrollThreadToEdge(page, "end", testInfo.project.name);
   await expect(timeline).toHaveCount(0);
@@ -10418,7 +10764,7 @@ test("nested process disclosures survive virtual row unmounts", async ({
   await expect(timeline.locator("details.process-activity"))
     .toHaveAttribute("open", "");
   await expect(timeline.locator("details.process-reasoning"))
-    .toHaveAttribute("open", "");
+    .not.toHaveAttribute("open", "");
 });
 
 test("one stationary press opens a process timeline while a newer turn grows", async ({
@@ -10468,6 +10814,9 @@ test("one stationary press opens nested thinking while a newer turn grows", asyn
   await timeline.locator(".turn-process-head").click();
   await waitForScrollIdle(page);
   const summary = timeline.locator(".process-reasoning > summary");
+  await summary.click();
+  await expect(timeline.locator("details.process-reasoning")).not.toHaveAttribute("open", "");
+  await waitForScrollIdle(page);
   const box = await summary.boundingBox();
   if (!box) throw new Error("nested reasoning summary has no bounds");
 
@@ -10524,6 +10873,11 @@ test(`dragging nested process ${kind} outside cannot leave output following lock
   const disclosure = timeline.locator(kind === "thinking"
     ? "details.process-reasoning" : "details.process-activity");
   const summary = disclosure.locator(":scope > summary");
+  // Start both drags with the preceding reasoning closed, so the activity
+  // label is inside the mobile viewport rather than below its bottom edge.
+  await timeline.locator("details.process-reasoning > summary").click();
+  await waitForScrollIdle(page);
+  await expect(disclosure).not.toHaveAttribute("open", "");
   const box = await summary.boundingBox();
   const labelBox = await summary.locator(kind === "thinking"
     ? ":scope > span" : ".process-item-title").boundingBox();
@@ -10553,6 +10907,9 @@ test("nested process disclosures preserve keyboard activation and body selection
   await timeline.locator(".turn-process-head").click();
   const disclosure = timeline.locator("details.process-reasoning");
   const summary = disclosure.locator(":scope > summary");
+  await expect(disclosure).toHaveAttribute("open", "");
+  await summary.click();
+  await expect(disclosure).not.toHaveAttribute("open", "");
   await summary.press("Enter");
   await expect(disclosure).toHaveAttribute("open", "");
   await expect(summary).toBeFocused();
@@ -10607,7 +10964,7 @@ test("iOS pointercancel releases process interactions and output following", asy
   await dispatchCancelledTouchTap(
     reasoning.locator(":scope > summary"), 185,
   );
-  await expect(reasoning).not.toHaveAttribute("open", "");
+  await expect(reasoning).toHaveAttribute("open", "");
   await page.getByTestId("grow-stream").click();
   await expect.poll(() => viewport.evaluate((node) =>
     node.scrollHeight - node.scrollTop - node.clientHeight,
@@ -10874,8 +11231,9 @@ test("returning to a background-grown live turn settles at its current tail", as
 async function assertCodexBurstNeverPaintsAboveTail(
   page: import("@playwright/test").Page,
   projectName: string,
+  query = "",
 ): Promise<void> {
-  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  await page.goto(`/tests/history-browser.html?codex-live-burst=1${query}`);
   const viewport = page.locator(".thread");
   await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
   await waitForScrollIdle(page);
@@ -10967,18 +11325,26 @@ async function assertCodexBurstNeverPaintsAboveTail(
   // The pre-paint observer is active only while the newest turn is open. A
   // reader who has deliberately left the tail must retain the exact row while
   // the same long Codex tool burst continues in the background.
-  await page.goto("/tests/history-browser.html?codex-live-burst=1");
+  await page.goto(`/tests/history-browser.html?codex-live-burst=1${query}`);
   await wheelUntilTurn(page, "burst-history-1", -2_000, projectName);
   const before = await readingAnchor(page);
   await page.getByTestId("start-codex-burst").click();
   await expect.poll(() => page.evaluate(
     () => document.documentElement.dataset.codexBurst,
-  )).toBe("done");
+  ), { timeout: 10_000 }).toBe("done");
   await page.waitForTimeout(100);
   const after = await readingAnchor(page);
   expect(after.id).toBe(before.id);
   expect(Math.abs(after.offset - before.offset)).toBeLessThan(2);
 }
+
+test("live append follows separate commentary and tool messages without bobbing", async ({ page }, testInfo) => {
+  await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name, "&staged-live=1");
+});
+
+test("live append follows mixed tool statuses without bobbing", async ({ page }, testInfo) => {
+  await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name, "&mixed-tools=1");
+});
 
 test("multi-line IME growth stays pinned during a Codex tool burst", async ({
   page,
@@ -13711,3 +14077,144 @@ test("right panel layout Artifacts retries expired thumbnails and ignores their 
   expect(thumbs()).toHaveLength(7);
   expect(relay.commands.some(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toBe(false);
 });
+
+for (const action of ["sidebar", "panel"]) {
+  test(`right panel layout preserves the reading paragraph during ${action} changes`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1000, height: 881 });
+    await mockRightPanelRelay(page, {
+      seedTurns: [{
+        id: "reading-long", prompt: "长段落", done: true,
+        blocks: [{
+          kind: "text", message_id: "reading-answer", channel: "final", done: true,
+          text: Array.from({ length: 24 }, (_, i) => `段落${i}：${
+            "这是一段用于检查阅读位置的长段落。收起和展开侧栏时，应保留用户正在阅读的内容。".repeat(6)
+          }`).join("\n\n"),
+        }],
+      }],
+    });
+    await page.goto("/");
+    const thread = page.locator(".pane .thread");
+    await expect(thread.locator(".prose p").nth(12)).toBeAttached();
+    await page.evaluate(() => document.fonts.ready);
+    await page.waitForTimeout(450);
+    await thread.evaluate(el => {
+      const paragraph = el.querySelectorAll(".prose p")[12];
+      el.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -100 }));
+      el.scrollTop += paragraph.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await waitForScrollIdle(page);
+    const frames = await page.evaluate(async action => {
+      const el = document.querySelector<HTMLElement>(".pane .thread")!;
+      const paragraph = el.querySelectorAll(".prose p")[12];
+      const prose = el.querySelector(".prose")!;
+      const frames: { width: number; y: number; scroll: number }[] = [];
+      const record = () => frames.push({
+        width: prose.getBoundingClientRect().width,
+        y: paragraph.getBoundingClientRect().top - el.getBoundingClientRect().top,
+        scroll: el.scrollTop,
+      });
+      record();
+      window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: action === "sidebar" ? "b" : "K",
+        ctrlKey: true, shiftKey: action === "panel", bubbles: true,
+      }));
+      const start = performance.now();
+      await new Promise<void>(resolve => {
+        const step = () => {
+          record();
+          if (performance.now() - start > 750) resolve();
+          else requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      });
+      return frames;
+    }, action);
+    await testInfo.attach(`reading-${action}.json`, {
+      body: JSON.stringify(frames), contentType: "application/json",
+    });
+    expect(new Set(frames.map(frame => Math.round(frame.width))).size).toBeLessThanOrEqual(2);
+    expect(Math.max(...frames.map(frame => Math.abs(frame.y - frames[0].y)))).toBeLessThan(2);
+  });
+}
+
+for (const engine of ["claude", "codex", "dsh"]) {
+  for (const working of [false, true]) {
+    test(`desktop wheel scrolling preserves cold measured rows after switching to ${engine} ${working ? "working" : "complete"}`, async ({ page, isMobile }, testInfo) => {
+      test.skip(isMobile, "Mobile WebKit has no native mouse wheel; touch cases run separately.");
+      await page.goto(`/tests/history-browser.html?large=40&paragraphs=12&engine=${engine}&remount-session=1${working ? "&interactive-timeline=1" : ""}`);
+      await expect(page.locator(".thread")).toBeVisible();
+      await page.getByTestId("switch-session").click();
+      await expect(page.locator('[data-turn-id="b4"]')).toBeAttached();
+      await page.getByTestId("switch-session").click();
+      await expect(page.locator(`[data-turn-id="${working ? "streaming" : "m40"}"]`)).toBeAttached();
+      await page.waitForTimeout(400);
+      await page.locator(".thread").evaluate(el => {
+        const probe = {
+          active: true, writes: 0, writtenDistance: 0,
+          frames: [] as { t: number; movement: number; scroll: number; written: number }[],
+        };
+        Object.assign(window, { coldWheelProbe: probe });
+        const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+        Object.defineProperty(el, "scrollTop", {
+          configurable: true,
+          get: () => descriptor.get!.call(el),
+          set: (value: number) => {
+            const before = descriptor.get!.call(el) as number;
+            descriptor.set!.call(el, value);
+            probe.writes++;
+            probe.writtenDistance += el.scrollTop - before;
+          },
+        });
+        let previous = new Map<string, { y: number; height: number }>();
+        const frame = () => {
+          const top = el.getBoundingClientRect().top;
+          const next = new Map<string, { y: number; height: number }>();
+          const movements: number[] = [];
+          for (const row of el.querySelectorAll<HTMLElement>("[data-turn-id]")) {
+            const rect = row.getBoundingClientRect();
+            const y = rect.top - top;
+            next.set(row.dataset.turnId!, { y, height: rect.height });
+            const old = previous.get(row.dataset.turnId!);
+            if (old && old.y < el.clientHeight && old.y + old.height > 0) {
+              movements.push(y - old.y);
+            }
+          }
+          if (movements.length) probe.frames.push({
+            t: performance.now(),
+            movement: movements.sort((a, b) => a - b)[Math.floor(movements.length / 2)],
+            scroll: el.scrollTop, written: probe.writtenDistance,
+          });
+          previous = next;
+          if (probe.active) requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+      });
+      const box = await page.locator(".thread").boundingBox();
+      await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+      for (let i = 0; i < 80; i++) {
+        await page.mouse.wheel(0, -60);
+        await page.waitForTimeout(35);
+      }
+      await page.waitForTimeout(350);
+      const probe = await page.evaluate(() => {
+        const probe = (window as unknown as { coldWheelProbe: {
+          active: boolean; writes: number;
+          frames: { t: number; movement: number; scroll: number; written: number }[];
+        } }).coldWheelProbe;
+        probe.active = false;
+        return probe;
+      });
+      await testInfo.attach("cold-wheel-frames.json", {
+        body: JSON.stringify(probe), contentType: "application/json",
+      });
+      const movements = probe.frames.map(frame => frame.movement);
+      // Permit two native ticks in one painted frame, but never an extra
+      // estimate-to-measurement jump (the regression displaced 277px / tick).
+      expect(Math.max(...movements)).toBeLessThanOrEqual(122);
+      expect(Math.min(...movements)).toBeGreaterThanOrEqual(-2);
+      // A visually stable viewport must not hide a measurement/scroll loop.
+      expect(probe.writes).toBeLessThan(80);
+    });
+  }
+}

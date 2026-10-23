@@ -8,6 +8,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -392,18 +393,19 @@ class PreviewCapabilityStore:
     ) -> CapabilityKey:
         return engine, space, session_id, path
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self._path.parent, 0o700)
         connection = sqlite3.connect(self._path, timeout=1.0)
         try:
             os.chmod(self._path, 0o600)
-        except OSError:
+            connection.execute("PRAGMA busy_timeout = 1000")
+            connection.execute("PRAGMA synchronous = FULL")
+            with connection:
+                yield connection
+        finally:
             connection.close()
-            raise
-        connection.execute("PRAGMA busy_timeout = 1000")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:

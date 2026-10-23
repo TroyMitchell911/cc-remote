@@ -48,6 +48,11 @@ export default defineConfig({
       },
     },
     {
+      name: "chromium-android-history",
+      grep: /history prefetch|live append follows mixed tool/,
+      use: { ...devices["Pixel 7"] },
+    },
+    {
       name: "webkit-desktop-selection",
       grep: /desktop (text selection|native selection|wheel scrolling)|turn regressions/,
       use: {

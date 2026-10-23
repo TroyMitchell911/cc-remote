@@ -405,8 +405,9 @@ class DshRuntime:
                 row.pop("forkPointId", None)
             refs = projection.image_refs.get(row["id"])
             if refs:
+                # These attachments load through GetHistoryImage, not turn
+                # detail. Do not advertise them as deferred answer content.
                 row["imageRefs"] = [{k: v for k, v in ref.items() if k != "attachment_id"} for ref in refs]
-                row["detailReasons"] = list(dict.fromkeys([*row.get("detailReasons", []), "image_deferred"]))
         self.builds[sid] = self.builds.get(sid, 0) + (0 if cmd.before else 1)
         result = History(
             sid=sid, session_id=sid, revision=self.machine.instance_id,

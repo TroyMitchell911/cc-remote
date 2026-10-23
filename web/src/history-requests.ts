@@ -26,9 +26,11 @@ export interface HistoryBrowseRequestContext {
   pendingBefore: string;
   sourcePageKey: string | null;
   anchorTurnId?: string | null;
+  /** Warm one page without starting a viewport/browse transaction. */
+  cacheOnly?: boolean;
 }
 
-function sameBrowseWaiter(
+export function sameBrowseWaiter(
   left: HistoryBrowseRequestContext,
   right: HistoryBrowseRequestContext,
 ): boolean {
@@ -37,6 +39,7 @@ function sameBrowseWaiter(
     && left.windowEpoch === right.windowEpoch
     && left.pendingBefore === right.pendingBefore
     && left.sourcePageKey === right.sourcePageKey
+    && !!left.cacheOnly === !!right.cacheOnly
     && (left.anchorTurnId ?? null) === (right.anchorTurnId ?? null);
 }
 

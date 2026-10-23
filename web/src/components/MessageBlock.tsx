@@ -28,6 +28,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { useMarkdownExtras } from "../use-markdown-extras";
 import { rehypeMessageBreaks } from "../markdown-breaks";
+import { messageImageGeometry } from "../media-geometry";
 
 // Keep the parser behind its own memo boundary. MessageBlock still receives
 // fresh callbacks/assets through context, but an unchanged displayed string
@@ -249,6 +250,15 @@ function MessageImage({ src, alt, title, asset, onLoadImage,
     width: number;
     height: number;
   } | null>(null);
+  const lastDimensions = useRef<{ src: string; size?: readonly [number, number] }>({ src });
+  if (lastDimensions.current.src !== src) lastDimensions.current = { src };
+  const measuredSize = asset?.width && asset.height
+    ? [asset.width, asset.height] as const
+    : naturalSize?.src === src ? [naturalSize.width, naturalSize.height] as const
+    : externalImageDimensions.get(src);
+  if (measuredSize) lastDimensions.current.size = measuredSize;
+  const dimensions = lastDimensions.current.size;
+  const frameStyle = messageImageGeometry(dimensions?.[0], dimensions?.[1]);
   const svg = useSanitizedSvgUrl(
     asset?.status === "ready" ? asset.data : undefined,
     asset?.status === "ready" ? asset.mediaType : undefined,
@@ -403,18 +413,14 @@ function MessageImage({ src, alt, title, asset, onLoadImage,
         : `data:${asset.mediaType};base64,${asset.data}`
       : null;
   if (!resolved) {
-    return <span className="message-image-loading" role="status">
+    return <span className="message-image-frame" style={frameStyle}>
+      <span className="message-image-loading" role="status">
       <span className="thinking"><span/><span/><span/></span>
       {alt || "正在加载图片"}
+      </span>
     </span>;
   }
 
-  const cachedSize = externalImageDimensions.get(resolved);
-  const dimensions = asset?.width && asset.height
-    ? [asset.width, asset.height] as const
-    : naturalSize?.src === resolved
-      ? [naturalSize.width, naturalSize.height] as const
-      : cachedSize;
   const image = <img className="message-inline-image" src={resolved}
     alt={alt || ""} title={title} loading="lazy" decoding="async"
     width={dimensions?.[0]} height={dimensions?.[1]}
@@ -425,12 +431,13 @@ function MessageImage({ src, alt, title, asset, onLoadImage,
       if (width <= 0 || height <= 0) return;
       rememberExternalImageDimensions(resolved, [width, height]);
       if (dimensions?.[0] === width && dimensions[1] === height) return;
-      setNaturalSize({ src: resolved, width, height });
+      setNaturalSize({ src, width, height });
     }} />;
-  if (!onPreviewImage) return image;
-  return <button type="button" className="message-image-trigger"
+  return <span className="message-image-frame" style={frameStyle}>
+    {onPreviewImage ? <button type="button" className="message-image-trigger"
     aria-label={`预览图片${alt ? `：${alt}` : ""}`}
-    onClick={() => onPreviewImage(resolved, alt || "图片预览")}>{image}</button>;
+    onClick={() => onPreviewImage(resolved, alt || "图片预览")}>{image}</button> : image}
+  </span>;
 }
 
 function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
@@ -606,7 +613,6 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
               <span>{part.label}</span>
             </div>;
         })}
-        {!done && <span className="cursor" />}
       </div>
     </MessageMarkdownContext.Provider>
   );

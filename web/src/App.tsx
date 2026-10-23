@@ -39,7 +39,9 @@ import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
-import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import type { ChatViewHandle } from "./components/ChatView";
+const ChatView = lazy(() => import("./components/ChatView").then(m => ({ default: m.ChatView })));
+import { useChatReadingMemory } from "./chat-reading-memory";
 import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
@@ -188,7 +190,9 @@ import {
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
   type HistoryRequestOptions,
+  type HistoryRequestKey,
 } from "./history-requests";
+import type { HistoryPagePrefetch } from "./history-prefetch";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
@@ -205,8 +209,10 @@ import {
   appendNewerPage,
   cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
+  createHistoryBrowse,
   prependOlderPage,
   type HistoryBrowsePage,
+  type HistoryBrowseProjection,
 } from "./history-browse";
 import {
   HistoryPageCache,
@@ -617,6 +623,11 @@ export default function App() {
   } | null>(null);
   const capabilitiesScopeRef = useRef<SkillCatalogRequest | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const historyPrefetchRef = useRef<HistoryPagePrefetch | null>(null);
+  const historyPrefetchLoaderRef = useRef<Promise<HistoryPagePrefetch> | null>(null);
+  useEffect(() => {
+    historyPrefetchRef.current?.clear();
+  }, [machineId, engine, space, state.focusedSid]);
   const turnFileRequestsRef = useRef(new TurnFilePageRequests());
   const terminalHistoryRepairRef = useRef<Map<
     string, TerminalHistoryRepairAttempt
@@ -640,6 +651,7 @@ export default function App() {
   ) => {
     for (const request of cancelled) {
       const browse = request.browse;
+      if (browse.cacheOnly) continue;
       dispatch({
         type: "history_browse_page_failed",
         sid: request.sid,
@@ -1129,6 +1141,10 @@ export default function App() {
     newChatCatalogScopeKey,
   );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const chatReadingMemory = useChatReadingMemory(
+    activeScopeKey, focusedSid, rt, state.historyBrowse, dispatch,
+    !state.newChat && !isHistoryRecoveryPending(state.historyRecovery, focusedSid), authed,
+    historyPageCacheScopeKey({ machineId, engine, space, sid: focusedSid ?? "", revision: rt.historyRevision ?? "" }));
   const historyView = displayHistoryProjection(
     state.historyRecovery,
     focusedSid,
@@ -1811,6 +1827,7 @@ export default function App() {
     return scope;
   }, [machineId]);
   const invalidateHistoryPageScopes = useCallback((sid: string) => {
+    historyPrefetchRef.current?.clear();
     const scopes = new Map<string, HistoryPageCacheSessionScope>();
     for (const scope of historyPageScopesRef.current.values()) {
       if (scope.machineId !== machineId || scope.sid !== sid) continue;
@@ -1857,11 +1874,12 @@ export default function App() {
   const installBrowseHistoryPage = useCallback((
     history: History,
     waiters: readonly HistoryBrowseRequestContext[],
+    initialBrowse?: HistoryBrowseProjection,
   ) => {
     const turns = summaryHistoryTurns(history);
     if (!history.before || !turns) return;
     for (const waiter of waiters) {
-      const browse = stateRef.current.historyBrowse;
+      const browse = initialBrowse ?? stateRef.current.historyBrowse;
       if (!browse
           || stateRef.current.focusedSid !== history.session_id
           || browse.sid !== history.session_id
@@ -2844,8 +2862,10 @@ export default function App() {
             const completedHistory =
               historyRequestsRef.current.complete(msg);
             settledHistoryCausalKey = completedHistory.settledCausalKey;
-            const browseWaiters = completedHistory.matched;
-            for (const browse of completedHistory.stale) {
+            const browseWaiters = completedHistory.matched.filter(waiter => !waiter.cacheOnly);
+            historyPrefetchRef.current?.complete(msg, completedHistory.matched);
+            const staleBrowseWaiters = completedHistory.stale.filter(waiter => !waiter.cacheOnly);
+            for (const browse of staleBrowseWaiters) {
               dispatch({
                 type: "history_browse_page_failed",
                 sid: msg.session_id,
@@ -2861,7 +2881,7 @@ export default function App() {
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
             let retryScheduled = false;
-            if (msg.authoritative === false) {
+            if (msg.authoritative === false && (!msg.before || browseWaiters.length)) {
               const retryDelay = msg.error == null && !msg.before
                 ? HISTORY_PROVISIONAL_WATCHDOG_MS
                 : undefined;
@@ -2884,7 +2904,7 @@ export default function App() {
               recoverableReads.complete(retryKey);
             }
             if (msg.before) {
-              if (completedHistory.stale.some((waiter) => {
+              if (staleBrowseWaiters.some((waiter) => {
                 const browse = stateRef.current.historyBrowse;
                 return browse?.sid === msg.session_id
                   && browse.scopeKey === waiter.scopeKey
@@ -3866,6 +3886,7 @@ export default function App() {
               goalDismissMigrationByRequestRef.current,
             );
             recoverableReads.clear();
+            historyPrefetchRef.current?.clear();
             settleCancelledHistoryBrowse(
               historyRequestsRef.current.beginConnection());
             clearHistoryDetailRequests();
@@ -4011,6 +4032,7 @@ export default function App() {
       if (wsRef.current === effectWs) wsRef.current = null;
       historyRequests.clear();
       clearHistoryDetailRequests();
+      historyPrefetchRef.current?.clear();
       turnFileRequests.clear();
       recoverableReads.clear();
       contextRequestLaunches.clear();
@@ -4885,6 +4907,56 @@ export default function App() {
     const messageId = ws.pendingQueryFor(sid);
     return messageId ? ws.queryReceiptFor(sid, messageId) : null;
   };
+  const olderHistoryRequest = (): (HistoryRequestKey & {
+    revision: string;
+    browse: HistoryBrowseRequestContext;
+  }) | null => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision || !wsRef.current
+        || runtime.historyInvalidated
+        || current.connState !== "connected"
+        || isHistoryRecoveryPending(current.historyRecovery, sid)) return null;
+    const existing = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    const before = existing ? existing.olderCursor : runtime.oldestId;
+    if (!(existing ? existing.hasOlder : runtime.hasMore) || !before) return null;
+    const scopeKey = existing?.scopeKey ?? historyPageCacheScopeKey(
+      historyPageScopeFor(sid, runtime.historyRevision, focusedEngine, space));
+    if (!historyPageScopesRef.current.has(scopeKey)) return null;
+    return {
+      sid, before, limit: HISTORY_MORE_PAGE,
+      revision: existing?.revision ?? runtime.historyRevision,
+      generation: existing ? existing.generation : runtime.historyGeneration
+        ?? wsRef.current.generationFor(sid) ?? null,
+      browse: {
+        scopeKey, viewId: existing?.viewId ?? "",
+        windowEpoch: existing?.windowEpoch ?? 0,
+        pendingBefore: before, sourcePageKey: existing?.oldestPageKey ?? null,
+        cacheOnly: true,
+      },
+    };
+  };
+  const prefetchOlderHistoryPage = async () => {
+    // Only history readers need the speculative cache. Keep it off startup.
+    const current = stateRef.current;
+    try {
+      const cache = historyPrefetchRef.current ?? await (
+        historyPrefetchLoaderRef.current ??= import("./history-prefetch")
+          .then(({ HistoryPagePrefetch }) =>
+            historyPrefetchRef.current = new HistoryPagePrefetch())
+      );
+      if (stateRef.current !== current) return;
+      const request = olderHistoryRequest();
+      if (!request || !cache.begin(request)) return;
+      requestHistory(request.sid, request.before, request.limit,
+        request.generation, request.revision, request.browse);
+    } catch {
+      historyPrefetchLoaderRef.current = null;
+      // Foreground pagination remains available if the optional chunk fails.
+    }
+  };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
   ): boolean | {
@@ -4893,38 +4965,26 @@ export default function App() {
     scopeKey: string;
     generation: string | null;
   } => {
-    const current = stateRef.current;
-    const sid = current.focusedSid;
-    const runtime = sid ? current.runtimes[sid] : null;
-    if (!sid || !runtime?.historyRevision || !wsRef.current
-        || runtime.historyInvalidated
-        || isHistoryRecoveryPending(current.historyRecovery, sid)) return false;
-    const existing = current.historyBrowse?.sid === sid
-      ? current.historyBrowse : null;
-    if (existing) {
-      if (!existing.hasOlder || !existing.olderCursor
-          || !historyPageScopesRef.current.has(existing.scopeKey)) return false;
-      const context: HistoryBrowseRequestContext = {
-        scopeKey: existing.scopeKey,
-        viewId: existing.viewId,
-        windowEpoch: existing.windowEpoch,
-        pendingBefore: existing.olderCursor,
-        sourcePageKey: existing.oldestPageKey,
-        anchorTurnId: anchorTurnId ?? null,
-      };
-      return requestHistory(
-        sid, existing.olderCursor, HISTORY_MORE_PAGE,
-        existing.generation, existing.revision, context);
+    const request = olderHistoryRequest();
+    if (!request) return false;
+    const { sid, revision, browse: prefetchContext } = request;
+    const { scopeKey } = prefetchContext;
+    const warmed = historyPrefetchRef.current?.take(request);
+    const context = { ...prefetchContext, cacheOnly: false, anchorTurnId };
+    const send = () => requestHistory(sid, request.before, request.limit,
+      request.generation, revision, context);
+    if (stateRef.current.historyBrowse?.sid === sid) {
+      if (!warmed) return send();
+      installBrowseHistoryPage(warmed, [context]);
+      return true;
     }
-    if (!runtime.hasMore || !runtime.oldestId) return false;
-    const scope = historyPageScopeFor(
-      sid, runtime.historyRevision, focusedEngine, space);
-    const scopeKey = historyPageCacheScopeKey(scope);
+    const runtime = stateRef.current.runtimes[sid];
+    const scope = historyPageScopesRef.current.get(scopeKey)!;
     const viewId = uuid();
     const basePageKey = `${HISTORY_LATEST_PAGE_KEY}:${viewId}`;
-    const browseGeneration = runtime.historyGeneration
-      ?? wsRef.current.generationFor(sid)
-      ?? null;
+    const browseGeneration = request.generation ?? null;
+    context.viewId = viewId;
+    context.sourcePageKey = basePageKey;
     const basePage: HistoryBrowsePage = {
       pageKey: basePageKey,
       turns: runtime.turns,
@@ -4935,25 +4995,20 @@ export default function App() {
       isLatest: true,
     };
     void historyPageCacheRef.current.putPage(scope, basePage);
-    dispatch({
-      type: "begin_history_browse",
-      sid,
-      scopeKey,
-      revision: runtime.historyRevision,
-      generation: browseGeneration,
-      viewId,
-      basePageKey,
-    });
-    const accepted = requestHistory(
-      sid, runtime.oldestId, HISTORY_MORE_PAGE,
-      browseGeneration, runtime.historyRevision, {
-        scopeKey,
-        viewId,
-        windowEpoch: 0,
-        pendingBefore: runtime.oldestId,
-        sourcePageKey: basePageKey,
-        anchorTurnId: anchorTurnId ?? null,
-      });
+    const identity = {
+      sid, scopeKey, revision, generation: browseGeneration, viewId, basePageKey,
+    };
+    dispatch({ type: "begin_history_browse", ...identity });
+    if (warmed) {
+      // Both actions reduce in order. Preparing the base here also lets us
+      // persist any evicted pages without waiting a render/network round trip.
+      const initial = createHistoryBrowse({
+        ...identity, baseTurns: runtime.turns,
+        hasOlder: true, olderCursor: runtime.oldestId ?? null,
+      }).projection;
+      installBrowseHistoryPage(warmed, [context], initial);
+    }
+    const accepted = warmed ? true : send();
     return accepted ? {
       accepted: true,
       viewId,
@@ -6108,7 +6163,8 @@ export default function App() {
             onSend={sendFirstMessage} /></Suspense>
         ) : (
           <>
-            <ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+            <Suspense fallback={<div className="thread" />}><ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+              {...chatReadingMemory}
               sid={focusedSid} turns={historyView.turns}
               sessionLink={(nativeId) => {
                 const session = findMessageSession(nativeId);
@@ -6145,6 +6201,7 @@ export default function App() {
               browseMode={historyView.browsing}
               hasNewer={historyView.hasNewer}
               onLoadMore={loadOlderHistoryPage}
+              onPrefetchOlder={prefetchOlderHistoryPage}
               onLoadNewer={loadNewerHistoryPage}
               onReturnLatest={returnToLatestHistory}
               onLoadDetail={historyView.recovering
@@ -6200,7 +6257,7 @@ export default function App() {
                 ? openAgentDetail : undefined}
               onFork={!historyView.recovering && !archivedBrowse
                   && space === "code"
-                ? forkFromTurn : undefined} />
+                ? forkFromTurn : undefined} /></Suspense>
 
             <Suspense fallback={((!archivedBrowse
                 && ((goalUi?.revealed && !completedGoalRetired)

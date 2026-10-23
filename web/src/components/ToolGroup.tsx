@@ -61,7 +61,7 @@ export function ToolGroup({ tools, active = true }: {
             {running ? `正在调用 ${tools.length} 个工具` : `${tools.length} 个工具调用`}
             {hasErr && !running && <span className="tool-group-err"> · 有错</span>}
           </span>
-          <span className="tool-group-sub">{sub}</span>
+          <span className="tool-group-sub" title={sub}>{sub}</span>
         </span>
         <span className="tool-group-chev"><Icon name="chev" size={14} sw={2} /></span>
       </summary>

@@ -1564,13 +1564,12 @@ for (const filename of [
   assert.match(source, /nativeEvent\.keyCode/);
 }
 
-// Desktop sidebar motion must not regress to the old discrete grid-track swap.
-// Chromium could strand an animated 0px/1fr grid, so the safe implementation
-// slides the fixed sidebar and offsets the pane using ordinary CSS lengths.
+// Reserve the final desktop column width immediately. Neither grid-track nor
+// pane-width interpolation may repeatedly rewrap the reader's paragraphs.
 const layoutCss = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
 assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
-assert.match(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*margin-left[^}]*width/s);
+assert.doesNotMatch(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*\bwidth/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
 assert.doesNotMatch(layoutCss, /\.scard\.has-profile-ribbon\s*\{[^}]*padding-top/,
   "profile stamps must not add a second row to every session card");

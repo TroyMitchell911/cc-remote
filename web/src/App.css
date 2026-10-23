@@ -547,7 +547,10 @@
 .generated-image-preview { display: block; width: 100%; padding: 0; overflow: hidden; border-color: var(--border); border-radius: 12px; background: #fff; cursor: zoom-in; }
 .generated-image-preview img { display: block; width: 100%; height: auto; border-radius: 0; object-fit: contain; }
 .generated-image-preview .process-image-placeholder { display: grid; place-items: center; width: 100%; height: auto; aspect-ratio: 16 / 9; border-radius: 0; background: var(--raised); }
-.generated-image-preview > span:last-child:not(.process-image-placeholder) { display: block; padding: 10px; color: var(--dim); }
+.generated-image-frame { position: relative; display: block; width: 100%; }
+.generated-image-preview>.generated-image-frame { padding: 0; }
+.generated-image-frame>img, .generated-image-frame>.process-image-placeholder { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; }
+.generated-image-preview > span:last-child:not(.process-image-placeholder):not(.generated-image-frame) { display: block; padding: 10px; color: var(--dim); }
 .generated-output figcaption { display: flex; align-items: center; gap: 7px; margin-top: 8px; color: var(--dim); font-size: 12px; }
 .generated-image-size { color: var(--faint); font-size: 11px; }
 .generated-image-open { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 5px 0 5px 10px; border: 0; background: none; color: var(--dim); font: inherit; cursor: pointer; }

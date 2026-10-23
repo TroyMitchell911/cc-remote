@@ -14,6 +14,7 @@ assert.equal(isNeutralSilhouette(pixels(clear, clear)), false, "empty icons are 
 
 const icon = "data:image/png;base64,aWNvbg==";
 const originalFetch = globalThis.fetch;
+const originalNow = Date.now;
 const harness = await createServer({
   root: process.cwd(), appType: "custom", logLevel: "silent",
   server: { middlewareMode: true, watch: null },
@@ -47,8 +48,28 @@ try {
   const late: string[] = [];
   subscribeLinkIcon("https://example.org/new", (value) => late.push(value))();
   assert.deepEqual(late, [icon], "newly mounted links paint the cached icon immediately");
+  let now = originalNow();
+  Date.now = () => now;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    return new Response(JSON.stringify({ title: "Recoverable", icon,
+      ...(attempts > 1 ? { image: icon } : {}) }));
+  };
+  const partial = await getLinkMetadata("https://partial.example/article", "page");
+  assert.equal(partial.image, undefined);
+  now += 30_000;
+  await getLinkMetadata("https://partial.example/article", "page");
+  assert.equal(attempts, 1, "a partial preview is cached briefly, avoiding repeated downloads");
+  now += 31_000;
+  assert.equal((await getLinkMetadata("https://partial.example/article", "page")).image, icon,
+    "a missing cover retries after the short expiry even when the title succeeded");
+  now += 61_000;
+  await getLinkMetadata("https://partial.example/article", "page");
+  assert.equal(attempts, 2, "a complete preview retains the longer cache lifetime");
 } finally {
   globalThis.fetch = originalFetch;
+  Date.now = originalNow;
   await harness.close();
 }
 console.log("link preview icon tests passed");

@@ -193,7 +193,10 @@ class LinkPreviewService:
         self.inflight: dict[tuple[str, bool], asyncio.Future] = {}
 
     def _remember(self, key: tuple[str, bool], result: dict) -> None:
-        self.cache[key] = (time.monotonic() + (3600 if any(result.values()) else 60), result)
+        complete = bool(result.get("icon")) and (key[1] or bool(result.get("image")))
+        # A readable title is not proof that its image downloads succeeded.
+        # Keep partial previews briefly so a transient miss can recover on reopen.
+        self.cache[key] = (time.monotonic() + (3600 if complete else 60), result)
         self.cache.move_to_end(key)
         while len(self.cache) > CACHE_LIMIT:
             self.cache.popitem(last=False)
@@ -236,13 +239,21 @@ class LinkPreviewService:
                         "title": " ".join((parser.values.get("og:title") or parser.title).split())[:240],
                         "description": " ".join((parser.values.get("og:description")
                                                  or parser.values.get("description", "")).split())[:400],
+                        "icon": None,
+                        "image": None,
                     }
                     cover = parser.values.get("og:image") or parser.values.get("twitter:image")
-                    icon, image = await asyncio.gather(
-                        _declared_icon(final, parser),
-                        _image(urljoin(final, cover), IMAGE_LIMIT) if cover else asyncio.sleep(0, result=None),
-                    )
-                    result.update(icon=icon, image=image)
+
+                    async def collect_icon():
+                        result["icon"] = await _declared_icon(final, parser)
+
+                    async def collect_cover():
+                        if cover:
+                            result["image"] = await _image(urljoin(final, cover), IMAGE_LIMIT)
+
+                    # Publish each completed asset before the shared deadline.
+                    # A stalled icon must not discard an already decoded cover.
+                    await asyncio.gather(collect_icon(), collect_cover())
         except (ValueError, OSError, httpx.HTTPError, TimeoutError):
             pass
         finally:
@@ -250,8 +261,9 @@ class LinkPreviewService:
             # A page preview can discover a good icon while an older icon-only
             # request is still failing. Never replace that success with a miss.
             known = self.cache.get(icon_key)
-            if icon_only and not result.get("icon") and known and known[0] > time.monotonic():
-                result = known[1]
+            if (not result.get("icon") and known and known[0] > time.monotonic()
+                    and known[1].get("icon")):
+                result["icon"] = known[1].get("icon")
             # Cancelled requests release all waiters and are not cached.
             if not future.done():
                 future.set_result(result)
