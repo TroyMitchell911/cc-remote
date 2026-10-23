@@ -17881,6 +17881,53 @@ function assertDshMutationsNeverReplay() {
 }
 assertDshMutationsNeverReplay();
 
+function assertInterruptRecoveryIsEngineScoped() {
+  for (const engine of ["dsh", "claude", "codex"] as const) {
+    for (const focused of [false, true]) {
+      const interruptRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+      const sid = engine === "dsh" ? "dsh@interrupt" : `${engine}-interrupt`;
+      interruptRelay.setFocusedSid(sid, engine, "code");
+      // Explicit targets must retain their own engine after surface navigation.
+      if (!focused) interruptRelay.setSurface(engine === "dsh" ? "claude" : "dsh", "code");
+      const stop = () => focused ? interruptRelay.sendInterrupt() : interruptRelay.sendInterruptTo(sid);
+      stop(); // Offline: only Claude/Codex retain the existing reliable behavior.
+      interruptRelay.start();
+      const interruptSocket = FakeWebSocket.instances.at(-1)!;
+      const stops = () => interruptSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.type === "interrupt");
+      interruptSocket.onopen?.();
+      try {
+        assert.equal(stops().length, engine === "dsh" ? 0 : 1, `${engine}: offline stop`);
+        stop();
+        const firstCount = stops().length;
+        const frame = stops().at(-1)!;
+        assert.equal(frame.sid, sid);
+        assert.ok(frame.cmd_id && frame.client_id, "stop retains error correlation");
+        interruptSocket.onopen?.(); // Lost ACK / Wrapper restart.
+        assert.equal(stops().length, engine === "dsh" ? firstCount : firstCount * 2,
+          `${engine}: only DSH session-wide cancel must stay out of recovery`);
+        interruptSocket.readyState = 3;
+        stop();
+        interruptSocket.readyState = FakeWebSocket.OPEN;
+        const before = stops().length;
+        interruptSocket.onopen?.();
+        assert.equal(stops().length, engine === "dsh" ? before : before + firstCount + 1,
+          `${engine}: disconnected stop`);
+      } finally { interruptRelay.stop(); }
+    }
+  }
+  const noFocus = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  noFocus.setSurface("dsh", "code");
+  noFocus.start();
+  const noFocusSocket = FakeWebSocket.instances.at(-1)!;
+  noFocusSocket.onopen?.();
+  try {
+    noFocus.sendInterrupt();
+    assert.ok(!noFocusSocket.sent.some(raw => JSON.parse(raw).type === "interrupt"),
+      "DSH stop must have an exact session target");
+  } finally { noFocus.stop(); }
+}
+assertInterruptRecoveryIsEngineScoped();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({

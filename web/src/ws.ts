@@ -768,10 +768,20 @@ export class RelayWs {
   }
 
   sendInterrupt(): void {
+    if (this.focusedSid) {
+      this.sendInterruptTo(this.focusedSid);
+      return;
+    }
+    if (this.activeEngine === "dsh") return;
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", ts: nowTs(), ...this.sidObj() });
   }
 
   sendInterruptTo(sid: string): void {
+    if (sid.startsWith("dsh@") || this.engineBySession[sid] === "dsh") {
+      // session/cancel has no turn ID: replay could stop a later native turn.
+      this.sendDshMutation({ type: "interrupt", sid });
+      return;
+    }
     this.send({ v: PROTOCOL_VERSION, type: "interrupt", sid, ts: nowTs() });
   }
 

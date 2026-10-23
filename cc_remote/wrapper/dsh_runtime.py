@@ -17,7 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from cc_remote.attachments import validate_attachments
 from cc_remote.protocol import (
+    ERR_BAD_PROMPT, ERR_NOT_STEERABLE,
     AgentDetail, BackgroundProcessItem, BackgroundProcessSync, AskQuestion, DshCommandInfo, DshCommandResult, DshGoal, DshState, Effort, EngineCapabilities, Error, FilePreview, FilesListed, History, HistoryImage, Model,
     Models, Perm, Query, SessionActivity, SessionFocus, SessionForked, SessionInfo,
     SessionList, SessionListInvalidated, StateEvent, TurnBinding, TurnDetail,
@@ -268,7 +270,12 @@ class DshRuntime:
         if cmd.type == "list_sessions":
             await self.machine.transport.send(SessionList(engine="dsh", sessions=[],
                 request_id=cmd.cmd_id, to=cmd.client_id))
-        msg = Error(code="dsh_" + exc.code, message=str(exc), sid=sid,
+        # Shared input rejections must release the browser's exact acceptance
+        # latch without terminating the native turn that a steer was targeting.
+        code = "dsh_" + exc.code
+        if exc.code == "bad_prompt":
+            code = ERR_NOT_STEERABLE if cmd.type == "steer" else ERR_BAD_PROMPT
+        msg = Error(code=code, message=str(exc), sid=sid,
                     to=getattr(cmd, "client_id", None), request_id=getattr(cmd, "cmd_id", None),
                     msg_id=getattr(cmd, "msg_id", None))
         await self.machine.transport.send(msg)
@@ -668,6 +675,8 @@ class DshRuntime:
         return None
 
     async def handle_new_session(self, cmd):
+        if cmd.prompt is not None or cmd.images or cmd.files:
+            self.validate_input(cmd)
         payload = cmd.model_dump(exclude={"ts", "v", "client_id", "owner_id", "cmd_id", "machine_id"})
         identity, fresh, receipt = await self.mutation_intent(cmd, "create", payload)
         if not fresh:
@@ -765,8 +774,16 @@ class DshRuntime:
         if native_session_id(sid) in self.archived:
             raise DshError("archived", "该会话已归档，仍可查看历史和导出记录。")
 
+    @staticmethod
+    def validate_input(cmd, *, allow_empty=False):
+        if not allow_empty and not cmd.prompt and not cmd.images and not cmd.files:
+            raise DshError("bad_prompt", "消息内容为空，请输入内容或添加附件。")
+        if validate_attachments(cmd.images, cmd.files):
+            raise DshError("bad_prompt", "附件不符合要求，请调整后重试。")
+
     async def query(self, ctx, cmd, *, steer=False, launch_receipt=None):
         try:
+            self.validate_input(cmd)
             await self.connection()
             await self.ensure_unarchived(ctx.key)
             await self.activate(ctx)
@@ -853,8 +870,26 @@ class DshRuntime:
             return await self.query(ctx, cmd, steer=True)
 
     async def handle_interrupt(self, cmd):
-        ctx = await self.ctx(getattr(cmd, "sid", None))
-        await self.client.rpc("session/cancel", {"request": {"sessionId": ctx.sdk.native_id}})
+        # Older browsers can replay an unacknowledged stop after a restart.
+        # Claim before native I/O: a session-wide cancel must never be repeated
+        # against a newer queued, scheduled or locally started turn.
+        sid = cmd.sid or self.machine.focused_sid
+        identity, fresh, receipt = await self.mutation_intent(cmd, "interrupt", {"sid": sid})
+        if not fresh:
+            if receipt["result"] is None:
+                raise self.uncertain_mutation()
+            result = json.loads(receipt["result"])
+            if "error" in result:
+                raise DshError(**result["error"])
+            return None
+        try:
+            ctx = await self.ctx(sid)
+            await self.client.rpc("session/cancel", {"request": {"sessionId": ctx.sdk.native_id}})
+        except DshError as exc:
+            await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+            raise
+        await asyncio.to_thread(self.mutations.finish, identity, {"status": "success"})
         # Only the native terminal/status closes the turn.
         return None
 
@@ -885,6 +920,8 @@ class DshRuntime:
     async def handle_set_dsh_control(self, cmd):
         if cmd.kind in {"job_stop", "plugin_enable", "plugin_disable", "manage", "terminal"}:
             return await self.features.control(cmd)
+        if cmd.kind == "command":
+            self.validate_input(cmd, allow_empty=True)
         ctx = await self.ctx(cmd.sid)
         await self.ensure_unarchived(ctx.key)
         await self.activate(ctx)
