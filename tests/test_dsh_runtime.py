@@ -1,5 +1,6 @@
 """DSH integration through the real shared WrapperMachine command boundary."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 
 class Client:
     def __init__(self):
+        self.connection = SimpleNamespace(origin="http://127.0.0.1:5544")
         self.calls = []
         self.cursor = -1
         self.summaries = {}

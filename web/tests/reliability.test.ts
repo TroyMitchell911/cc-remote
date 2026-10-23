@@ -17820,6 +17820,29 @@ function assertAutomaticPreviewReads() {
 }
 assertAutomaticPreviewReads();
 
+function assertDshCommandsNeverReplay() {
+  const commandRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  assert.equal(commandRelay.sendDshControl("dsh@s", "command", "/run"), null,
+    "offline native commands must not be queued for later execution");
+  commandRelay.start();
+  const commandSocket = FakeWebSocket.instances.at(-1)!;
+  commandSocket.onopen?.();
+  try {
+    const files = [{ filename: "note.txt", data: "aGk=" }];
+    const id = commandRelay.sendDshControl("dsh@s", "command", "/run", undefined, files);
+    assert.ok(id);
+    const sent = commandSocket.sent.map(raw => JSON.parse(raw));
+    assert.deepEqual(sent.find(frame => frame.cmd_id === id)?.files, files);
+    // Re-run the actual reconnect preamble without acknowledging the write.
+    commandSocket.onopen?.();
+    assert.equal(commandSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === id).length, 1,
+      "lost ACKs must not replay a native command on reconnect");
+    commandSocket.readyState = 3;
+    assert.equal(commandRelay.sendDshControl("dsh@s", "command", "/run"), null);
+  } finally { commandRelay.stop(); }
+}
+assertDshCommandsNeverReplay();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({

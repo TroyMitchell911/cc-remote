@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from cc_remote.protocol import (
     AgentDetail, BackgroundProcessItem, BackgroundProcessSync, AskQuestion, DshCommandInfo, DshCommandResult, DshGoal, DshState, Effort, EngineCapabilities, Error, FilePreview, FilesListed, History, HistoryImage, Model,
@@ -35,6 +36,7 @@ from cc_remote.wrapper.session_ctx import ActiveTurnBinding, SessionContext
 from cc_remote.wrapper.dsh_features import DshFeatures
 from cc_remote.wrapper.dsh_changes import DshChanges
 from cc_remote.wrapper.dsh_sidechats import DshSidechats
+from cc_remote.wrapper.dsh_mutations import DshMutationJournal, digest
 
 _COMMON = frozenset({
     "hello", "ping", "list_dir", "get_file_preview", "browse_files", "save_markdown",
@@ -126,6 +128,22 @@ class DshRuntime:
         self.workspace_ready = asyncio.Event()
         self.archived: set[str] = set()
         self.jobs: dict[str, list] = {}
+        self.mutations = DshMutationJournal(machine.cfg.state_dir)
+
+    async def mutation_intent(self, cmd, kind, payload):
+        # IDs are scoped to the native authority and the authenticated owner.
+        # Legacy untracked callers have no recovery identity to replay.
+        request = (getattr(cmd, "msg_id", None) if kind == "command" else None)
+        request = request or getattr(cmd, "cmd_id", None) or getattr(cmd, "request_id", None) or str(uuid4())
+        owner = getattr(cmd, "owner_id", None) or getattr(cmd, "client_id", None)
+        identity = digest([self.client.connection.origin, owner, kind, request])
+        fresh, receipt = await asyncio.to_thread(self.mutations.begin, identity, digest(payload))
+        return identity, fresh, receipt
+
+    @staticmethod
+    def uncertain_mutation():
+        return DshError("mutation_unknown", "上次 DSH 操作的结果尚未确认，已停止自动重试。请先查看会话和原生状态。",
+                        outcome_unknown=True)
 
     async def connection(self) -> DshClient:
         async with self.lock:
@@ -655,6 +673,43 @@ class DshRuntime:
         return None
 
     async def handle_new_session(self, cmd):
+        payload = cmd.model_dump(exclude={"ts", "v", "client_id", "owner_id", "cmd_id", "machine_id"})
+        identity, fresh, receipt = await self.mutation_intent(cmd, "create", payload)
+        if not fresh:
+            focus = None
+            if receipt["sid"]:
+                # A recovery read must not follow, reconfigure or resubmit work.
+                ctx = await self.ctx(receipt["sid"])
+                focus = await self.created_focus(ctx, cmd)
+            if receipt["result"] is None:
+                raise self.uncertain_mutation()
+            result = json.loads(receipt["result"])
+            if "error" in result:
+                raise DshError(**result["error"])
+            reply = result.get("reply")
+            if reply:
+                reply = {"error": Error, "dsh_command_result": DshCommandResult}[reply["type"]].model_validate(reply)
+                reply.to = cmd.client_id
+                await self.machine.transport.send(reply)
+            return tuple(frame for frame in (focus, reply) if frame is not None)
+        try:
+            focus, reply = await self.create_session(cmd, identity)
+        except DshError as exc:
+            await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+            raise
+        await asyncio.to_thread(self.mutations.finish, identity, {
+            "reply": reply.model_dump(exclude={"v", "ts", "to"}) if reply is not None else None})
+        return tuple(frame for frame in (focus, reply) if frame is not None)
+
+    async def created_focus(self, ctx, cmd):
+        self.machine.focused_sid = ctx.key
+        focus = SessionFocus(session_id=ctx.key, cwd=ctx.cwd,
+                             request_id=cmd.request_id, to=cmd.client_id)
+        await self.machine.transport.send(focus)
+        return focus
+
+    async def create_session(self, cmd, identity):
         await self.read_catalog()
         preset = getattr(cmd, "dsh_agent_preset", None)
         if preset and not any(p["id"] == preset and p["available"] for p in self.presets):
@@ -672,6 +727,8 @@ class DshRuntime:
         value = await self.client.rpc("session/create", {"request": {
             "cwd": cwd, **({"agentPreset": preset} if preset else {})}})
         sid = wire_session_id(value["sessionId"])
+        # Persist the known identity before activation or the initial prompt.
+        await asyncio.to_thread(self.mutations.created, identity, sid)
         ctx = await self.ctx(sid)
         await self.activate(ctx)
         # A native default or Agent Preset may still select another model.
@@ -679,15 +736,14 @@ class DshRuntime:
         await self.select_model(ctx, selected, effort)
         if cmd.dsh_permission:
             await self.command(ctx, "/permission " + cmd.dsh_permission)
-        self.machine.focused_sid = sid
-        await self.machine.transport.send(SessionFocus(
-            session_id=sid, cwd=ctx.cwd, request_id=cmd.request_id, to=cmd.client_id))
+        focus = await self.created_focus(ctx, cmd)
         await self.projections(ctx, {})
         await self.invalidate()
         if cmd.prompt is not None or cmd.images or cmd.files:
-            return await self.query(ctx, Query(sid=sid, prompt=cmd.prompt or "", msg_id=cmd.msg_id,
+            reply = await self.query(ctx, Query(sid=sid, prompt=cmd.prompt or "", msg_id=cmd.msg_id,
                                               images=cmd.images, files=cmd.files, client_id=cmd.client_id, cmd_id=cmd.cmd_id or cmd.request_id))
-        return None
+            return focus, reply
+        return focus, None
 
     async def activate(self, ctx):
         handle = ctx.sdk
@@ -734,7 +790,7 @@ class DshRuntime:
             if is_command:
                 self.validate_command(ctx, cmd.prompt.strip(), bool(cmd.images or cmd.files))
                 attachments = await self.content(ctx, SimpleNamespace(prompt="", images=cmd.images, files=cmd.files))
-                value = await self.command(ctx, cmd.prompt.strip(), attachments)
+                value = await self.command(ctx, cmd.prompt.strip(), attachments, request=cmd)
                 await self.machine._artifacts.uploads(ctx, cmd.msg_id, cmd.files, cmd.images)
                 handle.admitted.add(cmd.msg_id)
                 result = DshCommandResult(sid=ctx.key, to=cmd.client_id, request_id=cmd.cmd_id or cmd.msg_id,
@@ -846,7 +902,7 @@ class DshRuntime:
         if cmd.kind == "command":
             self.validate_command(ctx, line, bool(cmd.images or cmd.files))
             attachments = await self.content(ctx, SimpleNamespace(prompt="", images=cmd.images, files=cmd.files))
-        value = await self.command(ctx, line, attachments)
+        value = await self.command(ctx, line, attachments, request=cmd)
         if cmd.kind == "command" and cmd.cmd_id:
             result = DshCommandResult(sid=ctx.key, request_id=cmd.cmd_id, status="success",
                 text=str(value.get("result", {}).get("text", ""))[:16384], to=cmd.client_id)
@@ -889,20 +945,45 @@ class DshRuntime:
         if attachments and not (command.get("input") or {}).get("attachments"):
             raise DshError("command_attachments", "这个 DSH 命令不接受附件。")
 
-    async def command(self, ctx, line, attachments=None):
-        await self.activate(ctx)
-        self.validate_command(ctx, line, attachments)
-        value = await self.client.rpc("commands/execute", {
-            "agentId": ctx.sdk.native_id, "line": line, "submittedAttachments": attachments or []})
-        if value is None:
-            raise DshError("unknown_command", "此 DSH 会话没有这个命令。")
-        if value.get("result", {}).get("kind") == "error":
-            raise DshError("command_failed", str(value["result"].get("text", "DSH 命令未成功。"))[:4096])
+    async def command(self, ctx, line, attachments=None, *, request=None):
+        identity = None
+        if request is not None:
+            # Fingerprint source attachments, not newly generated upload receipts.
+            identity, fresh, receipt = await self.mutation_intent(request, "command", {
+                "sid": ctx.key, "line": line, "images": getattr(request, "images", None),
+                "files": getattr(request, "files", None)})
+            if not fresh:
+                if receipt["result"] is None:
+                    raise self.uncertain_mutation()
+                result = json.loads(receipt["result"])
+                if "error" in result:
+                    raise DshError(**result["error"])
+                return result["value"]
+        try:
+            await self.activate(ctx)
+            self.validate_command(ctx, line, attachments)
+            value = await self.client.rpc("commands/execute", {
+                "agentId": ctx.sdk.native_id, "line": line, "submittedAttachments": attachments or []})
+            if value is None:
+                raise DshError("unknown_command", "此 DSH 会话没有这个命令。")
+            if value.get("result", {}).get("kind") == "error":
+                raise DshError("command_failed", str(value["result"].get("text", "DSH 命令未成功。"))[:4096])
+        except DshError as exc:
+            if identity:
+                await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                    "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+            raise
+        if identity:
+            # Only the bounded command result is needed for a duplicate reply.
+            value = {"result": {
+                "kind": value.get("result", {}).get("kind", "success"),
+                "text": str(value.get("result", {}).get("text", ""))[:16384]}}
+            await asyncio.to_thread(self.mutations.finish, identity, {"value": value})
         await self.refresh_goal(ctx)
         return value
 
     async def handle_compact_session(self, cmd):
-        return await self.command(await self.ctx(cmd.session_id), "/compact")
+        await self.command(await self.ctx(cmd.session_id), "/compact", request=cmd)
 
     async def handle_get_context(self, cmd):
         ctx = await self.ctx(getattr(cmd, "sid", None))

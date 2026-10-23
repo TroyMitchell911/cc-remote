@@ -788,13 +788,15 @@ export class RelayWs {
   }
 
   sendDshControl(sid: string, kind: import("./protocol").DshControlKind, value: string, images?: QueryImg[], files?: QueryFile[]): string | null {
-    // PTY keystrokes belong to one physical attachment, never the recovery outbox.
-    if (kind === "terminal" || (kind === "manage" && (() => {
+    // Native commands have no idempotency key. Like PTY input and schedule
+    // creation, uncertain writes must never be replayed by reconnect recovery.
+    if (kind === "command" || kind === "terminal" || (kind === "manage" && (() => {
       try { return JSON.parse(value).action === "schedule_create"; } catch { return false; }
     })())) {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
       const cmd_id = uuid();
-      this.sendUntracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, cmd_id, client_id: this.clientId });
+      this.sendUntracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, cmd_id, client_id: this.clientId,
+        ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
       return cmd_id;
     }
     return this.sendTracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
