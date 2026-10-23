@@ -11107,6 +11107,7 @@ class WrapperMachine:
                     if replace_index is not None:
                         ctx.queued_queries.pop(replace_index)
                         ctx.queued_query_errors.pop(replaced.msg_id, None)
+                        ctx.queued_query_blocked.discard(replaced.msg_id)
                         ctx.queued_query_bytes -= replaced_size
                         self._queued_query_count -= 1
                         self._queued_query_bytes -= replaced_size
@@ -11193,6 +11194,7 @@ class WrapperMachine:
                     ):
                         removed = ctx.queued_queries.pop(index)
                         ctx.queued_query_errors.pop(removed.msg_id, None)
+                        ctx.queued_query_blocked.discard(removed.msg_id)
                         size = self._queued_query_size(removed)
                         ctx.queued_query_bytes -= size
                         self._queued_query_count -= 1
@@ -11310,8 +11312,8 @@ class WrapperMachine:
                             )
                         else:
                             ctx.queued_queries[index] = replacement
-                            ctx.queued_query_errors.pop(
-                                previous.msg_id, None)
+                            if previous.msg_id not in ctx.queued_query_blocked:
+                                ctx.queued_query_errors.pop(previous.msg_id, None)
                             ctx.queued_query_bytes += (
                                 replacement_size - previous_size)
                             self._queued_query_bytes = projected_bytes
@@ -11412,6 +11414,12 @@ class WrapperMachine:
                 # another preflight.  If this attempt fails and nobody changes
                 # anything, wait instead of emitting the same error in a loop.
                 ctx.queued_query_wakeup.clear()
+                if (ctx.queued_queries
+                        and ctx.queued_queries[0].msg_id in ctx.queued_query_blocked):
+                    # Keep failed attachment uploads inspectable. Neither timer
+                    # retries nor unrelated terminal/wakeup events may repeat them.
+                    await ctx.queued_query_wakeup.wait()
+                    continue
                 try:
                     # The browser command lane and this worker share query_lock:
                     # once an item starts preflight, no later immediate query can
@@ -11483,6 +11491,7 @@ class WrapperMachine:
                                     self._queued_query_bytes -= size
                                 ctx.queued_query_errors.pop(
                                     command.msg_id, None)
+                                ctx.queued_query_blocked.discard(command.msg_id)
                                 if (
                                     ctx.queued_query_starting_msg_id
                                     == command.msg_id
@@ -11534,6 +11543,10 @@ class WrapperMachine:
                             ):
                                 ctx.queued_query_errors[
                                     command.msg_id] = launch_error
+                                if (isinstance(result, Error) and result.code in {
+                                    "dsh_upload_unknown", "dsh_upload_failed",
+                                }):
+                                    ctx.queued_query_blocked.add(command.msg_id)
                             if (
                                 ctx.queued_query_starting_msg_id
                                 == command.msg_id
@@ -11548,6 +11561,8 @@ class WrapperMachine:
                                     session_id=self._ctx_wire_sid(ctx),
                                     error_type=type(exc).__name__,
                                 )
+                    if command.msg_id in ctx.queued_query_blocked:
+                        continue
                     try:
                         await asyncio.wait_for(
                             ctx.queued_query_wakeup.wait(),
@@ -11597,6 +11612,7 @@ class WrapperMachine:
                 ctx.queued_queries = []
                 ctx.queued_query_bytes = 0
                 ctx.queued_query_errors = {}
+                ctx.queued_query_blocked.clear()
                 ctx.queued_query_starting_msg_id = None
                 if publish:
                     await self._emit_locked(
@@ -11790,7 +11806,11 @@ class WrapperMachine:
         if cmd.type in {"get_models", "get_permission_profiles"}:
             self._start_models_command(cmd)
             return
-        if cmd.type in {"steer", "set_dsh_control"}:
+        if (cmd.type == "steer" and not self._dsh.targets(cmd)
+                or cmd.type == "set_dsh_control"
+                and cmd.kind in {"terminal", "job_stop"}):
+            # Session settings must precede later prompt admission. Only
+            # interactive input/cancellation bypasses the ordered mutation lane.
             self._start_interactive_control_command(cmd)
             return
         if cmd.type in {"get_status", "consume_rate_limit_reset_credit"}:
@@ -11820,7 +11840,7 @@ class WrapperMachine:
         if creation:
             target = None
         serial = not urgent and not (
-            target and cmd.type in {"query", "get_context", "interrupt"})
+            target and cmd.type in {"query", "steer", "get_context", "interrupt"})
         await self._command_scheduler.submit(
             cmd, target=target, serial=serial,
             barrier=not target and not creation and not urgent,

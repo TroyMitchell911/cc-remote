@@ -136,7 +136,7 @@ class DshRuntime:
     async def mutation_intent(self, cmd, kind, payload):
         # IDs are scoped to the native authority and the authenticated owner.
         # Legacy untracked callers have no recovery identity to replay.
-        request = (getattr(cmd, "msg_id", None) if kind == "command" else None)
+        request = (getattr(cmd, "msg_id", None) if kind in {"command", "file_upload"} else None)
         if kind == "fork":
             # A business retry can change cmd_id while retaining this identity.
             request = cmd.request_id
@@ -362,6 +362,10 @@ class DshRuntime:
         handle.model, handle.effort = handle.projection.model, handle.projection.effort
         await self.snapshot_projections(ctx, snapshot)
         handle.jobs_watch = asyncio.create_task(self._job_watch(ctx))
+        if ctx.state == "running":
+            # A rejected cold control (e.g. archive while busy) may never call
+            # activate(). Observe the real terminal so it can release capacity.
+            self.start_follow(ctx)
         return ctx
 
     async def ensure_capacity(self):
@@ -792,11 +796,15 @@ class DshRuntime:
             return focus, reply
         return focus, None
 
-    async def activate(self, ctx):
+    def start_follow(self, ctx):
         handle = ctx.sdk
         if handle.watch is None or handle.watch.done():
             handle.ready.clear()
             handle.watch = asyncio.create_task(self._follow(ctx), name=f"dsh-follow-{ctx.key}")
+
+    async def activate(self, ctx):
+        self.start_follow(ctx)
+        handle = ctx.sdk
         try:
             await asyncio.wait_for(handle.ready.wait(), 15)
             await asyncio.wait_for(self.events_ready.wait(), 15)
@@ -844,7 +852,7 @@ class DshRuntime:
                     is_command = False
             if is_command:
                 self.validate_command(ctx, cmd.prompt.strip(), bool(cmd.images or cmd.files))
-                attachments = await self.content(ctx, SimpleNamespace(prompt="", images=cmd.images, files=cmd.files))
+                attachments = await self.content(ctx, cmd, include_text=False)
                 value = await self.command(ctx, cmd.prompt.strip(), attachments, request=cmd)
                 await self.machine._artifacts.uploads(ctx, cmd.msg_id, cmd.files, cmd.images)
                 handle.admitted.add(cmd.msg_id)
@@ -894,14 +902,43 @@ class DshRuntime:
                 launch_receipt.set_result(False)
             return await self.error(cmd, exc)
 
-    async def content(self, ctx, cmd):
-        blocks = [{"type": "text", "text": cmd.prompt}] if cmd.prompt else []
+    async def content(self, ctx, cmd, *, include_text=True):
+        blocks = [{"type": "text", "text": cmd.prompt}] if include_text and cmd.prompt else []
         for img in cmd.images or []:
             blocks.append({"type": "image", "mediaType": img["media_type"], "data": img["data"]})
-        for file in cmd.files or []:
-            uploaded = await self.client.rpc("fileUploads/upload", {
-                "agentId": ctx.sdk.native_id, "request": {"name": file["filename"], "data": file["data"]}})
-            blocks.append({"type": "file", "receiptId": uploaded["receiptId"]})
+        if cmd.files:
+            blocks.extend(await self.upload_files(ctx, cmd))
+        return blocks
+
+    async def upload_files(self, ctx, cmd):
+        # Uploads have no native idempotency key. Claim the entire attachment
+        # batch before its first write; a partial/unknown batch must not repeat.
+        # The journal stores only hashes and receipts, never attachment bytes.
+        identity, fresh, receipt = await self.mutation_intent(cmd, "file_upload", {
+            "sid": ctx.key, "files": cmd.files})
+        if not fresh:
+            if receipt["result"] is None:
+                raise DshError("upload_unknown", "附件上传结果未确认，已暂停重试。请核实后移除排队消息并重新发送。",
+                               outcome_unknown=True)
+            result = json.loads(receipt["result"])
+            if "error" in result:
+                raise DshError(**result["error"])
+            return result["blocks"]
+        blocks = []
+        try:
+            for file in cmd.files:
+                uploaded = await self.client.rpc("fileUploads/upload", {
+                    "agentId": ctx.sdk.native_id, "request": {"name": file["filename"], "data": file["data"]}})
+                blocks.append({"type": "file", "receiptId": uploaded["receiptId"]})
+        except DshError as exc:
+            error = DshError("upload_unknown" if exc.outcome_unknown else "upload_failed",
+                "附件上传结果未确认，已暂停重试。请核实后移除排队消息并重新发送。" if exc.outcome_unknown
+                else "附件上传失败，已暂停重试。请移除排队消息并重新发送。",
+                outcome_unknown=exc.outcome_unknown)
+            await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                "code": error.code, "message": str(error), "outcome_unknown": error.outcome_unknown}})
+            raise error from exc
+        await asyncio.to_thread(self.mutations.finish, identity, {"blocks": blocks})
         return blocks
 
     async def handle_steer(self, cmd):
@@ -977,7 +1014,8 @@ class DshRuntime:
             return None
         try:
             ctx = await self.ctx(sid)
-            await self.select_model(ctx, selected, effort)
+            async with ctx.query_lock:
+                await self.select_model(ctx, selected, effort)
         except DshError as exc:
             await asyncio.to_thread(self.mutations.finish, identity, {"error": {
                 "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
@@ -992,6 +1030,10 @@ class DshRuntime:
         if cmd.kind == "command":
             self.validate_input(cmd, allow_empty=True)
         ctx = await self.ctx(cmd.sid)
+        async with ctx.query_lock:
+            return await self.session_control(ctx, cmd)
+
+    async def session_control(self, ctx, cmd):
         await self.ensure_unarchived(ctx.key)
         await self.activate(ctx)
         if cmd.kind == "permission":
@@ -1003,7 +1045,7 @@ class DshRuntime:
         attachments = None
         if cmd.kind == "command":
             self.validate_command(ctx, line, bool(cmd.images or cmd.files))
-            attachments = await self.content(ctx, SimpleNamespace(prompt="", images=cmd.images, files=cmd.files))
+            attachments = await self.content(ctx, cmd, include_text=False)
         value = await self.command(ctx, line, attachments, request=cmd)
         if cmd.kind == "command" and cmd.cmd_id:
             result = DshCommandResult(sid=ctx.key, request_id=cmd.cmd_id, status="success",
@@ -1579,8 +1621,8 @@ class DshRuntime:
                             for parent in list(self.machine.sessions.values()):
                                 if parent.engine == "dsh" and any(child["id"] == args[0] for child in parent.sdk.children):
                                     await self.refresh_children(parent)
-                            if ctx and args[1] and (ctx.sdk.watch is None or ctx.sdk.watch.done()):
-                                ctx.sdk.watch = asyncio.create_task(self._follow(ctx))
+                            if ctx and args[1]:
+                                self.start_follow(ctx)
                         if frame.get("event") in {"api-session/added", "api-session/removed"}:
                             await self.invalidate()
             except asyncio.CancelledError:
@@ -1614,10 +1656,10 @@ class DshRuntime:
             item = items[native]
             if item.get("origin") != "subagent":
                 ctx = await self.ctx(wire_session_id(native))
-                if item.get("running") and (ctx.sdk.watch is None or ctx.sdk.watch.done()):
+                if item.get("running"):
                     # This Agent is already executing and waiting for input.
                     # Follow its continuation/terminal even if never focused.
-                    ctx.sdk.watch = asyncio.create_task(self._follow(ctx))
+                    self.start_follow(ctx)
                 return ctx
             native = item.get("parentSessionId")
             if not native:

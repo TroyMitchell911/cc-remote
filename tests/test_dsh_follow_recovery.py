@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from cc_remote.protocol import Query
+from cc_remote.protocol import ArchiveSession, Query
 from cc_remote.wrapper.dsh_client import DshError
 from tests.test_dsh_runtime import long_native_snapshot, setup_runtime
 
@@ -99,4 +99,68 @@ async def test_follow_reconnect_drains_queue_only_after_native_idle(restored_run
         if ctx.queued_query_drain_task:
             ctx.queued_query_drain_task.cancel()
             await asyncio.gather(ctx.queued_query_drain_task, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finished_before_follow", [False, True])
+async def test_rejected_cold_archive_observes_terminal_and_releases_capacity(finished_before_follow, monkeypatch):
+    machine, output, runtime, client = setup_runtime()
+    machine.cfg.max_concurrent_sessions = 1
+    running = await long_native_snapshot(client, steps=1)
+    ended = await long_native_snapshot(client, steps=1, completed=True)
+    client.summaries["session"]["running"] = True
+    finish, idle = asyncio.Event(), asyncio.Event()
+    follows = []
+    runtime.events_ready.set()
+    set_state, rpc = machine._set_state, client.rpc
+
+    async def state_changed(ctx, state):
+        await set_state(ctx, state)
+        if state == "idle":
+            idle.set()
+
+    async def no_activate(*args):
+        pytest.fail("observing an already-running cold session must not activate it")
+
+    async def history(sid, **options):
+        if finished_before_follow and follows:
+            return ended
+        return running
+
+    async def stream(endpoint, args):
+        assert endpoint == "session/follow"
+        follows.append(args)
+        yield {"type": "snapshot", "cursor": (ended if finished_before_follow else running)["cursor"]}
+        await finish.wait()
+        if not finished_before_follow:
+            for record in ended["records"][len(running["records"]):]:
+                yield {"type": "event", **record}
+        await asyncio.Future()
+
+    async def commands(endpoint, args=None):
+        return [] if endpoint == "commands/list" else await rpc(endpoint, args)
+
+    monkeypatch.setattr(machine, "_set_state", state_changed)
+    monkeypatch.setattr(runtime, "activate", no_activate)
+    client.history_snapshot, client.stream, client.rpc = history, stream, commands
+    try:
+        await machine._process_command(ArchiveSession(
+            session_id="dsh@session", archived=True, cmd_id="archive", client_id="browser"))
+        assert any(frame.type == "error" and frame.code == "dsh_archive_busy" for frame in output.sent)
+        ctx = machine.sessions["dsh@session"]
+        assert ctx.sdk.watch is not None
+        await asyncio.wait_for(ctx.sdk.ready.wait(), 1)
+        watch = ctx.sdk.watch
+        runtime.start_follow(ctx)
+        assert ctx.sdk.watch is watch  # Status/question recovery shares this reader.
+        finish.set()
+        await asyncio.wait_for(idle.wait(), 1)
+        assert ctx.state == "idle" and len(follows) == 1
+        assert await machine._ensure_session_capacity()
+        assert not machine.sessions and watch.done()
+        assert not any(frame.type == "session_focus" for frame in output.sent)
+        assert not any(call[0] in {"session/prompt", "session/create", "workspace/archiveSession"}
+                       for call in client.calls)
+    finally:
         await runtime.close()
