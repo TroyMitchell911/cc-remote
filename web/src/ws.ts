@@ -806,11 +806,10 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
   }
 
-  private sendDshMutation(frame: Record<string, unknown>): string | null {
+  private sendDshMutation(frame: Record<string, unknown>, cmd_id = uuid()): string | null {
     // A lost response cannot authorize another native write. Keep a correlation
     // ID, but no reconnect outbox entry for RPCs without native deduplication.
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
-    const cmd_id = uuid();
     this.sendUntracked({ v: PROTOCOL_VERSION, ts: nowTs(), ...frame, cmd_id, client_id: this.clientId });
     return cmd_id;
   }
@@ -1385,7 +1384,9 @@ export class RelayWs {
     if (this.pendingListOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
       this.pendingListOwnershipByRequest.delete(this.pendingListOwnershipByRequest.keys().next().value!);
     }
-    const queued = this.sendTracked(obj, commandId);
+    const queued = engine === "dsh" && (obj.type === "rename_session" || obj.type === "archive_session")
+      ? this.sendDshMutation(obj, commandId)
+      : this.sendTracked(obj, commandId);
     if (!queued) this.pendingListOwnershipByRequest.delete(commandId);
     return queued;
   }
@@ -1537,7 +1538,7 @@ export class RelayWs {
   sendRenameSession(sessionId: string, title: string,
                     engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
     const targetEngine = engine
-      ?? this.engineBySession[sessionId] ?? this.activeEngine;
+      ?? (sessionId.startsWith("dsh@") ? "dsh" : this.engineBySession[sessionId] ?? this.activeEngine);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
@@ -1547,7 +1548,7 @@ export class RelayWs {
   sendArchiveSession(sessionId: string, archived: boolean,
                      engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
     const targetEngine = engine
-      ?? this.engineBySession[sessionId] ?? this.activeEngine;
+      ?? (sessionId.startsWith("dsh@") ? "dsh" : this.engineBySession[sessionId] ?? this.activeEngine);
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;

@@ -102,7 +102,7 @@ import {
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
 import {
-  protocolRecoveryAction, RelayWs, stableTabClientId,
+  type EventOwnership, protocolRecoveryAction, RelayWs, stableTabClientId,
 } from "../src/ws.ts";
 import {
   dismissGoalUi,
@@ -17944,6 +17944,61 @@ function assertSessionSetterRecoveryIsEngineScoped() {
   }
 }
 assertSessionSetterRecoveryIsEngineScoped();
+
+function assertSessionMetadataRecoveryIsEngineScoped() {
+  const mutations: Array<{
+    type: string;
+    send: (relay: RelayWs, sid: string, engine?: "claude" | "codex" | "dsh") => void;
+  }> = [
+    { type: "rename_session", send: (relay, sid, engine) => relay.sendRenameSession(sid, "new title", engine) },
+    { type: "archive_session", send: (relay, sid, engine) => relay.sendArchiveSession(sid, true, engine) },
+    { type: "archive_session", send: (relay, sid, engine) => relay.sendArchiveSession(sid, false, engine) },
+  ];
+  for (const mutation of mutations) {
+    for (const engine of ["dsh", "claude", "codex"] as const) {
+      for (const route of ["explicit", "catalog", "prefix"] as const) {
+        if (route === "prefix" && engine !== "dsh") continue;
+        const events: Array<{ event: ServerEvent; ownership?: EventOwnership }> = [];
+        const metadataRelay = new RelayWs({
+          onEvent: (event, ownership) => events.push({ event, ownership }), onConnState: () => {},
+        });
+        const sid = engine === "dsh" ? "dsh@metadata" : `${engine}-metadata`;
+        if (route === "catalog") metadataRelay.setSessionEngines([{ session_id: sid, engine, space: "code" }]);
+        metadataRelay.setSurface(engine === "dsh" ? "claude" : "dsh", "code");
+        const send = () => mutation.send(metadataRelay, sid, route === "explicit" ? engine : undefined);
+        send();
+        metadataRelay.start();
+        const metadataSocket = FakeWebSocket.instances.at(-1)!;
+        const frames = () => metadataSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.type === mutation.type);
+        metadataSocket.onopen?.();
+        try {
+          const label = `${engine}/${route}/${mutation.type}`;
+          assert.equal(frames().length, engine === "dsh" ? 0 : 1, `${label}: offline writes`);
+          send();
+          const frame = frames().at(-1)!;
+          assert.equal(frame.session_id, sid);
+          assert.ok(frame.cmd_id && frame.client_id, `${label}: response correlation`);
+          // A delayed list response must retain the mutation's engine even
+          // while the user views another surface.
+          metadataSocket.receive({ type: "session_list", engine, space: "code",
+            request_id: frame.cmd_id, sessions: [{ session_id: sid, engine, space: "code" }] });
+          assert.equal(events.at(-1)?.ownership?.engine, engine, `${label}: list ownership`);
+          const sent = frames().length;
+          metadataSocket.onopen?.(); // Lost ACK, including a restarted Wrapper.
+          assert.equal(frames().length, engine === "dsh" ? sent : sent * 2, `${label}: reconnect replay`);
+          metadataSocket.readyState = 3;
+          send();
+          metadataSocket.readyState = FakeWebSocket.OPEN;
+          const before = frames().length;
+          metadataSocket.onopen?.();
+          assert.equal(frames().length, engine === "dsh" ? before : before + sent + 1,
+            `${label}: disconnected writes`);
+        } finally { metadataRelay.stop(); }
+      }
+    }
+  }
+}
+assertSessionMetadataRecoveryIsEngineScoped();
 
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;

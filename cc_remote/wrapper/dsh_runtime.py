@@ -10,7 +10,7 @@ import asyncio
 import json
 import re
 from collections import OrderedDict
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,6 +149,30 @@ class DshRuntime:
     def uncertain_mutation():
         return DshError("mutation_unknown", "上次 DSH 操作的结果尚未确认，已停止自动重试。请先查看会话和原生状态。",
                         outcome_unknown=True)
+
+    @asynccontextmanager
+    async def metadata_mutation(self, cmd, payload):
+        # Claim before reads/locks as well as writes: a stale replay must not
+        # overwrite newer native metadata or restore an old archive snapshot.
+        identity, fresh, receipt = await self.mutation_intent(cmd, cmd.type, payload)
+        if not fresh:
+            if receipt["result"] is None:
+                raise self.uncertain_mutation()
+            result = json.loads(receipt["result"])
+            if "error" in result:
+                raise DshError(**result["error"])
+            yield False
+            return
+        try:
+            yield True
+        except DshError as exc:
+            await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+            raise
+        else:
+            # Commit before notification/ACK delivery. Cancellation or an
+            # unexpected failure leaves a pending claim that cannot run again.
+            await asyncio.to_thread(self.mutations.finish, identity, {"status": "success"})
 
     async def connection(self) -> DshClient:
         async with self.lock:
@@ -634,19 +658,22 @@ class DshRuntime:
         return result
 
     async def handle_archive_session(self, cmd):
-        native = native_session_id(cmd.session_id)
-        ctx = await self.ctx(cmd.session_id)
-        if ctx.query_lock.locked():
-            raise DshError("archive_busy", "会话正在处理请求，请稍后归档。")
-        async with ctx.query_lock:
-            items = await self.client.list_sessions()
-            row = next((x for x in items if x["sessionId"] == native), None)
-            if row is None:
-                raise DshError("not_found", "DSH 会话不存在。")
-            if row.get("running") or ctx.state != "idle" or ctx.queued_queries:
-                raise DshError("archive_busy", "请先停止任务并清空排队，再归档会话。")
-            value = await self.client.rpc("workspace/archiveSession" if cmd.archived else "workspace/unarchiveSession", {"request": {"sessionId": native}})
-            self.archived = set(value["archivedSessionIds"])
+        async with self.metadata_mutation(cmd, {"sid": cmd.session_id, "archived": cmd.archived}) as fresh:
+            if not fresh:
+                return
+            native = native_session_id(cmd.session_id)
+            ctx = await self.ctx(cmd.session_id)
+            if ctx.query_lock.locked():
+                raise DshError("archive_busy", "会话正在处理请求，请稍后归档。")
+            async with ctx.query_lock:
+                items = await self.client.list_sessions()
+                row = next((x for x in items if x["sessionId"] == native), None)
+                if row is None:
+                    raise DshError("not_found", "DSH 会话不存在。")
+                if row.get("running") or ctx.state != "idle" or ctx.queued_queries:
+                    raise DshError("archive_busy", "请先停止任务并清空排队，再归档会话。")
+                value = await self.client.rpc("workspace/archiveSession" if cmd.archived else "workspace/unarchiveSession", {"request": {"sessionId": native}})
+                self.archived = set(value["archivedSessionIds"])
         await self.invalidate()
 
     async def handle_read_dsh(self, cmd):
@@ -1114,8 +1141,11 @@ class DshRuntime:
         return result
 
     async def handle_rename_session(self, cmd):
-        await self.client.rpc("session/rename", {"request": {
-            "sessionId": native_session_id(cmd.session_id), "title": cmd.title}})
+        async with self.metadata_mutation(cmd, {"sid": cmd.session_id, "title": cmd.title}) as fresh:
+            if not fresh:
+                return
+            await self.client.rpc("session/rename", {"request": {
+                "sessionId": native_session_id(cmd.session_id), "title": cmd.title}})
         await self.invalidate()
 
     async def handle_pin_session(self, cmd):
