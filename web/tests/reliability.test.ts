@@ -17843,6 +17843,44 @@ function assertDshCommandsNeverReplay() {
 }
 assertDshCommandsNeverReplay();
 
+function assertDshMutationsNeverReplay() {
+  const cases: Array<[string, (relay: RelayWs) => string | null]> = [];
+  for (const action of ["create", "edit", "pause", "resume", "complete", "clear"] as const) {
+    cases.push([`goal/${action}`, relay => relay.sendActDshGoal("dsh@s", {
+      action, ...(action === "create" ? {} : { goal_id: "goal", revision: 3 }),
+      ...(["create", "edit"].includes(action) ? { objective: "finish", max_rounds: 64 } : {}),
+    })]);
+  }
+  for (const kind of ["permission", "effort", "command", "job_stop", "plugin_enable", "plugin_disable", "terminal"] as const) {
+    cases.push([kind, relay => relay.sendDshControl("dsh@s", kind, "value")]);
+  }
+  for (const action of ["settings", "preset_default", "schedule_create", "schedule_update", "schedule_delete",
+    "bundle_install", "bundle_enable", "bundle_disable", "bundle_remove"]) {
+    cases.push([action, relay => relay.sendDshControl("dsh@s", "manage", JSON.stringify({ action }))]);
+  }
+  cases.push(["child/stop", relay => relay.sendActDshSubagent("dsh@s", "dsh@child", "stop", "")]);
+  for (const [name, send] of cases) {
+    const mutationRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+    assert.equal(send(mutationRelay), null, `${name}: offline writes must not be queued`);
+    mutationRelay.start();
+    const mutationSocket = FakeWebSocket.instances.at(-1)!;
+    mutationSocket.onopen?.();
+    try {
+      const id = send(mutationRelay);
+      assert.ok(id, name);
+      const frame = mutationSocket.sent.map(raw => JSON.parse(raw)).find(row => row.cmd_id === id);
+      assert.ok(frame?.client_id, `${name}: preserve response correlation`);
+      assert.equal(frame.sid, "dsh@s");
+      // No ACK: reconnect to the same or a restarted Wrapper must not resubmit.
+      mutationSocket.onopen?.();
+      assert.equal(mutationSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.cmd_id === id).length, 1, name);
+      mutationSocket.readyState = 3;
+      assert.equal(send(mutationRelay), null, `${name}: disconnected writes must not be queued`);
+    } finally { mutationRelay.stop(); }
+  }
+}
+assertDshMutationsNeverReplay();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({

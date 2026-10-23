@@ -125,13 +125,17 @@ session files.
   Wrapper queue owns deferred messages. Closing the page or reconnecting never
   answers a question or stops an Agent. Ambiguous writes are not retried; an
   unanswered interaction must be confirmed again by native event delivery.
-  Session creation, persistent forks and native slash commands keep durable,
+  Session creation, persistent forks, native slash commands and goal actions keep durable,
   device-local intent receipts before native I/O. After a Wrapper restart, a
   known created session is restored without resubmitting its initial prompt.
   An unresolved receipt requires inspecting native state instead of repeating
   the mutation. Receipts contain request hashes and bounded results, not prompts
   or attachments, and must be retained with Wrapper private state. Native
-  command controls are also excluded from the browser reconnect outbox.
+  controls, goal actions and child stops are excluded from the browser reconnect
+  outbox. Goal receipts bind the action, session, exact revision and requested
+  values; completed retries return the saved outcome without activating an
+  Agent or issuing another goal mutation. Settings and plugin changes also
+  require a live connection and are never automatically resubmitted.
   Fork receipts bind the stable request ID to its parent and completed turn.
   A known child is recorded before history/catalog reads; retries resume only
   those reads or replay the completed response. A lost native fork result never

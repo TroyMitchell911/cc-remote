@@ -909,6 +909,37 @@ class DshRuntime:
         return None
 
     async def handle_act_dsh_goal(self, cmd):
+        # Also protect tracked requests from older browsers after a Wrapper
+        # restart. Claim before activation and save the outcome before refresh
+        # or delivery; a pending receipt never authorizes another goals/* RPC.
+        identity, fresh, receipt = await self.mutation_intent(cmd, "goal", {
+            "sid": cmd.sid, "action": cmd.action, "goal_id": cmd.goal_id,
+            "revision": cmd.revision, "objective": cmd.objective,
+            "max_rounds": cmd.max_rounds})
+        if not fresh:
+            if receipt["result"] is None:
+                raise self.uncertain_mutation()
+            saved = json.loads(receipt["result"])
+            if "error" in saved:
+                raise DshError(**saved["error"])
+        else:
+            try:
+                ctx = await self.apply_goal(cmd)
+            except DshError as exc:
+                await asyncio.to_thread(self.mutations.finish, identity, {"error": {
+                    "code": exc.code, "message": str(exc), "outcome_unknown": exc.outcome_unknown}})
+                ctx = self.machine.sessions.get(cmd.sid)
+                if ctx:
+                    await self.refresh_goal_projection(ctx)
+                raise
+            await asyncio.to_thread(self.mutations.finish, identity, {"status": "success"})
+            await self.refresh_goal_projection(ctx)
+        result = DshCommandResult(sid=cmd.sid, request_id=cmd.cmd_id,
+            status="success", text="", to=cmd.client_id)
+        await self.machine.transport.send(result)
+        return result
+
+    async def apply_goal(self, cmd):
         ctx = await self.ctx(cmd.sid)
         await self.ensure_unarchived(ctx.key)
         await self.activate(ctx)
@@ -922,18 +953,14 @@ class DshRuntime:
                 **({"objective": cmd.objective} if cmd.objective is not None else {}),
                 **({"maxGoalRounds": cmd.max_rounds} if cmd.max_rounds is not None else {}),
             }
-        try:
-            await self.client.rpc("goals/" + cmd.action, args)
-        finally:
-            # Refresh even after a stale ref or lost response, without retrying.
-            with suppress(DshError):
-                snapshot = await self.client.history_snapshot(ctx.key, max_messages=1)
-                await self.snapshot_projections(ctx, snapshot)
-            await self.refresh_goal(ctx)
-        result = DshCommandResult(sid=ctx.key, request_id=cmd.cmd_id,
-            status="success", text="", to=cmd.client_id)
-        await self.machine.transport.send(result)
-        return result
+        await self.client.rpc("goals/" + cmd.action, args)
+        return ctx
+
+    async def refresh_goal_projection(self, ctx):
+        with suppress(DshError):
+            snapshot = await self.client.history_snapshot(ctx.key, max_messages=1)
+            await self.snapshot_projections(ctx, snapshot)
+        await self.refresh_goal(ctx)
 
     def validate_command(self, ctx, line, attachments=False):
         name = line.lstrip("/").split(maxsplit=1)[0] if line.strip() else ""

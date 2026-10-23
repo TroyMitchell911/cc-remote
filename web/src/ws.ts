@@ -787,19 +787,18 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
   }
 
+  private sendDshMutation(frame: Record<string, unknown>): string | null {
+    // A lost response cannot authorize another native write. Keep a correlation
+    // ID, but no reconnect outbox entry for RPCs without native deduplication.
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
+    const cmd_id = uuid();
+    this.sendUntracked({ v: PROTOCOL_VERSION, ts: nowTs(), ...frame, cmd_id, client_id: this.clientId });
+    return cmd_id;
+  }
+
   sendDshControl(sid: string, kind: import("./protocol").DshControlKind, value: string, images?: QueryImg[], files?: QueryFile[]): string | null {
-    // Native commands have no idempotency key. Like PTY input and schedule
-    // creation, uncertain writes must never be replayed by reconnect recovery.
-    if (kind === "command" || kind === "terminal" || (kind === "manage" && (() => {
-      try { return JSON.parse(value).action === "schedule_create"; } catch { return false; }
-    })())) {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
-      const cmd_id = uuid();
-      this.sendUntracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, cmd_id, client_id: this.clientId,
-        ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
-      return cmd_id;
-    }
-    return this.sendTracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
+    return this.sendDshMutation({ type: "set_dsh_control", sid, kind, value,
+      ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
   }
 
   sendReadDsh(sid: string, kind: DshReadKind, fields: { job_id?: string; query?: string; target_sid?: string; before_seq?: number }): string | null {
@@ -807,11 +806,13 @@ export class RelayWs {
   }
 
   sendActDshSubagent(sid: string, target_sid: string, action: "queue" | "steer" | "stop", prompt: string): string | null {
+    if (action === "stop") return this.sendDshMutation({ type: "act_dsh_subagent", sid, target_sid, action, prompt });
+    // Native subagent prompts deduplicate by cmd_id forwarded as requestId.
     return this.sendTracked({ v: PROTOCOL_VERSION, type: "act_dsh_subagent", ts: nowTs(), sid, target_sid, action, prompt });
   }
 
   sendActDshGoal(sid: string, action: DshGoalAction): string | null {
-    return this.sendTracked({ v: PROTOCOL_VERSION, type: "act_dsh_goal", ts: nowTs(), sid, ...action });
+    return this.sendDshMutation({ type: "act_dsh_goal", sid, ...action });
   }
 
   sendDownloadDsh(sid: string, export_id?: string, offset = 0, cancel = false): string | null {
