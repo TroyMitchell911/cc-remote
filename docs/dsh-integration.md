@@ -116,6 +116,11 @@ session files.
 - Idle history, search, previews and catalogs never create a model turn. Native
   cold history requires V4; old sessions that require migration are reported
   explicitly and must be migrated by the official client first.
+- DSH shares the resident session pool with Claude and Codex. Capacity reclaims
+  eligible idle contexts across engines while preserving focus, side chats,
+  queued input, pending questions and active work. New DSH sessions check
+  capacity before native creation; invalid cold metadata does not evict a
+  healthy resident.
 - Model request admission, steering and termination are native. The existing
   Wrapper queue owns deferred messages. Closing the page or reconnecting never
   answers a question or stops an Agent. Ambiguous writes are not retried; an

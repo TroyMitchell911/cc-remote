@@ -36110,6 +36110,42 @@ class WrapperMachine:
 
     # ---- spawn (build a ctx: SdkHandle + connect + history) ----
 
+    def _session_can_evict(self, key: str, ctx: SessionContext) -> bool:
+        """One residency policy for every engine and ordinary/side-chat spawn."""
+        if (key == self.focused_sid or ctx.state != "idle" or ctx.btw
+                or ctx.queued_queries or ctx.pending_asks
+                or self._query_queue_task_active(ctx)
+                or self._command_scheduler.owns_target(key)
+                or ctx.query_lock.locked()
+                or ctx.claude_control_persist_lock.locked()
+                or any(task is not None and not task.done() for task in (
+                    ctx.turn_task, ctx.auto_compact_apply_task,
+                    ctx.claude_followup_recovery_task))):
+            return False
+        if ctx.engine == "claude" and self._claude_has_background_work(ctx):
+            return False
+        if ctx.engine == "dsh":
+            return not (
+                any(job.status in {"running", "stopping"} for job in ctx.sdk.state.jobs)
+                or any(child.get("activity") == "running" for child in ctx.sdk.children))
+        return True
+
+    async def _ensure_session_capacity(self) -> bool:
+        if len(self.sessions) < self.cfg.max_concurrent_sessions:
+            return True
+        victim = next((key for key, ctx in self.sessions.items()
+                       if self._session_can_evict(key, ctx)), None)
+        if victim is None:
+            return False
+        ctx = self.sessions.pop(victim)
+        self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+        try:
+            await ctx.sdk.disconnect()
+        except Exception:
+            log.exception("idle session detach failed during eviction", key=victim)
+        log.info("evicted idle session for cap", key=victim)
+        return True
+
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
                      claude_profile_id: Optional[str] = None,
@@ -36288,29 +36324,10 @@ class WrapperMachine:
         # non-focused session (tear down its subprocess; the client keeps its
         # runtime and re-spawns on re-focus). Only reject if ALL are running —
         # so merely browsing between sessions never wedges you.
-        if not bootstrap and not _service_recovering and len(self.sessions) >= self.cfg.max_concurrent_sessions:
-            victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)
-                           and not self._command_scheduler.owns_target(k)
-                           and not c.query_lock.locked()
-                           and not c.claude_control_persist_lock.locked()
-                           and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())
-                           and (c.claude_followup_recovery_task is None
-                                or c.claude_followup_recovery_task.done())), None)
-            if victim is None:
-                await reject(
-                    ERR_BUSY, "所有会话都在运行,先中断一个再切换")
-                return None
-            vc = self.sessions.pop(victim)
-            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
-            try:
-                await vc.sdk.disconnect()
-            except Exception:
-                pass
-            log.info("evicted idle session for cap", key=victim)
+        if (not bootstrap and not _service_recovering
+                and not await self._ensure_session_capacity()):
+            await reject(ERR_BUSY, "所有会话都在运行,先中断一个再切换")
+            return None
         # Resolve the target cwd.
         if resume_id and engine == "codex":
             # Codex sessions live in ~/.codex/sessions (not the Claude SDK's store),
@@ -37471,27 +37488,8 @@ class WrapperMachine:
                     _claude_preflight_user_message(exc),
                 ) from exc
         # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
-        if len(self.sessions) >= self.cfg.max_concurrent_sessions:
-            victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)
-                           and not self._command_scheduler.owns_target(k)
-                           and not c.query_lock.locked()
-                           and not c.claude_control_persist_lock.locked()
-                           and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())
-                           and (c.claude_followup_recovery_task is None
-                                or c.claude_followup_recovery_task.done())), None)
-            if victim is None:
-                raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
-            vc = self.sessions.pop(victim)
-            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
-            try:
-                await vc.sdk.disconnect()
-            except Exception:
-                pass
-            log.info("evicted idle session for btw", key=victim)
+        if not await self._ensure_session_capacity():
+            raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
         if engine == "codex":
             codex_handle_kwargs = {
                 "cwd": parent.cwd,

@@ -297,21 +297,6 @@ class DshRuntime:
                 raise DshError("invalid_session", "会话与引擎不匹配。")
             return ctx
         snapshot = await self.client.history_snapshot(sid, max_messages=8)
-        # Respect the shared pool bound; a cold history read never evicts work.
-        if len(self.machine.sessions) >= self.machine.cfg.max_concurrent_sessions:
-            candidates = [c for c in self.machine.sessions.values()
-                          if c.engine == "dsh" and not c.btw and c.state == "idle" and not c.queued_queries
-                          and not c.pending_asks and not c.query_lock.locked()
-                          and not self.machine._query_queue_task_active(c)
-                          and not self.machine._command_scheduler.owns_target(c.key)
-                          and not any(j.status in {"running", "stopping"} for j in c.sdk.state.jobs)
-                          and not any(child.get("activity") == "running" for child in c.sdk.children)
-                          and c.key != self.machine.focused_sid]
-            if not candidates:
-                raise DshError("session_limit", "驻留会话已满，请先结束一个运行中的会话。")
-            victim = candidates[0]
-            await victim.sdk.disconnect()
-            self.machine.sessions.pop(victim.key, None)
         handle = DshHandle(native)
         # A successful read proves reachability without activating an Agent.
         # Explicit controls (e.g. resume goal) may establish follow afterwards.
@@ -320,6 +305,9 @@ class DshRuntime:
         cwd = row.get("cwd") if row else None
         if not isinstance(cwd, str) or not Path(cwd).is_absolute():
             raise DshError("invalid_cwd", "DSH 会话目录不可读取，请刷新会话目录。")
+        # Validate cold metadata before releasing an eligible resident of any
+        # engine. Active work and focused/private contexts keep their slots.
+        await self.ensure_capacity()
         ctx = SessionContext(session_id=sid, key=sid, sdk=handle, cwd=cwd
                              , engine="dsh", buffer=RingBuffer(
                                  self.machine.cfg.ring_max_events, self.machine.cfg.ring_max_bytes))
@@ -331,6 +319,10 @@ class DshRuntime:
         await self.snapshot_projections(ctx, snapshot)
         handle.jobs_watch = asyncio.create_task(self._job_watch(ctx))
         return ctx
+
+    async def ensure_capacity(self):
+        if not await self.machine._ensure_session_capacity():
+            raise DshError("session_limit", "驻留会话已满，请先结束一个运行中的会话。")
 
     def _project(self, snapshot, projection=None):
         records = [record["event"] for record in snapshot["records"]]
@@ -727,6 +719,9 @@ class DshRuntime:
         self.validate_model(selected, effort)
         if cmd.dsh_permission and not any(p["value"] == cmd.dsh_permission for p in self.permissions):
             raise DshError("invalid_permission", "所选 DSH 权限当前不可用。")
+        # Reject a genuinely busy pool before creating a native session that
+        # cannot accept its initial prompt.
+        await self.ensure_capacity()
         value = await self.client.rpc("session/create", {"request": {
             "cwd": cwd, **({"agentPreset": preset} if preset else {})}})
         sid = wire_session_id(value["sessionId"])
