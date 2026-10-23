@@ -28,6 +28,7 @@ import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { useMarkdownExtras } from "../use-markdown-extras";
 import { rehypeMessageBreaks } from "../markdown-breaks";
+import { remarkReplySections } from "../markdown-reply-sections";
 import { messageImageGeometry } from "../media-geometry";
 
 // Keep the parser behind its own memo boundary. MessageBlock still receives
@@ -530,9 +531,10 @@ const MESSAGE_MARKDOWN_COMPONENTS: Components = Object.freeze({
 // token delta is wasteful, so we hold a "shown" buffer that catches up on a
 // timer while streaming, and snaps to the full text when the block is done.
 export function MessageBlock({ text, done, onOpenFile, imageAssets,
-  onLoadImage, onAuthorizeImage, onPreviewImage }: {
+  onLoadImage, onAuthorizeImage, onPreviewImage, formatReplySections = false }: {
   text: string;
   done: boolean;
+  formatReplySections?: boolean;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string) => boolean;
@@ -582,8 +584,9 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   const extras = useMarkdownExtras(shown);
   const remarkPlugins = useMemo(() => [
     ...(math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS),
+    ...(formatReplySections && done ? [remarkReplySections] : []),
     ...(extras.citation ? [extras.citation] : []),
-  ], [extras.citation, math.plugins?.remarkPlugins]);
+  ], [done, formatReplySections, extras.citation, math.plugins?.remarkPlugins]);
   const rehypePlugins = useMemo(() => [
     ...(extras.details ? [extras.details] : []),
     rehypeMessageBreaks,

@@ -557,6 +557,13 @@ body{
   display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
 .message-link-disabled{ color:var(--dim); border-bottom:1px dotted var(--faint); cursor:not-allowed; }
 .prose blockquote{ border-left:3px solid var(--accent-line); margin:8px 0; padding:2px 12px; color:var(--dim); }
+.prose:has(>.message-reply-analysis){ overflow-wrap:anywhere; }
+.message-reply-analysis{ margin:0 0 22px; }
+.message-reply-analysis-label{ margin-bottom:10px; font-size:13px; font-weight:var(--font-weight-600); color:var(--dim); }
+.message-reply-analysis-body{ border-left:2px solid var(--border-strong); padding:0 0 0 14px;
+  font-size:13.5px; line-height:1.7; color:var(--dim); }
+.message-reply-analysis-body>:first-child{ margin-top:0; }
+.message-reply-analysis-body>:last-child{ margin-bottom:0; }
 .prose img:not(.message-site-icon){ max-width:100%; height:auto; }
 .prose .katex-display{ max-width:100%; margin:10px 0; padding:2px 0;
   overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; }

@@ -574,6 +574,60 @@ try {
     "/src/components/MessageBlock.tsx");
   const { preloadMarkdownExtras } = await harness.ssrLoadModule(
     "/src/use-markdown-extras.ts");
+  const replyAnalysis = "先核对 **职责边界**，再查看 [说明][guide]。\n\n"
+    + "```xml\n<summary>这是代码示例</summary>\n```";
+  const replySummary = "## 主要请求和意图\n\n1. 限定动作范围。\n2. 保留慢脑任务。\n\n"
+    + "[guide]: /tmp/guide.md";
+  const taggedReply = `<analysis>\n${replyAnalysis}\n</analysis>\n\n<summary>\n${replySummary}`;
+  for (const closing of ["", "\n</summary>"]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: taggedReply + closing, done: true, formatReplySections: true,
+      onOpenFile: () => {},
+    }));
+    assert.match(markup, /<section class="message-reply-analysis" aria-label="分析">/);
+    assert.match(markup, /message-reply-analysis-label">分析<\/div>/);
+    assert.match(markup, /<strong>职责边界<\/strong>/);
+    assert.match(markup, /message-file-link/, "references keep their definitions across reply sections");
+    assert.match(markup, /&lt;summary&gt;这是代码示例&lt;\/summary&gt;/);
+    assert.match(markup, /<h2>主要请求和意图<\/h2>/);
+    assert.match(markup, /<li>保留慢脑任务。<\/li>/);
+    assert.doesNotMatch(markup, /&lt;\/?analysis&gt;|<summary>|<details|process-reasoning|查看原文|展开分析/,
+      "reply presentation stays in the answer and adds no disclosures or actions");
+  }
+  for (const props of [{ done: false, formatReplySections: true },
+    { done: true, formatReplySections: false }]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, { text: taggedReply, ...props }));
+    assert.doesNotMatch(markup, /message-reply-analysis/,
+      "streaming, native thinking and other engines retain the ordinary renderer");
+    assert.match(markup, /&lt;analysis&gt;/);
+  }
+  for (const text of [
+    "普通正文提到 <analysis> 与 <summary>，不是摘要包装。",
+    `<analysis>\n还没写完`,
+    `<analysis>解释</analysis>\n普通正文`,
+    `<analysis>解释</analysis><summary>摘要</summary>\n尾部内容`,
+    `<analysis>解释</analysis><summary>摘要</summary><summary>重复包装</summary>`,
+    `<analysis class="example">解释</analysis><summary>摘要</summary>`,
+    `\\<analysis>解释</analysis><summary>摘要</summary>`,
+    `\`<analysis>解释</analysis><summary>摘要</summary>\``,
+    `\`\`\`xml\n${taggedReply}\n</summary>\n\`\`\``,
+    `    <analysis>解释</analysis><summary>摘要</summary>`,
+    `> <analysis>解释</analysis><summary>摘要</summary>`,
+    `<details><summary>原生折叠标题</summary>内容</details>`,
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text, done: true, formatReplySections: true,
+    }));
+    assert.doesNotMatch(markup, /message-reply-analysis/, "ambiguous or literal syntax must stay intact");
+  }
+  const unsafeReply = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "<analysis>\n<script>alert(1)</script>\n</analysis>\n<summary>\n"
+      + "[链接](javascript:alert(2))\n\n<img src=x onerror=alert(3)>\n</summary>",
+    done: true, formatReplySections: true,
+  }));
+  assert.match(unsafeReply, /message-reply-analysis/);
+  assert.doesNotMatch(unsafeReply, /<script|<img|href="javascript:/,
+    "formatting reply tags never enables arbitrary HTML");
   // Bare breaks work on the first render, before lazy disclosure parsers load.
   for (const tag of ["<br>", "<br/>", "<br />", "<BR>"]) {
     const markup = renderToStaticMarkup(createElement(MessageBlock, {

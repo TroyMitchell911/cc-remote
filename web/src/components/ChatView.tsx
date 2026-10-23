@@ -3089,6 +3089,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                         }} />
                     </Suspense>
                   : <MessageBlock text={block.text}
+                    formatReplySections={engine === "claude"}
                     done={block.done} onOpenFile={onOpenFile}
                     imageAssets={imageAssets} onLoadImage={onLoadImage}
                     onAuthorizeImage={onAuthorizeImage}
