@@ -4468,6 +4468,60 @@ test("side chat scope centered attachments fit a narrow viewport", async ({ page
   await page.screenshot({ path: testInfo.outputPath("btw-centered-mobile.png") });
 });
 
+for (const centered of [false, true]) {
+  test(`right panel layout restores ${centered ? "centered" : "docked"} file preview across engines`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const path = "/tmp/layout/README.md";
+    const relay = await mockRightPanelRelay(page, { engine: "claude", listReply: otherHarnessList,
+      seedTurns: [{ id: "preview-turn", prompt: "查看文件", done: true,
+        blocks: [{ kind: "text", message_id: "preview-answer", channel: "final", done: true,
+          text: `[文件](${path})` }] }] });
+    await page.goto("/");
+    await page.getByRole("button", { name: `在 Remote 中打开 ${path}`, exact: true }).click();
+    await expect.poll(() => relay.commands.some(c => c.type === "get_file_preview")).toBe(true);
+    const request = relay.commands.find(c => c.type === "get_file_preview")!;
+    // A response arriving while the owner is hidden must be retained, not lost
+    // or displayed over the other engine's conversation.
+    await page.keyboard.press("Meta+2");
+    const panel = page.locator(".artifact-panel");
+    await expect(panel).toHaveCount(0);
+    const content = "# Preview\n\n" + Array.from({ length: 100 }, (_, n) => `Paragraph ${n}\n\n`).join("");
+    relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(request.request_id),
+      path, format: "markdown", content, size: content.length,
+      mtime_ns: "1", revision: "a".repeat(64), writable: true });
+    await page.keyboard.press("Meta+1");
+    await expect(panel.getByRole("heading", { name: "Preview", exact: true })).toBeVisible();
+    if (centered) await panel.getByRole("button", { name: "居中展开文件预览", exact: true }).click();
+    const body = panel.locator(".artifact-body");
+    await body.evaluate(node => { node.scrollTop = 700; });
+    await expect.poll(() => body.evaluate(node => node.scrollTop)).toBe(700);
+    await page.keyboard.press("Meta+2");
+    await expect(panel).toHaveCount(0);
+    await page.keyboard.press("Meta+1");
+    await expect(panel).toBeVisible();
+    if (centered) await expect(panel).toHaveClass(/panel-expanded/);
+    else await expect(panel).not.toHaveClass(/panel-expanded/);
+    await expect.poll(() => body.evaluate(node => node.scrollTop)).toBe(700);
+    await panel.getByRole("button", { name: "源码", exact: true }).click();
+    const editor = panel.getByRole("textbox", { name: "Markdown 源码编辑器" });
+    await expect(editor).toHaveValue(content);
+    await expect(editor).toBeFocused();
+    await editor.evaluate(node => { node.scrollTop = 500; });
+    await expect.poll(() => editor.evaluate(node => node.scrollTop)).toBe(500);
+    await page.keyboard.press("Meta+2");
+    await expect(panel).toHaveCount(0);
+    await page.keyboard.press("Meta+1");
+    await expect(editor).toHaveValue(content);
+    await expect.poll(() => editor.evaluate(node => node.scrollTop)).toBe(500);
+    await panel.getByRole("button", { name: "收起", exact: true }).click();
+    await page.keyboard.press("Meta+2");
+    await page.keyboard.press("Meta+1");
+    await expect(panel).toHaveCount(0);
+    expect(relay.commands.filter(c => c.type === "get_file_preview")).toHaveLength(1);
+    expect(relay.commands.some(c => ["query", "steer", "open_btw", "interrupt"].includes(String(c.type)))).toBe(false);
+  });
+}
+
 for (const fromBrowser of [false, true]) {
   test(`right panel layout centered file edits survive ${fromBrowser ? "directory navigation" : "standalone preview"}`, async ({ page }, info) => {
     await page.setViewportSize({ width: 1568, height: 1000 });
@@ -6369,6 +6423,32 @@ for (const top of [24, 200, 400]) {
     await expect(preview).toHaveCount(0);
   });
 }
+
+test("local Markdown file link icons stay inside the inline button in document previews", async ({ page }) => {
+  const icon = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 16;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#4285f4"; ctx.fillRect(0, 0, 64, 16);
+    return canvas.toDataURL("image/png");
+  });
+  await page.route("**/api/link-preview", route => route.fulfill({ json: { icon } }));
+  await page.goto("/tests/history-browser.html?local-file-link=1");
+  const button = page.getByRole("button", { name: "预览 preview.example", exact: true });
+  const image = button.locator("img");
+  await expect(image).toBeVisible();
+  for (const documentPreview of [false, true]) {
+    await page.locator(".prose").evaluate((node, enabled) => {
+      node.classList.toggle("markdown-preview", enabled);
+    }, documentPreview);
+    await expect(image).toHaveCSS("height", "16px");
+    await expect(image).toHaveCSS("margin-top", "0px");
+    const bounds = (await button.boundingBox())!;
+    const pixels = (await image.boundingBox())!;
+    expect(pixels.y).toBeGreaterThanOrEqual(bounds.y);
+    expect(pixels.y + pixels.height).toBeLessThanOrEqual(bounds.y + bounds.height);
+  }
+});
 
 for (const artwork of ["dark", "white", "colored", "opaque", "details"] as const) {
   test(`local Markdown file link icons adapt ${artwork} artwork without losing brand colors`, async ({ page }) => {

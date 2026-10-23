@@ -163,6 +163,37 @@ try {
   }
   assert.throws(() => compiler.specifier("https://evil.example/module.js", base), /未登记/);
   const { initialState, reduce, createRuntime } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
+  {
+    const preview = { file: "/tmp/README.md", sid: "claude", requestId: "preview-1", kind: "md", loading: true };
+    let state = { ...initialState, focusedSid: "claude", artifact: preview };
+    state = reduce(state, { type: "restore_session_list", sessions: [] });
+    assert.equal(state.artifact, null, "a surface transition must hide the departing file");
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    state = reduce(state, { type: "event", event: { type: "file_preview", sid: "claude",
+      request_id: "wrong", path: preview.file, format: "markdown", content: "stale", size: 5 } });
+    assert.equal(state.retainedArtifacts.claude.loading, true, "late replies must still match the exact request");
+    state = reduce(state, { type: "event", event: { type: "file_preview", sid: "claude",
+      request_id: "preview-1", path: preview.file, format: "markdown", content: "# Readme", size: 8 } });
+    assert.equal(state.artifact, null, "a background preview response must not open over Codex");
+    state = reduce(state, { type: "set_artifact", artifact: { ...preview, sid: "codex", content: "Codex file" } });
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact.content, "# Readme");
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact.content, "# Readme", "reconfirming focus must preserve the preview");
+    state = reduce(state, { type: "clear_artifact" });
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    assert.equal(state.artifact.content, "Codex file");
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact, null, "an explicitly closed preview must stay closed");
+    state = reduce(state, { type: "event", event: { type: "artifact_invalidated", session_id: "codex" } });
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    assert.equal(state.artifact, null, "background invalidation must discard stale file bytes");
+    state = reduce(state, { type: "set_artifact", artifact: preview });
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    state = reduce(state, { type: "reset" });
+    assert.equal(state.artifact, null);
+    assert.equal(state.retainedArtifacts, undefined, "device changes must clear retained private previews");
+  }
   const { ChatReadingMemory } = await reducerHarness.ssrLoadModule("/src/chat-reading-memory.ts");
   const { createHistoryBrowse } = await reducerHarness.ssrLoadModule("/src/history-browse.ts");
   const memory = new ChatReadingMemory();

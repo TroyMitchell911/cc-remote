@@ -241,7 +241,7 @@ export interface ToolResult extends Base {
   duration_ms?: number | null;
 }
 export interface AsyncQuestionSpec { title: string; options?: string[] | null }
-export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel; delivery?: "async" | null; questions?: AsyncQuestionSpec[] | null }
+export interface AssistantMsgEnd extends Base { type: "assistant_msg_end"; message_id: string; canonical_message_id?: string | null; turn_id?: string | null; background?: boolean | null; channel?: AssistantChannel; delivery?: "async" | null; questions?: AsyncQuestionSpec[] | null }
 export interface ProcessEvent extends Base {
   type: "process";
   item_id: string;
@@ -764,7 +764,7 @@ export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 81;
+export const PROTOCOL_VERSION = 82;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

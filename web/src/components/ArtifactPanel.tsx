@@ -1,5 +1,5 @@
 import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
-import { lazy, Suspense, isValidElement, useCallback, useEffect, useMemo, useRef, useState,
+import { lazy, Suspense, isValidElement, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -9,6 +9,7 @@ import type {
   PreviewAuthorizationState,
 } from "../reducer";
 import { Icon } from "../icons";
+import { ArtifactReadingMemory, rememberArtifactReading } from "../artifact-reading-state";
 import { LocalFileLink, WebLink } from "./LinkPreview";
 import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
@@ -343,10 +344,14 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   theme?: HtmlPreviewTheme;
 }) {
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const readingMemory = useContext(ArtifactReadingMemory);
   const artifactKey = `${artifact.sid || ""}:${artifact.file}:${artifact.requestId || ""}`;
-  const [pageState, setPageState] = useState({ key: artifactKey, page: 0 });
+  const remembered = readingMemory?.get(artifactKey);
+  const restoringSource = useRef(remembered?.mode === "source");
+  const [pageState, setPageState] = useState({ key: artifactKey, page: remembered?.page ?? 0 });
   const [modeState, setModeState] = useState<{ key: string; mode: "preview" | "source" }>({
-    key: artifactKey, mode: "preview",
+    key: artifactKey, mode: remembered?.mode ?? "preview",
   });
   const [editorState, setEditorState] = useState({
     key: artifactKey,
@@ -385,9 +390,41 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   const sections = artifact.kind === "gitdiff"
     ? (artifact.sections || EMPTY_GIT_DIFF_SECTIONS) : EMPTY_GIT_DIFF_SECTIONS;
   const page = useMemo(() => pageGitDiff(sections, requestedPage), [sections, requestedPage]);
-  const showPage = (nextPage: number) => setPageState({ key: artifactKey, page: nextPage });
+  const showPage = (nextPage: number) => {
+    rememberArtifactReading(readingMemory, artifactKey, { page: nextPage, top: 0 });
+    setPageState({ key: artifactKey, page: nextPage });
+  };
+  const showMode = (nextMode: "preview" | "source") => {
+    rememberArtifactReading(readingMemory, artifactKey, { mode: nextMode });
+    setModeState({ key: artifactKey, mode: nextMode });
+  };
   const loading = !!artifact.loading;
   const empty = artifact.kind === "gitdiff" && !loading && sections.length === 0;
+
+  useLayoutEffect(() => {
+    if (loading) return;
+    const saved = readingMemory?.get(artifactKey);
+    if (!saved) return;
+    if (bodyRef.current) {
+      bodyRef.current.scrollTop = saved.top;
+      bodyRef.current.scrollLeft = saved.left;
+    }
+    if (editorRef.current) editorRef.current.scrollTop = saved.sourceTop;
+  }, [artifactKey, loading, mode, readingMemory]);
+
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    const source = editorRef.current;
+    // Scroll events can still be queued when a keyboard switch unmounts us.
+    // Capture synchronously before React removes the old reading surface.
+    return () => {
+      if (!body) return;
+      rememberArtifactReading(readingMemory, artifactKey, {
+        top: body.scrollTop, left: body.scrollLeft,
+        ...(source ? { sourceTop: source.scrollTop } : {}),
+      });
+    };
+  }, [artifactKey, mode, readingMemory]);
 
   useEffect(() => {
     const incoming = artifact.content || "";
@@ -420,6 +457,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
 
   useEffect(() => {
     if (artifact.kind !== "md" || mode !== "source" || loading) return;
+    if (restoringSource.current) { restoringSource.current = false; return; }
     const frame = window.requestAnimationFrame(() => editorRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
   }, [artifact.kind, loading, mode]);
@@ -552,9 +590,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           className="preview-modes" role="group"
           aria-label={`${mermaidFile ? "Mermaid" : artifact.kind === "html" ? "HTML" : "Markdown"} 显示模式`}>
           <button className={mode === "preview" ? "on" : ""}
-            onClick={() => setModeState({ key: artifactKey, mode: "preview" })}>预览</button>
+            onClick={() => showMode("preview")}>预览</button>
           <button className={mode === "source" ? "on" : ""}
-            onClick={() => setModeState({ key: artifactKey, mode: "source" })}>源码</button>
+            onClick={() => showMode("source")}>源码</button>
         </div>}
         {artifact.kind === "md" && !loading && !artifact.error && <button
           type="button" className="markdown-save"
@@ -586,7 +624,14 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         <PanelExpandButton label={artifact.kind === "gitdiff" ? "改动" : "文件预览"} />
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
-      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}${
+      <div ref={bodyRef} onScrollCapture={event => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        if (target === bodyRef.current) rememberArtifactReading(readingMemory, artifactKey,
+          { top: target.scrollTop, left: target.scrollLeft });
+        else if (target === editorRef.current) rememberArtifactReading(readingMemory, artifactKey,
+          { sourceTop: target.scrollTop });
+      }} className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}${
         artifact.kind === "md" && mode === "source"
           ? " source-artifact-body" : ""
       }`}>

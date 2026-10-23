@@ -1,5 +1,6 @@
 import type { DshState, DshPreset, DshPermissionOption, DshCommandResult } from "./protocol";
 import { isSyntheticReturnReceipt } from "./agent-returns";
+import { reduceWithRetainedArtifacts } from "./artifact-retention";
 // Turn/block state model for the chat UI.
 //
 // Multi-session: AppState holds a `runtimes` map keyed by session id (or a
@@ -398,6 +399,7 @@ export interface AppState {
   wrapperOnline: boolean;
   banner?: string;
   artifact: Artifact | null;
+  retainedArtifacts?: Record<string, Artifact>;
   dirPicker: {
     path: string;
     parent: string | null;
@@ -706,6 +708,50 @@ function mutableTurnBlocks(turn: Turn): Block[] {
     : turn.blocks;
 }
 
+function matchesTextMessage(block: TextBlock, id: string): boolean {
+  return block.message_id === id || block.stream_message_id === id;
+}
+
+/** A completed SDK record supplies the exact identity used by history pages.
+ * Keep its stream alias for late replay and final-channel corrections. Detail
+ * may already have arrived, so rebind every retained window before rendering. */
+function bindTurnMessageIdentity(turn: Turn, streamId: string, canonicalId: string): void {
+  if (streamId === canonicalId) return;
+  const rebind = (blocks: Block[]): Block[] => {
+    const out: Block[] = [];
+    let bound: TextBlock | undefined;
+    for (const block of blocks) {
+      if (block.kind === "tool" && block.message_id === streamId) {
+        block.message_id = canonicalId;
+      }
+      if (block.kind !== "text" || !(matchesTextMessage(block, streamId)
+          || block.message_id === canonicalId)) {
+        out.push(block);
+        continue;
+      }
+      block.message_id = canonicalId;
+      block.stream_message_id = streamId;
+      if (!bound) {
+        bound = block;
+        out.push(block);
+      } else {
+        // Only the explicit identity binding proves these are one occurrence.
+        // Keep the fuller payload when a bounded summary won the arrival race.
+        if (block.text.length > bound.text.length) bound.text = block.text;
+        bound.done ||= block.done;
+        bound.channel = resolvedChannel(bound.channel, block.channel ?? "unknown");
+        if (block.liveOrder != null) {
+          bound.liveOrder = Math.min(bound.liveOrder ?? block.liveOrder, block.liveOrder);
+        }
+      }
+    }
+    return out;
+  };
+  turn.blocks = rebind(turn.blocks);
+  if (turn.liveSpillBlocks) turn.liveSpillBlocks = rebind(turn.liveSpillBlocks);
+  if (turn.detailProjection) turn.detailProjection.blocks = rebind(turn.detailProjection.blocks);
+}
+
 function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   let turn = turns[turns.length - 1];
   if (!turn || turn.done) {
@@ -744,7 +790,7 @@ function findTurnOwningMessage(
   if (!messageId) return undefined;
   return [...turns].reverse().find((turn) => mutableTurnBlocks(turn).some((block) =>
     block.kind === "text"
-      ? block.message_id === messageId
+      ? matchesTextMessage(block, messageId)
       : block.kind === "tool"
         ? block.message_id === messageId
         : false));
@@ -2388,6 +2434,10 @@ function mergeRateLimitUpdate(
 }
 
 export function reduce(state: AppState, action: Action): AppState {
+  return reduceWithRetainedArtifacts(state, action, reduceCurrent);
+}
+
+function reduceCurrent(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "reset":
       return {
@@ -6326,7 +6376,7 @@ function reduceEvent(
         else claimClaudeContinuation(rt, t, e, boundCompletedTurns);
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
-          && b.message_id === e.message_id) as TextBlock | undefined;
+          && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
         const stamp = eventTimestampMs(e.ts);
         if (block) {
           block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
@@ -6368,7 +6418,7 @@ function reduceEvent(
         else claimClaudeContinuation(rt, t, e, boundCompletedTurns);
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
-          && b.message_id === e.message_id) as TextBlock | undefined;
+          && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
         if (!block) {
           block = { kind: "text", message_id: e.message_id, text: "", done: false,
             channel: e.channel ?? "unknown" };
@@ -6521,8 +6571,11 @@ function reduceEvent(
         const candidates = e.turn_id ? [explicit] : turns;
         for (const t of candidates) {
           if (!t) continue;
+          if (e.canonical_message_id) {
+            bindTurnMessageIdentity(t, e.message_id, e.canonical_message_id);
+          }
           const b = mutableTurnBlocks(t).find((b) => b.kind === "text"
-            && b.message_id === e.message_id) as TextBlock | undefined;
+            && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
           if (b) {
             const detachedBackground = t.done && (e.background === true
               || (!!rt.liveOwner && !turnHasIdentityAlias(t, rt.liveOwner.turnId)));

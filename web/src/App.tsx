@@ -5,6 +5,7 @@ import {
   requestHarmonyPermission, confirmHarmonyPermission,
 } from "./harmony-push";
 import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
+import { ArtifactReadingMemory, type ArtifactReadingState } from "./artifact-reading-state";
 import type { DshCommandInfo, FilePreview } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
@@ -390,9 +391,7 @@ export default function App() {
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
   // File panels share one slot; centered BTW is an independent overlay above it.
-  const [expandedPanel, setExpandedPanel] = useState<{
-    scope: string;
-  } | null>(null);
+  const [expandedPanelScopes, setExpandedPanelScopes] = useState<string[]>([]);
   const [centeredBtwScopes, setCenteredBtwScopes] = useState<string[]>([]);
   const btwChatViewRef = useRef<ChatViewHandle>(null);
   // A user action owns one focus request; restored panels and streaming updates
@@ -412,6 +411,11 @@ export default function App() {
     parentSid: string; sid: string; machineId: string; engine: Engine; space: Space;
     selected: SessionArtifactInfo | null; id: string;
   } | null>(null);
+  const panelViewsBySurfaceRef = useRef(new Map<string, {
+    rightView: RightPanelView;
+    fileBrowser: typeof fileBrowser;
+    sessionArtifacts: typeof sessionArtifacts;
+  }>());
   const artifactsListenerRef = useRef<((message: SessionArtifacts | FilePreview) => boolean) | null>(null);
   const listenArtifacts = useCallback((listener: ((message: SessionArtifacts | FilePreview) => boolean) | null) => {
     artifactsListenerRef.current = listener;
@@ -465,6 +469,9 @@ export default function App() {
   });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
+  const artifactReadingMemory = useMemo(() => ({
+    machineId, entries: new Map<string, ArtifactReadingState>(),
+  }), [machineId]);
   const notificationScopeRef = useRef({ machineId, authed });
   notificationScopeRef.current = { machineId, authed };
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
@@ -871,6 +878,7 @@ export default function App() {
     const previous = previousMachineRef.current;
     if (previous === machineId) return;
     previousMachineRef.current = machineId;
+    panelViewsBySurfaceRef.current.clear();
     localStorage.setItem(MACHINE_KEY, machineId);
     pendingCreateRef.current = null;
     createRequestsRef.current.clear();
@@ -1018,10 +1026,7 @@ export default function App() {
     current => setBtwPanelScope(current, btwScope, visible));
   const btwExpanded = !!btwPanelKey && centeredBtwScopes.includes(btwScope);
   const btwRendered = visibleRightPanel === "btw" || btwExpanded;
-  const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
-  useEffect(() => {
-    setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
-  }, [rightPanelKey]);
+  const panelExpanded = !!rightPanelKey && expandedPanelScopes.includes(rightPanelKey);
   useEffect(() => {
     setBtwFocusScope(current => current === btwScope ? current : null);
   }, [btwScope]);
@@ -2046,6 +2051,15 @@ export default function App() {
   ) => {
     clearForkFocusLease(false);
     rememberSurfaceFocus(engine, space);
+    const departingSurface = sessionScopeKey(machineId, engine, space);
+    const panelViews = panelViewsBySurfaceRef.current;
+    panelViews.delete(departingSurface);
+    panelViews.set(departingSurface, { rightView, fileBrowser, sessionArtifacts });
+    while (panelViews.size > 8) panelViews.delete(panelViews.keys().next().value!);
+    const restoredPanel = panelViews.get(sessionScopeKey(machineId, nextEngine, nextSpace));
+    setRightView(restoredPanel?.rightView ?? "diff");
+    setFileBrowser(restoredPanel?.fileBrowser ?? null);
+    setSessionArtifacts(restoredPanel?.sessionArtifacts ?? null);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
     const focusScopeKey = sessionScopeKey(
       machineId, nextEngine, nextSpace);
@@ -2095,6 +2109,9 @@ export default function App() {
     engine,
     machineId,
     rememberSurfaceFocus,
+    rightView,
+    fileBrowser,
+    sessionArtifacts,
     requestHistory,
     resumeListedSession,
     space,
@@ -3501,8 +3518,8 @@ export default function App() {
               setCenteredBtwScopes(current => [...new Set(current.map(
                 scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
               setBtwFocusScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
-              setExpandedPanel(current => current ? { ...current,
-                scope: rekeyPanelScope(current.scope, msg.old_key, msg.session_id)! } : null);
+              setExpandedPanelScopes(current => [...new Set(current.map(
+                scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
               setSessionArtifacts(current => current && current.machineId === machineId ? { ...current,
                 parentSid: current.parentSid === msg.old_key ? msg.session_id : current.parentSid,
                 sid: current.sid === msg.old_key ? msg.session_id : current.sid } : current);
@@ -5640,10 +5657,10 @@ export default function App() {
     openBtw();
     dismissCenteredBtw();
   };
-  const dockPanel = () => setExpandedPanel(null);
+  const dockPanel = () => setExpandedPanelScopes(current => current.filter(scope => scope !== rightPanelKey));
   const togglePanelExpanded = () => {
     if (panelExpanded) dockPanel();
-    else if (rightPanelKey) setExpandedPanel({ scope: rightPanelKey });
+    else if (rightPanelKey) setExpandedPanelScopes(current => [...current, rightPanelKey].slice(-16));
   };
   const selectBtw = (sid: string) => {
     const parentSid = visibleParentSid;
@@ -6492,6 +6509,7 @@ export default function App() {
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
+      <ArtifactReadingMemory.Provider value={artifactReadingMemory.entries}>
       <RightPanelPresentation.Provider value={{ expanded: panelExpanded, covered: btwExpanded, layer: 0, chat: false,
         onOpenChat: toggleCenteredBtw, onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
       {visibleRightPanel === "dsh" && dshPanel && <Suspense fallback={null}>
@@ -6595,18 +6613,20 @@ export default function App() {
               <p className="loading-tx">加载预览…</p>
             </div>
           }>
-            <ArtifactPanel artifact={state.artifact} active="diff"
+            <ArtifactPanel key={`${state.artifact.sid}:${state.artifact.file}:${state.artifact.requestId}`}
+              artifact={state.artifact} active="diff"
               hasBtw={!!activeBtwGroup}
               theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
               onAuthorizePreview={authorizePreview}
               onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
-              onClose={() => dispatch({ type: "clear_artifact" })} />
+              onClose={() => { dockPanel(); dispatch({ type: "clear_artifact" }); }} />
           </Suspense>;
         return null;
       })()}
       </RightPanelPresentation.Provider>
+      </ArtifactReadingMemory.Provider>
       <RightPanelPresentation.Provider value={{ expanded: btwExpanded, covered: false, layer: 1, chat: true,
         onOpenChat: toggleCenteredBtw, onExpand: showCenteredBtw, onDock: dockBtw, onDismiss: dismissCenteredBtw }}>
         {btwRendered && (<Suspense fallback={null}>

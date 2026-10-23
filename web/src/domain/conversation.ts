@@ -24,6 +24,8 @@ export const UNKNOWN_TERMINAL_ERROR =
 export interface TextBlock {
   kind: "text";
   message_id: string;
+  /** Exact stream alias retained after binding to the persisted message UUID. */
+  stream_message_id?: string;
   text: string;
   done: boolean;
   channel?: AssistantChannel;

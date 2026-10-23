@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Reconcile streamed Claude text and thinking with canonical transcript message IDs to avoid duplicates after history refresh. Wire protocol v82 requires Relay, Wrapper and Web to upgrade together.
+- Retain file previews, centered layout, preview mode and reading position when switching engines or sessions.
+- Keep inline site icons visible in Markdown previews by excluding them from document image spacing.
+
 - Show the current DSH session mode beside the Code page title. Replace the unavailable official plugin-market search with an explanation while retaining local plugin management.
 - Stream DSH terminal output with bounded render acknowledgements, pipeline ordered input, and keep the final row visible when centering the panel. Use the shared terminal picker instead of a system dropdown.
 - Restore touch scrolling through DSH terminal history; incoming output preserves the reading position and swipes never send shell input.

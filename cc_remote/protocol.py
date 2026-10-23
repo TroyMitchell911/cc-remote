@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 81
+PROTOCOL_VERSION = 82
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -988,6 +988,9 @@ class AsyncQuestionSpec(BaseModel):
 class AssistantMsgEnd(_Base):
     type: Literal["assistant_msg_end"] = "assistant_msg_end"
     message_id: WireId
+    # Claude stream envelopes and persisted assistant records have different
+    # UUIDs. Bind the provisional stream item to its exact transcript identity.
+    canonical_message_id: Optional[WireId] = None
     turn_id: Optional[WireId] = None
     background: Optional[bool] = None
     channel: AssistantChannel = "unknown"
