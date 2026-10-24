@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+## v5.0.1
+
+Repair legacy Desktop compatibility, refresh the bilingual feature guides, and preserve Claude background continuations in history. Wire protocol v82 is unchanged. See the bilingual [release notes](docs/releases/v5.0.1.md).
+
+- Stage a signed repair for the known macOS Desktop shell so it loads the configured Relay UI instead of stale bundled assets; preserve cookies, settings and native integrations.
+- Keep Claude continuation identity, timeline order and terminal outcomes consistent across live events, refreshed history and browser caches; retain original provider errors without marking successful continuations incomplete.
+- Rebuild derived Claude history pages once when the history cache advances from schema 50 to 51; preserve native transcripts, indexes and binary assets.
+- Document Claude/Codex/DSH capabilities and current boundaries in both READMEs, with 13 sanitized Desktop screenshots and a local demonstration fixture.
+
 ## v5.0.0
 
 Add optional DSH integration alongside Claude/Codex, stabilize session history and previews, and harden reconnect recovery. Wire protocol v82 requires a coordinated upgrade from v79. See the bilingual [release notes](docs/releases/v5.0.0.md).
