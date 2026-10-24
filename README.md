@@ -7,7 +7,7 @@
 **产品版本：v5.0.0** · Wire protocol v82
 
 [English](README_en.md) · [Release 安装（推荐）](#安装与升级) · [功能对照](#引擎与功能) · [源码体验](#快速开始) ·
-[终端工作台](#terminal-workspace) · [文档](#文档) · [更新记录](CHANGELOG_zh.md)
+[界面导览](#界面导览) · [终端工作台](#terminal-workspace) · [文档](#文档) · [更新记录](CHANGELOG_zh.md)
 
 cc-remote 把本机 agent 的会话、工具过程、文件和运行控制带到远端。你可以在电脑上
 开始任务，用手机查看进度、回答询问、补充指令，再回到原来的会话继续工作。
@@ -20,14 +20,17 @@ cc-remote 把本机 agent 的会话、工具过程、文件和运行控制带到
 本文说明当前源码的能力。安装已发布包时，请阅读对应 tag 的文档；产品版本号相同，
 也不代表不同提交的功能和协议相同。
 
-![Claude 会话与多会话工作台](assets/readme-claude-multisession.jpg)
+![Codex 多会话工作台](assets/readme-v5-codex.png)
+
+本文截图由 computer use 从 cc-remote Desktop 实际截取，使用 v5.0.0 Web 界面与隔离的
+合成演示数据；项目、路径、设备、对话、额度和运行结果均不来自真实用户。更多功能见[界面导览](#界面导览)。
 
 ## 可以做什么
 
 - **同时处理多个任务**：会话按目录分组，支持搜索、置顶、重命名和后台运行。
   切换页面不会停止任务；历史按需加载，工具细节展开后再读取。
 - **跟进完整过程**：查看流式回复、引擎公开的思考摘要、计划、工具调用、命令输出、
-  文件改动和审批。Claude 与 Codex 运行中均支持引导或排队；引导会补充当前任务，不会打断正在执行的工具。
+  文件改动和审批。Claude、Codex 与 DSH 运行中均支持引导或排队；引导会补充当前任务，不会打断正在执行的工具。
 - **管理长任务**：通过 `/goal` 设置目标，查看进展并使用各引擎原生的预算与控制。
   Claude、Codex 还支持 `/btw` 临时侧聊，主任务继续运行。
 - **直接查看文件**：聊天里的文件和目录链接连接到 `/open` 与预览面板，支持源码、
@@ -60,26 +63,43 @@ v5.0.0 新增可选的 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界�
 下表描述 **cc-remote 已接入的能力**。模型、权限和扩展目录仍以所选设备上的原生
 引擎为准。
 
-| 能力 | Claude Code | Codex |
-|---|---|---|
-| 接入方式 | 日常 Claude CLI + Agent SDK | 官方 app-server，共享 daemon |
-| Code / Work | 两者支持 | 两者支持 |
-| 全屏终端 TUI | 支持 | 支持 |
-| 模型与思考 | 原生模型与支持的档位 | 原生模型、思考强度、服务档位 |
-| Plan | 原生 Plan 模式 | 原生 Plan 协作模式 |
-| Goal | 完成条件、检查轮次、最近检查结果、Token 用量和耗时 | 目标、可选 Token 预算、暂停／继续、完成和清除 |
-| `/btw` 临时侧聊 | 支持 | 支持 |
-| 归档与删除 | 归档、恢复、删除 | 归档、恢复、删除 |
-| 会话派生 | 支持 | 支持；可派生到独立 worktree |
-| 特有工具 | Hooks 管理、原生询问与工具审批 | Review、空闲会话目录迁移、状态与账号限额 |
-| 扩展 | Skills、插件、MCP、Hooks 等，按能力管理 | Skills、插件、Apps、MCP；Hooks 只读 |
+| 能力 | Claude Code | Codex | DSH |
+|---|---|---|---|
+| 接入方式 | 日常 Claude CLI + Agent SDK | 官方 app-server，共享 daemon | 原生本地 API，独立配对 |
+| Code / Work | 两者支持 | 两者支持 | 仅 Code |
+| 全屏终端 TUI | 支持 | 支持 | 暂不支持 |
+| 模型与思考 | 原生模型与支持的档位 | 原生模型、思考强度、服务档位 | 原生模型、推理档位、权限与模式预设 |
+| Plan | 原生 Plan 模式 | 原生 Plan 协作模式 | 原生命令；以当前预设目录为准 |
+| Goal | 完成条件、检查轮次、最近检查结果、Token 用量和耗时 | 目标、可选 Token 预算、暂停／继续、完成和清除 | 目标、轮次上限、暂停／继续、完成和清除 |
+| `/btw` 临时侧聊 | 支持 | 支持 | 暂时禁用，等待官方删除能力 |
+| 归档与删除 | 归档、恢复、删除 | 归档、恢复、删除 | 归档、恢复；不支持删除 |
+| 会话派生 | 支持 | 支持；可派生到独立 worktree | 原生持久化派生；不支持 worktree |
+| 文件差异 | 项目 Git Diff、逐轮改动记录 | 项目 Git Diff、逐轮改动记录 | 项目 Git Diff、原生逐轮快照；已释放且未保存的旧快照不可恢复 |
+| 特有工具 | Hooks 管理、原生询问与工具审批 | Review、空闲会话目录迁移、状态与账号限额 | 子代理、后台任务、工作流、执行轨迹、终端与自动化 |
+| 扩展 | Skills、插件、MCP、Hooks 等，按能力管理 | Skills、插件、Apps、MCP；Hooks 只读 | Skills、本机插件与插件包；插件市场暂不可用 |
 
 ### Goal 的预算不是上下文窗口
 
-`/goal` 打开当前引擎的目标小窗，两家的控制分别对应原生能力：
+`/goal` 打开当前引擎的目标小窗，三种引擎的控制分别对应原生能力：
 
 - **Claude** 使用完成条件和原生检查反馈；展示用量与耗时，没有 Codex 式 Token 预算输入。
 - **Codex** 可设置目标累计 Token 预算，或不设预算；预算不用于扩大上下文窗口。
+- **DSH** 使用原生轮次上限和自动续行状态，可暂停、继续、完成或清除；不是 Token 预算。
+
+### DSH 的会话工具
+
+在 **更多 → DSH 会话工具** 中，按用途切换子代理、后台任务、工作流、执行轨迹、
+产出文件、自动化、运行设置、插件、预设、终端和连接诊断。
+
+- **模式**：新建会话时选择标准、PTC、极简或创造模式；可用项来自本机 DSH，当前模式显示在页面 `Code` 旁。
+- **子代理与任务**：查看原生执行过程；支持控制的子代理可继续提问、引导或停止，旧格式会话可能要先在官方客户端迁移。
+- **终端**：直接使用设备上的交互式终端，支持滚动、Ctrl+C 中断、重连和关闭。收起面板保留终端；这些命令由用户直接执行。
+- **自动化**：通过表单选择目标会话、重复规则与时间，也可通过对话创建。投递记录表示消息已送达，任务结果仍在目标会话中查看。
+- **运行设置与扩展**：按原生接口的生效范围保存参数，管理本机插件与插件包；需要重启的修改保留到下次启动。
+
+**当前边界**：DSH 仅支持 Code；官方尚未提供适用的会话删除与插件市场能力。
+侧聊菜单、快捷键和 `/btw` 已禁用，等待官方能力完善后再接入。归档只隐藏会话，不回收原生历史。
+DSH 支持项目 Git Diff，也会保存原生逐轮文件快照。旧快照若已被原生端释放且未保存，会明确显示不可用，不会用当前 Git 状态冒充历史改动。
 
 ## 常用操作
 
@@ -89,7 +109,7 @@ v5.0.0 新增可选的 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界�
 |---|---|
 | `/model` | 选择模型与思考强度 |
 | `/goal` | 打开当前引擎的目标小窗 |
-| `/plan` | 进入计划模式，用 `/normal` 退出 |
+| `/plan` | Claude/Codex 用 `/normal` 退出；DSH 使用原生命令，支持时用 `/plan off` 退出 |
 | `/btw [问题]` | 在 Claude/Codex 中创建基于当前会话的临时侧聊 |
 | `/open [路径]` | 浏览目录；也可从“更多 → 会话文件”进入 |
 | `/preview <路径>` | 打开文件预览 |
@@ -103,7 +123,7 @@ v5.0.0 新增可选的 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界�
 **Esc** 只关闭小窗，问题仍保持未回答。中文输入法确认候选字时不会提交。
 
 侧聊、文件预览、Diff、会话文件、协作代理详情和远程预览都支持右上角按钮居中放大、收回右侧。
-**⌘/Ctrl+Shift+K** 打开或收起侧聊；**⌘/Ctrl+Shift+E** 只打开或收起居中侧聊。
+Claude/Codex 中，**⌘/Ctrl+Shift+K** 打开或收起侧聊；**⌘/Ctrl+Shift+E** 只打开或收起居中侧聊。
 居中侧聊可覆盖已放大的文件，收起后保留原文件的布局和编辑状态；文件仍通过自己的按钮放大或收回。
 再按一次、点击窗口外或按 **Esc** 返回打开前的状态：原本隐藏则完全隐藏，原本在右侧则收回右侧。
 切换布局保留当前对话、草稿、文件编辑和预览页面，不中断正在运行的任务；
@@ -162,7 +182,7 @@ flowchart LR
   browser["手机 / 浏览器"] <-->|HTTPS / WSS| relay["Relay + Web 静态文件"]
   terminal["终端 TUI"] <-->|WSS| relay
   subgraph device["你的机器"]
-    wrapper["Wrapper"] <--> engine["Claude SDK / Codex app-server"]
+    wrapper["Wrapper"] <--> engine["Claude SDK / Codex app-server / DSH 本地 API"]
   end
   relay <-->|WebSocket| wrapper
   engine -->|原生配置与登录| model["模型服务"]
@@ -185,6 +205,9 @@ Wrapper 主动出站连接 Relay，设备不需要开放公网入站端口。Rel
   Wrapper 使用该 CLI；Python Agent SDK 固定为 `0.2.157`。
 - **Codex**：已登录的官方 CLI。共享控制需要同时支持
   `codex app-server daemon --help` 和 `codex app-server proxy --help`。
+
+- **DSH（可选）**：Node 24 与 `@deepseek-ai/dsh@0.2.1-rc.2`。先按 [DSH 接入说明](docs/dsh-integration.md)
+  启动本地 API、加载元数据插件并完成配对；普通 Wrapper 安装不会自动安装或升级 DSH。
 
 ### 1. 安装依赖并构建
 
@@ -260,7 +283,8 @@ cc-remote update           # 升级到最新稳定 Release，不需要加 latest
 设备会先检查配对的 VPS：需要时先升级 Relay + Web，已是兼容的新版本则只更新本机。
 首次远程升级 VPS 可用 `cc-remote update --relay-ssh operator@relay-host` 绑定已有的
 SSH 管理入口。其他设备各自执行更新即可。安装使用预构建产物，不在用户机器跑 CI、
-pytest 或前端构建；Electron 应用本体单独更新。
+pytest 或前端构建。协议跨版本升级需要按[协议协调升级](docs/installation.md#后续更新)处理全部设备。
+旧版实验性 Electron 应用本体单独维护，见 [Desktop 兼容修复](docs/desktop.md)。
 
 v4.0.10 新增自动备份保留：升级验收通过后，保留当前版本、上一版完整回滚资料及仍在使用的
 运行依赖，清理可确认的更早版本。Linux Wrapper 也可通过已有 Supervisor 安装并接入同一更新器，
@@ -285,12 +309,21 @@ Codex 需核对每个账号的 CLI 与 Wrapper 共用官方 daemon；已安装�
 接入是单独的可选步骤，提供 [macOS](docs/codex-desktop-launcher.md) 和
 [Linux](docs/codex-desktop-linux.md) 流程，不影响核心部署结果。
 
+### Web、PWA 与 Desktop
+
+Web / PWA 是正式发布的图形客户端，三种引擎共用同一套页面。既有的 macOS Desktop
+是实验性 Electron 壳，v5.0.0 Release 不包含新的 Desktop 安装包。修复后的旧壳从配置的
+Relay 加载页面，避免内置旧页面导致“等待服务端完成部署”的循环；登录和原生集成保留。
+`cc-remote update` 更新 Relay、Web 和 Wrapper，不替换 Electron 本体。
+
 ## 配置与原生客户端
 
 - **Claude**：原生 CLI／Desktop／Agent View 持有的会话先只读镜像；由用户明确接管后，
   Remote 才恢复写入。官方 `claude` 命令保持原样。
 - **Codex Code**：通过官方共享 daemon 与原生客户端协同。私有 stdio 降级不具备
   同样的双向共享能力，部署验收不能把它当作共享成功；Work 使用私有进程。
+
+- **DSH**：保留自己的模型登录、插件与会话存储，使用独立的本地 API 配对文件；不混用 Claude/Codex 的账号目录。旧会话格式升级仍由官方客户端处理。
 
 账号目录、代理、设备授权、通知和环境变量见 [配置、账号与数据](docs/configuration.md)。
 Claude/Codex 可混合接入官方 OAuth 登录账号和原生 CLI 兼容的中转站 API 账号。
@@ -321,6 +354,8 @@ Code 默认权限较宽；Work 的私有目录策略不能替代独立系统用�
 | [安装与升级](docs/installation.md) | Release、源码、配对、网络入口 |
 | [配置、账号与数据](docs/configuration.md) | 多账号、环境变量、鉴权、队列与历史边界 |
 | [部署流程](deploy/README.md) | 不可变发布、回滚、共享控制与上线验收 |
+| [DSH 接入](docs/dsh-integration.md) | 安装配对、模式、原生控制与功能边界 |
+| [Desktop 兼容修复](docs/desktop.md) | 旧 Electron 壳的页面升级、保留登录与回滚 |
 | [远程 Viewer](docs/remote-viewer.md) | 交互式静态页面、Bridge／Isolated 模式 |
 | Codex App 接入：[macOS](docs/codex-desktop-launcher.md)／[Linux](docs/codex-desktop-linux.md) | 可选桌面 App、日常 CLI 与 Wrapper 共用 daemon |
 | [Codex App 工具](docs/codex-app-tools.md) | 可选 App-control MCP |
@@ -404,20 +439,92 @@ Playwright 不进入 CI 或必跑的本地 PR 检查，现有用例仅保留供�
 - **手机访问需要给电脑开公网端口吗？** 不需要。Wrapper 主动出站连接 Relay；
   公网入口位于 Relay 主机。
 
+## 界面导览
+
+以下均为 Desktop 中的真实界面截图，使用隔离演示数据。点击图片可查看原图。
+截图用于展示界面与功能入口，不是模型实测结果；功能边界以[三引擎对照](#引擎与功能)为准。
+
 <details>
-<summary>更多界面截图</summary>
+<summary>Claude：多会话与可折叠处理过程</summary>
 
-以下为 Claude/Codex 的界面示例；不同引擎和版本的菜单会有所区别。
+![Claude：多会话与可折叠处理过程](assets/readme-v5-claude.png)
 
-![按目录分组的会话列表](assets/readme-multi-session.jpg)
+</details>
 
-![Claude 的工具调用与处理过程](assets/readme-claude-session.jpg)
+<details>
+<summary>DSH：模式标签、原生 Goal 与统一聊天界面</summary>
 
-![选择引擎与工作目录](assets/readme-new-session.jpg)
+![DSH：模式标签、原生 Goal 与统一聊天界面](assets/readme-v5-dsh.png)
 
-![Codex 的可折叠过程时间线](assets/readme-process-timeline.jpg)
+</details>
 
-![模型与会话控制](assets/readme-model-controls.jpg)
+<details>
+<summary>DSH：新会话模式选择</summary>
+
+![DSH：新会话模式选择](assets/readme-v5-dsh-modes.png)
+
+</details>
+
+<details>
+<summary>DSH：按用途组织的会话工具</summary>
+
+![DSH：按用途组织的会话工具](assets/readme-v5-dsh-tools.png)
+
+</details>
+
+<details>
+<summary>子代理：查看执行过程与继续协作</summary>
+
+![子代理：查看执行过程与继续协作](assets/readme-v5-subagent.png)
+
+</details>
+
+<details>
+<summary>交互终端：中断、重连与关闭</summary>
+
+![交互终端：中断、重连与关闭](assets/readme-v5-terminal.png)
+
+</details>
+
+<details>
+<summary>自动化：选择会话、规则与执行时间</summary>
+
+![自动化：选择会话、规则与执行时间](assets/readme-v5-automation.png)
+
+</details>
+
+<details>
+<summary>DSH Goal：轮次预算与续行控制</summary>
+
+![DSH Goal：轮次预算与续行控制](assets/readme-v5-goal.png)
+
+</details>
+
+<details>
+<summary>Artifacts：当前会话的交付文件</summary>
+
+![Artifacts：当前会话的交付文件](assets/readme-v5-artifacts.png)
+
+</details>
+
+<details>
+<summary>文档侧栏：Markdown、表格与 Mermaid</summary>
+
+![文档侧栏：Markdown、表格与 Mermaid](assets/readme-v5-preview.png)
+
+</details>
+
+<details>
+<summary>居中预览：专注阅读与源码切换</summary>
+
+![居中预览：专注阅读与源码切换](assets/readme-v5-preview-focus.png)
+
+</details>
+
+<details>
+<summary>外观：每个引擎独立保存浅色与深色配置</summary>
+
+![外观：每个引擎独立保存浅色与深色配置](assets/readme-v5-appearance.png)
 
 </details>
 

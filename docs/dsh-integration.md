@@ -2,8 +2,8 @@
 
 ## Baseline and ownership
 
-The integration starts at cc-remote `v4.0.29` (`fb60c7ef9348`), on a new
-development branch. It does not merge the historical DSH development branch.
+DSH integration ships in cc-remote **v5.0.0**. Development started from
+`v4.0.29` (`fb60c7ef9348`) without merging the historical DSH branch.
 The implementation target is exactly `@deepseek-ai/dsh@0.2.1-rc.2`, upstream
 commit `687f282e8625c6b8d11ff58211a90524be2e4317`.
 

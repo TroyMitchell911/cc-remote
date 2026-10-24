@@ -7,7 +7,7 @@ Self-hosted · Multiple sessions and devices · Live tool activity · Code / Wor
 **Product version: v5.0.0** · Wire protocol v82
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
-[Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
+[Interface tour](#interface-tour) · [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
 
 cc-remote brings your local agent's sessions, tool activity, files and controls to
 remote clients. Start a task on your computer, check progress from your phone,
@@ -25,7 +25,11 @@ This README describes the current source tree. For a published package, read the
 documentation at its tag: the same product version does not guarantee the same
 features or wire protocol across different commits.
 
-![Claude sessions and the multi-session workspace](assets/readme-claude-multisession.jpg)
+![Codex multi-session workspace](assets/readme-v5-codex.png)
+
+Screenshots were captured from cc-remote Desktop through computer use, with the v5.0.0 Web UI
+and isolated synthetic data. Projects, paths, devices, conversations, quotas and results are
+fictional. See the [interface tour](#interface-tour) for more features.
 
 ## What you can do
 
@@ -34,7 +38,7 @@ features or wire protocol across different commits.
   a task. History is paged, with tool details loaded when expanded.
 - **Follow the work.** Read streaming replies, engine-provided reasoning
   summaries, plans, tool calls, command output, file changes and approvals.
-  Claude and Codex support steering or queueing while busy. Steering adds
+  Claude, Codex and DSH support steering or queueing while busy. Steering adds
   instructions to the current task without interrupting running tools.
 - **Manage longer tasks.** `/goal` exposes each engine's native progress, budget
   and controls. Claude and Codex also offer temporary `/btw` side conversations
@@ -77,19 +81,20 @@ not automatically upgrade or migrate existing DSH data.
 This table describes **capabilities connected in cc-remote**. Models, permissions
 and extensions still depend on the native installation on the selected device.
 
-| Capability | Claude Code | Codex |
-|---|---|---|
-| Connection | Daily Claude CLI + Agent SDK | Official app-server, shared daemon |
-| Code / Work | Both | Both |
-| Full-screen terminal TUI | Supported | Supported |
-| Models and reasoning | Native models and supported levels | Native models, reasoning effort, service tier |
-| Plan | Native Plan mode | Native Plan collaboration mode |
-| Goal | Completion condition, check count, latest feedback, token usage and elapsed time | Objective, optional token budget, pause/resume, complete and clear |
-| `/btw` side conversation | Supported | Supported |
-| Archive and delete | Archive, restore, delete | Archive, restore, delete |
-| Fork sessions | Supported | Supported, including a separate worktree |
-| Engine-specific tools | Hook management, native questions and tool approvals | Review, idle-session directory migration, status and account limits |
-| Extensions | Skills, plugins, MCP, Hooks and supported management | Skills, plugins, Apps, MCP; read-only Hooks |
+| Capability | Claude Code | Codex | DSH |
+|---|---|---|---|
+| Connection | Daily Claude CLI + Agent SDK | Official app-server, shared daemon | Native local API, separate pairing |
+| Code / Work | Both | Both | Code only |
+| Full-screen terminal TUI | Supported | Supported | Not yet supported |
+| Models and reasoning | Native models and supported levels | Native models, reasoning effort, service tier | Native models, reasoning levels, permissions and presets |
+| Plan | Native Plan mode | Native Plan collaboration mode | Native command catalog; depends on the preset |
+| Goal | Completion condition, check count, latest feedback, token usage and elapsed time | Objective, optional token budget, pause/resume, complete and clear | Objective, round limit, pause/resume, complete and clear |
+| `/btw` side conversation | Supported | Supported | Disabled pending native session deletion |
+| Archive and delete | Archive, restore, delete | Archive, restore, delete | Archive and restore; no deletion |
+| Fork sessions | Supported | Supported, including a separate worktree | Persistent native fork; no worktree |
+| File changes | Project Git diff and per-turn records | Project Git diff and per-turn records | Project Git diff and native per-turn snapshots; released, unsaved snapshots cannot be recovered |
+| Engine-specific tools | Hook management, native questions and tool approvals | Review, idle-session directory migration, status and account limits | Subagents, jobs, workflows, trajectory, terminals and schedules |
+| Extensions | Skills, plugins, MCP, Hooks and supported management | Skills, plugins, Apps, MCP; read-only Hooks | Skills, local plugins and bundles; no marketplace yet |
 
 ### Goal budgets are separate from context capacity
 
@@ -99,6 +104,24 @@ and extensions still depend on the native installation on the selected device.
   usage and elapsed time, without a Codex-style token-budget input.
 - **Codex** can set a cumulative token budget for a goal or leave it unlimited.
   That budget does not increase the context window.
+- **DSH** uses a native round limit and automatic continuation state, with pause, resume, complete and clear controls. This is not a token budget.
+
+### DSH session tools
+
+Open **More → DSH session tools** for subagents, background jobs, workflows, trajectory,
+outputs, automation, runtime settings, plugins, presets, terminals and diagnostics.
+
+- **Modes:** choose Standard, PTC, Minimal or Cordis when starting a session. Available presets come from local DSH; the current mode appears beside `Code`.
+- **Agents and jobs:** inspect native activity and continue, steer or stop controllable agents. Older sessions may first need migration in the official client.
+- **Terminals:** use the device's interactive shell with scrollback, Ctrl+C, reconnect and close controls. Hiding the panel keeps the terminal alive; commands are executed directly by the user.
+- **Automation:** choose a target session, recurrence and time in a form, or create a schedule through conversation. Delivery records confirm delivery; inspect the target session for the task result.
+- **Settings and extensions:** save settings according to native application scopes and manage local plugins/bundles. Changes requiring restart remain pending until the next launch.
+
+**Current boundaries:** DSH supports Code only. Suitable session deletion and marketplace APIs
+are unavailable. Side-chat menus, shortcuts and `/btw` are disabled pending upstream support.
+Archiving hides sessions without reclaiming native history. DSH supports project Git diffs
+and archived native per-turn file snapshots. Released snapshots that were not saved are
+shown as unavailable; current Git state never substitutes for historical changes.
 
 ## Common operations
 
@@ -108,7 +131,7 @@ Type `/` in the composer to see commands available for the current engine.
 |---|---|
 | `/model` | Choose a model and reasoning level |
 | `/goal` | Open the current engine's goal dialog |
-| `/plan` | Enter planning; exit with `/normal` |
+| `/plan` | Claude/Codex exit with `/normal`; DSH follows native commands, using `/plan off` when available |
 | `/btw [question]` | Start a temporary side conversation based on the current Claude/Codex session |
 | `/open [path]` | Browse directories; also available from More → Session files |
 | `/preview <path>` | Open a file preview |
@@ -150,7 +173,7 @@ Deleting a session releases its copies; archiving does not. Delivered originals
 are never counted against these limits or deleted by this cleanup.
 The existing session file browser continues to browse directories independently.
 
-**⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** only toggles
+In Claude/Codex, **⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** only toggles
 centered side chat, above any open or expanded file preview. Files keep their
 own expand/dock buttons and retain their layout and unsaved edits underneath.
 Pressing it again, clicking outside, or pressing **Esc** restores the previous
@@ -207,7 +230,7 @@ flowchart LR
   browser["Phone / browser"] <-->|HTTPS / WSS| relay["Relay + static Web client"]
   terminal["Terminal TUI"] <-->|WSS| relay
   subgraph device["Your machine"]
-    wrapper["Wrapper"] <--> engine["Claude SDK / Codex app-server"]
+    wrapper["Wrapper"] <--> engine["Claude SDK / Codex app-server / DSH local API"]
   end
   relay <-->|WebSocket| wrapper
   engine -->|Native config and login| model["Model service"]
@@ -232,6 +255,9 @@ Prepare at least one working engine:
   Wrapper launches that CLI; the Python Agent SDK is pinned to `0.2.157`.
 - **Codex:** an authenticated official CLI. Shared control requires both
   `codex app-server daemon --help` and `codex app-server proxy --help`.
+
+- **DSH (optional):** Node 24 and `@deepseek-ai/dsh@0.2.1-rc.2`. Follow [DSH integration](docs/dsh-integration.md)
+  to start the local API, load the metadata plugin and pair. Wrapper installation does not install or upgrade DSH automatically.
 
 ### 1. Install dependencies and build
 
@@ -315,7 +341,9 @@ An already-current compatible Relay is skipped. Use
 `cc-remote update --relay-ssh operator@relay-host` to bind an existing SSH admin
 entry for the first remote server upgrade. Update other devices individually.
 Installation uses prebuilt artifacts; it does not run CI, pytest or a frontend
-build on users' machines. The Electron application is updated separately.
+build on users' machines. Protocol upgrades require coordinated Relay, Web and Wrapper
+activation; follow the [deployment procedure](deploy/README.md). The Electron application
+is updated separately; see [Desktop compatibility](docs/desktop.md).
 
 v4.0.10 adds automatic retention: after acceptance, keep the active
 version, one complete previous rollback set and all live runtime dependencies;
@@ -347,6 +375,14 @@ installed Codex App is a separate optional step, with distinct
 [macOS](docs/codex-desktop-launcher.md) and [Linux](docs/codex-desktop-linux.md)
 procedures, independent of core deployment success.
 
+### Web, PWA and Desktop
+
+Web/PWA are the released graphical clients, sharing one UI across all three engines.
+The existing macOS Desktop is an experimental Electron shell; v5.0.0 does not ship a new
+Desktop installer. The compatibility repair loads the configured Relay's pages instead of
+outdated bundled assets, retaining sign-in and native integrations. `cc-remote update` updates
+Relay, Web and Wrapper, not the Electron application. See [Desktop compatibility](docs/desktop.md).
+
 ## Configuration and native clients
 
 - **Claude:** sessions owned by native CLI/Desktop/Agent View are mirrored
@@ -355,6 +391,9 @@ procedures, independent of core deployment success.
 - **Codex Code:** coordinates through the official shared daemon. A private stdio
   fallback lacks the same bidirectional sharing and does not satisfy shared-control
   deployment acceptance. Work uses private processes.
+- **DSH:** keeps its own model authentication, plugins and session storage, with a
+  separate local API pairing file. It does not share Claude/Codex account directories;
+  older session formats are migrated in the official client.
 
 See [Configuration, accounts and data](docs/configuration_en.md) for account
 directories, proxies, device policy, notifications and environment variables.
@@ -395,6 +434,8 @@ policy is not a replacement for separate OS users, containers or virtual machine
 | [Installation and upgrades](docs/installation_en.md) | Release packages, source, pairing, network access |
 | [Configuration, accounts and data](docs/configuration_en.md) | Profiles, environment variables, authentication, queues and history |
 | [Deployment procedure](deploy/README.md) | Immutable releases, rollback, shared control and acceptance |
+| [DSH integration](docs/dsh-integration.md) | Pairing, modes, native controls and capability boundaries |
+| [Desktop compatibility](docs/desktop.md) | Legacy Electron UI recovery, sign-in preservation and rollback |
 | [Remote Viewer](docs/remote-viewer.md) | Interactive static pages, Bridge/Isolated modes |
 | Codex App: [macOS](docs/codex-desktop-launcher.md) / [Linux](docs/codex-desktop-linux.md) | Optional App, daily CLI and Wrapper on one daemon |
 | [Codex App tools](docs/codex-app-tools.md) | Optional App-control MCP |
@@ -492,20 +533,92 @@ web client for same-origin integration.
 - **Does phone access need an inbound port on my computer?** No. Wrapper connects
   outbound; the public entry point is on the Relay host.
 
+## Interface tour
+
+Real Desktop screenshots with isolated demo data. Click an image for full resolution.
+These illustrate the interface, not live model benchmark results. See the [engine comparison](#engines-and-features) for capability boundaries.
+
 <details>
-<summary>More interface screenshots</summary>
+<summary>Claude: sessions and collapsible activity</summary>
 
-These show Claude/Codex interface examples. Menus vary by engine and version.
+![Claude: sessions and collapsible activity](assets/readme-v5-claude.png)
 
-![Sessions grouped by directory](assets/readme-multi-session.jpg)
+</details>
 
-![Claude tool calls and activity](assets/readme-claude-session.jpg)
+<details>
+<summary>DSH: mode badge, native Goal and shared chat UI</summary>
 
-![Engine and working-directory selection](assets/readme-new-session.jpg)
+![DSH: mode badge, native Goal and shared chat UI](assets/readme-v5-dsh.png)
 
-![Codex collapsible activity timeline](assets/readme-process-timeline.jpg)
+</details>
 
-![Model and session controls](assets/readme-model-controls.jpg)
+<details>
+<summary>DSH: new-session modes</summary>
+
+![DSH: new-session modes](assets/readme-v5-dsh-modes.png)
+
+</details>
+
+<details>
+<summary>DSH: session tool categories</summary>
+
+![DSH: session tool categories](assets/readme-v5-dsh-tools.png)
+
+</details>
+
+<details>
+<summary>Subagents: inspect activity and continue collaboration</summary>
+
+![Subagents: inspect activity and continue collaboration](assets/readme-v5-subagent.png)
+
+</details>
+
+<details>
+<summary>Interactive terminal: interrupt, reconnect and close</summary>
+
+![Interactive terminal: interrupt, reconnect and close](assets/readme-v5-terminal.png)
+
+</details>
+
+<details>
+<summary>Automation: target session, recurrence and time</summary>
+
+![Automation: target session, recurrence and time](assets/readme-v5-automation.png)
+
+</details>
+
+<details>
+<summary>DSH Goal: round budget and continuation</summary>
+
+![DSH Goal: round budget and continuation](assets/readme-v5-goal.png)
+
+</details>
+
+<details>
+<summary>Artifacts: files delivered in this session</summary>
+
+![Artifacts: files delivered in this session](assets/readme-v5-artifacts.png)
+
+</details>
+
+<details>
+<summary>Document sidebar: Markdown, tables and Mermaid</summary>
+
+![Document sidebar: Markdown, tables and Mermaid](assets/readme-v5-preview.png)
+
+</details>
+
+<details>
+<summary>Centered preview: focused reading and source view</summary>
+
+![Centered preview: focused reading and source view](assets/readme-v5-preview-focus.png)
+
+</details>
+
+<details>
+<summary>Appearance: independent light/dark styles per engine</summary>
+
+![Appearance: independent light/dark styles per engine](assets/readme-v5-appearance.png)
 
 </details>
 
