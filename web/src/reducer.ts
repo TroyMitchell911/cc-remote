@@ -6945,6 +6945,21 @@ function reduceEvent(
         }
         const terminalClosedOpenTurn = !!t && !t.done;
         if (t) {
+          const binding = rt.pendingLiveBinding;
+          const claudeContinuationTerminal = t.done
+            && (ownership?.engine === "claude" || state.sessions.some((session) =>
+              session.session_id === e.sid && session.engine === "claude"))
+            && binding && binding.turnId === e.turn_id
+            && binding.generation === runtimeOrderingGeneration(rt)
+            && (typeof e.seq !== "number" || e.seq >= binding.seq)
+            && turnHasIdentityAlias(t, binding.msgId);
+          if (claudeContinuationTerminal) {
+            // This exact native Result belongs to the later main response,
+            // not the earlier failed human response or a background child.
+            delete t.error;
+            delete t.interrupted;
+            delete t.terminalSource;
+          }
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           if (rt.acceptancePending === t.id) {
             clearAcceptance(rt);

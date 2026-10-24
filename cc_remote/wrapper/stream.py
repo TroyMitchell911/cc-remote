@@ -3383,7 +3383,8 @@ def translate_history(
             if _is_synthetic_no_response(msg):
                 continue
             pending_interrupted_alias = None
-            if _is_synthetic_api_error(msg):
+            synthetic_api_error = _is_synthetic_api_error(msg)
+            if synthetic_api_error:
                 turn_failed = True
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
@@ -3415,15 +3416,21 @@ def translate_history(
                     for b in content)
             )
             # Any later assistant activity re-opens the conversational tail.
-            # A top-level end_turn text settles it again; nested Agent answers
-            # and tool-bearing messages are not enclosing-turn boundaries.
+            # A top-level end_turn or native provider error settles it again;
+            # nested Agent answers and tools are not enclosing boundaries.
             settled_answer_seen = (
                 parent is None
                 and not has_tool_activity
                 and text_channel == "final"
                 and has_text
-                and msg.get("stop_reason") == "end_turn"
+                and (msg.get("stop_reason") == "end_turn" or synthetic_api_error)
             )
+            # A native task notification can restart the main assistant after
+            # a provider failure. Only its real top-level end_turn settles that
+            # later response; a receipt, tool result or nested agent cannot heal
+            # the failure. Keep the original API error text in the narrative.
+            if background_followup and settled_answer_seen and not synthetic_api_error:
+                turn_failed = False
             if has_tool_activity:
                 ambiguous_final_mid = None
                 ambiguous_final_start = None

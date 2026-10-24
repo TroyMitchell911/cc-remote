@@ -1,4 +1,4 @@
-import type { Block, ProcessBlock, TextBlock } from "./domain/conversation";
+import type { Block, ProcessBlock, TextBlock, Turn } from "./domain/conversation";
 import { finalTextBlocks } from "./process-blocks";
 import { isReturnReceipt, isSyntheticReturnReceipt, returnedAgents, hasParentContinuation } from "./agent-returns.ts";
 
@@ -9,6 +9,26 @@ export interface AssistantContinuation {
   returns: ProcessBlock[];
   startedTs?: number;
   doneTs?: number;
+}
+
+/** Attribute the enclosing terminal to one response, not every continuation.
+ * Earlier provider errors remain visible in the original answer text. */
+export function continuationTerminalOwner(
+  turn: Turn, continuations: AssistantContinuation[],
+): AssistantContinuation | undefined {
+  if (!turn.done) return undefined;
+  const exact = turn.forkPointId && continuations.find((segment) => segment.blocks.some((block) =>
+    block.kind === "text" && (block.message_id === turn.forkPointId
+      || block.stream_message_id === turn.forkPointId)));
+  if (exact) return exact;
+  // Live stream aliases can differ from the assembled terminal UUID. Native
+  // source clocks still fence an error before a later continuation starts.
+  for (let index = continuations.length - 1; index >= 0; index -= 1) {
+    const segment = continuations[index];
+    if (segment.startedTs != null && turn.doneTs != null
+        && segment.startedTs <= turn.doneTs) return segment;
+  }
+  return undefined;
 }
 
 /** Native receipt order for Codex, background main-agent output for Claude.

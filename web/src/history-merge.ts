@@ -371,6 +371,14 @@ function mergeBlocks(
             : combineText(existing.text, block.text)
         : combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
+      if (sameNativeMessage) {
+        // The exact native item may already have streamed before a summary
+        // refresh. Keep its detached scope and clocks even when an older
+        // projection omitted them; equal prose is not scope evidence.
+        if (block.background === true) existing.background = true;
+        if (block.startedTs != null) existing.startedTs ??= block.startedTs;
+        if (block.doneTs != null) existing.doneTs ??= block.doneTs;
+      }
       if (block.channel !== "unknown") existing.channel = block.channel;
       if (block.delivery === "async") {
         existing.delivery = "async";
@@ -999,6 +1007,16 @@ export function restoreCachedTurnDetails(
   return restored;
 }
 
+function successfulClaudeContinuation(success: Turn, failed: Turn): boolean {
+  return !!success.checkpointId && success.done && !success.error && !success.interrupted
+    && sharesExactTurnAlias(success, failed)
+    && !!(failed.error || failed.interrupted)
+    && success.doneTs != null && failed.doneTs != null && success.doneTs >= failed.doneTs
+    && success.blocks.some((block) => block.kind === "text" && block.done
+      && block.background === true && block.channel === "final"
+      && block.message_id === success.forkPointId);
+}
+
 function mergeTurn(
   history: Turn,
   live: Turn,
@@ -1018,6 +1036,12 @@ function mergeTurn(
     ?? (history.id !== live.id ? history.id : live.historyTurnId);
   const detailProjection = live.detailProjection ?? history.detailProjection;
   const terminalSource = live.terminalSource ?? history.terminalSource;
+  // A repaired source page (or an exact live Result retained across an older
+  // page) may settle a later Claude response in the same human row. Old failed
+  // cache state must not overwrite that terminal. Never infer success from
+  // mere text, a task receipt, an open snapshot, or an older response.
+  const recovered = successfulClaudeContinuation(history, live) ? history
+    : successfulClaudeContinuation(live, history) ? live : undefined;
   // preserveLiveOpen only says that a live projection overlaps the newest
   // source row. It is not authority to erase a real interrupted/failed source
   // terminal. Compact continuation is proven later from the wrapper's exact
@@ -1071,7 +1095,7 @@ function mergeTurn(
     sourceThreadId: history.sourceThreadId ?? live.sourceThreadId,
     sessionMessages: history.sessionMessages ?? live.sessionMessages,
     historyTurnId,
-    forkPointId: history.forkPointId ?? live.forkPointId,
+    forkPointId: recovered?.forkPointId ?? history.forkPointId ?? live.forkPointId,
     forkAvailable: history.forkAvailable ?? live.forkAvailable,
     checkpointId: history.checkpointId ?? live.checkpointId,
     continuation: history.continuation ?? live.continuation,
@@ -1081,10 +1105,10 @@ function mergeTurn(
     // synthetic TurnEnd.  While this same live tail is still running, that
     // marker is only a snapshot boundary and must not close the turn early.
     done: liveOwnsLifecycle ? live.done : history.done || live.done,
-    interrupted: liveOwnsLifecycle
+    interrupted: recovered ? undefined : liveOwnsLifecycle
       ? live.interrupted : history.interrupted || live.interrupted,
-    error: live.error ?? history.error,
-    ...(terminalSource ? { terminalSource } : {}),
+    error: recovered ? undefined : live.error ?? history.error,
+    ...(terminalSource ? { terminalSource: recovered ? undefined : terminalSource } : {}),
     progress: liveOwnsLifecycle ? live.progress : undefined,
     // A summary page replaces optimistic inline image bodies with canonical,
     // payload-free references. Retaining both makes ChatView lay out the same
@@ -1104,9 +1128,10 @@ function mergeTurn(
     doneTs: liveOwnsLifecycle
       ? live.doneTs
       : Math.max(history.doneTs ?? 0, live.doneTs ?? 0) || undefined,
-    durationMs: history.durationMs === 0 && (live.durationMs ?? 0) > 0
-      ? live.durationMs
-      : history.durationMs ?? live.durationMs,
+    durationMs: recovered ? recovered.durationMs
+      : history.durationMs === 0 && (live.durationMs ?? 0) > 0
+        ? live.durationMs
+        : history.durationMs ?? live.durationMs,
     ...processMetadata,
     // Detail is a monotonic, revision-bound local projection. A later summary
     // may legitimately contain no heavyweight blocks; it must not erase pages

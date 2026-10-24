@@ -3,7 +3,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
-import type { Block } from "../src/domain/conversation.ts";
+import type { Block, Turn } from "../src/domain/conversation.ts";
 import { isComposerBusy } from "../src/composer-submit.ts";
 import {
   MAX_BACKGROUND_PROCESS_ITEMS,
@@ -25,6 +25,8 @@ try {
   const { ChatView } = await harness.ssrLoadModule(
     "/src/components/ChatView.tsx");
   const { assistantContinuations: claudeContinuations } = await harness.ssrLoadModule("/src/assistant-continuations.ts");
+  const { mergeInitialHistory, mergeAuthoritativeTurnDetail } =
+    await harness.ssrLoadModule("/src/history-merge.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: PROTOCOL_VERSION,
     ts: 10,
@@ -343,7 +345,8 @@ try {
       sessions: [{ session_id: sid, engine }],
       runtimes: { [sid]: { ...createRuntime(), controlGeneration: "generation-1",
         turns: [{ id: "parent", prompt: "review", done: true, doneTs: 10_000,
-          forkPointId: "original-answer", checkpointId: "native-human", blocks: [] },
+          forkPointId: "original-answer", checkpointId: "native-human", blocks: [],
+          error: "Earlier response failed", interrupted: true, terminalSource: "failed" },
         { id: "unrelated", prompt: "other", done: true, doneTs: 11_000,
           forkPointId: "other-answer", blocks: [] }] } },
     };
@@ -371,6 +374,9 @@ try {
     assert.equal(parent.doneTs, engine === "claude" ? 22_000 : 10_000);
     assert.equal(parent.forkPointId, engine === "claude" ? "followup-answer" : "original-answer");
     assert.equal(parent.checkpointId, "native-human");
+    assert.equal(parent.error, engine === "claude" ? undefined : "Earlier response failed");
+    assert.equal(parent.interrupted, engine === "claude" ? undefined : true);
+    assert.equal(parent.terminalSource, engine === "claude" ? undefined : "failed");
     assert.equal(unrelated.doneTs, 11_000);
     if (engine === "claude") {
       completeSend({ type: "completion_state", completion_id: "followup-answer",
@@ -379,6 +385,101 @@ try {
       assert.equal(completedState.runtimes[sid].completion.unread, true);
     }
   }
+
+  // A provider failure and its later native continuation share a human row,
+  // but not a terminal outcome. Exercise live, cache, detail and rendered order.
+  const failedAnswer: Block = { kind: "text", message_id: "api-error", channel: "final",
+    text: "API Error: 400 upstream refused the request", done: true };
+  const recoveryWork: Block = { kind: "tool", message_id: "recovery-work", tool_use_id: "recheck",
+    tool: "Bash", input: { command: "check" }, background: true, done: true,
+    startedTs: 20_000, doneTs: 21_000, result: { content: "ok", is_error: false } };
+  const recoveryAnswer: Block = { kind: "text", message_id: "recovered", channel: "final",
+    text: "Recovered response complete.", background: true, done: true,
+    startedTs: 22_000, doneTs: 23_000 };
+  const failedParent: Turn = { id: "human", checkpointId: "native-human", prompt: "check",
+    done: true, doneTs: 10_000, error: "Earlier response failed", terminalSource: "failed",
+    forkPointId: "api-error", blocks: [failedAnswer] };
+  for (const subtype of ["error", "error_during_execution"]) {
+    let failureState = { ...initialState, focusedSid: sid,
+      sessions: [{ session_id: sid, engine: "claude" }],
+      runtimes: { [sid]: { ...createRuntime(), turns: [failedParent] } } };
+    for (const body of [
+      { type: "state", state: "running", msg_id: "human", continuation: true, seq: 1 },
+      { type: "turn_binding", msg_id: "human", turn_id: "new-failure", seq: 2 },
+      { type: "turn_end", turn_id: "new-failure", seq: 3, ts: 23,
+        result: { subtype, duration_ms: 3_000, is_error: true },
+        notification_context: { engine: "claude", space: "code" } },
+    ]) failureState = reduce(failureState, { type: "event", event: event({ sid, ...body }) });
+    const terminal = failureState.runtimes[sid].turns[0];
+    assert.equal(terminal.doneTs, 23_000);
+    assert.equal(terminal.forkPointId, "new-failure");
+    assert.equal(terminal.error, subtype === "error" ? "本次回复未完成，请重试。" : undefined);
+    assert.equal(terminal.interrupted, subtype === "error_during_execution" ? true : undefined);
+    assert.equal(terminal.terminalSource, subtype === "error" ? "failed" : "unexpected_interrupt");
+  }
+  const successfulHistory: Turn = { ...failedParent, doneTs: 23_000, forkPointId: "recovered",
+    error: undefined, terminalSource: undefined, blocks: [failedAnswer, recoveryWork, recoveryAnswer] };
+  const staleCache: Turn = { ...failedParent, doneTs: 23_000, forkPointId: "recovered",
+    blocks: [failedAnswer, recoveryWork, { ...recoveryAnswer, background: undefined }] };
+  const refreshed = reduce({ ...initialState, focusedSid: sid,
+    sessions: [{ session_id: sid, engine: "claude" }],
+    runtimes: { [sid]: { ...createRuntime(), turns: [staleCache] } },
+  }, { type: "event", event: event({ type: "history", sid, session_id: sid,
+    revision: "continuation-repaired", detail: "summary", in_progress: false,
+    has_more: false, events: [], turns: [successfulHistory] }) });
+  for (const merged of [
+    refreshed.runtimes[sid].turns[0],
+    mergeInitialHistory([successfulHistory], [staleCache])[0],
+    mergeInitialHistory([staleCache], [successfulHistory])[0],
+    mergeAuthoritativeTurnDetail(successfulHistory, staleCache),
+  ]) {
+    assert.equal(merged.error, undefined, "old failed cache cannot override a successful native continuation");
+    assert.equal(merged.terminalSource, undefined);
+    const markup = renderToStaticMarkup(createElement(ChatView, {
+      sid, engine: "claude", turns: [merged],
+    }));
+    assert.match(markup, /API Error:[\s\S]*Claude 继续处理[\s\S]*已处理[\s\S]*Recovered response complete\./);
+    assert.doesNotMatch(markup, /回复未完成/);
+  }
+  for (const history of [
+    { ...successfulHistory, done: false },
+    { ...successfulHistory, checkpointId: undefined },
+    { ...successfulHistory, doneTs: 9_000 },
+    { ...successfulHistory, forkPointId: "unproven-final" },
+    { ...successfulHistory, blocks: [failedAnswer, recoveryWork] },
+  ]) {
+    assert.equal(mergeInitialHistory([history], [failedParent])[0].error, failedParent.error,
+      "a receipt, process-only snapshot, other engine or older terminal cannot erase a failure");
+  }
+  const legacyHistory = { ...successfulHistory, blocks: [failedAnswer,
+    { ...recoveryAnswer, background: undefined, startedTs: undefined, doneTs: undefined }] };
+  const withScope = mergeInitialHistory([legacyHistory], [successfulHistory])[0];
+  const retainedAnswer = withScope.blocks.find((block: Block) =>
+    block.kind === "text" && block.message_id === "recovered");
+  assert.equal(retainedAnswer.background, true);
+  assert.equal(retainedAnswer.startedTs, 22_000);
+  assert.equal(retainedAnswer.doneTs, 23_000);
+
+  const laterWork: Block = { ...recoveryWork, message_id: "later-work", tool_use_id: "later-check",
+    startedTs: 30_000, doneTs: 31_000 };
+  const laterFailed: Turn = { ...successfulHistory, doneTs: 32_000, forkPointId: "later-error",
+    error: "Later response failed", terminalSource: "failed",
+    blocks: [...successfulHistory.blocks, laterWork, { ...failedAnswer, message_id: "later-error",
+      background: true, startedTs: 32_000, doneTs: 32_000 }] };
+  const failedMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid, engine: "claude", turns: [laterFailed],
+  })).split("Claude 继续处理");
+  assert.doesNotMatch(failedMarkup[1], /回复未完成/,
+    "a later failure cannot mark an earlier successful continuation failed");
+  assert.match(failedMarkup[2], /回复未完成/);
+  assert.equal(mergeInitialHistory([successfulHistory], [laterFailed])[0].error, laterFailed.error);
+  const runningMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid, engine: "claude", activeTurnId: "human", activePhase: "process",
+    turns: [{ ...failedParent, blocks: [failedAnswer, { ...recoveryWork, done: false, result: undefined }] }],
+  })).split("Claude 继续处理")[1];
+  assert.match(runningMarkup, /正在处理/);
+  assert.doesNotMatch(runningMarkup, /回复未完成/,
+    "the earlier terminal cannot suppress a genuinely active native continuation");
 
   // A resident Claude can continue a settled turn after the browser has only
   // loaded its lightweight summary. A subsequent summary omits the Bash item,

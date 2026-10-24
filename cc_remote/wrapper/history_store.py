@@ -83,7 +83,8 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v48 retains Codex async task receipt boundaries in compact summaries.
 # v49 retains native child/task return identities for all engines.
 # v50 keeps return-link metadata out of process counts and timing.
-_SCHEMA_VERSION = 50
+# v51 repairs Claude's failed-answer -> native background continuation scope.
+_SCHEMA_VERSION = 51
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -1385,6 +1386,11 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if current in range(10, 51):
+                # Source bytes are unchanged. Rebuild only derived Claude
+                # narrative; retain native indexes, binary assets and engines.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
             if current in range(10, 44):
                 # Accepted human attachments change Claude turn ownership and
                 # cursors without changing transcript bytes. Rebuild only its
@@ -1559,7 +1565,7 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49):
+            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50):
                 # The independent v22-v44 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
