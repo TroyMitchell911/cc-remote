@@ -4482,6 +4482,64 @@ test("side chat scope centered attachments fit a narrow viewport", async ({ page
   await page.screenshot({ path: testInfo.outputPath("btw-centered-mobile.png") });
 });
 
+test("session message tool keeps its receipt in chronology while later work continues", async ({ page }, info) => {
+  const message = "请整理当前任务的目标、已完成的改动、验证结果与待办事项，回复一份完整交接说明。";
+  const relay = await mockRightPanelRelay(page, { engine: "claude", retained: false,
+    secondParent: true, historyReply: () => null });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true,
+      value: { writeText: async (text: string) => { document.documentElement.dataset.copiedMessage = text; } } });
+  });
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(c => c.type === "get_history")).toBe(true);
+  const sid = "layout-parent", turnId = "message-turn";
+  relay.emit({ type: "user_msg", sid, msg_id: turnId, prompt: "确认交接信息后继续检查" });
+  relay.emit({ type: "turn_binding", sid, msg_id: turnId, turn_id: turnId });
+  relay.emit({ type: "state", sid, state: "running" });
+  relay.emit({ type: "tool_use", sid, turn_id: turnId, message_id: "assistant-send",
+    tool_use_id: "send-first", tool: "mcp__cc_remote_messages__send_message", category: "mcp",
+    input: { session_ref: "ccr:claude:layout-other", message, request_id: "first" } });
+  const turn = page.locator(`[data-turn-id="${turnId}"]`);
+  await turn.locator(".tool-group-h").click();
+  const first = turn.locator(".session-message-tool").first();
+  await expect(first.getByRole("status")).toHaveText("发送中");
+  await first.locator(".tool-h").click();
+  const node = await first.elementHandle();
+  await expect(first.getByRole("button", { name: "进入会话 Second parent" })).toBeEnabled();
+  await first.getByRole("button", { name: "复制发送内容", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-copied-message", message);
+  relay.emit({ type: "tool_result", sid, turn_id: turnId, tool_use_id: "send-first",
+    content: '[{"type":"text","text":"{\\"status\\":\\"accepted\\"}"}]', is_error: false });
+  await expect(first.getByRole("status")).toHaveText("已发送");
+  relay.emit({ type: "assistant_msg_start", sid, turn_id: turnId, message_id: "later-thinking", channel: "thinking" });
+  relay.emit({ type: "delta", sid, turn_id: turnId, message_id: "later-thinking", channel: "thinking",
+    text: "继续检查本地改动。" });
+  relay.emit({ type: "assistant_msg_end", sid, turn_id: turnId, message_id: "later-thinking", channel: "thinking" });
+  relay.emit({ type: "tool_use", sid, turn_id: turnId, message_id: "later-assistant",
+    tool_use_id: "send-second", tool: "mcp__cc_remote_messages__send_message", category: "mcp",
+    input: { session_ref: "ccr:claude:missing", message: "另一条独立消息", request_id: "second" } });
+  await turn.locator(".tool-group-h").last().click();
+  const second = turn.locator(".session-message-tool").last();
+  await expect(second.getByRole("status")).toHaveText("发送中");
+  relay.emit({ type: "tool_result", sid, turn_id: turnId, tool_use_id: "send-second",
+    content: '{"status":"rejected","reason":"target_unavailable"}', is_error: true });
+  await expect(second.getByRole("status")).toHaveText("发送失败");
+  await second.locator(".tool-h").click();
+  await expect(second.locator(".session-message-tool-target button")).toBeDisabled();
+  await expect(first.getByRole("status")).toHaveText("已发送");
+  expect(await node!.evaluate(el => el.isConnected && el.hasAttribute("open"))).toBe(true);
+  expect(await first.evaluate(el => !!(el.compareDocumentPosition(
+    [...el.closest(".turn")!.querySelectorAll(".prose")].find(p => p.textContent?.includes("继续检查本地改动。"))!,
+  ) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+  await expect(turn.locator(".session-message-sent")).toHaveCount(0);
+  await expect(turn.locator(".turn-working")).not.toContainText("已发送");
+  await expect(first.locator(".tool-raw[open]")).toHaveCount(0);
+  expect(await first.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  await first.scrollIntoViewIfNeeded();
+  await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+  await page.screenshot({ path: info.outputPath("inline-send-tool.png") });
+});
+
 for (const centered of [false, true]) {
   test(`right panel layout restores ${centered ? "centered" : "docked"} file preview across engines`, async ({ page }) => {
     await page.setViewportSize({ width: 1568, height: 1000 });
@@ -13782,7 +13840,14 @@ for (const scenario of [
           turns: [{ id: `turn-${sid}`, prompt: sid === originSid ? "请审查消息来源" : "目标会话的完整历史",
             sourceThreadId: sid === originSid ? sourceRef : undefined,
             sessionMessages: sid === targetSid ? [{ itemId: "sent", threadId: returnRef, status: "sent" }] : [],
-            done: true, blocks: [{ kind: "text", message_id: `answer-${sid}`, done: true,
+            done: true, blocks: [...(sid === targetSid ? [{ kind: "tool" as const,
+              message_id: "send-assistant", tool_use_id: "sent",
+              tool: native ? "mcp__codex_app__send_message_to_thread" : "mcp__cc_remote_messages__send_message",
+              category: "mcp" as const, done: true,
+              input: native ? { threadId: returnRef, input: "交接说明\n已完成验证，请继续。" }
+                : { session_ref: returnRef, message: "交接说明\n已完成验证，请继续。", request_id: "handoff-test" },
+              result: { content: '{"status":"accepted"}', is_error: false },
+            }] : []), { kind: "text", message_id: `answer-${sid}`, done: true,
               text: sid === originSid ? "原会话回答" : "这里是可继续交流的目标会话" }] }] };
       },
     });
@@ -13804,7 +13869,19 @@ for (const scenario of [
     await expect(composer).toHaveValue("");
     await composer.fill("目标会话自己的草稿");
     await page.screenshot({ path: testInfo.outputPath("session-direct-navigation.png") });
-    await page.getByRole("button", { name: /已发送给 代码审查/ }).click();
+    await expect(page.locator(".session-message-sent")).toHaveCount(0);
+    await page.locator(".turn-process-head").click();
+    await page.locator(".tool-group-h").click();
+    const tool = page.locator(".session-message-tool");
+    await expect(tool.locator(".session-message-tool-status")).toHaveText("已发送");
+    await tool.locator(".tool-h").click();
+    await expect(tool.locator(".session-message-tool-content")).toContainText("交接说明\n已完成验证，请继续。");
+    await expect(tool.locator(".session-message-tool-account")).toHaveText("iris");
+    await expect(tool.getByText('{"status":"accepted"}', { exact: true })).toHaveCount(0);
+    await tool.locator("summary", { hasText: "原始输出" }).click();
+    await expect(tool.getByText('{"status":"accepted"}', { exact: true })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("session-message-tool.png") });
+    await tool.getByRole("button", { name: "进入会话 代码审查", exact: true }).click();
     await expect(page.getByText("原会话回答", { exact: true })).toBeVisible();
     await expect(composer).toHaveValue("原会话未发送的草稿");
     await expect(page.locator("html")).toHaveAttribute("data-engine", scenario.engine);

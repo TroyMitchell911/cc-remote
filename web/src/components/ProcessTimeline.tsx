@@ -20,6 +20,7 @@ import { MessageBlock } from "./MessageBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { HistoryUserImage } from "./HistoryUserImage";
 import { ToolGroup } from "./ToolGroup";
+import type { SessionMessageToolContext } from "../session-messages";
 import { ToolInput, ToolOutput } from "./LazyToolDetails";
 import { displayCommand } from "../tool-command";
 import {
@@ -715,6 +716,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
   externalPlanItemId,
+  sessionMessages, sessionLink, onOpenSession,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
   onInteractionStart, onInteractionEnd, onOpenAgent }: {
   blocks: Block[];
@@ -764,7 +766,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
   onInteractionStart?: () => number;
   onInteractionEnd?: (token: number, followOutput?: boolean) => void;
   onOpenAgent?: (runId: string, title?: string) => void;
-}) {
+} & SessionMessageToolContext) {
   const retainedPlanBlock = useRef<ProcessBlock | null>(null);
   // Codex does not expose its private chain of thought in official clients.
   // Keep actionable commentary, plans, hook failures and tools, but suppress
@@ -1012,7 +1014,8 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
             ? engine === "dsh" ? <Suspense key={`tools-${row.tools[0].tool_use_id}`} fallback={<ToolGroup tools={row.tools} active={processActive} />}>
                 <DshToolTree tools={row.tools} active={processActive} />
               </Suspense> : <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
-                active={processActive} />
+                active={processActive} sessionMessages={sessionMessages}
+                sessionLink={sessionLink} onOpenSession={onOpenSession} />
             : <TimelineItem key={row.block.kind === "text"
                 ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
                 block={row.block} expandThinking={engine === "claude"}

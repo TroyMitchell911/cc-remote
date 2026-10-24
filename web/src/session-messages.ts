@@ -1,4 +1,19 @@
-import type { SessionInfo } from "./protocol";
+import type { SessionInfo, SessionMessageReceipt } from "./protocol";
+
+export interface SessionMessageTarget {
+  title: string;
+  available: boolean;
+  account?: string | null;
+}
+
+export interface SessionMessageNavigation {
+  sessionLink?: (id: string) => SessionMessageTarget;
+  onOpenSession?: (id: string) => void;
+}
+
+export interface SessionMessageToolContext extends SessionMessageNavigation {
+  sessionMessages?: readonly SessionMessageReceipt[] | null;
+}
 
 const NATIVE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const LOCAL_REF = /^ccr:(claude|codex):([A-Za-z0-9][A-Za-z0-9._@-]{0,110})$/;
