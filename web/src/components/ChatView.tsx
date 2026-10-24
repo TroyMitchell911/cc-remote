@@ -26,7 +26,7 @@ import type { Space } from "../protocol";
 import type { LoadTurnFilePage } from "../turn-file-pages";
 import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
-import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
+import { assistantContinuations, continuationTerminalOwner, type AssistantContinuation } from "../assistant-continuations";
 import { returnRunId, returnedAgents } from "../agent-returns";
 import { TimedMessageTag } from "./TimedMessageTag";
 import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
@@ -2889,6 +2889,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               </button> : null;
             };
             const lastContinuation = narrative.continuations.at(-1);
+            const terminalContinuation = engine === "claude"
+              ? continuationTerminalOwner(t, narrative.continuations) : undefined;
             const originalProcessItems = presentableProcessBlocks(
               narrative.original, engine);
             const enclosingTaskActive = activeTurnId === t.id;
@@ -2901,7 +2903,11 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
             // A failed/interrupted enclosing terminal is authoritative. A
             // successful answer may still own genuine background agent work,
             // but a stale child flag must never animate beside "已打断".
-            const terminalProblem = t.done && (!!t.interrupted || !!t.error);
+            const laterClaudeContinuation = engine === "claude" && lastContinuation
+              && lastContinuation.startedTs != null && t.doneTs != null
+              && lastContinuation.startedTs > t.doneTs;
+            const terminalProblem = t.done && (!!t.interrupted || !!t.error)
+              && !laterClaudeContinuation;
             const working = !terminalProblem && (
               enclosingTaskActive || !t.done || activeTimeline);
             // A source can positively report process presence while an
@@ -3006,12 +3012,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 && enclosingTaskActive && !terminalProblem;
               const disclosureKey = segment
                 ? `${processOpenKey}\u0000continuation:${segment.id}` : processOpenKey;
+              const ownsTerminal = engine !== "claude" || segment === terminalContinuation;
               return (
               <ProcessTimeline blocks={segment?.blocks ?? narrative.original}
                 done={segment ? !continuing : t.done || !!lastContinuation}
                 active={activePhase === "process" && (segment ? continuing : !lastContinuation)} engine={engine}
-                outcome={t.error ? "failed" : t.interrupted ? "interrupted" : undefined}
-                problem={t.error}
+                outcome={ownsTerminal ? t.error ? "failed" : t.interrupted ? "interrupted" : undefined : undefined}
+                problem={ownsTerminal ? t.error : undefined}
                 durationMs={segment || engine === "codex" || (lastContinuation
                   && t.doneTs != null && lastContinuation.startedTs != null
                   && t.doneTs > lastContinuation.startedTs) ? undefined : t.durationMs}

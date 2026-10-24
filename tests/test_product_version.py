@@ -54,7 +54,13 @@ def test_readmes_use_safe_markdown_for_navigation_and_images():
         assert '<p align="center">' not in document
         assert "<img " not in document
         assert "<a href=" not in document
-        assert document.count("](assets/") == 6
+        images = re.findall(r"!\[[^\]]*\]\((assets/[^)]+)\)", document)
+        assert images, "README should include a product screenshot"
+        for image in images:
+            assert (ROOT / image).is_file(), f"Missing README screenshot: {image}"
+    assert set(re.findall(r"!\[[^\]]*\]\((assets/[^)]+)\)", readme)) == set(
+        re.findall(r"!\[[^\]]*\]\((assets/[^)]+)\)", readme_en)
+    )
 
     assert "[English](README_en.md)" in readme
     assert "[中文](README.md)" in readme_en
