@@ -1072,9 +1072,9 @@ export function Composer(p: Props) {
                 ? `执行环境：${permissionProfileName ?? "默认"}；审批：${perm?.name ?? "读取中"}`
                 : "点击切换权限模式")}
           >
-            {deferredClaudeControls
+            <span className="hint-mode-label">{deferredClaudeControls
               ? externalClaudeOwner
-              : p.permissionProfilePending ? "环境切换中…" : modeLabel}
+              : p.permissionProfilePending ? "环境切换中…" : modeLabel}</span>
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>}
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{

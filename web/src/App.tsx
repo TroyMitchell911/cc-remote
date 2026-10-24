@@ -6185,7 +6185,9 @@ export default function App() {
               sid={focusedSid} turns={historyView.turns}
               sessionLink={(nativeId) => {
                 const session = findMessageSession(nativeId);
-                return { title: relatedSessionTitle(session, nativeId), available: !!session };
+                return { title: relatedSessionTitle(session, nativeId), available: !!session,
+                  account: session?.claude_profile_id ?? session?.codex_profile_id
+                    ?? (session?.session_id.includes("@") ? session.session_id.split("@")[0] : undefined) };
               }}
               onOpenSession={space === "code" ? (nativeId) => {
                 const session = findMessageSession(nativeId);

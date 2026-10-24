@@ -1,11 +1,13 @@
 # Claude account quota
 
-The quota meter reads on session focus/reconnect, when opened or refreshed, and
-once per minute while the Claude page is visible. Returning to the page resumes
-these periodic reads. This does not send a prompt, resume an engine, modify history,
-interrupt work, or consume model tokens. Native `RateLimitEvent` updates remain
-enabled. The Wrapper coalesces reads per account with a 15-second minimum
-interval, including failures, across sessions and browser clients.
+The quota meter reads the Wrapper's account cache on session focus/reconnect,
+when opened or refreshed, and once per minute while the Claude page is visible.
+Native `RateLimitEvent` updates remain enabled. Active helper queries are **off
+by default**, even if a helper is already configured or the cache is empty.
+For an opted-in account, these same reads also refresh through its helper, with
+a 15-second minimum interval, including failures, across sessions and clients.
+Neither path sends a prompt, resumes an engine, modifies history, interrupts
+work, or consumes model tokens. There is no SDK query or model-request fallback.
 
 The pinned Agent SDK exposes quota events but no account-usage pull method.
 Active reads therefore use an optional **operator-owned usage helper**. The
@@ -15,6 +17,23 @@ No helper or authentication data comes from the browser. A helper must be a
 read-only query, not `claude -p`, `/usage` submitted as a chat prompt, or a tool
 that logs in, redeems credits or refreshes model conversations.
 
+Enable `usage_query_enabled: true` only for the intended account in the local
+Claude profile registry (see [account configuration](configuration_en.md#multiple-accounts)):
+
+```json
+{
+  "personal": {"label": "Personal", "config_dir": "/home/youruser/.claude", "default": true},
+  "custom": {"label": "Custom", "config_dir": "/home/youruser/.claude-custom", "usage_query_enabled": true}
+}
+```
+
+The field is a strict boolean; absent or false means native synchronization
+only. Existing helper users must explicitly opt in after upgrading. A legacy
+single account can use an explicit one-entry registry with its original native
+root; this keeps its session IDs. No account name or provider is special.
+The account configuration takes effect when Wrapper next starts. This setting
+and helper command stay local, never browser-supplied.
+
 Place a private, mode-0600 `claude-usage-helpers.json` in `CC_REMOTE_STATE_DIR`
 (normally `~/.cc-remote`). It is external configuration and survives upgrades.
 Use absolute paths and bind every entry to its actual native account root:
@@ -23,7 +42,7 @@ Use absolute paths and bind every entry to its actual native account root:
 {
   "version": 1,
   "profiles": {
-    "primary": {
+    "custom": {
       "config_dir": "/absolute/native/account/root",
       "command": ["/absolute/path/to/provider-usage-helper"]
     }
@@ -46,6 +65,7 @@ and stdout to 64 KiB. Stderr and raw errors are never shown or logged.
 {
   "five_hour": {"utilization": 37, "resets_at": "2026-10-01T12:00:00Z"},
   "seven_day": {"utilization": 12.5, "resets_at": "2026-10-05T12:00:00Z"},
+  "monthly": {"utilization": 16, "resets_at": "2026-11-01T00:00:00Z"},
   "seven_day_opus": null,
   "seven_day_sonnet": null
 }
@@ -58,12 +78,25 @@ account details and paid-credit balances are discarded. Newer native events
 win over older in-flight HTTP results. Invalid results do not replace valid
 observations. Cached windows expire individually at their reset time.
 
-A missing helper keeps native-event synchronization and shows that active
-reads are not configured; this does not mean the provider lacks a usage API.
+`monthly` is optional and uses the same percentage/reset fields. It represents
+the provider's actual subscription cycle, never a guessed 30-day duration. A
+monthly observation without a reset expires after 15 minutes for freshness.
+The UI shows only present windows, in 5-hour / weekly / monthly order: 5-hour
+plus monthly, monthly only, and all three are supported without empty rows.
+Use `seven_day: null` when a snapshot explicitly has no weekly quota, and
+likewise null any other unsupported window to clear an older cached value.
+Missing fields preserve existing observations, so sparse native events cannot
+erase a helper's monthly quota. The context ring remains a separate control.
+
+A disabled query keeps native-event synchronization and reports the disabled
+setting without an error. An enabled account without a helper shows that its
+query source needs configuring; it does not try an inferred URL or SDK method.
 A failed read keeps still-valid observations with a
 refresh-failure notice; absent data is not reported as exhausted quota.
-The existing status wire shape is reused; Codex's app-server status, coupons
-and account authentication paths are unchanged.
+Protocol v83 adds optional `monthly` to account quota snapshots/events and
+`quota_query_state` to status reports. All control-link tiers must upgrade
+together. Codex's app-server status, coupons and account authentication paths
+are unchanged.
 
 For a private gateway, the provider helper can GET its existing
 `/api/oauth/usage` endpoint using the gateway's own authentication and release

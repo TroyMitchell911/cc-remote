@@ -1,5 +1,6 @@
 """Active quota reads never create, resume, interrupt or write a model turn."""
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import sys
@@ -7,8 +8,8 @@ import time
 
 import pytest
 
-from cc_remote.claude_profiles import ClaudeProfile
-from cc_remote.protocol import GetStatus, StatusReport
+from cc_remote.claude_profiles import ClaudeProfile, ClaudeProfileRegistry
+from cc_remote.protocol import GetStatus, StatusReport, deserialize, serialize
 from cc_remote.wrapper import claude_usage
 from cc_remote.wrapper.claude_rate_limits import ClaudeRateLimitStore
 from cc_remote.wrapper.claude_usage import ClaudeUsageError, ClaudeUsageReader
@@ -29,6 +30,14 @@ def configure(reader, profile, command):
         profile.id: {"config_dir": str(profile.config_dir), "command": command},
     }}))
     reader.path.chmod(0o600)
+
+
+def enable_queries(machine):
+    machine._claude_profiles = ClaudeProfileRegistry(tuple(
+        replace(profile, usage_query_enabled=True)
+        for profile in machine._claude_profiles
+    ))
+    return machine._claude_profiles.default
 
 
 def test_usage_percentages_and_null_windows_are_not_sdk_fractions(tmp_path):
@@ -70,7 +79,8 @@ def test_new_native_observation_wins_over_inflight_snapshot(tmp_path):
 @pytest.mark.asyncio
 async def test_real_helper_receives_only_profile_binding(monkeypatch, tmp_path):
     reader = ClaudeUsageReader(tmp_path)
-    profile = ClaudeProfile("company", "Company", tmp_path / "native")
+    profile = ClaudeProfile("company", "Company", tmp_path / "native",
+                            usage_query_enabled=True)
     monkeypatch.setenv("WRAPPER_TOKEN", "must-not-reach-helper")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "wrong-account")
     code = ("import json,os,sys; d=json.load(sys.stdin); "
@@ -84,7 +94,7 @@ async def test_real_helper_receives_only_profile_binding(monkeypatch, tmp_path):
         seen.append(await read())
     assert await reader.refresh(profile, apply) is None
     assert seen == [{"seven_day": {"utilization": 0, "resets_at": None}}]
-    other = ClaudeProfile(profile.id, profile.label, tmp_path / "other-account")
+    other = replace(profile, config_dir=tmp_path / "other-account")
     with pytest.raises(ClaudeUsageError, match="configuration invalid"):
         await reader.refresh(other, apply)
     reader.path.chmod(0o644)
@@ -96,7 +106,7 @@ async def test_real_helper_receives_only_profile_binding(monkeypatch, tmp_path):
 @pytest.mark.parametrize("mode", ["large", "fail", "timeout"])
 async def test_helper_bounds_output_time_and_private_errors(monkeypatch, tmp_path, mode):
     reader = ClaudeUsageReader(tmp_path)
-    profile = ClaudeProfile("primary", "Primary", tmp_path)
+    profile = ClaudeProfile("primary", "Primary", tmp_path, usage_query_enabled=True)
     code = {"large": "print('secret' * 30000)",
             "fail": "import sys; print('private'); sys.exit(1)",
             "timeout": "import time; time.sleep(10)"}[mode]
@@ -112,7 +122,7 @@ async def test_helper_bounds_output_time_and_private_errors(monkeypatch, tmp_pat
 async def test_busy_session_read_and_parallel_sessions_share_one_get(monkeypatch, tmp_path):
     machine, transport = _mk_machine()
     reader = machine._claude_usage_reader = ClaudeUsageReader(tmp_path)
-    profile = machine._claude_profiles.default
+    profile = enable_queries(machine)
     configure(reader, profile, [sys.executable])
     one, two = _mk_ctx("one", "one"), _mk_ctx("two", "two")
     one.state = "running"
@@ -154,7 +164,13 @@ async def test_failed_or_unconfigured_read_retains_native_cache(monkeypatch, tmp
     await machine._observe_claude_rate_limit_message(ctx, _event("five_hour", .42))
     request = GetStatus(sid=ctx.key, cmd_id="read", client_id="browser")
     report = await machine._handle_get_status(request)
-    assert report.component_errors == ["rate_limits: usage helper unavailable"]
+    assert report.quota_query_state == "disabled"
+    assert report.component_errors == []
+    assert report.rate_limits[0].primary.used_percent == 42
+    profile = enable_queries(machine)
+    report = await machine._handle_get_status(request)
+    assert report.quota_query_state == "unconfigured"
+    assert report.component_errors == []
     assert report.rate_limits[0].primary.used_percent == 42
     configure(reader, profile, [sys.executable])
     async def malformed(*args):
@@ -164,3 +180,99 @@ async def test_failed_or_unconfigured_read_retains_native_cache(monkeypatch, tmp
     assert report.component_errors == ["rate_limits: usage response invalid"]
     assert report.rate_limits[0].primary.used_percent == 42
     assert "private" not in report.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_disabled_queries_never_inspect_or_run_existing_helper(monkeypatch, tmp_path):
+    machine, _ = _mk_machine()
+    reader = machine._claude_usage_reader = ClaudeUsageReader(tmp_path)
+    profile = machine._claude_profiles.default
+    configure(reader, profile, [sys.executable, "-c", "raise AssertionError()"])
+    def forbidden(*args):
+        pytest.fail("disabled account must not access the helper or model")
+    monkeypatch.setattr(reader, "command", forbidden)
+    monkeypatch.setattr(reader, "_read", forbidden)
+    ctx = _mk_ctx("native", "native")
+    ctx.sdk = None
+    machine.sessions = {ctx.key: ctx}
+    for _ in range(3):
+        report = await machine._handle_get_status(GetStatus(sid=ctx.key))
+        assert report.quota_query_state == "disabled"
+        assert report.rate_limits == [] and not report.component_errors
+        assert await reader.refresh(profile, forbidden) == "usage query disabled"
+    await machine._observe_claude_rate_limit_message(ctx, _event("five_hour", .42))
+    report = await machine._handle_get_status(GetStatus(sid=ctx.key))
+    assert report.rate_limits[0].primary.used_percent == 42
+
+
+@pytest.mark.parametrize("windows", [
+    ("monthly",), ("five_hour", "monthly"), ("seven_day", "monthly"),
+    ("five_hour", "seven_day", "monthly"),
+])
+def test_monthly_usage_preserves_named_cycle_through_cache_and_protocol(tmp_path, windows):
+    now = int(time.time())
+    reset = datetime.fromtimestamp(now + 27 * 86400, timezone.utc).isoformat()
+    payload = {name: {"utilization": 16, "resets_at": reset} for name in windows}
+    store = ClaudeRateLimitStore(tmp_path)
+    store.observe_usage(payload, {}, now=now)
+    update, = ClaudeRateLimitStore(tmp_path).snapshot(now=now)
+    wire = deserialize(serialize(update))
+    assert wire.monthly.used_percent == 16
+    assert wire.monthly.resets_at == now + 27 * 86400
+    assert wire.monthly.window_duration_mins is None
+    assert (wire.primary is not None) == ("five_hour" in windows)
+    assert (wire.secondary is not None) == ("seven_day" in windows)
+    assert store.snapshot(now=now + 27 * 86400) == ()
+
+
+def test_monthly_clear_invalid_snapshot_and_native_updates(tmp_path):
+    now = int(time.time())
+    store = ClaudeRateLimitStore(tmp_path)
+    store.observe_usage({**usage(), "monthly": {"utilization": 22, "resets_at": None}}, {})
+    original = store.path.read_bytes()
+    with pytest.raises(ValueError):
+        store.observe_usage({"five_hour": None, "monthly": {"utilization": 101}}, {})
+    assert store.path.read_bytes() == original
+    store.observe(_event("five_hour", .6).rate_limit_info)
+    row, = store.snapshot()
+    assert row.monthly.used_percent == 22 and row.primary.used_percent == 60
+    store.observe_usage({"seven_day": None, "monthly": None}, dict(store.revisions))
+    row, = store.snapshot()
+    assert row.primary.used_percent == 60 and row.secondary is None and row.monthly is None
+    store.observe_usage({"monthly": {"utilization": 0, "resets_at": None}}, {}, now=now)
+    assert ClaudeRateLimitStore(tmp_path).snapshot(now=now)[0].monthly.used_percent == 0
+    assert store.snapshot(now=now + 901)[0].monthly is None
+
+
+@pytest.mark.asyncio
+async def test_opted_in_monthly_snapshot_is_account_scoped_and_read_only(monkeypatch, tmp_path):
+    machine, _ = _mk_machine()
+    reader = machine._claude_usage_reader = ClaudeUsageReader(tmp_path)
+    native = machine._claude_profiles.default
+    custom = ClaudeProfile("custom-account", "Custom", tmp_path / "custom",
+                           usage_query_enabled=True)
+    machine._claude_profiles = ClaudeProfileRegistry((native, custom))
+    machine._claude_rate_limit_stores[custom.id] = ClaudeRateLimitStore(tmp_path / "custom-cache")
+    configure(reader, custom, [sys.executable])
+    ctx = _mk_ctx("custom-session", "custom-session")
+    ctx.claude_profile_id = custom.id
+    ctx.sdk = None
+    other = _mk_ctx("native-session", "native-session")
+    other.claude_profile_id = native.id
+    other.sdk = None
+    machine.sessions = {ctx.key: ctx, other.key: other}
+    calls = []
+    async def read(profile, command):
+        calls.append(profile.id)
+        return {"five_hour": {"utilization": 28}, "seven_day": None,
+                "monthly": {"utilization": 16}}
+    monkeypatch.setattr(reader, "_read", read)
+    result = await machine._handle_get_status(GetStatus(sid=ctx.key))
+    assert result.quota_query_state == "enabled" and not result.component_errors
+    wire = deserialize(serialize(result))
+    assert wire.rate_limits[0].monthly.used_percent == 16
+    assert wire.rate_limits[0].primary.used_percent == 28
+    assert wire.rate_limits[0].secondary is None
+    other_result = await machine._handle_get_status(GetStatus(sid=other.key))
+    assert other_result.rate_limits == [] and other_result.quota_query_state == "disabled"
+    assert calls == [custom.id]

@@ -650,7 +650,7 @@ export interface StatusRuntime {
 export interface StatusContext { used_tokens?: number | null; max_tokens?: number | null; percentage?: number | null }
 export interface StatusAccount { auth_type: string; plan_type?: string | null; requires_openai_auth: boolean }
 export interface StatusRateWindow { used_percent?: number | null; resets_at?: number | null; window_duration_mins?: number | null }
-export interface StatusRateLimit { limit_id?: string | null; limit_name?: string | null; plan_type?: string | null; rate_limit_reached_type?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null }
+export interface StatusRateLimit { limit_id?: string | null; limit_name?: string | null; plan_type?: string | null; rate_limit_reached_type?: string | null; primary?: StatusRateWindow | null; secondary?: StatusRateWindow | null; monthly?: StatusRateWindow | null }
 export interface StatusRateLimitResetCredit { id: string; granted_at: number; expires_at?: number | null; reset_type: "codexRateLimits" | "unknown"; status: "available" | "redeeming" | "redeemed" | "unknown"; title?: string | null; description?: string | null }
 export interface StatusRateLimitResetCredits { available_count: number; credits?: StatusRateLimitResetCredit[] | null }
 export interface StatusDailyUsageBucket { start_date: string; tokens: number }
@@ -671,6 +671,7 @@ export interface StatusReport extends Base {
   context: StatusContext;
   account?: StatusAccount | null;
   rate_limits: StatusRateLimit[];
+  quota_query_state?: "disabled" | "unconfigured" | "enabled" | null;
   reset_credits?: StatusRateLimitResetCredits | null;
   usage?: StatusUsage | null;
   component_errors: string[];
@@ -701,6 +702,7 @@ export interface RateLimitUpdate extends Base {
   reached_type?: string | null;
   primary?: StatusRateWindow | null;
   secondary?: StatusRateWindow | null;
+  monthly?: StatusRateWindow | null;
 }
 export interface ContextCategory { name: string; tokens: number; color: string; isDeferred?: boolean }
 export interface ContextReport extends Base {
@@ -764,7 +766,7 @@ export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 82;
+export const PROTOCOL_VERSION = 83;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

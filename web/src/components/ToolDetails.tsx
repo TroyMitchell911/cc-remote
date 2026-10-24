@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { readableToolInput, readableToolOutput } from "../tool-details";
 
-function RawToolData({ label, value }: { label: string; value: unknown }) {
+export function RawToolData({ label, value }: { label: string; value: unknown }) {
   const [open, setOpen] = useState(false);
   return <details className="tool-raw" onToggle={(event) => setOpen(event.currentTarget.open)}>
     <summary>{label}</summary>

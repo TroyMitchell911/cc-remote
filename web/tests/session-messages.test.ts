@@ -3,7 +3,8 @@ import { createServer } from "vite";
 import type { ServerEvent, SessionInfo } from "../src/protocol.ts";
 import { PROTOCOL_VERSION } from "../src/protocol.ts";
 import { resolveRelatedSession } from "../src/session-messages.ts";
-import { outgoingSessionMessages } from "../src/session-message-receipts.ts";
+import { outgoingSessionMessages, sessionMessageForTool } from "../src/session-message-receipts.ts";
+import type { ToolBlock } from "../src/domain/conversation.ts";
 
 const sessions: SessionInfo[] = [
   { session_id: "nyx@sender", engine: "codex", space: "code", summary: "开发" },
@@ -44,6 +45,25 @@ assert.deepEqual(outgoingSessionMessages({ ...receiptTurn, blocks: [{
   server: "codex_app", input: { threadId: "sender" }, done: true,
   result: { content: "rejected", is_error: true },
 }] }), [{ itemId: "call", threadId: "sender", status: "failed" }]);
+
+const sendTool: ToolBlock = { kind: "tool", message_id: "m", tool_use_id: "send-one",
+  tool: "mcp__cc_remote_messages__send_message", done: false,
+  input: { session_ref: "ccr:claude:nyx@claude", message: "Line one\nLine two", request_id: "r" } };
+assert.equal(sessionMessageForTool(sendTool)?.message, "Line one\nLine two");
+assert.equal(sessionMessageForTool({ ...sendTool, tool: "mcp__other__send_message" }), null);
+assert.equal(sessionMessageForTool({ ...sendTool, input: { ...sendTool.input, session_ref: "https://example.com" } }), null);
+assert.equal(sessionMessageForTool(sendTool, [
+  { itemId: "send-two", threadId: "ccr:claude:nyx@claude", status: "sent" },
+  { itemId: "send-one", threadId: "ccr:claude:another@target", status: "sent" },
+])?.status, "sending", "another call or target cannot supply this tool's receipt");
+assert.equal(sessionMessageForTool({ ...sendTool, done: true,
+  result: { content: '{"status":"queued"}', is_error: false } }, [
+  { itemId: "send-one", threadId: "ccr:claude:nyx@claude", status: "sent" },
+])?.status, "sent", "a later delivery receipt updates the original queued tool in place");
+assert.equal(sessionMessageForTool({ ...sendTool, done: true,
+  result: { content: "transport failed", is_error: true } })?.status, "failed");
+assert.equal(sessionMessageForTool({ ...sendTool, tool: "send_message_to_thread", server: "codex_app",
+  input: { threadId: "sender", input: "Native message body" } })?.message, "Native message body");
 
 const harness = await createServer({ root: process.cwd(), appType: "custom", logLevel: "silent",
   server: { middlewareMode: true, watch: null } });

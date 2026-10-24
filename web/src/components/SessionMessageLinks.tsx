@@ -1,11 +1,9 @@
 import type { Turn } from "../domain/conversation";
-import { outgoingSessionMessages } from "../session-message-receipts";
 import { Icon } from "../icons";
 import "./session-messages.css";
 
-export default function SessionMessageLinks({ turn, source, resolve, onOpen }: {
+export default function SessionMessageLinks({ turn, resolve, onOpen }: {
   turn: Turn;
-  source?: boolean;
   resolve?: (nativeId: string) => { title: string; available: boolean };
   onOpen?: (nativeId: string) => void;
 }) {
@@ -13,7 +11,7 @@ export default function SessionMessageLinks({ turn, source, resolve, onOpen }: {
     const target = resolve?.(id);
     const enabled = !!onOpen && !!target?.available;
     return <button key={key} type="button"
-      className={source ? "session-message-source" : "session-message-sent"}
+      className="session-message-source"
       disabled={!enabled} title={enabled ? "进入会话" : "会话不可用或不在当前可见范围中"}
       onClick={() => onOpen?.(id)}>
       <Icon name="message" size={13} />
@@ -21,12 +19,6 @@ export default function SessionMessageLinks({ turn, source, resolve, onOpen }: {
       {enabled && <span aria-hidden="true">↗</span>}
     </button>;
   };
-  if (source) return turn.sourceThreadId
+  return turn.sourceThreadId
     ? link(turn.sourceThreadId, "来自会话 ·", "source") : null;
-  return outgoingSessionMessages(turn).map((receipt) => link(
-    receipt.threadId,
-    receipt.status === "queued" ? "已排队发送给" : receipt.status === "sent" ? "已发送给" : receipt.status === "failed"
-      ? "未能发送给" : turn.done ? "发送状态未确认 ·" : "正在发送给",
-    receipt.itemId,
-  ));
 }

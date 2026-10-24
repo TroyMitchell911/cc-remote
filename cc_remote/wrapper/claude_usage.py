@@ -70,6 +70,10 @@ class ClaudeUsageReader:
         authoritative, so native events received after a GET are never replaced
         with an old cached response.
         """
+        # An absent cache never authorizes a request. Even an existing helper
+        # must be explicitly enabled in this account's local configuration.
+        if not profile.usage_query_enabled:
+            return "usage query disabled"
         async with self._locks.setdefault(profile.id, asyncio.Lock()):
             command = self.command(profile)
             if command is None:

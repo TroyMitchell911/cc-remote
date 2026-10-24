@@ -9,6 +9,9 @@ import {
 } from "../pointer-tap";
 import { isToolFailure, presentTool } from "../tool-presentation";
 import { ToolInput, ToolOutput } from "./ToolDetails";
+import { sessionMessageForTool } from "../session-message-receipts";
+import type { SessionMessageToolContext } from "../session-messages";
+import { SessionMessageToolDetails, SessionMessageToolStatus } from "./SessionMessageToolDetails";
 
 function EditDiff({ oldString, newString, serverDiff }: {
   oldString: string; newString: string; serverDiff?: string | null;
@@ -36,11 +39,14 @@ function EditDiff({ oldString, newString, serverDiff }: {
   );
 }
 
-export function ToolCallCard({ block }: { block: ToolBlock }) {
+export function ToolCallCard({ block, active = true, sessionMessages, sessionLink, onOpenSession }: {
+  block: ToolBlock; active?: boolean;
+} & SessionMessageToolContext) {
   const [open, setOpen] = useState(false);
   const tapGuard = useRef(new PointerTapGuard());
   const status = !block.done ? "run" : isToolFailure(block) ? "err" : "done";
   const presentation = presentTool(block);
+  const message = sessionMessageForTool(block, sessionMessages);
   const inp = block.input as { file_path?: string; old_string?: string; new_string?: string; content?: string };
   const isEdit = block.tool === "Edit";
   const isWrite = block.tool === "Write";
@@ -58,13 +64,15 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
   const header = (
     <>
       <span className="tool-ic"><Icon name={presentation.icon} size={15} /></span>
-      <span className="tool-nm">{presentation.title}</span>
+      <span className="tool-nm">{message
+        ? block.tool.endsWith("send_message_to_thread") ? "send_message_to_thread" : "send_message"
+        : presentation.title}</span>
       <span className="tool-arg">{presentation.subtitle}</span>
-      <span className={`tool-st ${status}`}>
+      {message ? <SessionMessageToolStatus message={message} pending={active && !block.done} /> : <span className={`tool-st ${status}`}>
         {status === "done" ? <Icon name="verify" size={16} />
           : status === "err" ? <Icon name="close" size={16} />
           : null}
-      </span>
+      </span>}
       {hasBody && (
         <span className="tool-chev"><Icon name="chev" size={16} sw={2} /></span>
       )}
@@ -78,7 +86,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
     );
   }
   return (
-    <details className="tool" open={open}>
+    <details className={`tool${message ? " session-message-tool" : ""}`} open={open}>
       <summary className="tool-h"
         onPointerDown={(event) => {
           tapGuard.current.pointerDown(
@@ -104,6 +112,8 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
           if (tapGuard.current.consumeClick(event.detail)) setOpen(!open);
         }}>{header}</summary>
       {open && <div className="tool-b">
+        {message ? <SessionMessageToolDetails block={block} message={message}
+          sessionLink={sessionLink} onOpenSession={onOpenSession} /> : <>
         {block.progress && <div className="tool-progress">{block.progress}</div>}
         {resultSummary && resultSummary !== output && (
           <div className="tool-progress">{resultSummary}</div>
@@ -138,6 +148,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
             {block.result.duration_ms != null && <span>{Math.max(0, block.result.duration_ms / 1000).toFixed(1)}s</span>}
           </div>
         )}
+        </>}
       </div>}
     </details>
   );

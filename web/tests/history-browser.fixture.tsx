@@ -13,6 +13,7 @@ import { BackgroundTasksFixture } from "./fixtures/background-tasks";
 import { MermaidArtifactFixture } from "./fixtures/mermaid-artifact";
 import { MediaLayoutFixture } from "./fixtures/media-layout";
 import { ReadingNavigationFixture } from "./fixtures/reading-navigation";
+import { QuotaLayoutFixture } from "./fixtures/quota-layout";
 
 import "../src/index.css";
 import "../src/App.css";
@@ -3228,6 +3229,7 @@ function CodexFileCitationFixture() {
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
+    : rootParams.has("quota-layout") ? <QuotaLayoutFixture />
     : rootParams.has("reading-navigation") ? <ReadingNavigationFixture />
     : rootParams.has("media-layout") ? <MediaLayoutFixture />
     : rootParams.has("turn-usage") ? <TurnUsageFixture />

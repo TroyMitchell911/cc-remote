@@ -23,6 +23,7 @@ import type {
   ProcessBlock, TextBlock, Turn,
 } from "../domain/conversation";
 import type { Space } from "../protocol";
+import type { SessionMessageNavigation } from "../session-messages";
 import type { LoadTurnFilePage } from "../turn-file-pages";
 import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
@@ -345,7 +346,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   initialReadingState, onReadingStateSave,
   surface = "code" }: {
   ref?: Ref<ChatViewHandle>;
-  sessionLink?: (nativeId: string) => { title: string; available: boolean };
+  sessionLink?: SessionMessageNavigation["sessionLink"];
   onOpenSession?: (nativeId: string) => void;
   turnUsage?: TurnUsageReadings;
   sid: string | null;
@@ -3015,6 +3016,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               const ownsTerminal = engine !== "claude" || segment === terminalContinuation;
               return (
               <ProcessTimeline blocks={segment?.blocks ?? narrative.original}
+                sessionMessages={t.sessionMessages} sessionLink={sessionLink}
+                onOpenSession={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined}
                 done={segment ? !continuing : t.done || !!lastContinuation}
                 active={activePhase === "process" && (segment ? continuing : !lastContinuation)} engine={engine}
                 outcome={ownsTerminal ? t.error ? "failed" : t.interrupted ? "interrupted" : undefined : undefined}
@@ -3149,7 +3152,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">
                   {t.sourceThreadId && <Suspense fallback={null}>
-                    <SessionMessageLinks turn={t} source resolve={sessionLink}
+                    <SessionMessageLinks turn={t} resolve={sessionLink}
                       onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
                   </Suspense>}
                   {t.timedTask && <TimedMessageTag task={t.timedTask} />}
@@ -3226,12 +3229,6 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               </div>
             )}
             {showProcessTimeline && renderProcess()}
-            {(!!t.sessionMessages?.length || t.blocks.some((b) =>
-              b.kind === "tool" && (b.tool.endsWith("send_message_to_thread")
-                || b.tool.endsWith("send_message")))) && <Suspense fallback={null}>
-              <SessionMessageLinks turn={t} resolve={sessionLink}
-                onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
-            </Suspense>}
             {modelNotices.map((notice) => <div className="turn-model-notice" key={notice.item_id} role="note">
               <Icon name="notify" size={15} />
               <span>{notice.summary}</span>

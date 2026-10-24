@@ -38,6 +38,7 @@ class ClaudeProfile:
     label: str
     config_dir: Path
     is_default: bool = False
+    usage_query_enabled: bool = False
 
     def public(self) -> dict[str, str]:
         return {"id": self.id, "label": self.label}
@@ -174,7 +175,7 @@ class ClaudeProfileRegistry:
                     "profile id")
             if not isinstance(entry, dict):
                 raise ValueError("Claude profile entries must be objects")
-            if set(entry) - {"label", "config_dir", "default"}:
+            if set(entry) - {"label", "config_dir", "default", "usage_query_enabled"}:
                 raise ValueError("Claude profile entry contains unknown fields")
             label = entry.get("label")
             if (
@@ -195,11 +196,15 @@ class ClaudeProfileRegistry:
             is_default = entry.get("default", False)
             if not isinstance(is_default, bool):
                 raise ValueError("Claude profile default must be a boolean")
+            usage_query_enabled = entry.get("usage_query_enabled", False)
+            if not isinstance(usage_query_enabled, bool):
+                raise ValueError("Claude profile usage_query_enabled must be a boolean")
             profiles.append(ClaudeProfile(
                 id=profile_id,
                 label=label,
                 config_dir=config_dir,
                 is_default=is_default,
+                usage_query_enabled=usage_query_enabled,
             ))
         return cls(tuple(profiles))
 

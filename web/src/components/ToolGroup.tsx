@@ -7,6 +7,7 @@ import {
   releaseDraggedPointer,
 } from "../pointer-tap";
 import { isToolFailure, presentTool } from "../tool-presentation";
+import type { SessionMessageToolContext } from "../session-messages";
 
 const ToolCallCard = lazy(() => import("./ToolCallCard").then((module) => ({ default: module.ToolCallCard })));
 
@@ -15,9 +16,9 @@ const ToolCallCard = lazy(() => import("./ToolCallCard").then((module) => ({ def
  * tool cards). ALWAYS collapsed by default — even while running, only the
  * summary shows live activity; the busy stack of Bash/Edit cards is hidden until
  * the user clicks. */
-export function ToolGroup({ tools, active = true }: {
+export function ToolGroup({ tools, active = true, sessionMessages, sessionLink, onOpenSession }: {
   tools: ToolBlock[]; active?: boolean;
-}) {
+} & SessionMessageToolContext) {
   const [open, setOpen] = useState(false);
   const tapGuard = useRef(new PointerTapGuard());
   const running = active && tools.some((t) => !t.done);
@@ -67,7 +68,8 @@ export function ToolGroup({ tools, active = true }: {
       </summary>
       {open && <div className="tool-group-b">
         <Suspense fallback={<span className="tool-lbl">读取工具详情…</span>}>
-        {tools.map((t) => <ToolCallCard key={t.tool_use_id} block={t} />)}
+        {tools.map((t) => <ToolCallCard key={t.tool_use_id} block={t} active={active}
+          sessionMessages={sessionMessages} sessionLink={sessionLink} onOpenSession={onOpenSession} />)}
         </Suspense>
       </div>}
     </details>

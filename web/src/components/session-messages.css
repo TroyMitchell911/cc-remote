@@ -1,13 +1,12 @@
-.session-message-source, .session-message-sent {
+.session-message-source {
   display: flex; align-items: center; gap: 7px;
   border: 0; background: transparent; color: var(--accent);
   font: inherit; font-size: 12px; text-align: left;
   padding: 0; cursor: pointer; max-width: 100%;
 }
 .session-message-source { margin-bottom: 8px; }
-.session-message-source > span:first-of-type, .session-message-sent > span:first-of-type {
+.session-message-source > span:first-of-type {
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }
-.session-message-source:disabled, .session-message-sent:disabled { cursor: default; opacity: .72; }
-.session-message-sent { margin: 10px 0; }
-.session-message-source:not(:disabled):hover, .session-message-sent:not(:disabled):hover { filter: brightness(1.15); }
+.session-message-source:disabled { cursor: default; opacity: .72; }
+.session-message-source:not(:disabled):hover { filter: brightness(1.15); }

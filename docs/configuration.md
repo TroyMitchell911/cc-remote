@@ -63,6 +63,12 @@ Claude 示例：
 }
 ```
 
+Claude 每个账号可选 `"usage_query_enabled": true` 开启**主动查询额度**，默认关闭。
+关闭时仍接收原生 `RateLimitEvent`，读取缓存不会请求模型或调用 SDK 查询。
+开启前须在本机为同一账号绑定只读额度 helper；未配置来源会在额度面板提示，
+不会自动猜测接口。helper 可以返回 5h、周、月的任意组合，前端只显示有数据的周期。
+详见[额度配置与数据格式](claude-usage.md)。该选项也随账号配置在 Wrapper 下次启动时生效。
+
 Codex 示例：
 
 ```json

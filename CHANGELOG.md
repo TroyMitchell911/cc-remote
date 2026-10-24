@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Add optional monthly account quotas alongside 5-hour and weekly windows, with
+  per-account active usage queries disabled by default. Native Claude quota
+  events continue without a helper or model request. Wire protocol v83 requires
+  Relay, Wrapper and Web to upgrade together.
+- Wrap long inline hashes and keep permission labels readable on narrow screens.
+
 ## v5.0.1
 
 Repair legacy Desktop compatibility, refresh the bilingual feature guides, and preserve Claude background continuations in history. Wire protocol v82 is unchanged. See the bilingual [release notes](docs/releases/v5.0.1.md).
