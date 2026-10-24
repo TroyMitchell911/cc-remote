@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## v5.0.0
+
+Add optional DSH integration alongside Claude/Codex, stabilize session history and previews, and harden reconnect recovery. Wire protocol v82 requires a coordinated upgrade from v79. See the bilingual [release notes](docs/releases/v5.0.0.md).
+
 - Reconcile streamed Claude text and thinking with canonical transcript message IDs to avoid duplicates after history refresh. Wire protocol v82 requires Relay, Wrapper and Web to upgrade together.
 - Retain file previews, centered layout, preview mode and reading position when switching engines or sessions.
 - Keep inline site icons visible in Markdown previews by excluding them from document image spacing.
@@ -23,6 +27,9 @@
 - Hide the return-to-bottom button after an intentional downward gesture reaches the latest content, including clamped wheel and touch gestures.
 - Ignore stale Codex child catalog entries whose source is missing, while retaining previously observed activity during temporary source failures.
 - Register agent-detail requests before sending them and honor replacement text updates to avoid lost fast responses and duplicated content.
+
+- Protect DSH creation, forks, uploads and controls against uncertain outcomes and reconnect replay; preserve queued work and shared resident capacity.
+- Reduce regression overhead and default local/CI pytest to two workers, preserving serial diagnostics and CI timing reports.
 
 ## v4.0.29
 

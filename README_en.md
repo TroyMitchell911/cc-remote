@@ -1,10 +1,10 @@
 # cc-remote
 
-**Use Claude Code and Codex on your machine from your phone, browser or terminal.**
+**Control Claude Code, Codex and DSH on your machine from a phone or browser.**
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v4.0.29** · Wire protocol v82
+**Product version: v5.0.0** · Wire protocol v82
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -57,7 +57,7 @@ features or wire protocol across different commits.
 ### Code and Work
 
 **Code** operates in your chosen project directory for development, debugging and
-other agent tasks. Both engines support it.
+other agent tasks. It supports Claude, Codex and the optional DSH integration.
 
 **Work** is a separate Claude/Codex workspace for documents, spreadsheets,
 presentations and research. It includes private projects, file/link/note sources,
@@ -67,7 +67,7 @@ library. Work sessions and material are separate from Code.
 
 ## Engines and features
 
-This development branch adds **DSH 0.2.1-rc.2**, using the current Code chat UI
+v5.0.0 adds optional **DSH 0.2.1-rc.2** integration, using the current Code chat UI
 and a separate white/blue default palette. It supports native commands, Skills,
 questions and approvals, steering/queueing, Goals, subagents, jobs and artifact
 previews. See [DSH integration](docs/dsh-integration.md) for pairing, verification

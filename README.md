@@ -1,10 +1,10 @@
 # cc-remote
 
-**在手机、浏览器和终端里，继续使用你机器上的 Claude Code 和 Codex。**
+**用手机、浏览器连接本机的 Claude Code、Codex 与 DSH。**
 
 自托管 · 多会话 · 多设备 · 实时工具过程 · Code / Work · Web / PWA / TUI
 
-**产品版本：v4.0.29** · Wire protocol v82
+**产品版本：v5.0.0** · Wire protocol v82
 
 [English](README_en.md) · [Release 安装（推荐）](#安装与升级) · [功能对照](#引擎与功能) · [源码体验](#快速开始) ·
 [终端工作台](#terminal-workspace) · [文档](#文档) · [更新记录](CHANGELOG_zh.md)
@@ -43,7 +43,7 @@ cc-remote 把本机 agent 的会话、工具过程、文件和运行控制带到
 
 ### Code 与 Work
 
-**Code** 面向你选择的项目目录，用于开发、调试和日常 agent 任务，支持两种引擎。
+**Code** 面向你选择的项目目录，用于开发、调试和日常 agent 任务，支持 Claude、Codex 和可选的 DSH。
 
 **Work** 是 Claude/Codex 的独立工作区，适合文档、表格、演示和资料整理。它有私有
 项目、文件／链接／笔记资料库、工作模板、Artifacts，以及一次、每日、每周定时任务。
@@ -52,7 +52,7 @@ cc-remote 把本机 agent 的会话、工具过程、文件和运行控制带到
 
 ## 引擎与功能
 
-当前开发分支新增 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界面与独立的白蓝默认配色。
+v5.0.0 新增可选的 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界面与独立的白蓝默认配色。
 支持原生命令、Skills、询问与审批、引导/排队、Goal、子代理、后台任务和产物预览。
 安装配对、验证方式与原生功能边界见 [DSH 接入说明](docs/dsh-integration.md)；
 模型认证仍由 DSH 管理，接入不会自动升级或迁移现有 DSH 数据。
