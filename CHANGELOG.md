@@ -4,11 +4,16 @@
 
 ## Unreleased
 
+## v5.1.0
+
+Add opt-in account quota windows and keep cross-session delivery receipts with their send tools. Wire protocol advances from v82 to v83. See the bilingual [release notes](docs/releases/v5.1.0.md).
+
 - Add optional monthly account quotas alongside 5-hour and weekly windows, with
   per-account active usage queries disabled by default. Native Claude quota
   events continue without a helper or model request. Wire protocol v83 requires
   Relay, Wrapper and Web to upgrade together.
 - Wrap long inline hashes and keep permission labels readable on narrow screens.
+- Show message delivery status, recipient, account and copyable content inside the originating MCP tool call; preserve receiving-session navigation and collapse raw tool data.
 
 ## v5.0.1
 
