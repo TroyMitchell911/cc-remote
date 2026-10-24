@@ -379,6 +379,12 @@ npm --prefix web run lint
 npm --prefix web run build
 ```
 
+本地与 CI 的 Python 回归都默认使用两个进程并行，配置统一放在 `pytest.ini`。
+Pytest 输出最慢的 20 项，CI 另保存 JUnit 耗时报告。
+需要串行排查时使用 `.venv/bin/python -m pytest -n 0`；开发时可用
+`.venv/bin/python -m pytest -n 0 tests/test_dsh_upload_recovery.py`
+等命令运行相关小模块，省去并行进程启动开销。
+
 维护者提交 PR 前执行完整本地检查，见 [AGENTS.md](AGENTS.md#commit-and-pr-gate)。
 其他贡献者可直接提交 PR，并说明已做的验证和未验证部分。PR 和推送到 `master` 会
 自动运行 **Web 编译与 pytest**，发布版本也复用这两项检查。

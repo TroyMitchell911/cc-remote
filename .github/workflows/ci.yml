@@ -42,7 +42,15 @@ jobs:
           name: ci-web-dist
           path: web/dist
       - name: Run pytest
-        run: .venv/bin/python -m pytest
+        run: .venv/bin/python -m pytest --junitxml=test-results/pytest.xml
+      - name: Preserve Python test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-results
+          path: test-results/pytest.xml
+          if-no-files-found: ignore
+          retention-days: 7
 
   web:
     name: Web build

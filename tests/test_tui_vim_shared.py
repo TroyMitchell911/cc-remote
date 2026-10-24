@@ -71,24 +71,55 @@ CASES = [
 @pytest.mark.parametrize(
     "surface", ["chat", "draft", "report", "form", "search"]
 )
-async def test_identical_vim_objects_counts_and_motions(surface):
+async def test_shared_vim_rules_on_each_surface(surface, subtests):
+    # The complete grammar matrix exercises the real mounted widgets directly.
+    # Keyboard dispatch/focus is covered below; waiting for a full paint after
+    # every character here repeats Textual's driver work for the same rules.
+    app = make_app()
+    async with app.run_test():
+        widget = await open_surface(app, surface)
+        for text, cursor, keys, expected in CASES:
+            with subtests.test(text=text, cursor=cursor, keys=keys):
+                widget.load_text(text)
+                widget.move_cursor(widget.document.get_location_from_index(cursor))
+                widget.set_mode("NORMAL")
+                app.copy_to_clipboard("")
+                for key in map(_character_to_key, keys):
+                    assert widget.edit_key(key)
+                assert app.clipboard == expected
+                assert widget.text == text
+                assert not widget.prefix
+                assert widget.vim_mode == "NORMAL"
+                assert not app.client._outbox
+                assert widget.cursor_location == (
+                    widget.document.get_location_from_index(text.index(expected))
+                )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat", "draft", "report", "form", "search"])
+async def test_vim_keyboard_routing_on_each_surface(surface, subtests):
     app = make_app()
     async with app.run_test() as pilot:
         widget = await open_surface(app, surface)
-        for text, cursor, keys, expected in CASES:
-            widget.load_text(text)
-            widget.move_cursor(widget.document.get_location_from_index(cursor))
-            widget.set_mode("NORMAL")
-            app.copy_to_clipboard("")
-            await pilot.press(*map(_character_to_key, keys))
-            assert app.clipboard == expected, (surface, keys, app.clipboard)
-            assert widget.text == text
-            assert not widget.prefix
-            assert widget.vim_mode == "NORMAL", (surface, keys)
-            assert not app.client._outbox
-            assert widget.cursor_location == (
-                widget.document.get_location_from_index(text.index(expected))
-            )
+        # Counts/text objects, a find target and inclusive Unicode Visual copy
+        # cross the app, modal and widget key handlers on every surface.
+        for text, cursor, keys, expected in [CASES[4], CASES[9], CASES[21]]:
+            with subtests.test(keys=keys):
+                widget.load_text(text)
+                widget.move_cursor(widget.document.get_location_from_index(cursor))
+                widget.set_mode("NORMAL")
+                app.copy_to_clipboard("")
+                await pilot.press(*map(_character_to_key, keys))
+                assert app.focused is widget
+                assert app.clipboard == expected
+                assert widget.text == text
+                assert not widget.prefix
+                assert widget.vim_mode == "NORMAL"
+                assert not app.client._outbox
+                assert widget.cursor_location == (
+                    widget.document.get_location_from_index(text.index(expected))
+                )
 
 
 @pytest.mark.asyncio

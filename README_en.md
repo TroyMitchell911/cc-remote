@@ -458,6 +458,12 @@ npm --prefix web run lint
 npm --prefix web run build
 ```
 
+Local and CI Python tests default to two parallel workers, configured in
+`pytest.ini`. Pytest reports the slowest 20 phases, and CI retains a JUnit
+timing report. Use `.venv/bin/python -m pytest -n 0` for serial debugging.
+During development, run small affected modules without worker startup overhead,
+for example `.venv/bin/python -m pytest -n 0 tests/test_dsh_upload_recovery.py`.
+
 Maintainers run the complete local gate before submitting a PR; see
 [AGENTS.md](AGENTS.md#commit-and-pr-gate). Other contributors may submit a PR
 with a description of the checks performed and any validation gaps. PRs and

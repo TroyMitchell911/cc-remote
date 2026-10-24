@@ -272,6 +272,14 @@ git diff --check
   on PRs and pushes to `master`. Release tags reuse the same CI before packaging
   and publishing. Pytest waits only for the Web build artifact. Lint, front-end
   reliability tests and shell checks remain part of the local gate above.
+- Local and CI Python tests default to two workers (`-n 2 --dist worksteal`)
+  through `pytest.ini`; `requirements-dev.txt` pins the xdist plugin. Use
+  `pytest -n 0` for serial debugging or `pytest -n 0 tests/test_foo.py` for a
+  small affected module without worker startup overhead. Pytest reports the
+  slowest phases; CI also retains a JUnit timing report.
+  Test shared editing rules at the component
+  boundary; retain real keyboard routing, focus, rendering and lifecycle tests
+  for UI integration rather than repeating every rule through every screen.
 - Playwright is not part of CI or the required local PR gate. Existing browser
   tests remain available for explicitly requested diagnostics. When the
   maintainer asks for PR acceptance, check out the requested revision, run the
