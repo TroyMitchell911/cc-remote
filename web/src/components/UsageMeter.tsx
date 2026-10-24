@@ -142,11 +142,12 @@ export function UsageMeter({
   });
   const fiveHour = remainingPercent(quotas.fiveHour);
   const weekly = remainingPercent(quotas.weekly);
+  const monthly = remainingPercent(quotas.monthly);
   const overall = remainingPercent(quotas.overall);
   const specializedRemaining = specializedWindows.map(
     ({ window }) => remainingPercent(window),
   );
-  const minimum = [fiveHour, weekly, overall, ...specializedRemaining].filter(
+  const minimum = [fiveHour, weekly, monthly, overall, ...specializedRemaining].filter(
     (value): value is number => value != null,
   ).reduce<number | null>(
     (current, value) => current == null ? value : Math.min(current, value),
@@ -156,12 +157,23 @@ export function UsageMeter({
   const plan = quotas.limit?.plan_type ?? visibleReport?.account?.plan_type;
   const hasOverallQuota = quotas.overall != null;
   const hasAccountQuota = !!(
-    quotas.fiveHour || quotas.weekly || quotas.overall
+    quotas.fiveHour || quotas.weekly || quotas.monthly || quotas.overall
   );
+  const periodRows = [
+    { key: "5h", label: "5 小时额度", window: quotas.fiveHour },
+    { key: "周", label: "每周额度", window: quotas.weekly },
+    { key: "月", label: "每月额度", window: quotas.monthly },
+  ].filter((row) => row.window != null);
   const hasAnyQuota = hasAccountQuota || specializedWindows.length > 0;
   const claudeReadError = engine === "claude"
-    ? report?.component_errors.find((reason) => reason.startsWith("rate_limits:"))
+    ? visibleReport?.component_errors.find((reason) => reason.startsWith("rate_limits:"))
     : undefined;
+  const queryState = engine === "claude" ? visibleReport?.quota_query_state : null;
+  const queryNote = queryState === "disabled"
+    ? "主动查询已关闭，保留原生额度同步。"
+    : queryState === "unconfigured"
+      ? "未配置额度查询来源，请先在本机配置。"
+      : null;
   const claudeReadNote = claudeReadError?.endsWith("usage helper unavailable")
     ? "未配置主动额度查询，等待原生同步。"
     : claudeReadError ? "额度刷新失败，请重试。" : null;
@@ -169,7 +181,8 @@ export function UsageMeter({
   const quotaSummary = hasOverallQuota
     ? `${provider} 总额度${compactPercent(overall)}`
     : hasAccountQuota
-      ? `5小时${compactPercent(fiveHour)}，每周${compactPercent(weekly)}`
+      ? periodRows.map(({ label, window }) =>
+          `${label}剩余${compactPercent(remainingPercent(window))}`).join("，")
       : specializedWindows.length > 0
         ? `专项周额度${compactPercent(minimum)}`
         : "额度尚未同步";
@@ -192,9 +205,11 @@ export function UsageMeter({
         ? <MiniQuota label="总" value={overall} />
         : !hasAccountQuota && specializedWindows.length > 0
           ? <MiniQuota label="专项" value={minimum} />
-        : <>
-          <MiniQuota label="5h" value={fiveHour} />
-          <MiniQuota label="周" value={weekly} />
+        : hasAccountQuota ? periodRows.map(({ key, window }) => (
+          <MiniQuota key={key} label={key} value={remainingPercent(window)} />
+        )) : <>
+          <MiniQuota label="5h" value={null} />
+          <MiniQuota label="周" value={null} />
         </>}
     </button>
     {!disabled && open && <div
@@ -209,9 +224,7 @@ export function UsageMeter({
           <small>
             {hasOverallQuota
               ? `当前账户的 ${provider} 总额度`
-              : engine === "claude"
-                ? "5 小时、每周与模型专项窗口"
-                : "5 小时与每周窗口"}
+              : "当前账号剩余额度"}
           </small>
         </span>
         {plan && <em>{plan}</em>}
@@ -234,10 +247,9 @@ export function UsageMeter({
           window={quotas.overall}
           showDuration
         />
-      ) : hasAccountQuota ? <>
-          <QuotaRow label="5 小时额度" window={quotas.fiveHour} />
-          <QuotaRow label="每周额度" window={quotas.weekly} />
-        </> : null}
+      ) : periodRows.map(({ key, label, window }) => (
+          <QuotaRow key={key} label={label} window={window} />
+        ))}
         {specializedWindows.map(({ limit, window }) => (
           <QuotaRow
             key={limit.limit_id ?? limit.limit_name ?? "specialized"}
@@ -249,10 +261,12 @@ export function UsageMeter({
       {hasAnyQuota && claudeReadNote && <div className="ctx-pop-loading" role="status">
         {claudeReadNote} 当前显示上次同步数据。
       </div>}
+      {queryNote && <p className="usage-query-note" role="status">{queryNote}</p>}
       <div className="usage-pop-actions">
         <span>{error ? "旧账户数据已隐藏"
           : loading ? "正在更新…"
-          : `来自当前 ${provider} 账户`}</span>
+          : engine === "claude" && queryState === "enabled"
+            ? "主动查询已开启" : `来自当前 ${provider} 账户`}</span>
         {onRefresh && <button type="button" onClick={onRefresh}
           disabled={loading}>刷新</button>}
         {onOpenStatus && <button type="button" onClick={onOpenStatus}>完整状态</button>}

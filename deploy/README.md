@@ -440,11 +440,11 @@ Quarantine is temporary transaction state, not another retained backup or Trash.
   migration transaction, restores matching pre-release data before an older
   wrapper is restarted, and verifies both engines' Work ownership backfills.
 
-Protocol v82 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v83 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v82 relay/web release; then start the v82 wrapper.
+activate the v83 relay/web release; then start the v83 wrapper.
 
 The wrapper installer treats local Work data and versioned private control state
 as part of the release
@@ -457,8 +457,8 @@ the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v82, and retain that snapshot with the previous release. To roll back,
-stop v82, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v83, and retain that snapshot with the previous release. To roll back,
+stop v83, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state

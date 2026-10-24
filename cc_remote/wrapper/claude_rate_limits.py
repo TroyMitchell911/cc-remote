@@ -24,9 +24,10 @@ from cc_remote.protocol import RateLimitUpdate, StatusRateLimitWindow
 
 _VERSION = 1
 _MAX_FILE_BYTES = 32 * 1024
-_RATE_LIMITS: dict[str, tuple[str, str, str, int]] = {
+_RATE_LIMITS: dict[str, tuple[str, str, str, int | None]] = {
     "five_hour": ("claude", "Claude", "primary", 300),
     "seven_day": ("claude", "Claude", "secondary", 10_080),
+    "monthly": ("claude", "Claude", "monthly", None),
     "seven_day_opus": (
         "claude-seven-day-opus", "Opus", "primary", 10_080,
     ),
@@ -83,7 +84,9 @@ def _resetless_entry_is_fresh(
         or observed_at > now + 300
     ):
         return False
-    duration_mins = _RATE_LIMITS[rate_type][3]
+    # A month has no fixed duration. Without an upstream reset, retain its
+    # observation for only 15 minutes; this is freshness, not a billing cycle.
+    duration_mins = _RATE_LIMITS[rate_type][3] or 15
     return observed_at + duration_mins * 60 > now
 
 

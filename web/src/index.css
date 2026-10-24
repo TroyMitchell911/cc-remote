@@ -463,7 +463,7 @@ body{
 .arole .nm{ font-size:12.5px; font-weight:var(--font-weight-600); color:var(--dim); letter-spacing:.02em; }
 
 /* prose (react-markdown output) */
-.prose{ font-size:15px; line-height:1.62; }
+.prose{ min-width:0; font-size:15px; line-height:1.62; overflow-wrap:anywhere; }
 .prose p{ margin:0 0 10px; } .prose p:last-child{ margin-bottom:0; }
 .prose strong{ font-weight:var(--font-weight-700); color:var(--emphasis-ink,inherit); }
 .prose h1,.prose h2,.prose h3{ font-family:var(--serif); font-weight:var(--font-weight-500); margin:18px 0 8px; letter-spacing:-.01em; }
@@ -1467,10 +1467,10 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .hint-ring .hr-track{ fill:none; stroke:var(--border); stroke-width:3.5; }
 .hint-ring .hr-fill{ fill:none; stroke:var(--accent); stroke-width:3.5; stroke-linecap:round; }
 .hint-ring.unavailable{ opacity:.55; }
-/* Codex account quota: two compact remaining-capacity bars beside context. */
+/* Account quota: up to three rows without moving the composer or context ring. */
 .usage-meter-wrap{ position:relative; display:flex; align-items:center; flex:none; }
-.usage-meter{ width:46px; min-height:34px; display:grid; align-content:center;
-  gap:2px; padding:7px 0; border:0; border-radius:8px;
+.usage-meter{ width:46px; height:34px; display:grid; align-content:center;
+  gap:2px; padding:3px 0; border:0; border-radius:8px;
   background:none; color:var(--dim); cursor:pointer; touch-action:manipulation; }
 .usage-meter:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
 .usage-meter-line{ display:grid; grid-template-columns:15px minmax(24px,1fr);
@@ -1484,7 +1484,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .usage-meter-line .warn{ background:var(--warn); }
 .usage-meter-line .critical{ background:var(--danger); }
 .usage-meter-line .unknown{ background:var(--border-strong); }
-.ctx-pop.usage-pop{ width:286px; }
+.ctx-pop.usage-pop{ width:min(286px,calc(100vw - 80px - env(safe-area-inset-left) - env(safe-area-inset-right))); }
 .usage-pop-head{ display:flex; align-items:center; justify-content:space-between;
   gap:10px; margin-bottom:3px; }
 .usage-pop-head>span{ display:flex; min-width:0; flex-direction:column; gap:1px; }
@@ -1515,8 +1515,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   font-size:10.5px; }
 .usage-pop-actions button:hover{ background:var(--raised); color:var(--text); }
 .usage-pop-actions button:disabled{ opacity:.45; cursor:default; }
+.usage-query-note{ margin:12px 0 0; color:var(--faint); font-size:10.5px; line-height:1.5; }
 @media (pointer:coarse){
-  .usage-meter{ min-height:44px; }
+  .usage-meter{ height:44px; }
 }
 /* context popover, anchored above the ring */
 .ctx-pop{ position:absolute; right:0; bottom:calc(100% + 8px); width:280px; z-index:30;
@@ -1621,8 +1622,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   white-space:nowrap; cursor:pointer; font:inherit; color:inherit; background:none; border:0;
   padding:0; display:inline-flex; align-items:center; gap:3px; }
 .hint-mode:hover{ color:var(--accent-ink); }
+.hint-mode-label{ min-width:0; overflow:hidden; text-overflow:ellipsis; }
 .hint-mode:disabled{ opacity:.45; cursor:default; color:inherit; }
-.hint-mode .hint-mode-ch{ font-size:9px; opacity:.6; }
+.hint-mode .hint-mode-ch{ flex:none; font-size:9px; opacity:.6; }
 .hint-mode.plan{ color:var(--accent-ink); }
 .hint-mode.danger{ color:var(--danger); }
 .hint-kbds{ white-space:nowrap; flex:1; text-align:center; overflow:hidden; text-overflow:ellipsis; }
@@ -1640,6 +1642,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   .hint{ align-items:center; flex-wrap:nowrap; gap:11px; }
   .hint-mode{ min-width:0; max-width:72px; min-height:34px; flex:0 1 auto;
     overflow:hidden; text-overflow:ellipsis; }
+  .hint-mode-label{ white-space:normal; overflow-wrap:anywhere; text-align:left; line-height:1.2; }
   .hint-right{ width:auto; min-width:0; margin-left:0; flex:1 1 auto;
     justify-content:flex-end; gap:11px; }
   .hint-control-scope{ display:none; }

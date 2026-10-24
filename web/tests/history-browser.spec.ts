@@ -12160,6 +12160,46 @@ test("composer action growth keeps the live tail visible without stealing histor
 });
 
 for (const width of [320, 390]) {
+  test(`Claude quota periods and mobile text stay visible at ${width} px`, async ({ page }, info) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto("/tests/history-browser.html?quota-layout=1");
+    const meter = page.locator(".usage-meter");
+    await expect(meter).toBeVisible();
+    const initial = await page.locator(".composer").boundingBox();
+    for (const [periods, labels] of [
+      ["5h,week", ["5h", "周"]], ["5h,month", ["5h", "月"]],
+      ["5h,week,month", ["5h", "周", "月"]], ["month", ["月"]],
+    ] as const) {
+      await page.getByRole("button", { name: periods, exact: true }).click();
+      await expect(meter.locator("b")).toHaveText([...labels]);
+      const current = await page.locator(".composer").boundingBox();
+      expect(Math.abs(current!.y - initial!.y)).toBeLessThan(1);
+      expect(Math.abs(current!.height - initial!.height)).toBeLessThan(1);
+    }
+    await page.getByRole("button", { name: "5h,month", exact: true }).click();
+    await meter.click();
+    const popover = page.getByRole("region", { name: "Claude 账户额度" });
+    await expect(popover).toContainText("5 小时额度");
+    await expect(popover).toContainText("每月额度");
+    await expect(popover).not.toContainText("每周额度");
+    for (const selector of [".composer", ".hint-mode-label", ".usage-pop", ".prose"]) {
+      const geometry = await page.locator(selector).first().evaluate(node => {
+        const bounds = node.getBoundingClientRect();
+        return { scroll: node.scrollWidth, client: node.clientWidth,
+          left: bounds.left, right: bounds.right, viewport: innerWidth };
+      });
+      expect(geometry.scroll).toBeLessThanOrEqual(geometry.client + 1);
+      expect(geometry.left).toBeGreaterThanOrEqual(0);
+      expect(geometry.right).toBeLessThanOrEqual(geometry.viewport);
+    }
+    const inlineCode = page.getByTestId("quota-prose").locator("code");
+    expect(await inlineCode.evaluate(node => node.getClientRects().length)).toBeGreaterThan(1);
+    await expect(page.locator(".hint-mode-label")).toHaveText("Bypass Permissions");
+    expect(await page.locator(".hint-mode-label").evaluate(node =>
+      node.clientHeight / Number.parseFloat(getComputedStyle(node).lineHeight))).toBeLessThanOrEqual(2.1);
+    await expect(page.getByRole("button", { name: "Opus", exact: true })).toBeVisible();
+    await page.screenshot({ path: info.outputPath(`monthly-quota-${width}.png`), animations: "disabled" });
+  });
   test(`Codex controls stay on one row in a ${width} px composer`, async ({
     page,
   }) => {

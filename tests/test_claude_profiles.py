@@ -39,6 +39,21 @@ from tests.test_multisession import _mk_ctx
 NATIVE_ID = "11111111-1111-4111-8111-111111111111"
 
 
+def test_usage_query_is_a_private_explicit_account_opt_in(tmp_path):
+    raw = json.loads(_profiles(tmp_path / "personal", tmp_path / "company"))
+    registry = ClaudeProfileRegistry.from_json(json.dumps(raw))
+    assert not any(profile.usage_query_enabled for profile in registry)
+    raw["company"]["usage_query_enabled"] = True
+    enabled = ClaudeProfileRegistry.from_json(json.dumps(raw))
+    assert enabled.get("company").usage_query_enabled
+    assert not enabled.default.usage_query_enabled
+    assert enabled.public_profiles() == registry.public_profiles()
+    for invalid in [1, "true", None, {}]:
+        raw["company"]["usage_query_enabled"] = invalid
+        with pytest.raises(ValueError, match="usage_query_enabled must be a boolean"):
+            ClaudeProfileRegistry.from_json(json.dumps(raw))
+
+
 class _StubTransport:
     def __init__(self) -> None:
         self.sent: list[object] = []

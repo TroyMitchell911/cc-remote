@@ -22178,10 +22178,17 @@ class WrapperMachine:
                 except (ValueError, ClaudeRateLimitStoreError):
                     raise ClaudeUsageError("usage response invalid") from None
 
-        try:
-            failure = await self._claude_usage_reader.refresh(profile, apply)
-        except ClaudeUsageError as exc:
-            failure = str(exc)
+        failure = None
+        query_state = "disabled"
+        if profile.usage_query_enabled:
+            query_state = "enabled"
+            try:
+                failure = await self._claude_usage_reader.refresh(profile, apply)
+            except ClaudeUsageError as exc:
+                failure = str(exc)
+            if failure == "usage helper unavailable":
+                query_state = "unconfigured"
+                failure = None
         windows = await self._claude_rate_limit_snapshot(ctx)
         report = StatusReport(
             thread={"thread_id": ctx.session_id or ctx.key,
@@ -22192,7 +22199,9 @@ class WrapperMachine:
                 "limit_id": update.limit_id, "limit_name": update.name,
                 "rate_limit_reached_type": update.reached_type,
                 "primary": update.primary, "secondary": update.secondary,
+                "monthly": update.monthly,
             } for update in windows],
+            quota_query_state=query_state,
             component_errors=[f"rate_limits: {failure}"] if failure else [],
             request_id=getattr(cmd, "cmd_id", None),
             to=getattr(cmd, "client_id", None),

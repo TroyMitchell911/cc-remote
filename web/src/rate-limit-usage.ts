@@ -7,6 +7,7 @@ import type {
 export interface QuotaWindows {
   fiveHour: StatusRateWindow | null;
   weekly: StatusRateWindow | null;
+  monthly: StatusRateWindow | null;
   overall: StatusRateWindow | null;
   limit: StatusRateLimit | null;
 }
@@ -49,7 +50,7 @@ export function quotaWindowsForLimits(
       (window) => window?.window_duration_mins === duration,
     );
   const hasUsableWindow = (limit: StatusRateLimit): boolean =>
-    [limit.primary, limit.secondary].some((window) =>
+    [limit.primary, limit.secondary, limit.monthly].some((window) =>
       window != null && (
         window.used_percent != null
         || window.resets_at != null
@@ -84,12 +85,14 @@ export function quotaWindowsForLimits(
   // bucket instead of the paid-plan 5-hour/weekly pair. Preserve the native
   // shape and present it as a single overall quota; never relabel it as a
   // weekly window.
-  const overall = fiveHour == null && weekly == null
+  const monthly = limit?.monthly ?? null;
+  const overall = fiveHour == null && weekly == null && monthly == null
     ? windows[0] ?? null
     : null;
   return {
     fiveHour,
     weekly,
+    monthly,
     overall,
     limit,
   };
@@ -113,8 +116,9 @@ export function activeRateLimits(
   return limits.flatMap((limit) => {
     const primary = activeWindow(limit.primary, nowSeconds);
     const secondary = activeWindow(limit.secondary, nowSeconds);
-    if (!primary && !secondary) return [];
-    return [{ ...limit, primary, secondary }];
+    const monthly = activeWindow(limit.monthly, nowSeconds);
+    if (!primary && !secondary && !monthly) return [];
+    return [{ ...limit, primary, secondary, monthly }];
   });
 }
 
@@ -125,6 +129,7 @@ export function nextRateLimitReset(
   const future = limits.flatMap((limit) => [
     limit.primary?.resets_at,
     limit.secondary?.resets_at,
+    limit.monthly?.resets_at,
   ]).filter((value): value is number => (
     value != null && Number.isFinite(value) && value > nowSeconds
   ));

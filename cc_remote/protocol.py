@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 82
+PROTOCOL_VERSION = 83
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -2343,6 +2343,8 @@ class StatusRateLimit(_StatusPart):
     rate_limit_reached_type: Optional[str] = Field(default=None, max_length=128)
     primary: Optional[StatusRateLimitWindow] = None
     secondary: Optional[StatusRateLimitWindow] = None
+    # A subscription month is a named cycle, not a fixed number of minutes.
+    monthly: Optional[StatusRateLimitWindow] = None
 
 
 class StatusRateLimitResetCredit(_StatusPart):
@@ -2405,6 +2407,7 @@ class StatusReport(_Base):
     context: StatusContext
     account: Optional[StatusAccount] = None
     rate_limits: list[StatusRateLimit] = Field(default_factory=list, max_length=16)
+    quota_query_state: Optional[Literal["disabled", "unconfigured", "enabled"]] = None
     reset_credits: Optional[StatusRateLimitResetCredits] = None
     usage: Optional[StatusUsage] = None
     # Entries are ``<component>: <generic reason>``. Raw RPC error text is never
@@ -2455,11 +2458,13 @@ class RateLimitUpdate(_Base):
     reached_type: Optional[str] = Field(default=None, max_length=128)
     primary: Optional[StatusRateLimitWindow] = None
     secondary: Optional[StatusRateLimitWindow] = None
+    monthly: Optional[StatusRateLimitWindow] = None
 
     @model_validator(mode="after")
     def has_public_field(self):
         if all(getattr(self, field) is None for field in (
             "limit_id", "name", "plan_type", "reached_type", "primary", "secondary",
+            "monthly",
         )):
             raise ValueError("rate_limit_update requires a public field")
         return self

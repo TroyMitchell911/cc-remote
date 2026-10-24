@@ -72,6 +72,15 @@ Claude example:
 }
 ```
 
+Each Claude account may opt into **active quota queries** with
+`"usage_query_enabled": true`; the default is off. Disabled accounts still
+receive native `RateLimitEvent` updates; reading the cache never sends a model
+request or SDK query. Bind a read-only helper to that exact account before
+enabling. A missing source is shown in the quota panel, with no inferred
+endpoint fallback. Helpers can return any combination of 5-hour, weekly and
+monthly windows. See [the quota contract](claude-usage.md). The setting takes
+effect with the account configuration when Wrapper next starts.
+
 Codex example:
 
 ```json

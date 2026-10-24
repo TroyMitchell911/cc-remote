@@ -78,14 +78,14 @@ function Row({ label, children, mono = false }: { label: string; children: React
   return <div className="status-row"><span>{label}</span><b className={mono ? "mono" : ""}>{children}</b></div>;
 }
 
-function RateWindow({ name, window }: { name: string; window?: StatusRateWindow | null }) {
+function RateWindow({ name, window, monthly = false }: { name: string; window?: StatusRateWindow | null; monthly?: boolean }) {
   if (!window) return null;
   const remaining = remainingPercent(window);
   const tone = quotaTone(remaining);
   return <div className="status-rate-window">
     <div><span>{name}</span><b>{remaining == null ? "—" : `剩余 ${remaining.toFixed(0)}%`}</b></div>
     <i><span className={tone} style={{ width: `${remaining ?? 0}%` }} /></i>
-    <small>{quotaWindowLabel(window.window_duration_mins)} · {resetTime(window.resets_at)} 重置</small>
+    <small>{monthly ? "每月额度" : quotaWindowLabel(window.window_duration_mins)} · {resetTime(window.resets_at)} 重置</small>
   </div>;
 }
 
@@ -95,6 +95,7 @@ function RateLimit({ limit }: { limit: StatusRateLimit }) {
     {limit.rate_limit_reached_type && <div className="status-rate-attention">当前限额已用尽，请等待重置。</div>}
     <RateWindow name="主要限额" window={limit.primary} />
     <RateWindow name="次要限额" window={limit.secondary} />
+    <RateWindow name="每月额度" window={limit.monthly} monthly />
   </div>;
 }
 

@@ -195,7 +195,7 @@ session files.
   implementation and existing private associations remain intact for future
   integration; no existing session is deleted, archived or transferred by this
   change. Claude/Codex side chats remain available.
-- Wire protocol v82 must be activated across all tiers together. This branch
+- Wire protocol v83 must be activated across all tiers together. This branch
   does not automatically upgrade, migrate, deploy, or restart any existing DSH
   installation.
 

@@ -29,7 +29,7 @@ try {
     "/src/components/UsageMeter.tsx");
   const {
     accountQuotaWindows, activeRateLimits, quotaTone, quotaWindowLabel,
-    quotaWindowsForLimits, remainingPercent,
+    quotaWindowsForLimits, remainingPercent, nextRateLimitReset,
   } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { conversationNotices, statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
@@ -651,6 +651,72 @@ try {
   const quotas = accountQuotaWindows(quotaReport);
   assert.equal(remainingPercent(quotas.fiveHour), 60);
   assert.equal(remainingPercent(quotas.weekly), 25);
+  // The monthly cycle is explicit, not inferred from an arbitrary duration.
+  // Exercise every supported combination without filling absent windows.
+  for (let mask = 1; mask < 8; mask++) {
+    const rate = { limit_id: "claude",
+      primary: mask & 1 ? { used_percent: 28, resets_at: 1_900_000_000,
+        window_duration_mins: 300 } : null,
+      secondary: mask & 2 ? { used_percent: 42, resets_at: 1_901_000_000,
+        window_duration_mins: 10_080 } : null,
+      monthly: mask & 4 ? { used_percent: 16, resets_at: 1_902_000_000 } : null,
+    };
+    const monthlyReport: StatusReport = { ...quotaReport, account: null,
+      rate_limits: [rate], quota_query_state: "enabled" };
+    const rows = quotaWindowsForLimits([rate], "claude");
+    assert.equal(rows.monthly, rate.monthly);
+    const html = renderToStaticMarkup(createElement(UsageMeter, {
+      engine: "claude", open: true, report: monthlyReport, onToggle: () => {},
+    }));
+    for (const [bit, label, percent] of [[1, "5 小时额度", 72],
+      [2, "每周额度", 58], [4, "每月额度", 84]] as const) {
+      assert.equal(html.includes(label), !!(mask & bit));
+      assert.equal(html.includes(`剩余 ${percent}%`), !!(mask & bit));
+    }
+    assert.equal((html.match(/class="usage-meter-line"/g) ?? []).length,
+      [1, 2, 4].filter(bit => mask & bit).length);
+    assert.doesNotMatch(html, /总额度|30 天|43200|Kimi|GLM/);
+  }
+  const monthlyOnly = [{ limit_id: "claude", monthly: { used_percent: 0, resets_at: 2000 } }];
+  assert.equal(nextRateLimitReset(monthlyOnly, 1000), 2000);
+  assert.equal(activeRateLimits(monthlyOnly, 1000).length, 1);
+  assert.equal(activeRateLimits(monthlyOnly, 2000).length, 0);
+  assert.equal(quotaWindowsForLimits([
+    { limit_id: "claude", primary: { used_percent: 28, window_duration_mins: 300 } },
+    { limit_id: "other-account", monthly: { used_percent: 99 } },
+  ], "claude").monthly, null, "monthly quota must not cross account buckets");
+  for (const [queryState, note] of [
+    ["disabled", "主动查询已关闭"], ["unconfigured", "未配置额度查询来源"],
+    ["enabled", "主动查询已开启"],
+  ] as const) {
+    const html = renderToStaticMarkup(createElement(UsageMeter, {
+      engine: "claude", open: true, onToggle: () => {},
+      report: { ...quotaReport, quota_query_state: queryState,
+        rate_limits: [{ limit_id: "claude", monthly: { used_percent: 16 } }] },
+    }));
+    assert.match(html, new RegExp(note));
+    assert.match(html, /剩余 84%/);
+    assert.doesNotMatch(html, /刷新失败/);
+  }
+  let monthState = { ...initialState, focusedSid: claudeSid,
+    runtimes: { [claudeSid]: createRuntime() } };
+  monthState = reduce(monthState, { type: "event", event: event({
+    type: "rate_limit_update", sid: claudeSid, limit_id: "claude",
+    monthly: { used_percent: 16, resets_at: 1_902_000_000 },
+  }) });
+  monthState = reduce(monthState, { type: "event", event: event({
+    type: "rate_limit_update", sid: claudeSid, limit_id: "claude",
+    primary: { used_percent: 28, window_duration_mins: 300 },
+  }) });
+  assert.equal(monthState.runtimes[claudeSid].rateLimits[0].monthly.used_percent, 16,
+    "native 5-hour updates must preserve a helper's monthly observation");
+  monthState = reduce(monthState, { type: "event", event: event({
+    ...quotaReport, type: "status_report", sid: claudeSid,
+    rate_limits: [{ limit_id: "claude", primary: { used_percent: 28,
+      window_duration_mins: 300 }, monthly: null }],
+  }) });
+  assert.equal(monthState.runtimes[claudeSid].rateLimits[0].monthly, null,
+    "an authoritative refresh can clear the month without stale rows");
   assert.equal(quotaTone(51), "good");
   assert.equal(quotaTone(50), "warn");
   assert.equal(quotaTone(21), "warn");

@@ -2423,6 +2423,8 @@ function mergeRateLimitCollection(
     current.primary, update.primary, clearsReachedLimit);
   next.secondary = mergeRateWindow(
     current.secondary, update.secondary, clearsReachedLimit);
+  next.monthly = mergeRateWindow(
+    current.monthly, update.monthly, clearsReachedLimit);
   limits[index] = next;
   return limits.slice(-16);
 }
