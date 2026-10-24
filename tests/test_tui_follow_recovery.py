@@ -17,10 +17,12 @@ async def test_wheel_arrives_at_bottom_after_initial_callback():
         await pilot.press("k")
         reader.scroll_to(y=reader.max_scroll_y - 5, animate=False, immediate=True)
         reader.on_mouse_scroll_down()
-        await pilot.pause()
+        await reader.wait_for_refresh()
         assert not view.follow  # Scroll animation has not reached its target.
         reader.scroll_end(animate=False, immediate=True)
-        await pilot.pause()
+        # Follow is committed by a post-refresh callback. Pilot.pause() can
+        # return after scheduling that callback but before it has executed.
+        await reader.wait_for_refresh()
         assert view.follow
         view.put(Block("new", "assistant", "new output\n" * 30))
         app.paint()
