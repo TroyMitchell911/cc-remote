@@ -17,6 +17,7 @@ export function newChatCatalogRequest(
   codexProfileId?: string | null,
   claudeProfileId?: string | null,
 ): NewChatCatalogRequest | null {
+  if (engine === "dsh") return { engine };
   if (engine === "codex") {
     return {
       engine,

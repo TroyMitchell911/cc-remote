@@ -1,3 +1,5 @@
+import { dshCommandMatches } from "../dsh-commands";
+import type { DshCommandInfo, DshPreset, DshPermissionOption } from "../protocol";
 // Empty-state "new chat" page: a centered composer (a la Claude app / Codex)
 // with a working directory, optional model/effort overrides, and attachments.
 // A null override is intentional: the wrapper/engine keeps its own local default.
@@ -9,7 +11,7 @@ import { EngineIcon, Icon } from "../icons";
 import { SpeedPicker } from "./SpeedPicker";
 import { newChatSpeed, normalizeSpeed, speedsFor } from "../codex-speed";
 import {
-  clientSlashesFor, matchCommands, matchSkills, modelsFor, permsFor, routeComposerInput, skillToken, slashToken,
+  clientSlashesFor, matchCommands, matchSkills, modelsFor, permsFor, routeComposerInput, skillToken, slashToken, dshPermissionLabel,
   type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, snapshotAttachmentFiles } from "../img";
@@ -43,13 +45,22 @@ import {
 } from "../auto-compact";
 
 const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
+const DshPresetPicker = lazy(() => import("./DshPresetPicker"));
 
-type Engine = "claude" | "codex";
+type Engine = "claude" | "codex" | "dsh";
 import { newChatEfforts } from "../new-chat-selection";
 export { compatibleNewChatEffort, newChatCatalogRequest, resolveNewChatLocalDefaults,
   reconcileNewChatSelection, newChatEfforts } from "../new-chat-selection";
 
 interface Props {
+  editPrompt?: string | null;
+  onEditConsumed?: () => void;
+  dshCommands?: DshCommandInfo[];
+  dshPresets?: DshPreset[];
+  dshPermissions?: DshPermissionOption[];
+  dshPreset?: string | null;
+  dshError?: string | null;
+  onPickDshPreset?: (value: string) => void;
   cwd: string;
   /** Authorization boundary for local execution-control choices. */
   controlScopeKey: string;
@@ -92,7 +103,7 @@ interface Props {
            permissionMode?: PermissionMode,
            permissionProfile?: string,
            webSearch?: CodexWebSearchMode,
-           serviceTier?: CodexServiceTier) => boolean;
+           serviceTier?: CodexServiceTier, dshPermission?: string) => boolean;
 }
 
 interface SelectorOption {
@@ -170,7 +181,7 @@ function displayEffort(
   return efforts.find((candidate) => candidate.id === id)?.name ?? id;
 }
 
-export function NewChatView({ cwd, controlScopeKey,
+export function NewChatView({ cwd, controlScopeKey, editPrompt, onEditConsumed,
   space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
   autoCompact = { mode: "inherit", thresholdTokens: null },
@@ -181,8 +192,12 @@ export function NewChatView({ cwd, controlScopeKey,
   onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile, onRequestModels,
   onPickCodexProfile, skills, skillsOnline = true, skillsError = false, onRequestSkills,
   permissionProfiles, onGetPermissionProfiles, onOpenExtensions,
+  dshCommands, dshPresets = [], dshPermissions = [], dshPreset, dshError, onPickDshPreset,
   onSend }: Props) {
   const [text, setText] = useState("");
+  useEffect(() => {
+    if (editPrompt != null) { setText(editPrompt); onEditConsumed?.(); }
+  }, [editPrompt, onEditConsumed]);
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
   const [pastes, setPastes] = useState<ComposerPaste[]>([]);
@@ -196,15 +211,21 @@ export function NewChatView({ cwd, controlScopeKey,
   const [executionControls, setExecutionControls] =
     useState<NewChatExecutionControls>(
       () => defaultExecutionControls(controlScopeKey));
+  const [dshPermissionChoice, setDshPermissionChoice] = useState<{scope: string; value: string} | null>(null);
+  const dshPermission = dshPermissionChoice?.scope === controlScopeKey ? dshPermissionChoice.value : "";
   const [permissionsOpen, setPermissionsOpen] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const pasteGuard = useClipboardPasteGuard(taRef, `${controlScopeKey}:${cwd}:${engine}`);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (engine === "dsh" && skillsOnline && !skillsError && dshCommands === undefined) onRequestSkills?.();
+  }, [engine, skillsOnline, skillsError, dshCommands, onRequestSkills]);
   const commandToken = slashToken(text);
-  const commandMatches = commandToken === null ? [] : matchCommands(commandToken, engine, space);
+  const commandMatches = commandToken === null ? [] : [...matchCommands(commandToken, engine, space),
+    ...(engine === "dsh" ? dshCommandMatches(commandToken, {commands: dshCommands ?? [], agent_preset: dshPreset}) : [])];
   // Work gets a private cwd only when created; the Code cwd cannot describe it.
-  const currentSkillToken = engine === "codex" && space === "code" ? skillToken(text) : null;
+  const currentSkillToken = (engine === "codex" || engine === "dsh") && space === "code" ? skillToken(text) : null;
   const skillMatches = currentSkillToken !== null && skills ? matchSkills(currentSkillToken, skills) : [];
   const skillLoading = currentSkillToken !== null && skills === undefined;
   const skillOpen = currentSkillToken !== null
@@ -288,7 +309,7 @@ export function NewChatView({ cwd, controlScopeKey,
       ...patch,
     }));
   };
-  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const accountProfiles = engine === "dsh" ? [] : engine === "codex" ? codexProfiles : claudeProfiles;
   const defaultAccountProfileId = engine === "codex"
     ? defaultCodexProfileId : defaultClaudeProfileId;
   const accountProfileId = engine === "codex"
@@ -302,7 +323,7 @@ export function NewChatView({ cwd, controlScopeKey,
   const selectedProfileWarning = selectedProfileMissing
     ? `所选 ${engine === "codex" ? "Codex" : "Claude"} 账号已移除，请重新选择。`
     : selectedAccountProfile?.error ?? null;
-  const canSend = (text.trim().length > 0 || hasAttachments || pastes.length > 0)
+  const canSend = !(engine === "dsh" && (dshError || !dshPresets.some(p => p.id === dshPreset && p.available))) && (text.trim().length > 0 || hasAttachments || pastes.length > 0)
     && !creating && !importing && !selectedProfileMissing;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
@@ -416,7 +437,7 @@ export function NewChatView({ cwd, controlScopeKey,
       engine === "codex" && space === "code"
         ? (webSearch ?? undefined)
         : undefined,
-      engine === "codex" ? serviceTier : undefined);
+      engine === "codex" ? serviceTier : undefined, engine === "dsh" ? dshPermission || undefined : undefined);
     if (!queued) setCreating(false);
   };
 
@@ -552,6 +573,7 @@ export function NewChatView({ cwd, controlScopeKey,
   };
 
   const pickCommand = (slash: string) => {
+    if (commandMatches.find(command => command.slash === slash)?.unavailable) return;
     if (creating || importingRef.current || selectedProfileMissing) return;
     if (slash !== "autocompact" && clientSlashesFor(engine).has(slash)) {
       runClientSlash(slash, "");
@@ -561,7 +583,7 @@ export function NewChatView({ cwd, controlScopeKey,
     }
   };
   const pickSkill = (name: string) => {
-    setText(`$${name} `);
+    setText(`${engine === "dsh" ? "/" : "$"}${name} `);
     taRef.current?.focus();
   };
 
@@ -586,7 +608,10 @@ export function NewChatView({ cwd, controlScopeKey,
     || selectedProfileMissing;
   const pickAccountProfile = engine === "codex"
     ? onPickCodexProfile : onPickClaudeProfile;
-  const profileSelector = showProfileSelector ? (
+  const profileSelector = engine === "dsh" ? (
+    <Suspense fallback={null}><DshPresetPicker presets={dshPresets} value={dshPreset}
+      onChange={onPickDshPreset} disabled={creating || importing} /></Suspense>
+  ) : showProfileSelector ? (
     <ChoicePicker key={`${controlScopeKey}:account`} className="newchat-profile"
       showChevron={space === "work"}
       label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}
@@ -673,7 +698,13 @@ export function NewChatView({ cwd, controlScopeKey,
       <Icon name="send" size={20} />{space === "work" && "开始"}
     </button>
   );
-  const accessControl = engine === "codex" && space === "code" ? (
+  const accessControl = engine === "dsh" ? (
+    <button type="button" className="newchat-access" title="选择权限模式"
+      onClick={() => setPermissionsOpen(true)} disabled={creating || importing}>
+      <Icon name="shield" size={14} /><span>{dshPermission ? dshPermissionLabel(dshPermission,
+        dshPermissions.find(p => p.value === dshPermission)?.name) : "默认权限"}</span>
+    </button>
+  ) : engine === "codex" && space === "code" ? (
     <button type="button" className="newchat-access"
       onClick={() => {
         setPermissionsOpen(true);
@@ -731,6 +762,7 @@ export function NewChatView({ cwd, controlScopeKey,
             {profileSelector}
             {cwdButton}
             {profileWarning}
+            {engine === "dsh" && dshError && <p role="alert" className="newchat-profile-error">{dshError}</p>}
           </div>
         )}
 
@@ -770,7 +802,7 @@ export function NewChatView({ cwd, controlScopeKey,
           {suggestionOpen && !creating && !importing && (
             <div className="cmd-pop" role="listbox" aria-label={skillOpen ? "Skills" : "命令"} data-lock-horizontal-swipe>
               {commandMatches.map(command => (
-                <button key={command.slash} type="button" className="cmd"
+                <button key={command.slash} type="button" className="cmd" disabled={command.unavailable}
                   onClick={() => pickCommand(command.slash)}>
                   <span className="cmd-ic"><Icon name={command.ic} size={17} /></span>
                   <span className="cmd-tx">
@@ -892,14 +924,21 @@ export function NewChatView({ cwd, controlScopeKey,
         open={permissionsOpen}
         kind="perms"
         engine={engine}
+        dshPermissions={engine === "dsh" ? dshPermissions : undefined}
         onClose={() => setPermissionsOpen(false)}
-        currentPerm={permissionMode ?? (engine === "codex" ? "never" : undefined)}
+        currentPerm={engine === "dsh" ? dshPermission : permissionMode ?? (engine === "codex" ? "never" : undefined)}
         onPickPerm={(mode) => {
+          if (engine === "dsh") {
+            setDshPermissionChoice({ scope: controlScopeKey, value: mode });
+            setPermissionsOpen(false);
+            return;
+          }
           updateExecutionControls({ permissionMode: mode as PermissionMode });
           if (engine === "claude") setPermissionsOpen(false);
         }}
-        onUseDefaultPerm={engine === "claude" ? () => {
-          updateExecutionControls({ permissionMode: null });
+        onUseDefaultPerm={engine === "claude" || engine === "dsh" ? () => {
+          if (engine === "dsh") setDshPermissionChoice({ scope: controlScopeKey, value: "" });
+          else updateExecutionControls({ permissionMode: null });
           setPermissionsOpen(false);
         } : undefined}
         currentPermissionProfile={permissionProfile}

@@ -1,0 +1,4 @@
+.code-newchat .dsh-preset-trigger{ gap:8px; }
+.code-newchat .dsh-preset-trigger > b{ line-height:inherit; }
+.dsh-preset-sheet .cmd{ align-items:center; padding:14px 16px; }
+.dsh-preset-sheet .cmd-ds{ display:block; margin-top:6px; white-space:normal; overflow:visible; line-height:1.6; }

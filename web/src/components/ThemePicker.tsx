@@ -20,10 +20,10 @@ export default function ThemePicker({ engine, appearance, onClose, returnFocusRe
   const baseColors = appearanceColors(engine, mode, { preset: look.preset });
   const lowContrast = colorContrast(colors.background, colors.foreground) < 4.5;
   const modeLabel = mode === "light" ? "浅色" : "深色";
-  return <CenteredSheet open label="外观" onClose={onClose} maxWidth={620} maxHeight={740} minimumHeight={600}
-    className="theme-picker" returnFocusRef={returnFocusRef}>
+  return <CenteredSheet open label="外观" onClose={onClose} maxWidth={engine === "dsh" ? 520 : 620} maxHeight={740} minimumHeight={engine === "dsh" ? 700 : 600}
+    className={`theme-picker${engine === "dsh" ? " theme-picker-dsh" : ""}`} returnFocusRef={returnFocusRef}>
     <div className="theme-picker-intro">
-      <span>{engine !== "dsh" && <EngineIcon engine={engine} size={17} />}{({ claude: "Claude", codex: "Codex", dsh: "DSH" })[engine]}</span>
+      <span><EngineIcon engine={engine} size={17} />{({ claude: "Claude", codex: "Codex", dsh: "DSH" })[engine]}</span>
       <p>仅影响当前引擎，自动保存</p>
     </div>
     <div className="sheet-scroll theme-picker-scroll">

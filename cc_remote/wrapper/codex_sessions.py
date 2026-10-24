@@ -6,6 +6,7 @@ per-turn settings.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import glob
 from importlib import import_module
 import json
@@ -322,7 +323,7 @@ def codex_thread_rollout_record(
         return None
     try:
         uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
             schema = {
                 row[1]
                 for row in connection.execute('PRAGMA table_info("threads")')
@@ -369,7 +370,7 @@ def codex_session_presence(
         return None
     try:
         uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
             row = connection.execute(
                 "SELECT 1 FROM threads WHERE id=? LIMIT 1", (session_id,)
             ).fetchone()
@@ -453,7 +454,7 @@ def codex_thread_archive_states(
         return None
     try:
         uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
             schema = {
                 row[1]
                 for row in connection.execute('PRAGMA table_info("threads")')
@@ -613,7 +614,7 @@ def codex_thread_parent_maps(
         return None
     try:
         uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
             schema = {
                 row[1]
                 for row in connection.execute('PRAGMA table_info("threads")')
@@ -752,7 +753,7 @@ def codex_exact_catalog_rows(
     provider = codex_current_provider(codex_home=codex_home).strip()
     try:
         uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
             connection.row_factory = sqlite3.Row
             schema = {
                 row["name"]

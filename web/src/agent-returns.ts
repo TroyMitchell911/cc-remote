@@ -11,7 +11,7 @@ export function isReturnReceipt(block: Block): boolean {
 /** Extra presentation metadata must never create a process/answer boundary. */
 export function isSyntheticReturnReceipt(block: Block): boolean {
   return isReturnReceipt(block) && block.kind === "process" && block.server === "cc_remote"
-    && block.item_id.startsWith("return-");
+    && (block.item_id.startsWith("return-") || block.item_id.startsWith("dsh-return-"));
 }
 
 export function returnedAgents(blocks: Block[]): ProcessBlock[] {

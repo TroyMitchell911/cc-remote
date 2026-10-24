@@ -100,7 +100,7 @@ a separate choice; sharing alone does not authorize them.
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v79 is declared by
+- **Protocol version gate**: current wire protocol v82 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -352,18 +352,23 @@ by the explicit `claude-remote` CLI — separate from the Agent SDK path.
   committing, verify the stored message and scope with
   `git log -1 --format=raw --stat`, then recheck
   `git status --short --branch`.
-- Before opening or updating **every** PR, run the complete local gate below;
-  a docs-only or apparently narrow change does not skip it unless the user
-  explicitly accepts that exception. Every command must exit zero. Expected
-  platform-defined test skips are allowed, but failures or missing tools must
-  be reported rather than silently bypassed.
+- Before opening or updating a maintainer-authored PR (including work prepared
+  by an agent for the maintainer), run the complete local gate below. A docs-only
+  or apparently narrow change does not skip it unless the user explicitly
+  accepts that exception. Every command must exit zero. Expected platform-defined
+  test skips are allowed; report failures or missing tools rather than bypassing
+  them. During development, use checks appropriate to the change.
+- Other contributors may open or update a PR without running the complete local
+  gate. Include the checks performed and any known validation gaps in the PR
+  description. Automatic CI still builds Web and runs pytest for every PR.
+- Run the Web gate with Node 24 (see `.nvmrc`), matching CI. Newer Node
+  browser-like globals must not mask missing browser-environment guards.
 
 ```bash
 .venv/bin/python -m pytest
 uvx --from ruff==0.15.13 ruff check cc_remote tests deploy
 npm --prefix web run build
 npm --prefix web run test:reliability
-npm --prefix web run test:history-browser
 npm --prefix web run lint
 bash -n \
   deploy/install.sh \
@@ -379,9 +384,23 @@ shellcheck -x \
 git diff --check
 ```
 
-- `.github/workflows/ci.yml` repeats this gate for pushes and PRs. A local pass
-  is required before PR publication and does not replace green remote CI before
-  merge. These checks are zero-token; do not substitute a live model probe.
+- `.github/workflows/ci.yml` automatically runs only the Web build and pytest
+  on PRs and pushes to `master`. Release tags reuse the same CI before packaging
+  and publishing. Pytest waits only for the Web build artifact. Lint, front-end
+  reliability tests and shell checks remain part of the local gate above.
+- Local and CI Python tests default to two workers (`-n 2 --dist worksteal`)
+  through `pytest.ini`; `requirements-dev.txt` pins the xdist plugin. Use
+  `pytest -n 0` for serial debugging or `pytest -n 0 tests/test_foo.py` for a
+  small affected module without worker startup overhead. Pytest reports the
+  slowest phases; CI also retains a JUnit timing report.
+  Test shared editing rules at the component
+  boundary; retain real keyboard routing, focus, rendering and lifecycle tests
+  for UI integration rather than repeating every rule through every screen.
+- Playwright is not part of CI or the required local PR gate. Existing browser
+  tests remain available for explicitly requested diagnostics. When the
+  maintainer asks for PR acceptance, check out the requested revision, run the
+  application and verify the changed behavior; report the actual checks and
+  any remaining gaps. The automated checks above do not call a live model.
 
 ## Run / test
 ```bash

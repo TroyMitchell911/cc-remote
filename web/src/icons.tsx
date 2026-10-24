@@ -2,10 +2,12 @@
 // One <Icon name="..."/> component renders the SVG; sizes via prop.
 import { useEffect, useState } from "react";
 import type { Engine } from "./protocol";
+import dshMark from "./assets/dsh-mark.svg?no-inline";
 import engineMarks from "./assets/engine-marks.svg?no-inline";
 import claudeWorkingFrames from "./assets/claude-working.svg?no-inline";
 
 export function EngineIcon({ engine, size = 16 }: { engine: Engine; size?: number }) {
+  if (engine === "dsh") return <span className="engine-brand-icon dsh" aria-hidden="true" style={{ width: size, height: size, maskImage: `url(${dshMark})`, WebkitMaskImage: `url(${dshMark})` }} />;
   return <svg viewBox="0 0 24 24" width={size} height={size}
     className={`engine-brand-icon ${engine}`} aria-hidden="true" focusable="false">
     <use href={`${engineMarks}#${engine}`} />
@@ -37,7 +39,7 @@ export function EngineDone({ engine, size = 22, label }: {
         }}>
         {playing ? <EngineWorking engine={engine} size={size} /> : <EngineIcon engine={engine} size={size} />}
       </button>
-    : <ClaudeSpark size={size} label={label ?? "Codex"} />;
+    : engine === "dsh" ? <EngineIcon engine={engine} size={size} /> : <ClaudeSpark size={size} label={label ?? "Codex"} />;
 }
 
 const PATHS: Record<string, string> = {
@@ -66,6 +68,7 @@ const PATHS: Record<string, string> = {
   eye: '<path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="2.7"/>',
   'eye-off': '<path d="M3 3l18 18M10.6 5.2A9.7 9.7 0 0112 5c6 0 9.5 7 9.5 7a15 15 0 01-2.3 3.2M6.2 6.2C3.8 8 2.5 12 2.5 12s3.5 7 9.5 7a9.7 9.7 0 004-1M9.9 9.9a3 3 0 004.2 4.2"/>',
   user: '<circle cx="12" cy="8" r="3.4"/><path d="M5.5 20a6.5 6.5 0 0113 0"/>',
+  sliders: '<path d="M4 7h3m6 0h7M4 17h7m6 0h3"/><circle cx="10" cy="7" r="3"/><circle cx="14" cy="17" r="3"/>',
   spark: '<path d="M12 3l1.6 4.9L18.5 9.5l-4.9 1.6L12 16l-1.6-4.9L5.5 9.5l4.9-1.6L12 3z"/>',
   message: '<path d="M20 14a3 3 0 01-3 3H9l-5 4v-4a3 3 0 01-2-3V6a3 3 0 013-3h12a3 3 0 013 3z"/><path d="M7 8h8M7 12h5"/>',
   read: '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/>',

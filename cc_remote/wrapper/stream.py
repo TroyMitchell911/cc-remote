@@ -802,14 +802,19 @@ class StreamTranslator:
             text=bounded, channel=channel))
         self._emitted[channel_key] += len(bounded)
 
-    def _finish_message(self, events: list, text_channel: str) -> None:
+    def _finish_message(self, events: list, text_channel: str,
+                        native_uuid: str | None = None) -> None:
+        canonical = (native_uuid if isinstance(native_uuid, str)
+                     and _CLAUDE_MESSAGE_UUID.fullmatch(native_uuid) else None)
         if "thinking" in self._started_channels:
             events.append(AssistantMsgEnd(
                 message_id=self._message_ids["thinking"],
+                canonical_message_id=f"{canonical}:thinking" if canonical else None,
                 turn_id=self._message_turn_id, channel="thinking"))
         if "text" in self._started_channels:
             events.append(AssistantMsgEnd(
                 message_id=self._message_ids["text"],
+                canonical_message_id=canonical,
                 turn_id=self._message_turn_id, channel=text_channel))
         self._message_ids.clear()
         self._started_channels.clear()
@@ -1217,7 +1222,7 @@ class StreamTranslator:
                 )
         candidate_mid = (
             self._message_ids.get("text") if ambiguous_candidate else None)
-        self._finish_message(events, text_channel)
+        self._finish_message(events, text_channel, msg.uuid)
         if candidate_mid is not None:
             self._ambiguous_final_mid = candidate_mid
         return events

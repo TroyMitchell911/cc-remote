@@ -1,9 +1,12 @@
+import { lazyDshApi } from "./lazy-dsh-api";
+import type { DshPanelSelection } from "./components/DshPanel";
 import {
   harmonyPushSnapshot, subscribeHarmonyPush, hasHarmonyPush,
   requestHarmonyPermission, confirmHarmonyPermission,
 } from "./harmony-push";
 import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
-import type { FilePreview } from "./protocol";
+import { ArtifactReadingMemory, type ArtifactReadingState } from "./artifact-reading-state";
+import type { DshCommandInfo, FilePreview } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
   lazy,
@@ -37,7 +40,9 @@ import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
-import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import type { ChatViewHandle } from "./components/ChatView";
+const ChatView = lazy(() => import("./components/ChatView").then(m => ({ default: m.ChatView })));
+import { useChatReadingMemory } from "./chat-reading-memory";
 import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
@@ -60,7 +65,7 @@ import {
 const NewChatView = lazy(() => import("./components/NewChatView").then(m => ({ default: m.NewChatView })));
 const QuestionSheet = lazy(() => import("./components/QuestionSheet").then(
   m => ({ default: m.QuestionSheet })));
-import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
+const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
@@ -99,6 +104,7 @@ import {
   normalizeSessionList,
   scopedFocusForSessionList,
   shouldAcceptSessionList,
+  shortSessionId,
   updateScopedSessionLifecycle,
 } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
@@ -185,7 +191,9 @@ import {
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
   type HistoryRequestOptions,
+  type HistoryRequestKey,
 } from "./history-requests";
+import type { HistoryPagePrefetch } from "./history-prefetch";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
 import { HistoryImageAssetCache } from "./history-image-assets";
@@ -202,8 +210,10 @@ import {
   appendNewerPage,
   cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
+  createHistoryBrowse,
   prependOlderPage,
   type HistoryBrowsePage,
+  type HistoryBrowseProjection,
 } from "./history-browse";
 import {
   HistoryPageCache,
@@ -275,6 +285,7 @@ const HeaderMenu = lazy(() => import("./components/HeaderMenu").then(
 
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const MACHINE_KEY = "cc_remote_machine";
+const DshGoalPanel = lazy(() => import("./components/DshGoalPanel"));
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
 ));
@@ -313,6 +324,8 @@ const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").th
 const AgentDetailController = lazy(() => import("./components/AgentDetailController").then(
   ({ AgentDetailController: Controller }) => ({ default: Controller }),
 ));
+const DshPanel = lazy(() => import("./components/DshPanel"));
+const DshConnectionNotice = lazy(() => import("./components/DshCommandFeedback").then(m => ({ default: m.DshConnectionNotice })));
 const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
   ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
 ));
@@ -365,6 +378,7 @@ export default function App() {
   const sidebar = useSidebarController();
   const setSidebarOpen = sidebar.setOpen;
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [dshPresetSelection, setDshPresetSelection] = useState<{ scope: string; value: string } | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
   // A cold Work/Code or engine switch has no trustworthy row to paint until
@@ -377,9 +391,7 @@ export default function App() {
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
   // File panels share one slot; centered BTW is an independent overlay above it.
-  const [expandedPanel, setExpandedPanel] = useState<{
-    scope: string;
-  } | null>(null);
+  const [expandedPanelScopes, setExpandedPanelScopes] = useState<string[]>([]);
   const [centeredBtwScopes, setCenteredBtwScopes] = useState<string[]>([]);
   const btwChatViewRef = useRef<ChatViewHandle>(null);
   // A user action owns one focus request; restored panels and streaming updates
@@ -399,6 +411,11 @@ export default function App() {
     parentSid: string; sid: string; machineId: string; engine: Engine; space: Space;
     selected: SessionArtifactInfo | null; id: string;
   } | null>(null);
+  const panelViewsBySurfaceRef = useRef(new Map<string, {
+    rightView: RightPanelView;
+    fileBrowser: typeof fileBrowser;
+    sessionArtifacts: typeof sessionArtifacts;
+  }>());
   const artifactsListenerRef = useRef<((message: SessionArtifacts | FilePreview) => boolean) | null>(null);
   const listenArtifacts = useCallback((listener: ((message: SessionArtifacts | FilePreview) => boolean) | null) => {
     artifactsListenerRef.current = listener;
@@ -452,6 +469,9 @@ export default function App() {
   });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
+  const artifactReadingMemory = useMemo(() => ({
+    machineId, entries: new Map<string, ArtifactReadingState>(),
+  }), [machineId]);
   const notificationScopeRef = useRef({ machineId, authed });
   notificationScopeRef.current = { machineId, authed };
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
@@ -525,6 +545,8 @@ export default function App() {
     if (!transport || transport !== wsRef.current) throw new Error("连接已切换，请重试。");
     return goalApiRef.current ??= new GoalApi(() => wsRef.current);
   }, []);
+  const [dshApi] = useState(() => lazyDshApi(() => wsRef.current));
+  const [dshPanel, setDshPanel] = useState<{ sid: string; scope: string; selection: DshPanelSelection } | null>(null);
   const [permissionProfileRequests, setPermissionProfileRequests] =
     useState<Record<string, string>>({});
   const archivedBrowseRef = useRef<string | null>(null);
@@ -592,6 +614,7 @@ export default function App() {
         request.skillsOnly,
         request.codexProfileId,
         request.claudeProfileId,
+        request.sid, request.dshPreset,
       ) ?? null,
     );
   }
@@ -601,11 +624,17 @@ export default function App() {
     space: Space;
     cwd: string;
     skillsOnly: boolean;
+    sid?: string | null;
     claudeProfileId?: string | null;
     codexProfileId?: string | null;
   } | null>(null);
   const capabilitiesScopeRef = useRef<SkillCatalogRequest | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const historyPrefetchRef = useRef<HistoryPagePrefetch | null>(null);
+  const historyPrefetchLoaderRef = useRef<Promise<HistoryPagePrefetch> | null>(null);
+  useEffect(() => {
+    historyPrefetchRef.current?.clear();
+  }, [machineId, engine, space, state.focusedSid]);
   const turnFileRequestsRef = useRef(new TurnFilePageRequests());
   const terminalHistoryRepairRef = useRef<Map<
     string, TerminalHistoryRepairAttempt
@@ -629,6 +658,7 @@ export default function App() {
   ) => {
     for (const request of cancelled) {
       const browse = request.browse;
+      if (browse.cacheOnly) continue;
       dispatch({
         type: "history_browse_page_failed",
         sid: request.sid,
@@ -823,12 +853,13 @@ export default function App() {
   const shortcutRef = useRef<{
     artifact: typeof state.artifact;
     btwSid: string | null;
+    btwAvailable: boolean;
     rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
     collapseBtw: () => void;
     toggleCenteredBtw: () => void;
-  }>({ artifact: null, btwSid: null, rightView: "diff",
+  }>({ artifact: null, btwSid: null, btwAvailable: false, rightView: "diff",
     getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
     toggleCenteredBtw: () => {} });
 
@@ -847,6 +878,7 @@ export default function App() {
     const previous = previousMachineRef.current;
     if (previous === machineId) return;
     previousMachineRef.current = machineId;
+    panelViewsBySurfaceRef.current.clear();
     localStorage.setItem(MACHINE_KEY, machineId);
     pendingCreateRef.current = null;
     createRequestsRef.current.clear();
@@ -924,7 +956,9 @@ export default function App() {
   const focusedSid = state.focusedSid;
   const visibleParentSid = state.newChat || previousMachineRef.current !== machineId
     ? null : focusedSid;
-  const btwPanelKey = visibleParentSid
+  // DSH forks persist natively and cannot yet be deleted. Keep the side-chat
+  // implementation dormant, including any retained panel visibility.
+  const btwPanelKey = visibleParentSid && engine !== "dsh"
     ? btwPanelScopeKey(machineId, space, engine, visibleParentSid) : null;
   const btwPanelVisible = !!btwPanelKey && btwPanelScopes.includes(btwPanelKey);
   const btwPanelVisibleRef = useRef(btwPanelVisible);
@@ -975,7 +1009,7 @@ export default function App() {
   const artifactsShowing = sessionArtifacts?.parentSid === visibleParentSid
     && sessionArtifacts?.machineId === machineId && sessionArtifacts?.engine === engine
     && sessionArtifacts?.space === space;
-  const visibleRightPanel = viewerShowing ? "viewer" : agentPanel ? "agent"
+  const visibleRightPanel = dshPanel?.scope === sessionScopeKey(machineId, engine, space) && dshPanel.sid === visibleParentSid ? "dsh" : viewerShowing ? "viewer" : agentPanel ? "agent"
     : artifactsShowing ? "artifacts" : filesShowing ? "files"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
@@ -992,10 +1026,7 @@ export default function App() {
     current => setBtwPanelScope(current, btwScope, visible));
   const btwExpanded = !!btwPanelKey && centeredBtwScopes.includes(btwScope);
   const btwRendered = visibleRightPanel === "btw" || btwExpanded;
-  const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
-  useEffect(() => {
-    setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
-  }, [rightPanelKey]);
+  const panelExpanded = !!rightPanelKey && expandedPanelScopes.includes(rightPanelKey);
   useEffect(() => {
     setBtwFocusScope(current => current === btwScope ? current : null);
   }, [btwScope]);
@@ -1052,6 +1083,7 @@ export default function App() {
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
   useEffect(() => () => goalApiRef.current?.reset(), [activeScopeKey]);
+  useEffect(() => () => dshApi.reset(), [activeScopeKey, dshApi]);
   const activeWorkDashboard = workDashboardMachineId === machineId
     ? workDashboards[engine] ?? null
     : null;
@@ -1114,6 +1146,10 @@ export default function App() {
     newChatCatalogScopeKey,
   );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
+  const chatReadingMemory = useChatReadingMemory(
+    activeScopeKey, focusedSid, rt, state.historyBrowse, dispatch,
+    !state.newChat && !isHistoryRecoveryPending(state.historyRecovery, focusedSid), authed,
+    historyPageCacheScopeKey({ machineId, engine, space, sid: focusedSid ?? "", revision: rt.historyRevision ?? "" }));
   const historyView = displayHistoryProjection(
     state.historyRecovery,
     focusedSid,
@@ -1124,7 +1160,7 @@ export default function App() {
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
   const archivedBrowse = focusedSession?.tag === "archived";
-  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex" | "dsh";
   useEffect(() => {
     if (space !== "code" || state.connState !== "connected" || !state.wrapperOnline) return;
     if (!historyView.turns.some((turn) => turn.sourceThreadId?.startsWith("ccr:")
@@ -1238,12 +1274,16 @@ export default function App() {
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
   );
+  const newChatDshPreset = dshPresetSelection?.scope === activeScopeKey
+    ? dshPresetSelection.value : state.dshPresets?.find(preset => preset.is_default)?.id ?? null;
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
-    focusedCodexProfileId, focusedClaudeProfileId);
+    focusedCodexProfileId, focusedClaudeProfileId,
+    focusedEngine === "dsh" ? focusedSid : undefined);
   const newChatSkillCatalogKey = skillCatalogKey(
     machineId, engine, space, state.newChat?.cwd ?? currentCwd,
-    newChatCodexProfileId, newChatClaudeProfileId);
+    newChatCodexProfileId, newChatClaudeProfileId,
+    engine === "dsh" ? `preset:${newChatDshPreset ?? ""}` : undefined);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
@@ -1252,6 +1292,7 @@ export default function App() {
     skillsOnly: true,
     claudeProfileId: focusedClaudeProfileId,
     codexProfileId: focusedCodexProfileId,
+    sid: focusedSid,
   };
   // New-chat account/cwd overrides belong to the draft, not the last focused
   // session. Work has no private cwd until creation, so cannot read a catalog.
@@ -1260,19 +1301,19 @@ export default function App() {
       if (space === "work" || newChatClaudeProfileMissing || newChatCodexProfileMissing) return null;
       return { key: newChatSkillCatalogKey, engine, space, cwd: newChatCwd,
         skillsOnly: false, claudeProfileId: newChatClaudeProfileId,
-        codexProfileId: newChatCodexProfileId };
+        codexProfileId: newChatCodexProfileId, dshPreset: newChatDshPreset };
     }
     return { key: focusedSkillCatalogKey, engine: focusedEngine, space,
       cwd: capabilityCwd, skillsOnly: false,
-      claudeProfileId: focusedClaudeProfileId, codexProfileId: focusedCodexProfileId };
+      claudeProfileId: focusedClaudeProfileId, codexProfileId: focusedCodexProfileId, sid: focusedSid };
   }, [newChatCwd, space, newChatClaudeProfileMissing, newChatCodexProfileMissing,
     newChatSkillCatalogKey, engine, newChatClaudeProfileId, newChatCodexProfileId,
     focusedSkillCatalogKey, focusedEngine, capabilityCwd,
-    focusedClaudeProfileId, focusedCodexProfileId]);
+    focusedClaudeProfileId, focusedCodexProfileId, focusedSid, newChatDshPreset]);
   capabilitiesScopeRef.current = capabilitiesOpen ? capabilitiesScope : null;
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
-    (activeBtw?.engine === "codex" ? "codex" : "claude"),
+    (activeBtw?.engine ?? focusedEngine),
     `btw:${activeBtwSid ?? visibleParentSid ?? "opening"}`,
   );
   const inlineImageAssets = focusedSid
@@ -1330,7 +1371,7 @@ export default function App() {
   }, [activeBtwSid, focusedSid]);
 
   useEffect(() => {
-    if (!authed || !focusedSid || !focusedGoalScopeKey || state.newChat
+    if (focusedEngine === "dsh" || !authed || !focusedSid || !focusedGoalScopeKey || state.newChat
         || archivedBrowse
         || state.connState !== "connected" || !state.wrapperOnline) {
       return;
@@ -1368,6 +1409,7 @@ export default function App() {
   }, [
     authed,
     archivedBrowse,
+    focusedEngine,
     focusedGoalScopeKey,
     focusedSid,
     state.connState,
@@ -1493,10 +1535,10 @@ export default function App() {
   }, []);
   const storeSkillCatalog = useCallback((
     key: string,
-    items: EngineCapabilityItem[],
+    items: EngineCapabilityItem[], dshCommands?: DshCommandInfo[],
   ) => {
     const next = cacheSkillCatalog(
-      skillCatalogsRef.current, key, items);
+      skillCatalogsRef.current, key, items, Date.now(), dshCommands);
     skillCatalogsRef.current = next;
     setSkillCatalogs(next);
     clearSkillCatalogError(key);
@@ -1518,7 +1560,7 @@ export default function App() {
     if (!accepted.superseded && skillCatalogRefreshSucceeded(msg)) {
       storeSkillCatalog(
         matchedScope.key,
-        msg.items.filter((item) => item.kind === "skill"));
+        msg.items.filter((item) => item.kind === "skill"), msg.dsh_commands);
     } else if (!accepted.superseded && msg.skills_only) {
       setSkillCatalogErrors(current => ({ ...current, [matchedScope.key]: true }));
     }
@@ -1779,7 +1821,7 @@ export default function App() {
         .find((session) => session.session_id === sid);
     const scope: HistoryPageCacheScope = {
       machineId,
-      engine: listed?.engine === "codex" || listed?.engine === "claude"
+      engine: listed?.engine === "codex" || listed?.engine === "claude" || listed?.engine === "dsh"
         ? listed.engine : fallbackEngine,
       space: listed?.space === "work" || listed?.space === "code"
         ? listed.space : fallbackSpace,
@@ -1790,6 +1832,7 @@ export default function App() {
     return scope;
   }, [machineId]);
   const invalidateHistoryPageScopes = useCallback((sid: string) => {
+    historyPrefetchRef.current?.clear();
     const scopes = new Map<string, HistoryPageCacheSessionScope>();
     for (const scope of historyPageScopesRef.current.values()) {
       if (scope.machineId !== machineId || scope.sid !== sid) continue;
@@ -1836,11 +1879,12 @@ export default function App() {
   const installBrowseHistoryPage = useCallback((
     history: History,
     waiters: readonly HistoryBrowseRequestContext[],
+    initialBrowse?: HistoryBrowseProjection,
   ) => {
     const turns = summaryHistoryTurns(history);
     if (!history.before || !turns) return;
     for (const waiter of waiters) {
-      const browse = stateRef.current.historyBrowse;
+      const browse = initialBrowse ?? stateRef.current.historyBrowse;
       if (!browse
           || stateRef.current.focusedSid !== history.session_id
           || browse.sid !== history.session_id
@@ -2007,6 +2051,15 @@ export default function App() {
   ) => {
     clearForkFocusLease(false);
     rememberSurfaceFocus(engine, space);
+    const departingSurface = sessionScopeKey(machineId, engine, space);
+    const panelViews = panelViewsBySurfaceRef.current;
+    panelViews.delete(departingSurface);
+    panelViews.set(departingSurface, { rightView, fileBrowser, sessionArtifacts });
+    while (panelViews.size > 8) panelViews.delete(panelViews.keys().next().value!);
+    const restoredPanel = panelViews.get(sessionScopeKey(machineId, nextEngine, nextSpace));
+    setRightView(restoredPanel?.rightView ?? "diff");
+    setFileBrowser(restoredPanel?.fileBrowser ?? null);
+    setSessionArtifacts(restoredPanel?.sessionArtifacts ?? null);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
     const focusScopeKey = sessionScopeKey(
       machineId, nextEngine, nextSpace);
@@ -2056,6 +2109,9 @@ export default function App() {
     engine,
     machineId,
     rememberSurfaceFocus,
+    rightView,
+    fileBrowser,
+    sessionArtifacts,
     requestHistory,
     resumeListedSession,
     space,
@@ -2063,7 +2119,7 @@ export default function App() {
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
-      || selected.engine === "claude"
+      || selected.engine === "claude" || selected.engine === "dsh"
       ? selected.engine : engineRef.current;
     const selectedSpace: Space = selected.space === "work"
       || selected.space === "code"
@@ -2221,7 +2277,7 @@ export default function App() {
   };
 
   const switchSpace = (next: Space) => {
-    if (next === space || !confirmArtifactDiscard()) return;
+    if ((engine === "dsh" && next !== "code") || next === space || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
     setCreateError(null);
@@ -2322,6 +2378,7 @@ export default function App() {
           if (!acceptsLifecycle()) return;
           if (turnFileRequestsRef.current.accept(msg)) return;
           if (goalApiRef.current?.accept(msg)) return;
+          if (dshApi.accept(msg)) return;
           const settlesContextRequest = !!(
             (msg.type === "context_report"
                 || (msg.type === "error" && msg.code !== "wrapper_offline"))
@@ -2755,6 +2812,8 @@ export default function App() {
             }
           } else if (msg.type === "replay_start" && msg.sid
               && !msg.sid.startsWith("btw-")
+              && !Object.values(stateRef.current.btwByParentSid).some((group) =>
+                group.chats.some((chat) => chat.sid === msg.sid))
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
             clearHistoryDetailRequests();
@@ -2820,8 +2879,10 @@ export default function App() {
             const completedHistory =
               historyRequestsRef.current.complete(msg);
             settledHistoryCausalKey = completedHistory.settledCausalKey;
-            const browseWaiters = completedHistory.matched;
-            for (const browse of completedHistory.stale) {
+            const browseWaiters = completedHistory.matched.filter(waiter => !waiter.cacheOnly);
+            historyPrefetchRef.current?.complete(msg, completedHistory.matched);
+            const staleBrowseWaiters = completedHistory.stale.filter(waiter => !waiter.cacheOnly);
+            for (const browse of staleBrowseWaiters) {
               dispatch({
                 type: "history_browse_page_failed",
                 sid: msg.session_id,
@@ -2837,7 +2898,7 @@ export default function App() {
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
             let retryScheduled = false;
-            if (msg.authoritative === false) {
+            if (msg.authoritative === false && (!msg.before || browseWaiters.length)) {
               const retryDelay = msg.error == null && !msg.before
                 ? HISTORY_PROVISIONAL_WATCHDOG_MS
                 : undefined;
@@ -2860,7 +2921,7 @@ export default function App() {
               recoverableReads.complete(retryKey);
             }
             if (msg.before) {
-              if (completedHistory.stale.some((waiter) => {
+              if (staleBrowseWaiters.some((waiter) => {
                 const browse = stateRef.current.historyBrowse;
                 return browse?.sid === msg.session_id
                   && browse.scopeKey === waiter.scopeKey
@@ -3457,8 +3518,8 @@ export default function App() {
               setCenteredBtwScopes(current => [...new Set(current.map(
                 scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
               setBtwFocusScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
-              setExpandedPanel(current => current ? { ...current,
-                scope: rekeyPanelScope(current.scope, msg.old_key, msg.session_id)! } : null);
+              setExpandedPanelScopes(current => [...new Set(current.map(
+                scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
               setSessionArtifacts(current => current && current.machineId === machineId ? { ...current,
                 parentSid: current.parentSid === msg.old_key ? msg.session_id : current.parentSid,
                 sid: current.sid === msg.old_key ? msg.session_id : current.sid } : current);
@@ -3577,7 +3638,7 @@ export default function App() {
             // not start a second app-server and the user's first toggle is fast.
             const siblingSpace: Space = listedSpace === "work" ? "code" : "work";
             const siblingKey = `${siblingSpace}:${msg.engine}`;
-            if (!prefetchedSurfacesRef.current.has(siblingKey)) {
+            if (msg.engine !== "dsh" && !prefetchedSurfacesRef.current.has(siblingKey)) {
               prefetchedSurfacesRef.current.add(siblingKey);
               ws.sendListSessions(msg.engine, siblingSpace);
             }
@@ -3821,6 +3882,7 @@ export default function App() {
           if (s !== "connected") {
             turnFileRequestsRef.current.clear();
             goalApiRef.current?.reset();
+            dshApi.reset();
             skillCatalogRequestsRef.current?.resetReads();
             // The fork result is authoritative only for this live connection.
             // A reconnect will obtain a fresh native SessionList, so do not
@@ -3841,6 +3903,7 @@ export default function App() {
               goalDismissMigrationByRequestRef.current,
             );
             recoverableReads.clear();
+            historyPrefetchRef.current?.clear();
             settleCancelledHistoryBrowse(
               historyRequestsRef.current.beginConnection());
             clearHistoryDetailRequests();
@@ -3986,6 +4049,7 @@ export default function App() {
       if (wsRef.current === effectWs) wsRef.current = null;
       historyRequests.clear();
       clearHistoryDetailRequests();
+      historyPrefetchRef.current?.clear();
       turnFileRequests.clear();
       recoverableReads.clear();
       contextRequestLaunches.clear();
@@ -3993,6 +4057,7 @@ export default function App() {
     };
   }, [
     acceptSkillCatalog,
+    dshApi,
     authed,
     clearForkFocusLease,
     clearHistoryDetailRequests,
@@ -4067,7 +4132,7 @@ export default function App() {
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
       dispatch({ type: "focus_session", sid: latest.session_id });
-      const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
+      const latestEngine = (latest.engine as "claude" | "codex" | "dsh") || engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       requestHistory(
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
@@ -4118,6 +4183,7 @@ export default function App() {
       skillsOnly: true,
       claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
+      sid: focusedSid,
     });
   }, [
     authed,
@@ -4277,6 +4343,7 @@ export default function App() {
         e.preventDefault();
         setSidebarOpen((v) => !v);
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
+        if (!shortcutRef.current.btwAvailable) return;
         e.preventDefault();
         const latest = shortcutRef.current;
         if (document.querySelector('.btw-panel[aria-modal="true"]')
@@ -4285,6 +4352,7 @@ export default function App() {
         }
         else latest.openBtw();
       } else if (k === "e" && e.shiftKey) {
+        if (!shortcutRef.current.btwAvailable) return;
         e.preventDefault();
         shortcutRef.current.toggleCenteredBtw();
       }
@@ -4292,6 +4360,11 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, setSidebarOpen]);
+
+  const setPerm = useCallback((perm: string) => {
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "permission", perm);
+    else wsRef.current?.sendSetPerm(perm);
+  }, [focusedEngine, focusedSid]);
 
   // Shift+Tab follows each engine's real mode control: Claude cycles permission
   // modes; Codex toggles collaboration mode without touching approvalPolicy.
@@ -4308,7 +4381,10 @@ export default function App() {
             rt.collaborationMode === "plan" ? "default" : "plan");
           return;
         }
-        const modes = permsFor(focusedEngine).map((p) => p.id);
+        const modes = focusedEngine === "dsh"
+          ? (rt.dsh?.permissions ?? []).filter(p => p.value !== "custom").map(p => p.value)
+          : permsFor(focusedEngine).map((p) => p.id);
+        if (!modes.length) return;
         const current = modes.indexOf(rt.perm);
         setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
@@ -4316,7 +4392,7 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
-    rt.external, focusedEngine]);
+    rt.external, rt.dsh?.permissions, focusedEngine, setPerm]);
 
   const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
@@ -4492,7 +4568,7 @@ export default function App() {
   ]);
 
   const refreshStatus = useCallback(() => {
-    if (!focusedSid) return;
+    if (!focusedSid || focusedEngine === "dsh") return;
     const current = stateRef.current;
     if (current.sessions.find(
       (session) => session.session_id === focusedSid)?.tag === "archived") return;
@@ -4501,7 +4577,7 @@ export default function App() {
     if (requestId) {
       dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
     }
-  }, [focusedSid]);
+  }, [focusedSid, focusedEngine]);
   const consumeResetCredit = useCallback((creditId?: string | null) => {
     if (!focusedSid || focusedEngine !== "codex") return false;
     const current = stateRef.current;
@@ -4586,9 +4662,8 @@ export default function App() {
   }
 
   if (!authed) {
-    return <Suspense fallback={null}><LoginForm
-      onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }}
-      theme={theme} onToggleTheme={toggleTheme} /></Suspense>;
+    return <Suspense fallback={<div className="login" aria-busy="true">正在加载登录页面…</div>}><LoginForm
+      onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} /></Suspense>;
   }
 
   const runtimeIsReadOnly = (sid: string): boolean => {
@@ -4849,6 +4924,56 @@ export default function App() {
     const messageId = ws.pendingQueryFor(sid);
     return messageId ? ws.queryReceiptFor(sid, messageId) : null;
   };
+  const olderHistoryRequest = (): (HistoryRequestKey & {
+    revision: string;
+    browse: HistoryBrowseRequestContext;
+  }) | null => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime?.historyRevision || !wsRef.current
+        || runtime.historyInvalidated
+        || current.connState !== "connected"
+        || isHistoryRecoveryPending(current.historyRecovery, sid)) return null;
+    const existing = current.historyBrowse?.sid === sid
+      ? current.historyBrowse : null;
+    const before = existing ? existing.olderCursor : runtime.oldestId;
+    if (!(existing ? existing.hasOlder : runtime.hasMore) || !before) return null;
+    const scopeKey = existing?.scopeKey ?? historyPageCacheScopeKey(
+      historyPageScopeFor(sid, runtime.historyRevision, focusedEngine, space));
+    if (!historyPageScopesRef.current.has(scopeKey)) return null;
+    return {
+      sid, before, limit: HISTORY_MORE_PAGE,
+      revision: existing?.revision ?? runtime.historyRevision,
+      generation: existing ? existing.generation : runtime.historyGeneration
+        ?? wsRef.current.generationFor(sid) ?? null,
+      browse: {
+        scopeKey, viewId: existing?.viewId ?? "",
+        windowEpoch: existing?.windowEpoch ?? 0,
+        pendingBefore: before, sourcePageKey: existing?.oldestPageKey ?? null,
+        cacheOnly: true,
+      },
+    };
+  };
+  const prefetchOlderHistoryPage = async () => {
+    // Only history readers need the speculative cache. Keep it off startup.
+    const current = stateRef.current;
+    try {
+      const cache = historyPrefetchRef.current ?? await (
+        historyPrefetchLoaderRef.current ??= import("./history-prefetch")
+          .then(({ HistoryPagePrefetch }) =>
+            historyPrefetchRef.current = new HistoryPagePrefetch())
+      );
+      if (stateRef.current !== current) return;
+      const request = olderHistoryRequest();
+      if (!request || !cache.begin(request)) return;
+      requestHistory(request.sid, request.before, request.limit,
+        request.generation, request.revision, request.browse);
+    } catch {
+      historyPrefetchLoaderRef.current = null;
+      // Foreground pagination remains available if the optional chunk fails.
+    }
+  };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
   ): boolean | {
@@ -4857,38 +4982,26 @@ export default function App() {
     scopeKey: string;
     generation: string | null;
   } => {
-    const current = stateRef.current;
-    const sid = current.focusedSid;
-    const runtime = sid ? current.runtimes[sid] : null;
-    if (!sid || !runtime?.historyRevision || !wsRef.current
-        || runtime.historyInvalidated
-        || isHistoryRecoveryPending(current.historyRecovery, sid)) return false;
-    const existing = current.historyBrowse?.sid === sid
-      ? current.historyBrowse : null;
-    if (existing) {
-      if (!existing.hasOlder || !existing.olderCursor
-          || !historyPageScopesRef.current.has(existing.scopeKey)) return false;
-      const context: HistoryBrowseRequestContext = {
-        scopeKey: existing.scopeKey,
-        viewId: existing.viewId,
-        windowEpoch: existing.windowEpoch,
-        pendingBefore: existing.olderCursor,
-        sourcePageKey: existing.oldestPageKey,
-        anchorTurnId: anchorTurnId ?? null,
-      };
-      return requestHistory(
-        sid, existing.olderCursor, HISTORY_MORE_PAGE,
-        existing.generation, existing.revision, context);
+    const request = olderHistoryRequest();
+    if (!request) return false;
+    const { sid, revision, browse: prefetchContext } = request;
+    const { scopeKey } = prefetchContext;
+    const warmed = historyPrefetchRef.current?.take(request);
+    const context = { ...prefetchContext, cacheOnly: false, anchorTurnId };
+    const send = () => requestHistory(sid, request.before, request.limit,
+      request.generation, revision, context);
+    if (stateRef.current.historyBrowse?.sid === sid) {
+      if (!warmed) return send();
+      installBrowseHistoryPage(warmed, [context]);
+      return true;
     }
-    if (!runtime.hasMore || !runtime.oldestId) return false;
-    const scope = historyPageScopeFor(
-      sid, runtime.historyRevision, focusedEngine, space);
-    const scopeKey = historyPageCacheScopeKey(scope);
+    const runtime = stateRef.current.runtimes[sid];
+    const scope = historyPageScopesRef.current.get(scopeKey)!;
     const viewId = uuid();
     const basePageKey = `${HISTORY_LATEST_PAGE_KEY}:${viewId}`;
-    const browseGeneration = runtime.historyGeneration
-      ?? wsRef.current.generationFor(sid)
-      ?? null;
+    const browseGeneration = request.generation ?? null;
+    context.viewId = viewId;
+    context.sourcePageKey = basePageKey;
     const basePage: HistoryBrowsePage = {
       pageKey: basePageKey,
       turns: runtime.turns,
@@ -4899,25 +5012,20 @@ export default function App() {
       isLatest: true,
     };
     void historyPageCacheRef.current.putPage(scope, basePage);
-    dispatch({
-      type: "begin_history_browse",
-      sid,
-      scopeKey,
-      revision: runtime.historyRevision,
-      generation: browseGeneration,
-      viewId,
-      basePageKey,
-    });
-    const accepted = requestHistory(
-      sid, runtime.oldestId, HISTORY_MORE_PAGE,
-      browseGeneration, runtime.historyRevision, {
-        scopeKey,
-        viewId,
-        windowEpoch: 0,
-        pendingBefore: runtime.oldestId,
-        sourcePageKey: basePageKey,
-        anchorTurnId: anchorTurnId ?? null,
-      });
+    const identity = {
+      sid, scopeKey, revision, generation: browseGeneration, viewId, basePageKey,
+    };
+    dispatch({ type: "begin_history_browse", ...identity });
+    if (warmed) {
+      // Both actions reduce in order. Preparing the base here also lets us
+      // persist any evicted pages without waiting a render/network round trip.
+      const initial = createHistoryBrowse({
+        ...identity, baseTurns: runtime.turns,
+        hasOlder: true, olderCursor: runtime.oldestId ?? null,
+      }).projection;
+      installBrowseHistoryPage(warmed, [context], initial);
+    }
+    const accepted = warmed ? true : send();
     return accepted ? {
       accepted: true,
       viewId,
@@ -5027,7 +5135,7 @@ export default function App() {
                             permissionMode?: PermissionMode,
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
-                            serviceTier?: CodexServiceTier): boolean => {
+                            serviceTier?: CodexServiceTier, dshPermission?: string): boolean => {
     if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
         || newChatClaudeProfileMissing
         || restoringSurfaceScope === activeScopeKey) {
@@ -5061,7 +5169,9 @@ export default function App() {
         mode: autoCompactMode,
         thresholdTokens: autoCompactThresholdTokens,
       } : undefined,
-      engine === "claude" ? newChatClaudeProfileId : undefined);
+      engine === "claude" ? newChatClaudeProfileId : undefined,
+      engine === "dsh" ? newChatDshPreset ?? undefined : undefined,
+      engine === "dsh" ? dshPermission : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -5129,7 +5239,8 @@ export default function App() {
     wsRef.current?.sendSetModel(model);
   };
   const setEffort = (effort: string) => {
-    wsRef.current?.sendSetEffort(effort);
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "effort", effort);
+    else wsRef.current?.sendSetEffort(effort);
   };
   const setAutoCompact = (selection: AutoCompactSelection): boolean => (
     wsRef.current?.sendSetAutoCompact(
@@ -5139,9 +5250,6 @@ export default function App() {
   // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
     wsRef.current?.sendSetServiceTier(tier);
-  };
-  const setPerm = (perm: string) => {
-    wsRef.current?.sendSetPerm(perm);
   };
   const getPermissionProfiles = () => {
     wsRef.current?.sendGetPermissionProfiles();
@@ -5198,6 +5306,10 @@ export default function App() {
   };
   const runGoal = (args: string) => {
     if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return;
+    if (focusedEngine === "dsh") {
+      setGoalUi({ revealed: true, open: true, loading: false });
+      return;
+    }
     const command = parseGoalCommand(args, focusedEngine);
     rememberFocusedGoalUi();
     if (command.kind === "clear") {
@@ -5376,6 +5488,9 @@ export default function App() {
     previewFileForSid(activeBtwSid, file, line);
 
   const openAgentDetail = (runId: string, title?: string) => {
+    if (focusedEngine === "dsh" && focusedSid && !runId.startsWith("dsh@")) {
+      setDshPanel({sid: focusedSid, scope: activeScopeKey, selection: {kind: runId.startsWith("dsh-job-") ? "jobs" : "subagents"}}); return;
+    }
     if (!focusedSid || space !== "code"
         || !rt.historyRevision) return;
     setSessionArtifacts(null);
@@ -5486,7 +5601,7 @@ export default function App() {
   // concern; only closeBtw sends the destructive native-fork teardown.
   const createBtw = () => {
     const parentSid = visibleParentSid;
-    if (!parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
+    if (!btwPanelKey || !parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
     const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
     if (!requestId) {
       setBtwOpeningFor(parentSid, false);
@@ -5523,6 +5638,7 @@ export default function App() {
     if (!btwPanelKey || !confirmArtifactDiscard()) return;
     setCenteredBtw(false);
     setSessionArtifacts(null);
+    setDshPanel(null);
     closeViewer();
     setAgentPanel(null);
     setFileBrowser(null);
@@ -5541,10 +5657,10 @@ export default function App() {
     openBtw();
     dismissCenteredBtw();
   };
-  const dockPanel = () => setExpandedPanel(null);
+  const dockPanel = () => setExpandedPanelScopes(current => current.filter(scope => scope !== rightPanelKey));
   const togglePanelExpanded = () => {
     if (panelExpanded) dockPanel();
-    else if (rightPanelKey) setExpandedPanel({ scope: rightPanelKey });
+    else if (rightPanelKey) setExpandedPanelScopes(current => [...current, rightPanelKey].slice(-16));
   };
   const selectBtw = (sid: string) => {
     const parentSid = visibleParentSid;
@@ -5627,15 +5743,14 @@ export default function App() {
       || !!target.acceptancePending || !!target.pendingSend
       || target.queue.length > 0
     );
-    if (hasActiveWork && !window.confirm(
+    if (activeBtwGroup?.chats.find(chat => chat.sid === btwSid)?.engine !== "dsh" && hasActiveWork && !window.confirm(
       "这个侧边对话仍在工作或有排队消息，确定关闭并丢弃吗？")) return;
     if (!wsRef.current?.sendCloseBtw(btwSid)) return;
     const tracked = activeBtwByParentRef.current.get(parentSid);
     if (tracked?.sid === btwSid) activeBtwByParentRef.current.delete(parentSid);
     btwDraftsRef.current.delete(composerDraftKey(
       machineId, space,
-      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine
-        === "codex" ? "codex" : "claude"),
+      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine ?? focusedEngine),
       `btw:${btwSid}`,
     ));
     setBtwSendModeBySid((current) => {
@@ -5660,7 +5775,7 @@ export default function App() {
     }
   };
   shortcutRef.current = {
-    artifact: state.artifact, btwSid: activeBtwSid, rightView,
+    artifact: state.artifact, btwSid: activeBtwSid, btwAvailable: !!btwPanelKey, rightView,
     getDiff, openBtw, collapseBtw, toggleCenteredBtw,
   };
   const logout = async () => {
@@ -5762,6 +5877,13 @@ export default function App() {
   const effectiveState = mergeSessionActivityState(
     focusedSessionState, rt.state, rt.mirroredRunning,
   ) ?? rt.state;
+  const dshConnectionError = focusedEngine === "dsh" && !state.newChat
+    && rt.dsh?.connected === false ? rt.dsh.error ?? null : null;
+  const focusedDshPresetId = space === "code" && focusedEngine === "dsh" && !state.newChat
+    ? rt.dsh?.agent_preset : null;
+  const focusedDshPresetName = focusedDshPresetId
+    ? state.dshPresets?.find(preset => preset.id === focusedDshPresetId)?.name ?? focusedDshPresetId
+    : null;
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
@@ -5810,6 +5932,13 @@ export default function App() {
         completionBadges={completionBadges}
         activeSessionId={focusedSid}
         machineId={machineId}
+        readDsh={engine === "dsh" ? dshApi.read : undefined}
+        onDshSearch={(sid, query) => {
+          if (!focusedSid && !state.sessions.length) return;
+          setDshPanel({ sid: focusedSid ?? state.sessions[0].session_id, scope: activeScopeKey,
+            selection: { kind: "conversation", target: sid, query } });
+          if (isMobile()) setSidebarOpen(false);
+        }}
         onSelect={(id) => {
           if (!confirmArtifactDiscard()) return false;
           cancelPendingNotificationTarget();
@@ -5892,13 +6021,17 @@ export default function App() {
         onClose={closeSessionMigration}
       /></Suspense>}
       <section className={`pane ${space}-pane`}>
-        <header className={`c-head ${space}-head`}>
+        <header className={`c-head ${space}-head${focusedDshPresetName ? " has-dsh-mode" : ""}`}>
           <div className="titlewrap">
             <div className="ttl">
               <SidebarState controller={sidebar}>{sidebarOpen => <SidebarToggle className="surface-head-title" open={sidebarOpen} onOpenChange={setSidebarOpen}>
                 <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
                 <span>{space === "work" ? "Work" : "Code"}</span>
               </SidebarToggle>}</SidebarState>
+              {focusedDshPresetName && <span className="dsh-session-mode"
+                title={focusedDshPresetName} aria-label={`当前会话模式：${focusedDshPresetName}`}>
+                {focusedDshPresetName}
+              </span>}
               {focusedWorkProfile && (
                 <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
                   title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
@@ -5908,12 +6041,12 @@ export default function App() {
                 </span>
               )}
             </div>
-            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${focusedNativeSessionId.slice(0, 8)}` : "connected"}</div>
+            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
           </div>
-          <span className={`hstat ${effectiveState}`}><span className="sd" />
-            <span className="hstat-label">{effectiveState}</span></span>
+          <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
+            <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat
-              && !archivedBrowse && (
+              && !archivedBrowse && focusedEngine !== "dsh" && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -5939,8 +6072,9 @@ export default function App() {
             notificationNative={harmonyPush.available}
             notificationError={harmonyPush.error}
             onNotificationMode={updateNotificationMode}
+            onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
-            onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
+            onOpenBtw={btwPanelKey && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
@@ -5958,6 +6092,8 @@ export default function App() {
           busy={state.connState !== "connected" || !state.wrapperOnline
             || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
+        {focusedEngine === "dsh" && <Suspense fallback={null}><DshConnectionNotice
+          key={`${activeScopeKey}:${focusedSid}`} error={dshConnectionError} /></Suspense>}
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
@@ -5970,6 +6106,11 @@ export default function App() {
           </div>
         ) : state.newChat ? (
           <Suspense fallback={null}><NewChatView cwd={state.newChat.cwd}
+            editPrompt={editPrompt} onEditConsumed={() => setEditPrompt(null)}
+            dshPresets={state.dshPresets} dshPermissions={state.dshPermissions}
+            dshError={state.dshError}
+            dshPreset={newChatDshPreset}
+            onPickDshPreset={value => setDshPresetSelection({ scope: activeScopeKey, value })}
             controlScopeKey={`${activeScopeKey}\u0000${newChatProfileId ?? "__default__"}`}
             space={space}
             createError={createError}
@@ -5978,6 +6119,7 @@ export default function App() {
             catalog={newChatCatalog}
             skills={space === "code" && skillCatalogFresh(skillCatalogs[newChatSkillCatalogKey])
               ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
+            dshCommands={skillCatalogs[newChatSkillCatalogKey]?.dshCommands}
             skillsOnline={state.connState === "connected" && state.wrapperOnline}
             skillsError={!!skillCatalogErrors[newChatSkillCatalogKey]}
             onOpenExtensions={openExtensions}
@@ -5985,7 +6127,7 @@ export default function App() {
               if (!state.newChat || space !== "code" || state.connState !== "connected"
                   || !state.wrapperOnline) return;
               const requested = requestSkillCatalog({
-                key: newChatSkillCatalogKey,
+                key: newChatSkillCatalogKey, dshPreset: newChatDshPreset,
                 engine, space, cwd: state.newChat.cwd, skillsOnly: true,
                 claudeProfileId: newChatClaudeProfileId,
                 codexProfileId: newChatCodexProfileId,
@@ -6038,7 +6180,8 @@ export default function App() {
             onSend={sendFirstMessage} /></Suspense>
         ) : (
           <>
-            <ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+            <Suspense fallback={<div className="thread" />}><ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+              {...chatReadingMemory}
               sid={focusedSid} turns={historyView.turns}
               sessionLink={(nativeId) => {
                 const session = findMessageSession(nativeId);
@@ -6075,6 +6218,7 @@ export default function App() {
               browseMode={historyView.browsing}
               hasNewer={historyView.hasNewer}
               onLoadMore={loadOlderHistoryPage}
+              onPrefetchOlder={prefetchOlderHistoryPage}
               onLoadNewer={loadNewerHistoryPage}
               onReturnLatest={returnToLatestHistory}
               onLoadDetail={historyView.recovering
@@ -6130,7 +6274,7 @@ export default function App() {
                 ? openAgentDetail : undefined}
               onFork={!historyView.recovering && !archivedBrowse
                   && space === "code"
-                ? forkFromTurn : undefined} />
+                ? forkFromTurn : undefined} /></Suspense>
 
             <Suspense fallback={((!archivedBrowse
                 && ((goalUi?.revealed && !completedGoalRetired)
@@ -6138,7 +6282,12 @@ export default function App() {
               ? <span className="goal-suspense" role="status"
                   aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
               : null}>
-              <GoalPanel engine={focusedEngine} goal={rt.goal}
+              {focusedEngine === "dsh" && !archivedBrowse && <DshGoalPanel key={focusedGoalScopeKey}
+                goal={rt.dsh?.goal ?? null} open={!!goalUi?.open}
+                disabled={!state.wrapperOnline || !rt.dsh?.connected || !rt.dsh.commands.some(c => c.name === "goal")}
+                onOpen={() => setGoalUi({ open: true })} onClose={() => setGoalUi({ open: false })}
+                onAction={action => dshApi.goal(focusedSid!, action)} />}
+              {focusedEngine !== "dsh" && <GoalPanel engine={focusedEngine} goal={rt.goal}
                 revealed={!archivedBrowse && !!goalUi?.revealed}
                 open={!archivedBrowse && !!goalUi?.open}
                 key={focusedGoalScopeKey}
@@ -6186,7 +6335,7 @@ export default function App() {
                 onClear={async () => {
                   rememberFocusedGoalUi();
                   await (await getGoalApi()).clear(focusedSid!);
-                }} />
+                }} />}
             </Suspense>
 
             {rt.pendingQuestion && !activeBtwQuestionVisible && (
@@ -6227,6 +6376,11 @@ export default function App() {
             )}
 
             <Composer
+          dsh={rt.dsh}
+          dshSid={focusedSid ?? undefined}
+          readDsh={dshApi.read}
+          dshCommandResult={rt.dshCommandResult}
+          onDshCommand={(value, images, files) => focusedSid ? wsRef.current?.sendDshControl(focusedSid, "command", value, images, files) ?? null : null}
           draftKey={focusedComposerDraftKey}
           draftStore={composerDraftsRef.current}
           backgroundTasks={rt.backgroundProcesses.length > 0
@@ -6304,7 +6458,7 @@ export default function App() {
             codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
-          onOpenBtw={openBtw}
+          onOpenBtw={btwPanelKey ? openBtw : undefined}
           onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
           onOpenFiles={openFiles}
@@ -6333,6 +6487,7 @@ export default function App() {
               skillsOnly: true,
               claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
+              sid: focusedSid,
             });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
@@ -6354,8 +6509,33 @@ export default function App() {
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
+      <ArtifactReadingMemory.Provider value={artifactReadingMemory.entries}>
       <RightPanelPresentation.Provider value={{ expanded: panelExpanded, covered: btwExpanded, layer: 0, chat: false,
         onOpenChat: toggleCenteredBtw, onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
+      {visibleRightPanel === "dsh" && dshPanel && <Suspense fallback={null}>
+        <DshPanel key={`${dshPanel.sid}:${dshPanel.selection.target ?? ""}:${dshPanel.selection.query ?? ""}`}
+          onOpenAgent={(run, title) => { setDshPanel(null); openAgentDetail(run, title); }}
+          onCompose={(prompt, preset) => {
+            if (preset) {
+              if (!confirmArtifactDiscard()) return;
+              clearForkFocusLease(false); cancelPendingNotificationTarget();
+              pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null);
+              setNewChatAutoFocus(true); setRestoringSurfaceScope(null);
+              wsRef.current?.setFocusedSid(null);
+              setDshPresetSelection({ scope: activeScopeKey, value: preset });
+              dispatch({ type: "enter_new_chat", cwd: currentCwd, cwdSource: "explicit" });
+            }
+            setEditPrompt(prompt); setDshPanel(null);
+          }}
+          sid={dshPanel.sid} selection={dshPanel.selection} api={dshApi}
+          state={state.runtimes[dshPanel.sid]?.dsh} onClose={() => setDshPanel(null)}
+          onOpenFile={(path, sid, line) => {
+            if (previewFileForSid(sid ?? dshPanel.sid, path, line)) setDshPanel(null);
+          }} onOpenSession={sid => {
+            const selected = state.sessions.find(session => session.session_id === sid);
+            if (selected && confirmArtifactDiscard()) { focusListedSession(selected); setDshPanel(null); }
+          }} />
+      </Suspense>}
       {(() => {
         if (visibleRightPanel === "artifacts" && sessionArtifacts) {
           const owner = sessionArtifacts;
@@ -6418,7 +6598,7 @@ export default function App() {
         }
         if (visibleRightPanel === "agent" && agentPanel) {
           return <Suspense fallback={null}>
-            <AgentDetailController
+            <AgentDetailController dshApi={agentPanel.engine === "dsh" ? dshApi : undefined}
               key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
               selection={{ ...agentPanel, revision: rt.historyRevision || agentPanel.revision }} ws={wsRef.current}
               onListen={setAgentDetailListener}
@@ -6433,18 +6613,20 @@ export default function App() {
               <p className="loading-tx">加载预览…</p>
             </div>
           }>
-            <ArtifactPanel artifact={state.artifact} active="diff"
+            <ArtifactPanel key={`${state.artifact.sid}:${state.artifact.file}:${state.artifact.requestId}`}
+              artifact={state.artifact} active="diff"
               hasBtw={!!activeBtwGroup}
               theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}
               onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
               onAuthorizePreview={authorizePreview}
               onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
-              onClose={() => dispatch({ type: "clear_artifact" })} />
+              onClose={() => { dockPanel(); dispatch({ type: "clear_artifact" }); }} />
           </Suspense>;
         return null;
       })()}
       </RightPanelPresentation.Provider>
+      </ArtifactReadingMemory.Provider>
       <RightPanelPresentation.Provider value={{ expanded: btwExpanded, covered: false, layer: 1, chat: true,
         onOpenChat: toggleCenteredBtw, onExpand: showCenteredBtw, onDock: dockBtw, onDismiss: dismissCenteredBtw }}>
         {btwRendered && (<Suspense fallback={null}>
@@ -6592,7 +6774,7 @@ export default function App() {
           creating={forkWorktreeCreating} error={forkWorktreeError}
           onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
       </Suspense>}
-      <WorkDashboardSheet
+      {space === "work" && <Suspense fallback={null}><WorkDashboardSheet
         key={sessionScopeKey(machineId, engine, "work")}
         open={workManagerOpen && space === "work"}
         scopeKey={sessionScopeKey(machineId, engine, "work")}
@@ -6619,7 +6801,7 @@ export default function App() {
           engine === "claude" ? profileId : undefined)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
-        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
+        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} /></Suspense>}
       {workArtifactsOpen && space === "work" && !state.newChat
         && currentWorkArtifacts.length > 0 && <Suspense fallback={null}>
           <WorkArtifactsSheet open artifacts={currentWorkArtifacts}

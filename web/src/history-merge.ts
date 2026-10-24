@@ -385,6 +385,7 @@ function mergeBlocks(
       // Keeping the history id here makes the next delta create a second block,
       // which then survives every focus-triggered History reconciliation.
       if (preserveLiveOpen) existing.message_id = block.message_id;
+      if (block.stream_message_id) existing.stream_message_id ??= block.stream_message_id;
     } else if (settledCanonicalText && block.done) {
       // A settled Codex source page is authoritative for completed lightweight
       // text items. An older IndexedDB projection can carry a regenerated id,
@@ -1071,7 +1072,9 @@ function mergeTurn(
     sessionMessages: history.sessionMessages ?? live.sessionMessages,
     historyTurnId,
     forkPointId: history.forkPointId ?? live.forkPointId,
+    forkAvailable: history.forkAvailable ?? live.forkAvailable,
     checkpointId: history.checkpointId ?? live.checkpointId,
+    continuation: history.continuation ?? live.continuation,
     prompt: history.prompt || live.prompt,
     blocks,
     // A transcript has no ResultMessage, so its EOF is represented by a

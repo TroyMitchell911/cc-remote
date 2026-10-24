@@ -45,6 +45,7 @@ import {
 } from "../pointer-tap";
 
 const DETAIL_REQUEST_ERROR = "详情请求失败";
+const DshToolTree = lazy(() => import("./DshToolTree"));
 
 const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
   ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
@@ -236,6 +237,7 @@ function ProcessImagePreview({
   onPreviewImage,
   onPreviewHistoryImage,
   generated = false,
+  dimensions,
 }: {
   path: string;
   previewId?: string;
@@ -256,6 +258,7 @@ function ProcessImagePreview({
   onPreviewImage?: (src: string, alt: string) => void;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   generated?: boolean;
+  dimensions?: { width: number; height: number };
 }) {
   const liveAsset = !historyRef && previewId ? imageAssets?.[previewId] : undefined;
   const useHistory = !!historyRef;
@@ -292,6 +295,9 @@ function ProcessImagePreview({
   const canLoad = Boolean(
     (historyTurnId && historyRef) || previewId,
   );
+  const width = dimensions?.width ?? asset?.width;
+  const height = dimensions?.height ?? asset?.height;
+  const ratio = width && height && width > 0 && height > 0 ? `${width} / ${height}` : "16 / 9";
   if (!useHistory && liveAsset?.authorization) {
     return <PreviewAuthorizationPrompt
       authorization={liveAsset.authorization}
@@ -319,15 +325,19 @@ function ProcessImagePreview({
           onLoadImage?.(path, previewId);
         }
       }}>
-      {src
+      {generated ? <span className="generated-image-frame" style={{ aspectRatio: ratio }}>
+        {src ? <img src={src} alt="" width={width} height={height} />
+          : <span className="process-image-placeholder">
+              <Icon name="read" size={16} />
+              <span>{asset?.status === "error" ? "图片加载失败 · 点击重试"
+                : !canLoad ? "生成的图片暂不可用" : "正在加载图片…"}</span>
+            </span>}
+      </span> : src
         ? <img src={src} alt="" width={asset?.width} height={asset?.height} />
         : <span className="process-image-placeholder">
             <Icon name="read" size={16} />
           </span>}
-      {(!generated || !src) && <span>{generated
-        ? (asset?.status === "error" ? "图片加载失败 · 点击重试"
-          : !canLoad ? "生成的图片暂不可用" : "正在加载图片…")
-        : path || "查看过的图片"}</span>}
+      {!generated && <span>{path || "查看过的图片"}</span>}
     </button>
   );
 }
@@ -373,7 +383,8 @@ export function GeneratedImagePreview({ block, ...props }: {
         asset={historyAsset}
         onLoad={props.onLoadHistoryImage}
         onPreview={open} />
-    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId} />}
+    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId}
+      dimensions={ref ?? (live?.width && live.height ? { width: live.width, height: live.height } : undefined)} />}
     <figcaption><Icon name="read" size={14} /><span>生成的图片</span>
       {!!dimensions?.width && !!dimensions.height && <span className="generated-image-size">· {dimensions.width} × {dimensions.height}</span>}
       {(history || previewId) && <button type="button" className="generated-image-open" onClick={open}>
@@ -421,7 +432,7 @@ export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
     );
   }
   const inlineAgent = block.processKind === "agent" && block.input?.agent_run_id === null;
-  if (block.processKind === "agent" && !inlineAgent && onOpenAgent) {
+  if ((block.processKind === "agent" && !inlineAgent || block.processKind === "task" && block.item_id.startsWith("dsh-job-")) && onOpenAgent) {
     return (
       <button type="button"
         className={`process-activity process-agent-card process-${block.status}`}
@@ -436,7 +447,8 @@ export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
             </span>
           )}
         </span>
-        <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
+        {!(block.server === "dsh" && block.tool === "subagent_reference") &&
+          <span className="process-item-status">{statusIcon(block.status, block.done)}</span>}
         <span className="process-item-chev"><Icon name="chev" size={14} /></span>
       </button>
     );
@@ -742,7 +754,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
     variant: HistoryImageVariant,
   ) => boolean;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   /** The session-level progress strip owns this plan instead of this row. */
   externalPlanItemId?: string | null;
   openOverride?: boolean;
@@ -997,7 +1009,9 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
         )}
         {rows.map((row) => (
           row.kind === "tools"
-            ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
+            ? engine === "dsh" ? <Suspense key={`tools-${row.tools[0].tool_use_id}`} fallback={<ToolGroup tools={row.tools} active={processActive} />}>
+                <DshToolTree tools={row.tools} active={processActive} />
+              </Suspense> : <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
                 active={processActive} />
             : <TimelineItem key={row.block.kind === "text"
                 ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}

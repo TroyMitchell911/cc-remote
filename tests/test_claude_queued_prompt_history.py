@@ -184,7 +184,7 @@ def test_only_accepted_humans_on_active_ancestry_are_restored(tmp_path, compact)
         "old", "human", "steer-one", "steer-two"]
 
 
-def test_v43_migration_rebuilds_projections_preserving_dsh_and_assets(tmp_path):
+def test_v43_migration_rebuilds_projections_preserving_assets(tmp_path):
     path = tmp_path / f"{SID}.jsonl"
     write(path, transcript(True))
     store = HistoryIndexStore(tmp_path / "index")
@@ -201,7 +201,8 @@ def test_v43_migration_rebuilds_projections_preserving_dsh_and_assets(tmp_path):
     assert reopened.get_page(SID, "claude", fingerprint, before=None, limit=4) is None
     # The later v45 migration also refreshes newer Codex message projections.
     assert reopened.get_page(SID, "codex", fingerprint, before=None, limit=4) is None
-    assert reopened.get_page(SID, "dsh", fingerprint, before=None, limit=4) is not None
+    # v49 rebuilds all engines' summary pages with native return receipts.
+    assert reopened.get_page(SID, "dsh", fingerprint, before=None, limit=4) is None
     with sqlite3.connect(store.path) as db:
         assert db.execute("SELECT count(*) FROM claude_compact_records").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM history_image_assets").fetchone()[0] == 3

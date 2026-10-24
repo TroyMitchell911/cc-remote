@@ -104,7 +104,8 @@ function TurnChangesRevision({ turn, open, onToggle, onOpenDiff, onOpenLegacyDif
               <span>+{file.additions ?? 0}</span><span>−{file.deletions ?? 0}</span>
             </span> : null}
           {!work && file.state === "pending" && <small>修改中</small>}
-          {!work && file.state === "unavailable" && <small title={reason || "历史原生差异未完整保存"}>{!summary && canOpen ? "原始修改记录" : "差异未保存"}</small>}
+          {!work && file.state === "unavailable" && <small title={reason || "历史原生差异未完整保存"}>{!summary && canOpen ? "原始修改记录" : reason === "二进制文件" || reason === "文件过大" ? reason : "差异未保存"}</small>}
+          {!work && file.state === "available" && reason === "整文件对比" && <small>{reason}</small>}
           {!work && file.state === "available" && "additions" in file && file.additions === 0 && file.deletions === 0 && <small>无净改动</small>}
           {!work && onPreviewMarkdown && isMarkdownPath(file.path) && <button type="button"
             className="turn-change-preview" onClick={() => onPreviewMarkdown(file.path)}>预览当前文件</button>}

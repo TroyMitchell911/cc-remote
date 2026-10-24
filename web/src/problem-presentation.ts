@@ -117,6 +117,27 @@ export function presentCommandProblem(
   switch (error.code) {
     case "drain_timeout":
       return STOP_TIMEOUT_FAILURE;
+    case "dsh_invalid_session":
+      return "DSH 会话尚未选定或已失效，请重新选择会话。";
+    case "dsh_session/not-found":
+      return "DSH 会话不存在，请刷新会话列表。";
+    case "dsh_session/migration-required":
+      return "此旧版 DSH 会话需要先在官方客户端打开并完成格式升级；也可以新建会话。";
+    case "dsh_not_configured":
+    case "dsh_not_paired":
+    case "dsh_auth_required":
+    case "dsh_auth_expired":
+    case "dsh_invalid_connection":
+      return "DSH 本机配对不可用，请重新配对。";
+    case "dsh_disconnected":
+    case "dsh_unavailable":
+    case "dsh_closed":
+      return "无法连接本机 DSH，请检查服务后重试。";
+    case "dsh_metadata_required":
+      return "请为 DSH 加载对应版本的 cc-remote 元数据插件。";
+    case "dsh_unsupported":
+    case "dsh_gateway/not-found":
+      return "当前 DSH 版本不支持此操作，请检查版本和插件。";
     case "wrapper_offline":
       return "设备正在重新连接…";
     case "invalid_cwd":
@@ -155,11 +176,11 @@ export function presentCommandProblem(
   }
 }
 
-export function presentHistoricalTurnProblem(message: string, continuing = false): string {
+export function presentHistoricalTurnProblem(message: string, continuing = false): string | null {
   if (continuing && message.trim() === "当前模型繁忙，请稍后重试或切换模型。") {
     return "当前模型繁忙，这次请求未完成。";
   }
-  const normalized = message.trim().toLowerCase();
-  if (!normalized || normalized === "error") return "该轮未正常结束";
-  return safeTurnFailureMessage(message) ?? "该轮未正常结束";
+  // Generic terminal failures add no cause beyond the reply/process outcome.
+  // Keep them in state, but do not manufacture a second warning card.
+  return safeTurnFailureMessage(message);
 }

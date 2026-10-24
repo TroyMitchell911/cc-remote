@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import difflib
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -507,8 +509,14 @@ class TurnChangeArchive:
             db.execute("CREATE TABLE IF NOT EXISTS turn_change_files (sid TEXT, turn_id TEXT, revision TEXT, position INTEGER, path TEXT, summary TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(sid,turn_id,revision,position), UNIQUE(sid,turn_id,revision,path))")
         self.path.chmod(0o600)
 
-    def _connect(self):
-        return sqlite3.connect(self.path, timeout=5)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(self.path, timeout=5)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def put(self, sid: str, turn_id: str, payload: dict, *, final: bool = False) -> None:
         encoded = json.dumps(payload, ensure_ascii=True)

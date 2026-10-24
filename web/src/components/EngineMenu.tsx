@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import type { Engine } from "../protocol";
 import { EngineIcon, Icon } from "../icons";
 
-const engines: Engine[] = ["claude", "codex"];
+const engines: Engine[] = ["claude", "codex", "dsh"];
 
 export default function EngineMenu({ engine, anchor, keyboard, onClose, onSelect }: {
   engine: Engine;
@@ -50,10 +50,10 @@ export default function EngineMenu({ engine, anchor, keyboard, onClose, onSelect
     }}>
     {engines.map(value => <button key={value} type="button" role="menuitemradio"
       aria-checked={value === engine} tabIndex={-1} className="engine-menu-item"
-      aria-keyshortcuts={`Meta+${value === "claude" ? 1 : 2} Control+${value === "claude" ? 1 : 2}`}
+      aria-keyshortcuts={`Meta+${engines.indexOf(value) + 1} Control+${engines.indexOf(value) + 1}`}
       onClick={event => onSelect(value, event.detail === 0)}>
       <EngineIcon engine={value} size={18} />
-      <span>{value === "codex" ? "Codex" : "Claude"}</span>
+      <span>{value === "dsh" ? "DSH" : value === "codex" ? "Codex" : "Claude"}</span>
       {value === engine && <Icon name="check" size={16} />}
     </button>)}
   </div>, document.body);

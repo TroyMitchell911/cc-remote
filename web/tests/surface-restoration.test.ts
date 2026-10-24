@@ -162,7 +162,76 @@ try {
     assert.throws(() => compiler.specifier(`three/addons/${path}`, base), /前缀范围/);
   }
   assert.throws(() => compiler.specifier("https://evil.example/module.js", base), /未登记/);
-  const { initialState, reduce } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
+  const { initialState, reduce, createRuntime } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
+  {
+    const preview = { file: "/tmp/README.md", sid: "claude", requestId: "preview-1", kind: "md", loading: true };
+    let state = { ...initialState, focusedSid: "claude", artifact: preview };
+    state = reduce(state, { type: "restore_session_list", sessions: [] });
+    assert.equal(state.artifact, null, "a surface transition must hide the departing file");
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    state = reduce(state, { type: "event", event: { type: "file_preview", sid: "claude",
+      request_id: "wrong", path: preview.file, format: "markdown", content: "stale", size: 5 } });
+    assert.equal(state.retainedArtifacts.claude.loading, true, "late replies must still match the exact request");
+    state = reduce(state, { type: "event", event: { type: "file_preview", sid: "claude",
+      request_id: "preview-1", path: preview.file, format: "markdown", content: "# Readme", size: 8 } });
+    assert.equal(state.artifact, null, "a background preview response must not open over Codex");
+    state = reduce(state, { type: "set_artifact", artifact: { ...preview, sid: "codex", content: "Codex file" } });
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact.content, "# Readme");
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact.content, "# Readme", "reconfirming focus must preserve the preview");
+    state = reduce(state, { type: "clear_artifact" });
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    assert.equal(state.artifact.content, "Codex file");
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    assert.equal(state.artifact, null, "an explicitly closed preview must stay closed");
+    state = reduce(state, { type: "event", event: { type: "artifact_invalidated", session_id: "codex" } });
+    state = reduce(state, { type: "focus_session", sid: "codex" });
+    assert.equal(state.artifact, null, "background invalidation must discard stale file bytes");
+    state = reduce(state, { type: "set_artifact", artifact: preview });
+    state = reduce(state, { type: "focus_session", sid: "claude" });
+    state = reduce(state, { type: "reset" });
+    assert.equal(state.artifact, null);
+    assert.equal(state.retainedArtifacts, undefined, "device changes must clear retained private previews");
+  }
+  const { ChatReadingMemory } = await reducerHarness.ssrLoadModule("/src/chat-reading-memory.ts");
+  const { createHistoryBrowse } = await reducerHarness.ssrLoadModule("/src/history-browse.ts");
+  const memory = new ChatReadingMemory();
+  const runtime = { ...createRuntime(), historyRevision: "r1", historyGeneration: "g1" };
+  const position = { turnId: "read-row", blockIndex: 1, offset: -15, turnOffset: -140,
+    scrollTop: 600, sizes: {}, disclosures: {}, browsing: true };
+  const projection = createHistoryBrowse({ sid: "session", scopeKey: "device:code:codex",
+    revision: "r1", generation: "g1", viewId: "departed-view", basePageKey: "page",
+    baseTurns: [{ id: "read-row", done: true, blocks: [], detailLoading: true }],
+    hasOlder: false, olderCursor: null }).projection;
+  const saved = { position, revision: "r1", generation: "g1", browse: projection };
+  memory.save("device:code:codex:session", saved);
+  assert.equal(memory.read("device:code:codex:session", runtime), saved);
+  for (const key of ["another:code:codex:session", "device:work:codex:session", "device:code:claude:session"]) {
+    assert.equal(memory.read(key, runtime), undefined, "navigation memory is surface scoped");
+  }
+  for (const change of [{ historyRevision: "r2" }, { historyGeneration: "g2" }, { historyInvalidated: true }]) {
+    assert.equal(memory.read("device:code:codex:session", { ...runtime, ...change }), undefined,
+      "obsolete authority cannot reactivate old history");
+  }
+  for (let i = 0; i < 5; i++) memory.save(`key-${i}`, saved);
+  assert.equal(memory.read("device:code:codex:session", runtime), undefined, "retained windows are bounded");
+  memory.save("key-4", null);
+  assert.equal(memory.read("key-4", runtime), undefined, "bottom following removes the bookmark");
+  memory.clear();
+  assert.equal(memory.read("key-3", runtime), undefined, "logout clears navigation memory");
+  const beforeRestore = { ...initialState, focusedSid: "session", runtimes: { session: runtime } };
+  const restoreAction = { type: "restore_history_browse", projection: { ...projection, viewId: "returned-view", windowEpoch: 1 } };
+  const restored = reduce(beforeRestore, restoreAction);
+  assert.equal(restored.historyBrowse.viewId, "returned-view");
+  assert.equal(restored.historyBrowse.turns[0].detailLoading, false);
+  assert.equal(restored.runtimes, beforeRestore.runtimes, "restoration never overwrites live/control state");
+  assert.equal(reduce({ ...beforeRestore, focusedSid: "other" }, restoreAction).historyBrowse, null);
+  assert.equal(reduce({ ...beforeRestore, runtimes: { session: { ...runtime, historyRevision: "r2" } } }, restoreAction).historyBrowse, null);
+  assert.equal(reduce(restored, { type: "install_history_browse_page", sid: "session",
+    scopeKey: projection.scopeKey, revision: "r1", generation: "g1", viewId: "departed-view",
+    windowEpoch: 0, before: null, page: { pageKey: "late", turns: [] } }), restored,
+  "a response from before navigation cannot replace the restored window");
   const explicitDraftAfterMissingFocus = reduce({
     ...initialState,
     sessions: [{

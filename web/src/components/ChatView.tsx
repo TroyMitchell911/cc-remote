@@ -27,7 +27,7 @@ import type { LoadTurnFilePage } from "../turn-file-pages";
 import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
 import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
-import { returnRunId } from "../agent-returns";
+import { returnRunId, returnedAgents } from "../agent-returns";
 import { TimedMessageTag } from "./TimedMessageTag";
 import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
 import { canForkTurn } from "../session-worktree";
@@ -72,6 +72,7 @@ import {
   measureBottom,
   OlderHistoryLoadGate,
   shouldAutoLoadOlderHistory,
+  shouldPrefetchOlderHistory,
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
   type HistoryAnchorPoint,
@@ -90,10 +91,13 @@ import {
 } from "../history-requests";
 import { mergeDetailWithLiveTail } from "../history-merge";
 import { presentAsyncQuestionReplies } from "../async-question-presentation";
+import { bookmarkedReadingNode, captureReadingBookmark, captureReadingPosition, readingPositionDelta, type ReadingPosition } from "../reading-position";
+import type { ChatReadingState } from "../chat-reading-memory";
 import type { QueryAcceptanceResult } from "../outbox";
 
 const SessionMessageLinks = lazy(() => import("./SessionMessageLinks"));
 const TurnUsageIndicator = lazy(() => import("./TurnUsageIndicator").then(m => ({ default: m.TurnUsageIndicator })));
+const DshProducedFiles = lazy(() => import("./DshProducedFiles"));
 const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
 const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
 const PagePreviewLinks = lazy(() => import("./PagePreviewLinks").then((module) => ({ default: module.PagePreviewLinks })));
@@ -327,7 +331,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   historyWindowEpoch: incomingHistoryWindowEpoch = 0,
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
-  onLoadMore, onLoadNewer, onReturnLatest,
+  onLoadMore, onLoadNewer, onReturnLatest, onPrefetchOlder,
   onLoadDetail, onEdit, onReplyAsyncQuestion, asyncReplyMode, pendingReplyId, onOpenTurnDiff, onOpenArchivedDiff, onLoadFilePage, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
@@ -338,6 +342,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   sessionLink, onOpenSession,
   activeTurnId = null,
   ambiguousActiveTurnIds = [],
+  initialReadingState, onReadingStateSave,
   surface = "code" }: {
   ref?: Ref<ChatViewHandle>;
   sessionLink?: (nativeId: string) => { title: string; available: boolean };
@@ -345,8 +350,10 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   turnUsage?: TurnUsageReadings;
   sid: string | null;
   turns: Turn[];
+  initialReadingState?: ChatReadingState;
+  onReadingStateSave?: (position: ChatReadingState | null) => void;
   surface?: Space;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   loading?: boolean;
   hasMore?: boolean;
   historyPagingReady?: boolean;
@@ -363,6 +370,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   browseMode?: boolean;
   hasNewer?: boolean;
   onLoadMore?: (anchorTurnId?: string) => HistoryPageLoadResult;
+  onPrefetchOlder?: () => void;
   onLoadNewer?: (anchorTurnId?: string) => HistoryPageLoadResult;
   onReturnLatest?: () => void;
   onLoadDetail?: (
@@ -409,7 +417,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<ScrollFollowController | null>(null);
-  if (!controllerRef.current) controllerRef.current = new ScrollFollowController();
+  if (!controllerRef.current) {
+    controllerRef.current = new ScrollFollowController();
+    if (initialReadingState) controllerRef.current.pause({
+      scrollTop: initialReadingState.scrollTop, scrollHeight: 0, clientHeight: 0,
+    });
+  }
+  const pendingReadingRestoreRef = useRef(initialReadingState);
   const scrollCoordinatorRef = useRef(new ScrollCoordinator());
   const applyingScrollCommandRef = useRef(false);
   const [scrollPolicyEpoch, setScrollPolicyEpoch] = useState(0);
@@ -438,6 +452,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   }, []);
   const historyRequestRef = useRef<HistoryPageRequestTransaction | null>(null);
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
+  const turnSizeObserverRef = useRef<ResizeObserver | null>(null);
   const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
   const textSelectionRef = useRef<TextSelectionRetention | null>(null);
   const nativeSelectionBoundaryRef = useRef<ReturnType<typeof nativeSelectionBoundary> | null>(null);
@@ -626,9 +641,12 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   const [activeHistoryGeneration, setActiveHistoryGeneration] = useState<number | null>(null);
   const [measurementBoundary, setMeasurementBoundary] =
     useState<RetainedMeasurementBoundary | null>(null);
+  const readingPositionRef = useRef<ReadingPosition | null>(null);
   const [processDisclosureOpen, setProcessDisclosureOpen] = useState<
     Record<string, boolean>
   >({});
+  const processDisclosure = (key: string) => processDisclosureOpen[key]
+    ?? initialReadingState?.disclosures[key.slice(scrollScope.length + 1)];
   const rememberProcessDisclosure = useCallback((key: string, open: boolean) => {
     setProcessDisclosureOpen((current) => {
       const next = { ...current, [key]: open };
@@ -758,11 +776,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   const virtualizer = useVirtualizer({
     count: turns.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => HISTORY_VIRTUAL_ESTIMATE_PX,
+    estimateSize: index => initialReadingState?.sizes[turns[index]?.id]
+      ?? HISTORY_VIRTUAL_ESTIMATE_PX,
+    initialOffset: initialReadingState?.scrollTop ?? 0,
     getItemKey: turnKeySnapshot.getItemKey,
-    // In-flow rows let the browser own prepend/resize anchoring. A second keyed
-    // virtual-core anchor can apply after touchend and undo the browser's
-    // correction, so history always uses a start anchor here. Live-tail follow
+    // In-flow rows use the DOM reading/history anchors below. A second keyed
+    // virtual-core anchor can apply after touchend and undo their correction,
+    // so history always uses a start anchor here. Live-tail follow
     // remains owned by ChatView's measured-tail observer below.
     anchorTo: virtualAnchorTo,
     followOnAppend: virtualScrollPolicy.followOnAppend,
@@ -787,6 +807,9 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
         first = Math.min(first, index);
         last = Math.max(last, index);
       };
+      retain(pendingReadingRestoreRef.current
+        ? turns.findIndex(turn => turn.id === pendingReadingRestoreRef.current!.turnId)
+        : -1);
       retain(retainedMeasurementBoundary
         ? turns.findIndex((turn) => turn.id === retainedMeasurementBoundary.turnId)
         : -1);
@@ -812,13 +835,9 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     gap: HISTORY_TURN_GAP_PX,
     paddingStart: historyTopInset,
     paddingEnd: historyBottomInset,
-    // ResizeObserver already runs before paint. Deferring dynamic-row
-    // measurement through another animation frame exposes an estimate-only
-    // prepend for one frame before the retained row can be restored.
-    useAnimationFrameWithResizeObserver: false,
   });
-  // CSS anchoring owns in-flow row growth. TanStack resize correction would be
-  // a second scroll writer and can replay an old delta after native momentum.
+  // DOM reading-position compensation below owns in-flow row growth. CSS and
+  // virtualizer anchoring stay disabled to avoid applying the same delta twice.
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
 
   const measureTurnOffset = useCallback((turnId: string): number | null => {
@@ -832,29 +851,70 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     const boundary = retainedMeasurementBoundaryRef.current;
     const el = scrollRef.current;
     const controller = controllerRef.current;
-    if (!boundary || boundary.scope !== activeScrollScopeRef.current
-        || !el || !controller
-        || userScrollIntentRef.current
-        || touchYRef.current !== null
-        || wheelGestureActiveRef.current
-        || scrollCoordinatorRef.current.isInteractionLocked()) return false;
-    const currentOffset = measureTurnOffset(boundary.turnId);
-    if (currentOffset == null) return false;
-    const delta = currentOffset - boundary.anchorOffset;
+    if (!el || !controller) return false;
+    const reading = readingPositionRef.current;
+    let delta: number | null = null;
+    if (reading?.scope === activeScrollScopeRef.current
+        && !controller.isFollowing()
+        && !historyAnchorRef.current.current() && !detailAnchorRef.current
+        && !textSelectionRef.current && !scrollCoordinatorRef.current.isInteractionLocked()
+        && touchYRef.current === null && !touchMomentumActiveRef.current
+        && !scrollbarDragIntentRef.current) {
+      delta = readingPositionDelta(el, reading);
+    }
+    // Preserve native motion that has not reached onScroll yet. Explicit
+    // history/selection transactions instead own their exact viewport offset.
+    const nativeMotion = delta == null ? 0 : el.scrollTop - lastScrollTopRef.current;
+    if (delta == null) {
+      if (!boundary || boundary.scope !== activeScrollScopeRef.current
+          || userScrollIntentRef.current || touchYRef.current !== null
+          || wheelGestureActiveRef.current
+          || scrollCoordinatorRef.current.isInteractionLocked()) return false;
+      const offset = measureTurnOffset(boundary.turnId);
+      if (offset == null) return false;
+      delta = offset - boundary.anchorOffset;
+    }
     if (Math.abs(delta) <= 0.5) return false;
-    const target = Math.max(
-      0,
-      Math.min(
-        Math.max(0, el.scrollHeight - el.clientHeight),
-        el.scrollTop + delta,
-      ),
-    );
-    if (Math.abs(target - el.scrollTop) <= 0.5) return false;
-    el.scrollTop = target;
-    lastScrollTopRef.current = el.scrollTop;
-    controller.recordProgrammaticScroll(readScrollMetrics(el));
-    return true;
+    const previousTop = el.scrollTop;
+    // Let the native scroller clamp at its real edges.
+    el.scrollTop += delta;
+    lastScrollTopRef.current = el.scrollTop - nativeMotion;
+    controller.recordProgrammaticScroll({
+      ...readScrollMetrics(el), scrollTop: lastScrollTopRef.current,
+    });
+    return Math.abs(el.scrollTop - previousTop) > 0.5;
   }, [measureTurnOffset]);
+
+  const rememberReadingPosition = () => {
+    const el = scrollRef.current;
+    if (!el || controllerRef.current?.isFollowing()
+        || historyAnchorRef.current.current() || detailAnchorRef.current
+        || textSelectionRef.current || scrollCoordinatorRef.current.isInteractionLocked()) {
+      readingPositionRef.current = null;
+      return;
+    }
+    readingPositionRef.current = captureReadingPosition(el, scrollScope);
+  };
+
+  const saveReadingStateRef = useRef<() => void>(() => {});
+  saveReadingStateRef.current = () => {
+    const el = scrollRef.current;
+    if (!el || pendingReadingRestoreRef.current) return;
+    const bookmark = controllerRef.current?.isFollowing() ? null : captureReadingBookmark(el);
+    const sizes: Record<string, number> = {};
+    for (const item of virtualizer.takeSnapshot()) {
+      const turn = turns[item.index];
+      if (turn) sizes[turn.id] = item.size;
+    }
+    const disclosures = { ...initialReadingState?.disclosures };
+    for (const [key, value] of Object.entries(processDisclosureOpen)) {
+      if (key.startsWith(`${scrollScope}\u0000`)) disclosures[key.slice(scrollScope.length + 1)] = value;
+    }
+    onReadingStateSave?.(bookmark ? { ...bookmark, sizes,
+      disclosures: Object.fromEntries(Object.entries(disclosures).slice(-512)), browsing: browseMode } : null);
+  };
+  // Layout cleanup runs while the departing DOM is still measurable.
+  useLayoutEffect(() => () => saveReadingStateRef.current(), []);
 
   const measureDetailEdge = useCallback((
     turnId: string,
@@ -878,7 +938,6 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       const el = scrollRef.current;
       const viewportTop = el?.getBoundingClientRect().top;
       let anchorTurnId: string | null = null;
-      let anchorOffset = 0;
       let bestDistance = Number.POSITIVE_INFINITY;
       if (el && viewportTop != null) {
         for (const [turnId, node] of turnNodeRefs.current) {
@@ -888,21 +947,24 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
           const distance = Math.abs(rect.top - viewportTop);
           if (distance < bestDistance) {
             anchorTurnId = turnId;
-            anchorOffset = rect.top - viewportTop;
             bestDistance = distance;
           }
         }
       }
       anchorTurnId ??= firstTurnId;
       if (!anchorTurnId) return null;
-      anchorOffset = measureTurnOffset(anchorTurnId) ?? anchorOffset;
+      // A fast native scroll can reach the edge before virtualization mounts
+      // the first row. Its known top inset is still part of the reading offset;
+      // using zero would discard the history header on the next prepend.
+      const anchorOffset = measureTurnOffset(anchorTurnId)
+        ?? historyTopInset - (el?.scrollTop ?? 0);
       return {
         anchorTurnId,
         oldestTurnId: firstTurnId,
         anchorOffset,
       };
     },
-    [firstTurnId, measureTurnOffset],
+    [firstTurnId, historyTopInset, measureTurnOffset],
   );
 
   const clearHistoryRequestTimeout = useCallback((generation?: number) => {
@@ -991,10 +1053,19 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       // pre-paint notification so the spacer update never becomes a visible
       // intermediate jump.
       restoreRetainedMeasurementBoundary();
-      if (!hasOpenTailRef.current) return;
-      maintainFollowedLiveTail();
+      if (hasOpenTailRef.current) maintainFollowedLiveTail();
     };
-    const observer = new ResizeObserver(followMeasuredTail);
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const node = entry.target as HTMLElement;
+        if (node !== content && node.isConnected) virtualizer.resizeItem(
+          Number(node.dataset.index), node.getBoundingClientRect().height,
+        );
+      }
+      followMeasuredTail();
+    });
+    turnSizeObserverRef.current = observer;
+    for (const node of turnNodeRefs.current.values()) observer.observe(node);
     observer.observe(content);
     // WebKit can commit TanStack's in-flow spacer mutation after its current
     // ResizeObserver delivery, leaving one painted estimate-height gap before
@@ -1002,8 +1073,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     // so observe the actual streamed text/tool/spacer commit as well. The same
     // strict follow/gesture/selection/transaction gates above still own whether
     // a bottom command is allowed.
-    const mutationObserver = !hasOpenTail
-        || typeof MutationObserver === "undefined"
+    const mutationObserver = typeof MutationObserver === "undefined"
       ? null
       : new MutationObserver(followMeasuredTail);
     mutationObserver?.observe(content, {
@@ -1013,17 +1083,24 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       attributes: true,
       attributeFilter: ["style"],
     });
+    // Sidebar state updates the shell without rerendering ChatView. Correct
+    // that width change in the mutation microtask, before the next frame.
+    const shell = content.closest(".shell");
+    if (shell) mutationObserver?.observe(shell, {
+      attributes: true, attributeFilter: ["class", "style"],
+    });
     // Session/revision switches request bottom before every virtual row has
     // necessarily been measured. Re-assert the same follow intent on the next
     // frame after the replacement sizer is mounted.
     followMeasuredTail();
     return () => {
       observer.disconnect();
+      turnSizeObserverRef.current = null;
       mutationObserver?.disconnect();
     };
   }, [
     hasOpenTail, maintainFollowedLiveTail,
-    restoreRetainedMeasurementBoundary, scrollScope,
+    restoreRetainedMeasurementBoundary, scrollScope, virtualizer,
   ]);
 
   const pauseOutputFollow = useCallback(() => {
@@ -1513,8 +1590,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     source: "touch" | "wheel" | "other",
   ) => {
     const el = scrollRef.current;
-    if (!el || !movingTowardHistory
-        || !isAtHistoryEdge(readScrollMetrics(el))) return;
+    if (!el || !movingTowardHistory) return;
+    const metrics = readScrollMetrics(el);
+    if (!historyRequestRef.current && !historyAnchorRef.current.current()
+        && shouldPrefetchOlderHistory(metrics, true, canLoadOlder)) {
+      onPrefetchOlder?.();
+    }
+    if (!isAtHistoryEdge(metrics)) return;
     if (olderHistoryAvailability === "pending") {
       stageDeferredOlderIntent(source);
       return;
@@ -1727,9 +1809,11 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       wheelHistoryLoadGateRef.current.complete();
       wheelHistoryLoadGateRef.current.endGesture();
       setMeasurementBoundary(null);
+      readingPositionRef.current = null;
       cancelDetailAnchorFnRef.current?.(false);
-      applyScrollCommand(scrollCoordinatorRef.current.reset());
-      syncScrollState(browseMode
+      const resetCommand = scrollCoordinatorRef.current.reset();
+      if (!pendingReadingRestoreRef.current) applyScrollCommand(resetCommand);
+      syncScrollState(browseMode || pendingReadingRestoreRef.current
         ? controller.pause(readScrollMetrics(el))
         : controller.reset(readScrollMetrics(el)));
       return;
@@ -1749,6 +1833,33 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     resolvedHistoryViewId,
     scrollScope, sid, syncScrollState, turns,
   ]);
+
+  useLayoutEffect(() => {
+    const saved = pendingReadingRestoreRef.current;
+    const el = scrollRef.current;
+    if (!saved || !el) return;
+    if (!initialReadingState) {
+      pendingReadingRestoreRef.current = undefined;
+      return;
+    }
+    // App restores a saved paginated window in the same layout commit. Do not
+    // consume its bookmark against the interim latest-only rows.
+    if (saved.browsing && !browseMode) return;
+    const turn = turnNodeRefs.current.get(saved.turnId);
+    if (!turn) {
+      if (loading) return;
+      pendingReadingRestoreRef.current = undefined;
+      syncScrollState(controllerRef.current!.pause(readScrollMetrics(el)));
+      return;
+    }
+    const node = bookmarkedReadingNode(turn, saved.blockIndex);
+    const offset = node === turn ? saved.turnOffset : saved.offset;
+    applyScrollCommand({ kind: "offset", offset: el.scrollTop
+      + node.getBoundingClientRect().top - el.getBoundingClientRect().top - offset });
+    pendingReadingRestoreRef.current = undefined;
+    readingPositionRef.current = captureReadingPosition(el, scrollScope);
+    syncScrollState(controllerRef.current!.pause(readScrollMetrics(el)));
+  });
 
   // React commits streamed text/tool rows before paint. Keep the followed tail
   // physically pinned in this same commit; ResizeObserver above covers later
@@ -1827,6 +1938,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     // suppressing a queued resize correction. Catch up only after the native
     // gesture has settled; a history reader keeps their paused state.
     if (controller?.isFollowing()) maintainFollowedLiveTail();
+    restoreRetainedMeasurementBoundary();
+    rememberReadingPosition();
     const point = captureHistoryBoundary();
     const request = historyRequestRef.current;
     if (point && (!controller?.isFollowing()
@@ -1863,6 +1976,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   }));
 
   const markUserScrollIntent = (direction: UserScrollDirection) => {
+    pendingReadingRestoreRef.current = undefined;
     // A real wheel/touch/key/pointer action transfers ownership back to the
     // reader. Late detail responses and ResizeObserver callbacks must not pull
     // the viewport back to the edge captured before that gesture. Keep the
@@ -1945,6 +2059,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
+    restoreRetainedMeasurementBoundary();
     const metrics = readScrollMetrics(el);
     const movingTowardHistory = metrics.scrollTop < lastScrollTopRef.current - 0.5;
     const movingTowardLatest = metrics.scrollTop > lastScrollTopRef.current + 0.5;
@@ -2071,6 +2186,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       setMeasurementBoundary(null);
     }
     syncScrollState(nextScrollState);
+    rememberReadingPosition();
     if (!textSelectionDragging) {
       maybeAutoLoadOlder(
         movingTowardHistory && userDrivenScroll,
@@ -2120,6 +2236,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     if (event.deltaY < 0 || browseMode) {
       pauseOutputFollow();
     }
+    restoreRetainedMeasurementBoundary();
+    rememberReadingPosition();
     if (!wheelGestureActiveRef.current) {
       wheelGestureActiveRef.current = true;
       wheelHistoryLoadGateRef.current.beginGesture();
@@ -2328,6 +2446,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   };
 
   const beginProcessInteraction = useCallback((): number => {
+    readingPositionRef.current = null;
     const el = scrollRef.current;
     const resumeAtBottom = !!el
       && (controllerRef.current?.isFollowing() ?? false)
@@ -2579,10 +2698,10 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
 
   const renderTurnChanges = (t: Turn) => {
     const key = `${scrollScope}\u0000changes:${t.clientMsgId ?? t.id}`;
-    return <TurnChangesPanel key={key} turn={t} open={processDisclosureOpen[key] ?? false}
+    return <TurnChangesPanel key={key} turn={t} open={processDisclosure(key) ?? false}
       onToggle={() => {
         pauseOutputFollow();
-        rememberProcessDisclosure(key, !(processDisclosureOpen[key] ?? false));
+        rememberProcessDisclosure(key, !(processDisclosure(key) ?? false));
       }} onOpenDiff={onOpenArchivedDiff} onOpenLegacyDiff={onOpenTurnDiff}
       onLoadFilePage={onLoadFilePage} onBeforeLoad={pauseOutputFollow}
       onPreviewMarkdown={onPreviewMarkdown} work={surface === "work"}
@@ -2944,14 +3063,14 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 onInteractionStart={beginProcessInteraction}
                 onInteractionEnd={endProcessInteraction}
                 openOverride={
-                  processDisclosureOpen[`${disclosureKey}\u0000outer`]
+                  processDisclosure(`${disclosureKey}\u0000outer`)
                   ?? (!segment && t.detailRestoreOpen ? true : undefined)
                 }
                 onOpenChange={(open) => rememberProcessDisclosure(
                   `${disclosureKey}\u0000outer`, open,
                 )}
                 itemOpen={(key) =>
-                  processDisclosureOpen[`${disclosureKey}\u0000${key}`]}
+                  processDisclosure(`${disclosureKey}\u0000${key}`)}
                 onItemOpenChange={(key, open) => rememberProcessDisclosure(
                   `${disclosureKey}\u0000${key}`, open,
                 )}
@@ -2970,6 +3089,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                         }} />
                     </Suspense>
                   : <MessageBlock text={block.text}
+                    formatReplySections={engine === "claude"}
                     done={block.done} onOpenFile={onOpenFile}
                     imageAssets={imageAssets} onLoadImage={onLoadImage}
                     onAuthorizeImage={onAuthorizeImage}
@@ -2999,13 +3119,25 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 overflowAnchor: "none",
               }}
               ref={(node) => {
-                virtualizer.measureElement(node);
+                const previous = turnNodeRefs.current.get(t.id);
+                if (previous) turnSizeObserverRef.current?.unobserve(previous);
                 if (node) {
                   turnNodeRefs.current.set(t.id, node);
+                  // Cache first measurements synchronously: an in-flow row
+                  // already occupies real space even during a wheel gesture.
+                  // Subsequent sizes use our observer, never measureElement.
+                  virtualizer.resizeItem(virtualItem.index, node.getBoundingClientRect().height);
+                  turnSizeObserverRef.current?.observe(node);
                 } else {
                   turnNodeRefs.current.delete(t.id);
                 }
               }}>
+            {t.continuation && !t.prompt && (
+              <div className="turn-continuation">
+                {returnedAgents(timelineBlocks).map(renderAgentReturn)}
+                <span>收到子代理结果，继续处理</span>
+              </div>
+            )}
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">
@@ -3115,14 +3247,16 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                   <div key={segment.id} className="background-followup">
                     <div className="background-followup-boundary">
                       {segment.returns.map(renderAgentReturn)}
-                      <span>{engine === "codex" ? "Codex 收到后台消息，继续处理" : "Claude 继续处理"}</span>
+                      <span>{engine === "codex" ? "Codex 收到后台消息，继续处理" : engine === "dsh" ? "DSH 继续处理" : "Claude 继续处理"}</span>
                       {segment.startedTs != null && <time>{formatTime(segment.startedTs)}</time>}
                     </div>
                     {renderProcess(segment)}
                     {segment.answers.map(renderAnswer)}
                   </div>
                 ))}
-                {t.error && <TurnProblem message={t.error} continuing={activeTurnIndex > ti} />}
+                {engine === "dsh" && onOpenFile && <Suspense fallback={null}><DshProducedFiles turn={t} onOpen={onOpenFile} /></Suspense>}
+                {t.error && <TurnProblem message={t.error} continuing={activeTurnIndex > ti}
+                  hasVisibleContent={showProcessTimeline || finalBlocks.length > 0 || generatedImages.length > 0} />}
                 {/* Final metadata already has a stable row. While running,
                     page discovery shares the existing working indicator below
                     instead of reserving an empty 22px metadata row. */}

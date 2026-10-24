@@ -11,7 +11,7 @@ import {
 } from "./PlanProgressPopover";
 
 interface Props {
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   goal: ThreadGoal | null;
   revealed: boolean;
   open: boolean;

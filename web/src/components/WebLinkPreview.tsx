@@ -47,11 +47,13 @@ export default function PreviewWebLink({ href, url, children, title, id, pop }: 
     return () => { alive = false; observer.disconnect(); unsubscribe(); };
   }, [href, pop.anchor]);
   useEffect(() => {
-    if (!pop.shown || metadata) return;
+    if (!pop.shown) return;
     let alive = true;
+    // Reopening consults the bounded cache again. Holding component state
+    // forever otherwise defeats expiry of failed/partial image downloads.
     void getLinkMetadata(href, "page").then((data) => { if (alive) setMetadata(data); });
     return () => { alive = false; };
-  }, [href, pop.shown, metadata]);
+  }, [href, pop.shown]);
   return <>
       <button type="button" className="message-link-icon" aria-label={`预览 ${url.hostname}`}
         aria-expanded={pop.shown} aria-controls={pop.shown ? pop.id : undefined}

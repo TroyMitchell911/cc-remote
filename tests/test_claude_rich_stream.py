@@ -136,6 +136,40 @@ def test_text_channel_promotes_streamed_unknown_and_classifies_final_vs_commenta
     assert next(event for event in commentary if isinstance(event, Delta)).channel == "commentary"
 
 
+@pytest.mark.parametrize("channel", ["text", "thinking"])
+def test_completed_stream_binds_to_exact_transcript_identity(channel):
+    native_id = "12121212-1212-4212-8212-121212121212"
+    stream_id = "34343434-3434-4434-8434-343434343434"
+    text = "The same content can occur in distinct native messages."
+    translator = StreamTranslator(10_000, turn_id="user-turn")
+    streamed = translator.feed(StreamEvent(
+        uuid=stream_id, session_id="session-1",
+        event={"type": "content_block_delta", "index": 0, "delta": {
+            "type": f"{channel}_delta", channel: text,
+        }},
+    ))
+    block = (TextBlock(text=text) if channel == "text"
+             else ThinkingBlock(thinking=text, signature="opaque"))
+    assembled = translator.feed(_assistant([block], uuid=native_id))
+    completed = next(event for event in assembled if isinstance(event, AssistantMsgEnd))
+    native = translate_history([SimpleNamespace(
+        uuid=native_id, type="assistant", parent_tool_use_id=None,
+        message={"role": "assistant", "content": [{"type": channel, channel: text}]},
+    )], 10_000)
+    persisted = next(event for event in native if isinstance(event, Delta))
+    assert completed.message_id == next(
+        event.message_id for event in streamed if isinstance(event, Delta))
+    assert completed.canonical_message_id == persisted.message_id
+    assert completed.canonical_message_id != completed.message_id
+    assert completed.turn_id == "user-turn"
+    assert not any(isinstance(event, Delta) for event in assembled)
+    # Identical prose in a subsequent native record remains a separate item.
+    repeated = translator.feed(_assistant(
+        [block], uuid="56565656-5656-4656-8656-565656565656"))
+    assert next(event for event in repeated if isinstance(event, AssistantMsgEnd)
+                ).canonical_message_id != completed.canonical_message_id
+
+
 def test_live_result_promotes_last_ambiguous_top_level_text_without_repeating_it():
     translator = StreamTranslator(10_000)
     streamed = translator.feed(StreamEvent(

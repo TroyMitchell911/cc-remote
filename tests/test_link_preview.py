@@ -4,6 +4,7 @@ import io
 import random
 import socket
 import threading
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -281,6 +282,53 @@ async def test_page_discovery_wins_over_late_failed_automatic_icon(monkeypatch):
     gate.set()
     assert await automatic == {"icon": page["icon"]}
     assert await service.get("https://example.org/new", icon_only=True) == {"icon": page["icon"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slow_asset", ["icon", "image"])
+async def test_page_deadline_preserves_each_successful_asset_and_retries_partial(monkeypatch, slow_asset):
+    now = 100.0
+    calls = 0
+    slow = True
+    timeout = asyncio.timeout
+
+    async def metadata(url):
+        nonlocal calls
+        calls += 1
+        parser = preview.Metadata()
+        parser.feed('<title>Article</title><meta property="og:image" content="/cover.png">')
+        return url, parser
+
+    async def load(kind):
+        if slow and kind == slow_asset:
+            await asyncio.Event().wait()
+        return f"decoded-{kind}"
+
+    async def icon(*args, **kwargs):
+        return await load("icon")
+
+    async def image(*args, **kwargs):
+        return await load("image")
+
+    monkeypatch.setattr(preview, "_metadata", metadata)
+    monkeypatch.setattr(preview, "_declared_icon", icon)
+    monkeypatch.setattr(preview, "_image", image)
+    monkeypatch.setattr(preview, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(preview.asyncio, "timeout", lambda seconds: timeout(0.02))
+    service = preview.LinkPreviewService()
+    result = await service.get("https://example.org/article")
+    good_asset = "image" if slow_asset == "icon" else "icon"
+    assert result["title"] == "Article"
+    assert result[good_asset] == f"decoded-{good_asset}"
+    assert result[slow_asset] is None
+    slow = False
+    now += 30
+    assert await service.get("https://example.org/article") == result
+    assert calls == 1
+    now += 31
+    recovered = await service.get("https://example.org/article")
+    assert recovered == {"title": "Article", "description": "", "icon": "decoded-icon", "image": "decoded-image"}
+    assert calls == 2
 
 
 @pytest.mark.asyncio

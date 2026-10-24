@@ -2,7 +2,8 @@
 
 import pytest
 
-from textual.keys import _character_to_key
+from textual import events
+from textual.keys import _character_to_key, key_to_character
 
 from cc_remote.tui_app import (
     Composer,
@@ -39,6 +40,17 @@ def make_app():
     for order, (sid, row) in enumerate(client.workspace.catalog.items()):
         row.update(session_id=sid, engine="codex", last_modified=str(3 - order))
     return WorkspaceApp(client, connect=False)
+
+
+async def edit_keys(editor, keys):
+    """Exercise editor commands without a driver/paint cycle per character.
+
+    Focus switching and representative Insert/Normal/Visual key sequences use
+    Pilot in the integration tests below. Boundary matrices need the real
+    widget handler and editing state, not repeated application key dispatch.
+    """
+    for key in keys:
+        await editor._on_key(events.Key(key, key_to_character(key)))
 
 
 @pytest.mark.asyncio
@@ -112,7 +124,8 @@ async def test_draft_line_editing_boundaries(keys, expected):
     async with app.run_test() as pilot:
         editor = app.query_one(Composer)
         editor.load_text("abc\ndef")
-        await pilot.press("ctrl+j", "g", "g", *keys)
+        await pilot.press("ctrl+j")
+        await edit_keys(editor, ("g", "g", *keys))
         assert editor.text == expected
         assert app.focused is editor and editor.vim_mode == "NORMAL"
 
@@ -220,13 +233,14 @@ async def test_quote_then_vim_edit_then_read_keeps_reading_anchor():
         ("one two", 0, "di(", "one two"),
     ],
 )
-async def test_text_object_keyboard_commands(text, cursor, keys, expected):
+async def test_text_object_editor_commands(text, cursor, keys, expected):
     app = make_app()
     async with app.run_test() as pilot:
         editor = app.query_one(Composer)
         editor.load_text(text)
         editor.move_cursor((0, cursor))
-        await pilot.press("ctrl+j", *(_character_to_key(k) for k in keys))
+        await pilot.press("ctrl+j")
+        await edit_keys(editor, map(_character_to_key, keys))
         assert editor.text == expected
         assert app.focused is editor
         assert not app.client._outbox

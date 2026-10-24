@@ -151,7 +151,7 @@ def test_compact_graph_memory_is_bounded_and_rebuildable(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("old_version", [44, 45, 46, 47, 48, 49])
-def test_return_receipt_migration_rebuilds_chat_projections_preserving_other_engines_and_images(tmp_path, old_version):
+def test_return_receipt_migration_rebuilds_chat_projections_preserving_images(tmp_path, old_version):
     path = tmp_path / "source.jsonl"
     path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(path)
@@ -166,7 +166,7 @@ def test_return_receipt_migration_rebuilds_chat_projections_preserving_other_eng
     with sqlite3.connect(migrated.path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
         for table in ("history_pages", "history_turn_details"):
-            assert sorted(connection.execute(f"SELECT engine FROM {table}").fetchall()) == [("dsh",)]
+            assert sorted(connection.execute(f"SELECT engine FROM {table}").fetchall()) == []
         assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 3
     migrated.put_page("codex", "codex", source, before=None, limit=4, page=_page("new"))
     reopened = HistoryIndexStore(tmp_path / "state")
@@ -683,7 +683,7 @@ def test_background_and_summary_migrations_preserve_source_assets(tmp_path, old_
     migrated = HistoryIndexStore(tmp_path / "state")
     assert migrated.get_page("claude", "claude", source, before=None, limit=4) is None
     assert migrated.get_page("codex", "codex", source, before=None, limit=4) is None
-    assert migrated.get_page("dsh", "dsh", source, before=None, limit=4) == _page("dsh")
+    assert migrated.get_page("dsh", "dsh", source, before=None, limit=4) is None
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 3
     migrated.put_page("claude", "claude", source, before=None, limit=4, page=_page("rebuilt"))

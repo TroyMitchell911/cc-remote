@@ -156,6 +156,8 @@ class SessionContext:
     queued_queries: list[Any] = field(default_factory=list)
     queued_query_bytes: int = 0
     queued_query_errors: dict[str, str] = field(default_factory=dict)
+    # Non-retryable launch failures retain the message for inspection/removal.
+    queued_query_blocked: set[str] = field(default_factory=set)
     # A launch preflight may await daemon/ownership checks.  The item remains
     # wrapper-owned and visible until that preflight accepts it, while this
     # marker prevents concurrent cancel/edit/replace from mutating it.

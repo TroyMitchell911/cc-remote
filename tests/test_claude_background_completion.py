@@ -12,6 +12,9 @@ from tests.test_claude_service import environment, released
 from tests.test_claude_steering import NativeClient, assistant, requesting, result, until, user
 
 
+FOLLOWUP_ANSWER = "77777777-7777-4777-8777-777777777777"
+
+
 def task_input(uid, origin):
     return {**user(uid, "background task finished"), "origin": origin}
 
@@ -195,13 +198,21 @@ async def test_batched_task_inputs_settle_and_background_job_does_not_block_next
                 "uuid": "child-finished", "session_id": ctx.session_id,
             })
             await native.queue.put(task_input("last-notification", {"kind": "task-notification"}))
-            await native.queue.put(assistant("last-answer", [{"type": "text", "text": "check passed"}]))
+            await native.queue.put(assistant(FOLLOWUP_ANSWER, [{"type": "text", "text": "check passed"}]))
             await until(lambda: ctx.state == "running" and bool(ctx.claude_background_followups))
             await native.queue.put(result())
             await until(lambda: ctx.state == "idle" and sdk._background_callbacks_pending == 0)
             assert not ctx.claude_active_tasks
             assert not ctx.claude_background_followups
-            assert sum(e.type == "turn_end" for e in transport.sent) == int(managed) + 1
+            terminals = [e for e in transport.sent if e.type == "turn_end"]
+            assert len(terminals) == int(managed) + 2
+            assert terminals[-1].turn_id == FOLLOWUP_ANSWER
+            assert terminals[-1].checkpoint_id is None
+            assert terminals[-1].notification_context.engine == "claude"
+            receipt = [e for e in transport.sent if e.type == "completion_state"][-1]
+            assert receipt.completion_id == FOLLOWUP_ANSWER and receipt.unread
+            binding = [e for e in transport.sent if e.type == "turn_binding"][-1]
+            assert binding.msg_id == "next-human" and binding.turn_id == FOLLOWUP_ANSWER
             assert any(e.type == "state" and e.state == "running" and e.continuation for e in transport.sent)
             assert native.interrupts == 0
         finally:
@@ -238,7 +249,7 @@ async def test_shared_terminal_replays_without_resubmission_or_retiring_later_ac
         await native.queue.put(result())
         if later_continuation:
             await native.queue.put(task_input("later-input", {"kind": "task-notification", "taskId": "later"}))
-            await native.queue.put(assistant("later-output", [{"type": "text", "text": "later report"}]))
+            await native.queue.put(assistant(FOLLOWUP_ANSWER, [{"type": "text", "text": "later report"}]))
         await until(lambda: worker.journal.seq == (5 if later_continuation else 3) + int(managed))
 
         sdk = SdkHandle(WrapperConfig(claude_service_socket=first.connection.socket_path))
@@ -264,7 +275,7 @@ async def test_shared_terminal_replays_without_resubmission_or_retiring_later_ac
                         and worker.background_start is None)
             assert not ctx.claude_background_followups
             assert worker.background_start is None
-            assert sum(e.type == "turn_end" for e in transport.sent) == int(managed)
+            assert sum(e.type == "turn_end" for e in transport.sent) == int(managed) + int(later_continuation)
             assert native.prompts == (["inspect"] if managed else [])
             assert native.interrupts == 0 and not native.closed
         finally:

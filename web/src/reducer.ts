@@ -1,4 +1,6 @@
+import type { DshState, DshPreset, DshPermissionOption, DshCommandResult } from "./protocol";
 import { isSyntheticReturnReceipt } from "./agent-returns";
+import { reduceWithRetainedArtifacts } from "./artifact-retention";
 // Turn/block state model for the chat UI.
 //
 // Multi-session: AppState holds a `runtimes` map keyed by session id (or a
@@ -204,6 +206,8 @@ export interface Artifact {
 
 export interface SessionRuntime {
   turnUsage?: TurnUsageReadings;
+  dsh?: DshState;
+  dshCommandResult?: DshCommandResult;
   turns: Turn[];
   state: State;
   // Display-only activity observed from a native/external client. It must not
@@ -387,11 +391,15 @@ export interface SessionRuntime {
 }
 
 export interface AppState {
+  dshPresets?: DshPreset[];
+  dshPermissions?: DshPermissionOption[];
+  dshError?: string | null;
   // connection / global UI
   connState: ConnState;
   wrapperOnline: boolean;
   banner?: string;
   artifact: Artifact | null;
+  retainedArtifacts?: Record<string, Artifact>;
   dirPicker: {
     path: string;
     parent: string | null;
@@ -460,7 +468,7 @@ export interface AppState {
 
 export interface BtwChat {
   sid: string;
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   createdAt: number;
   state: "idle" | "running" | "interrupting" | "draining";
 }
@@ -561,6 +569,7 @@ export type Action =
   | { type: "focus_session"; sid: string }
   | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null; autoLoad?: boolean }
   | { type: "begin_history_browse"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; basePageKey: string }
+  | { type: "restore_history_browse"; projection: HistoryBrowseProjection }
   | { type: "install_history_browse_page"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; before: string; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "install_history_browse_newer"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; page: HistoryBrowsePage; protectedTurnIds?: string[]; prepared?: { from: HistoryBrowseProjection; to: HistoryBrowseProjection } }
   | { type: "history_browse_newer_settled"; sid: string; scopeKey: string; revision: string; generation?: string | null; viewId: string; windowEpoch: number; pageKey: string }
@@ -699,6 +708,50 @@ function mutableTurnBlocks(turn: Turn): Block[] {
     : turn.blocks;
 }
 
+function matchesTextMessage(block: TextBlock, id: string): boolean {
+  return block.message_id === id || block.stream_message_id === id;
+}
+
+/** A completed SDK record supplies the exact identity used by history pages.
+ * Keep its stream alias for late replay and final-channel corrections. Detail
+ * may already have arrived, so rebind every retained window before rendering. */
+function bindTurnMessageIdentity(turn: Turn, streamId: string, canonicalId: string): void {
+  if (streamId === canonicalId) return;
+  const rebind = (blocks: Block[]): Block[] => {
+    const out: Block[] = [];
+    let bound: TextBlock | undefined;
+    for (const block of blocks) {
+      if (block.kind === "tool" && block.message_id === streamId) {
+        block.message_id = canonicalId;
+      }
+      if (block.kind !== "text" || !(matchesTextMessage(block, streamId)
+          || block.message_id === canonicalId)) {
+        out.push(block);
+        continue;
+      }
+      block.message_id = canonicalId;
+      block.stream_message_id = streamId;
+      if (!bound) {
+        bound = block;
+        out.push(block);
+      } else {
+        // Only the explicit identity binding proves these are one occurrence.
+        // Keep the fuller payload when a bounded summary won the arrival race.
+        if (block.text.length > bound.text.length) bound.text = block.text;
+        bound.done ||= block.done;
+        bound.channel = resolvedChannel(bound.channel, block.channel ?? "unknown");
+        if (block.liveOrder != null) {
+          bound.liveOrder = Math.min(bound.liveOrder ?? block.liveOrder, block.liveOrder);
+        }
+      }
+    }
+    return out;
+  };
+  turn.blocks = rebind(turn.blocks);
+  if (turn.liveSpillBlocks) turn.liveSpillBlocks = rebind(turn.liveSpillBlocks);
+  if (turn.detailProjection) turn.detailProjection.blocks = rebind(turn.detailProjection.blocks);
+}
+
 function openTurn(turns: Turn[], fallbackId: string, ts?: number): Turn {
   let turn = turns[turns.length - 1];
   if (!turn || turn.done) {
@@ -737,7 +790,7 @@ function findTurnOwningMessage(
   if (!messageId) return undefined;
   return [...turns].reverse().find((turn) => mutableTurnBlocks(turn).some((block) =>
     block.kind === "text"
-      ? block.message_id === messageId
+      ? matchesTextMessage(block, messageId)
       : block.kind === "tool"
         ? block.message_id === messageId
         : false));
@@ -2381,6 +2434,10 @@ function mergeRateLimitUpdate(
 }
 
 export function reduce(state: AppState, action: Action): AppState {
+  return reduceWithRetainedArtifacts(state, action, reduceCurrent);
+}
+
+function reduceCurrent(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "reset":
       return {
@@ -2883,6 +2940,23 @@ export function reduce(state: AppState, action: Action): AppState {
             }
           : turn);
       }, true);
+    }
+    case "restore_history_browse": {
+      const saved = action.projection;
+      const runtime = state.runtimes[saved.sid];
+      if (state.focusedSid !== saved.sid || !runtime || runtime.historyInvalidated
+          || isHistoryRecoveryPending(state.historyRecovery, saved.sid)
+          || runtime.historyRevision !== saved.revision
+          || runtime.historyGeneration !== saved.generation) return state;
+      // Previous navigation's detail reads were revoked. Restore their content,
+      // never their transient loading indicators or request ownership.
+      const segments = saved.segments.map(segment => ({ ...segment,
+        turns: segment.turns.map(turn => turn.detailLoading
+          ? { ...turn, detailLoading: false } : turn),
+      }));
+      return { ...state, retainedHistoryBrowse: null, historyBrowse: {
+        ...saved, segments, turns: segments.flatMap(segment => segment.turns),
+      } };
     }
     case "begin_history_browse": {
       const runtime = state.runtimes[action.sid];
@@ -5050,6 +5124,8 @@ function reduceEvent(
       });
     }
     case "turn_file_changes_page":
+    case "dsh_read_result":
+    case "dsh_download_chunk":
     case "files_listed":
     case "session_artifacts":
     case "agent_detail":
@@ -5066,9 +5142,13 @@ function reduceEvent(
           requestId: e.request_id ?? null,
         },
       };
-    // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
-    // what we have (data.ts's static table) rather than blanking the pickers.
+    case "dsh_command_result":
+      return patch(state, e.sid, (rt) => { rt.dshCommandResult = e; });
+    case "dsh_state":
+      return patch(state, e.sid, (rt) => { rt.dsh = e; });
     case "models": {
+      // DSH catalogs are authoritative, including empty responses. Other engines
+      // retain their existing catalog on a failed/empty read.
       const cacheKey = modelCatalogScopeKey(
         e.engine,
         e.engine === "codex"
@@ -5078,7 +5158,7 @@ function reduceEvent(
             : null,
       );
       const catalogKey = e.engine === "claude" && e.cwd ? `${cacheKey}\u0000${e.cwd}` : cacheKey;
-      const catalog = e.models.length
+      const catalog = e.models.length || e.engine === "dsh"
         ? { ...state.catalog, [catalogKey]: e.models }
         : state.catalog;
       if (e.cwd && e.cwd !== state.newChat?.cwd) {
@@ -5089,9 +5169,9 @@ function reduceEvent(
       let catalogDefault = state.catalogDefault;
       let catalogDefaultEffort = state.catalogDefaultEffort;
       let catalogDefaultCwd = state.catalogDefaultCwd;
-      if (e.cwd) {
-        // A Claude response is authoritative even when probing failed and the
-        // value is null: clear an older cwd's value instead of showing stale data.
+      if (e.cwd || e.engine === "dsh") {
+        // Cwd-aware Claude and all DSH responses replace defaults even when
+        // absent: do not reuse a prior directory's or removed provider's values.
         catalogDefault = { ...catalogDefault };
         catalogDefaultEffort = { ...catalogDefaultEffort };
         if (e.default_model) {
@@ -5104,9 +5184,11 @@ function reduceEvent(
         } else {
           delete catalogDefaultEffort[cacheKey];
         }
-        catalogDefaultCwd = {
-          ...catalogDefaultCwd, [cacheKey]: e.cwd,
-        };
+        if (e.cwd) {
+          catalogDefaultCwd = {
+            ...catalogDefaultCwd, [cacheKey]: e.cwd,
+          };
+        }
       } else {
         if (e.default_model) {
           catalogDefault = { ...catalogDefault,
@@ -5120,6 +5202,7 @@ function reduceEvent(
       }
       return {
         ...state, catalog, catalogDefault, catalogDefaultEffort,
+        ...(e.engine === "dsh" ? { dshPresets: e.dsh_presets ?? [], dshPermissions: e.dsh_permissions ?? [], dshError: e.error ?? null } : {}),
         catalogDefaultCwd,
       };
     }
@@ -5756,9 +5839,13 @@ function reduceEvent(
       });
     case "replay_start": {
       const replaySid = e.sid ?? state.focusedSid;
+      const isSideChat = !!replaySid && (replaySid.startsWith("btw-")
+        || Object.values(state.btwByParentSid).some((group) =>
+          group.chats.some((chat) => chat.sid === replaySid)));
       // Side chats rebuild from a private item snapshot, not durable History.
+      // DSH forks retain native dsh@ ids, so use their owner catalog as well.
       const needsAuthoritativeHistory = (e.truncated || !!e.rebuild)
-        && !replaySid?.startsWith("btw-");
+        && !isSideChat;
       const submittedTurn = needsAuthoritativeHistory && !e.rebuild
         ? recoverableSubmittedTurn(
             state.runtimes[replaySid ?? ""] ?? createRuntime(),
@@ -5792,7 +5879,7 @@ function reduceEvent(
         }
       }
       const next = patch(state, e.sid, (rt) => {
-        if (replaySid?.startsWith("btw-") && !rt.btwReplayView && !rt.replaying && !rt.loading
+        if (isSideChat && !rt.btwReplayView && !rt.replaying && !rt.loading
             && rt.turns.length) {
           // SyncBtw refreshes the private snapshot on every reopen. Keep the
           // already-painted complete view while the live runtime rebuilds;
@@ -5807,7 +5894,7 @@ function reduceEvent(
         rt.replaying = true;
         rt.syncReady = false;
         rt.truncated = e.truncated;
-        if (replaySid?.startsWith("btw-") && e.rebuild) {
+        if (isSideChat && e.rebuild) {
           const pending = [...rt.turns, ...(rt.btwReplayPending ?? [])].find((turn) =>
             turn.id === rt.acceptancePending && !turnHasBoundEngineId(turn));
           rt.btwReplayPending = pending ? [pending] : [];
@@ -6291,7 +6378,7 @@ function reduceEvent(
         else claimClaudeContinuation(rt, t, e, boundCompletedTurns);
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
-          && b.message_id === e.message_id) as TextBlock | undefined;
+          && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
         const stamp = eventTimestampMs(e.ts);
         if (block) {
           block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
@@ -6333,7 +6420,7 @@ function reduceEvent(
         else claimClaudeContinuation(rt, t, e, boundCompletedTurns);
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
-          && b.message_id === e.message_id) as TextBlock | undefined;
+          && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
         if (!block) {
           block = { kind: "text", message_id: e.message_id, text: "", done: false,
             channel: e.channel ?? "unknown" };
@@ -6486,8 +6573,11 @@ function reduceEvent(
         const candidates = e.turn_id ? [explicit] : turns;
         for (const t of candidates) {
           if (!t) continue;
+          if (e.canonical_message_id) {
+            bindTurnMessageIdentity(t, e.message_id, e.canonical_message_id);
+          }
           const b = mutableTurnBlocks(t).find((b) => b.kind === "text"
-            && b.message_id === e.message_id) as TextBlock | undefined;
+            && matchesTextMessage(b, e.message_id)) as TextBlock | undefined;
           if (b) {
             const detachedBackground = t.done && (e.background === true
               || (!!rt.liveOwner && !turnHasIdentityAlias(t, rt.liveOwner.turnId)));
@@ -6720,6 +6810,16 @@ function reduceEvent(
         }
         let turns = cloneTurns(rt.turns);
         const seq = typeof e.seq === "number" ? e.seq : 0;
+        if (e.autonomous) {
+          let owner = turns.find(turn => turnHasIdentityAlias(turn, e.msg_id));
+          if (!owner) {
+            // Native rounds without a human prompt retain their exact owner.
+            owner = { id: e.msg_id, prompt: "", blocks: [], done: false,
+              forkPointId: e.turn_id, ts: eventTimestampMs(e.ts) };
+            turns.push(owner);
+          }
+          if (e.continuation) owner.continuation = e.continuation;
+        }
         const binding = {
           msgId: e.msg_id,
           turnId: e.turn_id,
@@ -6812,6 +6912,23 @@ function reduceEvent(
             rt, turns, e.checkpoint_id, e.seq, false)
             ?? findTurnByEngineId(turns, e.checkpoint_id);
         }
+        if (!t && !e.checkpoint_id && (ownership?.engine === "claude"
+            || state.sessions.some((session) =>
+              session.session_id === e.sid && session.engine === "claude"))) {
+          // A main Claude continuation retains its completed human row, but
+          // finishes with a different native assistant UUID. The wrapper binds
+          // that exact owner before the real terminal; do not reopen the row or
+          // guess from whichever turn is last/current. Stream envelope IDs can
+          // also differ from the assembled assistant's transcript UUID.
+          const binding = rt.pendingLiveBinding;
+          if (binding && binding.turnId === e.turn_id
+              && binding.generation === runtimeOrderingGeneration(rt)
+              && (typeof e.seq !== "number" || e.seq >= binding.seq)) {
+            const owners = turns.filter((turn) =>
+              turnHasIdentityAlias(turn, binding.msgId));
+            if (owners.length === 1 && owners[0].done) t = owners[0];
+          }
+        }
         if (!t) {
           const openTurns = turns.filter((turn) => !turn.done
             && !(rt.acceptanceKind === "steer_unknown"
@@ -6841,9 +6958,13 @@ function reduceEvent(
             t.forkPointId = e.turn_id;
             t.liveTaskId = undefined;
           }
+          if (e.sid?.startsWith("dsh@")) {
+            t.forkAvailable = e.result.subtype !== "steered";
+          }
           if (e.checkpoint_id) t.checkpointId = e.checkpoint_id;
           t.progress = undefined;
-          if (e.result.subtype === "error_during_execution") t.interrupted = true;
+          const nativeDshInterrupt = !!e.sid?.startsWith("dsh@") && e.result.subtype === "interrupted";
+          if (e.result.subtype === "error_during_execution" || nativeDshInterrupt) t.interrupted = true;
           if (e.result.is_error) {
             if (e.result.subtype !== "error_during_execution") {
               t.error ??= "本次回复未完成，请重试。";
@@ -6864,8 +6985,10 @@ function reduceEvent(
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
           finishOpenBlocks(
             t,
-            e.result.is_error ? "interrupted" : "succeeded",
-            e.result.is_error,
+            nativeDshInterrupt ? "interrupted"
+              : e.result.is_error ? (e.sid?.startsWith("dsh@") ? "failed" : "interrupted")
+                : "succeeded",
+            e.result.is_error || nativeDshInterrupt,
             e.result.subtype === "steered",
           );
           settleVisibleProcessIfComplete(

@@ -228,6 +228,18 @@ export function shouldAutoLoadOlderHistory(
     && metrics.scrollTop <= AUTO_LOAD_HISTORY_TOP_PX;
 }
 
+/** Fetch only, without changing the mounted history or its reading anchor.
+ * Long windows start halfway up; short windows get two screens of lead time. */
+export function shouldPrefetchOlderHistory(
+  metrics: ScrollMetrics,
+  movingTowardHistory: boolean,
+  canLoadOlder: boolean,
+): boolean {
+  const range = Math.max(0, metrics.scrollHeight - metrics.clientHeight);
+  return canLoadOlder && movingTowardHistory
+    && metrics.scrollTop <= Math.max(range / 2, metrics.clientHeight * 2);
+}
+
 /** Wheel/touch handlers use this only when the viewport cannot scroll farther.
  * Movement before the edge is handled by the later scroll event, after the
  * browser has established the position that history prepending must preserve. */

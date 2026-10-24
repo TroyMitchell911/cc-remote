@@ -14,13 +14,13 @@ export function EngineSelector({ engine, onChange }: {
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.keyCode === 229 || event.repeat
           || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
-          || (event.key !== "1" && event.key !== "2")) return;
+          || (event.key !== "1" && event.key !== "2" && event.key !== "3")) return;
       // Harness navigation belongs to the app, even inside a modal or editor.
       // Capture before their key handlers; never submit or dismiss their work.
       event.preventDefault();
       event.stopPropagation();
       setMenu(null);
-      const next = event.key === "1" ? "claude" : "codex";
+      const next = event.key === "1" ? "claude" : event.key === "2" ? "codex" : "dsh";
       if (next !== engine) onChange(next);
     };
     window.addEventListener("keydown", onKey, true);
@@ -44,7 +44,7 @@ export function EngineSelector({ engine, onChange }: {
         }
       }}>
       <span className="engine-label"><EngineIcon engine={engine} />
-        {engine === "codex" ? "Codex" : "Claude"}</span>
+        {engine === "dsh" ? "DSH" : engine === "codex" ? "Codex" : "Claude"}</span>
     </button>
     {menu !== null && <Suspense fallback={null}><EngineMenu engine={engine} anchor={button}
       keyboard={menu} onClose={close} onSelect={(next, keyboard) => {

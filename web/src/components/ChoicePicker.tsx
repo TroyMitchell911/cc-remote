@@ -3,13 +3,14 @@ import { Icon } from "../icons";
 import { CenteredSheet } from "./CenteredSheet";
 
 export function ChoicePicker({ label, value, options, onChange, disabled = false,
-  className = "", showChevron = true, children }: {
+  className = "", sheetClassName = "", showChevron = true, children }: {
   label: string;
   value: string;
   options: { value: string; label: string; description?: string; icon?: string; disabled?: boolean }[];
   onChange: (value: string) => void;
   disabled?: boolean;
   className?: string;
+  sheetClassName?: string;
   showChevron?: boolean;
   children: ReactNode;
 }) {
@@ -20,7 +21,7 @@ export function ChoicePicker({ label, value, options, onChange, disabled = false
       onClick={() => setOpen(!open)}>
       {children}{showChevron && <Icon name="chev" size={14} />}
     </button>
-    <CenteredSheet open={open && !disabled} label={label} onClose={() => setOpen(false)} maxWidth={440}>
+    <CenteredSheet open={open && !disabled} label={label} onClose={() => setOpen(false)} maxWidth={440} className={sheetClassName}>
       <div className="sheet-scroll" onKeyDown={event => {
         if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
         event.preventDefault();

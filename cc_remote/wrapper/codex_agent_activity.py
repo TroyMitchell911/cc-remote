@@ -5,6 +5,7 @@ child's own native turn markers, independently of the parent's turn.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, field
 import json
 import os
@@ -31,7 +32,7 @@ def _catalog(home: Path, parents: set[str]) -> dict[str, tuple[str, str]]:
         return {}
     uri = Path(database).resolve().as_uri() + "?mode=ro"
     result = {}
-    with sqlite3.connect(uri, uri=True, timeout=1) as db:
+    with closing(sqlite3.connect(uri, uri=True, timeout=1)) as db:
         # Bound work even with an unexpectedly large/corrupt native catalog.
         steps = 0
 

@@ -209,6 +209,52 @@ try {
   assert.equal(state.runtimes[sid].liveOwner, null);
   assert.doesNotMatch(panel(), /class="turn-working"/,
     "completion while hidden must not retain the old running spark");
+
+  // DSH keeps its native session id when used as a private side chat. Its
+  // complete SyncBtw replay must settle without waiting for a main History page.
+  const dshSid = "dsh@side-history";
+  const dshEvent = (body: Record<string, unknown>) => event({ sid: dshSid, ...body });
+  dshEvent({ type: "btw_opened", request_id: "dsh-open", parent_sid: "dsh@main",
+    btw_sid: dshSid, engine: "dsh", created_at: 2, revision: 2 });
+  for (const warm of [false, true]) {
+    const previousTurns = state.runtimes[dshSid].turns;
+    dshEvent({ type: "replay_start", generation: "dsh-g", from_seq: 0, to_seq: 5,
+      truncated: false, rebuild: true });
+    assert.equal(state.runtimes[dshSid].historyInvalidated, false,
+      "the private DSH replay is already the authoritative side-chat history");
+    if (warm) assert.equal(state.runtimes[dshSid].btwReplayView?.turns, previousTurns);
+    if (warm) {
+      dshEvent({ type: "user_msg", msg_id: "side-question", prompt: "side question" });
+      dshEvent({ type: "delta", message_id: "side-answer", text: "side answer", channel: "final" });
+      dshEvent({ type: "turn_end", turn_id: "side-question", result: {
+        subtype: "success", duration_ms: 100, is_error: false,
+      } });
+    }
+    dshEvent({ type: "replay_end", to_seq: 5, truncated: false });
+    assert.equal(state.runtimes[dshSid].loading, false);
+    assert.equal(state.runtimes[dshSid].syncReady, true);
+    assert.equal(state.runtimes[dshSid].turns.length, warm ? 1 : 0);
+    if (!warm) {
+      dshEvent({ type: "user_msg", msg_id: "side-question", prompt: "side question" });
+      dshEvent({ type: "delta", message_id: "side-answer", text: "side answer", channel: "final" });
+    }
+  }
+  // An already-stuck client recovers on the next sync; ordinary native DSH
+  // sessions still require their durable History, including released side chats.
+  state = { ...state, runtimes: { ...state.runtimes, [dshSid]: {
+    ...state.runtimes[dshSid], historyInvalidated: true, loading: true,
+  } } };
+  dshEvent({ type: "replay_start", generation: "dsh-g", from_seq: 0, to_seq: 6,
+    truncated: true, rebuild: true });
+  dshEvent({ type: "replay_end", to_seq: 6, truncated: true });
+  assert.equal(state.runtimes[dshSid].loading, false);
+  assert.equal(state.runtimes[dshSid].historyInvalidated, false);
+  dshEvent({ type: "btw_closed", btw_sid: dshSid, parent_sid: "dsh@main", revision: 3 });
+  dshEvent({ type: "replay_start", generation: "dsh-g", from_seq: 0, to_seq: 6,
+    truncated: false, rebuild: true });
+  dshEvent({ type: "replay_end", to_seq: 6, truncated: false });
+  assert.equal(state.runtimes[dshSid].historyInvalidated, true);
+  assert.equal(state.runtimes[dshSid].loading, true);
 } finally {
   await harness.close();
 }

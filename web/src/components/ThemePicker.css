@@ -5,11 +5,13 @@
   --editor-dark:#252431; --editor-light:#FAFAFC;
 }
 :root[data-engine="claude"] .theme-picker { --accent:#C15F3C; --accent-ink:#A64B2C; --accent-weak:#F2E7DF; }
+:root[data-engine="dsh"] .theme-picker { --accent:#2E6FF0; --accent-ink:#1B54D1; --accent-weak:#EAF0FC; }
 :root[data-theme="dark"] .theme-picker {
   --text:#ECEDF3; --dim:#B2AFBF; --surface:#202128; --raised:#292A33;
   --border:#393945; --border-strong:#484857; --accent:#9A96F0; --accent-ink:#B5B1FF; --accent-weak:#343248;
 }
 :root[data-engine="claude"][data-theme="dark"] .theme-picker { --accent:#DB7C5E; --accent-ink:#EB9679; --accent-weak:#3F2D27; }
+:root[data-engine="dsh"][data-theme="dark"] .theme-picker { --accent:#6BA5FF; --accent-ink:#94BDFF; --accent-weak:#28354A; }
 .theme-picker .centered-sheet-head { padding:20px 24px 10px; }
 .theme-picker .sheet-title { font-size:19px; }
 .theme-picker-intro { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding:0 24px 20px; }
@@ -136,4 +138,25 @@
   .theme-basics button { justify-items:center; }
   .appearance-miniature { width:100%; max-width:64px; height:48px; }
   .theme-picker-footer > span { font-size:10px; }
+}
+
+/* DSH uses the compact, flat editor; other engines keep their existing layout. */
+.theme-picker-dsh .appearance-mode-section { border:0; border-radius:0; padding:10px 0; }
+.theme-picker-dsh .appearance-fields { border:0; border-radius:0; padding:0; }
+.theme-picker-dsh .appearance-row { min-height:59px; }
+.theme-picker-dsh .appearance-fields { border-top:1px solid var(--border); }
+.theme-picker-dsh .appearance-color { border-color:transparent; border-radius:8px; background:transparent; }
+.theme-picker-dsh .appearance-select-trigger { border-radius:9px; }
+.theme-picker-dsh .appearance-mode-help { margin:12px 0 20px; }
+.theme-picker-dsh .appearance-help { margin:14px 0 0; font-size:11px; }
+.theme-picker-dsh .appearance-done { border-radius:10px; }
+.theme-picker-dsh .theme-picker-intro { padding-bottom:16px; }
+.theme-picker-dsh .theme-picker-scroll { padding-bottom:16px; }
+@media(max-width:600px) {
+  .theme-picker-dsh .appearance-mode-section { gap:12px; }
+  .theme-picker-dsh .appearance-row { min-height:56px; }
+  .theme-picker-dsh .appearance-miniature { width:68px; }
+}
+@media(max-width:430px) {
+  .theme-picker-dsh .appearance-miniature { width:100%; }
 }

@@ -2,17 +2,20 @@ import {
   useCallback,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { Icon } from "../icons";
 import {
+  cachedMermaidSvg,
   mermaidPreviewSvg,
   mermaidSourceProblem,
   renderMermaidSvg,
   type MermaidTheme,
 } from "../mermaid";
 import { ImageLightbox } from "./ImageLightbox";
+import { mediaViewportOptions } from "../media-viewport";
 
 interface RenderedMermaid {
   source: string;
@@ -47,6 +50,7 @@ export function MermaidBlock({ source }: { source: string }) {
   const [theme, setTheme] = useState<MermaidTheme>(activeTheme);
   const [copied, setCopied] = useState(false);
   const [preview, setPreview] = useState<MermaidPreview | null>(null);
+  const cached = useMemo(() => cachedMermaidSvg(source, renderId, theme), [source, renderId, theme]);
   const [rendered, setRendered] = useState<RenderedMermaid>({
     source: "",
     theme: "light",
@@ -64,7 +68,7 @@ export function MermaidBlock({ source }: { source: string }) {
       if (!entries.some((entry) => entry.isIntersecting)) return;
       setNearViewport(true);
       observer.disconnect();
-    }, { rootMargin: "600px 0px" });
+    }, mediaViewportOptions(node));
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
@@ -78,7 +82,7 @@ export function MermaidBlock({ source }: { source: string }) {
   }, []);
 
   useEffect(() => {
-    if (!nearViewport) return;
+    if (!nearViewport || cached) return;
     const generation = ++renderGeneration.current;
     const problem = mermaidSourceProblem(source);
     if (problem) {
@@ -104,7 +108,7 @@ export function MermaidBlock({ source }: { source: string }) {
     return () => {
       if (renderGeneration.current === generation) renderGeneration.current += 1;
     };
-  }, [nearViewport, renderId, source, theme]);
+  }, [cached, nearViewport, renderId, source, theme]);
 
   useEffect(() => () => {
     if (copyTimer.current) clearTimeout(copyTimer.current);
@@ -130,6 +134,7 @@ export function MermaidBlock({ source }: { source: string }) {
   };
   const current = rendered.source === source && rendered.theme === theme
     ? rendered
+    : cached ? { source, theme, state: "ready" as const, svg: cached }
     : { source, theme, state: "idle" as const };
   const openPreview = () => {
     if (current.state !== "ready" || !current.svg) return;

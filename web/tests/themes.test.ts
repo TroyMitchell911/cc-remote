@@ -106,7 +106,7 @@ let inMemory = saveAppearanceChange(readOnly, migrated, "codex", { target: "ligh
 inMemory = saveAppearanceChange(readOnly, inMemory, "codex", { target: "light", patch: { background: "#EFEFEF" } });
 assert.deepEqual(inMemory.codex?.light, { accent: "#111111", background: "#EFEFEF" });
 assert.equal(readAppearancePreferences(blocked).codex?.mode, "system");
-for (const engine of ["claude", "codex"] as const) {
+for (const engine of ["claude", "codex", "dsh"] as const) {
   for (const mode of ["light", "dark"] as const) {
     assert.deepEqual(appearanceVariables(engine, mode, {}), {}, "defaults keep their authored tokens");
     const colors = appearanceColors(engine, mode, {});

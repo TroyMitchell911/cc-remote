@@ -102,7 +102,7 @@ import {
   PROTOCOL_VERSION,
 } from "../src/protocol.ts";
 import {
-  protocolRecoveryAction, RelayWs, stableTabClientId,
+  type EventOwnership, protocolRecoveryAction, RelayWs, stableTabClientId,
 } from "../src/ws.ts";
 import {
   dismissGoalUi,
@@ -238,21 +238,21 @@ const preferenceStorage = {
   getItem: (key: string) => preferenceValues.get(key) ?? null,
 };
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "code", codex: "work",
+  claude: "code", codex: "work", dsh: "code",
 }, "legacy space migrates only to the previously active engine");
 preferenceValues.set(ENGINE_SPACES_KEY, JSON.stringify({
-  claude: "work", codex: "code",
+  claude: "work", codex: "code", dsh: "code",
 }));
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "work", codex: "code",
+  claude: "work", codex: "code", dsh: "code",
 }, "persisted engine spaces survive reload independently");
 assert.deepEqual(
-  rememberEngineSpace({ claude: "work", codex: "code" }, "codex", "work"),
-  { claude: "work", codex: "work" },
+  rememberEngineSpace({ claude: "work", codex: "code", dsh: "code" }, "codex", "work"),
+  { claude: "work", codex: "work", dsh: "code" },
   "changing one engine's space must preserve the other engine's memory",
 );
-let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work" } = {
-  claude: "code", codex: "code",
+let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work"; dsh: "code" | "work" } = {
+  claude: "code", codex: "code", dsh: "code",
 };
 switchingSpaces = rememberEngineSpace(switchingSpaces, "claude", "work");
 assert.equal(switchingSpaces.codex, "code",
@@ -1190,7 +1190,7 @@ assert.match(historyAppSource,
   /const refreshStatus = useCallback[\s\S]{0,300}\?\.tag === "archived"[\s\S]{0,220}sendGetStatus/,
   "archived history must not request live Codex status");
 assert.match(historyAppSource,
-  /!archivedBrowse && \(\s*<TerminalControl/,
+  /!archivedBrowse && focusedEngine !== "dsh" && \(\s*<TerminalControl/,
   "archived history must not expose terminal takeover controls");
 assert.match(historyAppSource,
   /<GoalPanel[\s\S]{0,180}revealed=\{!archivedBrowse[\s\S]{0,100}open=\{!archivedBrowse/,
@@ -1564,13 +1564,12 @@ for (const filename of [
   assert.match(source, /nativeEvent\.keyCode/);
 }
 
-// Desktop sidebar motion must not regress to the old discrete grid-track swap.
-// Chromium could strand an animated 0px/1fr grid, so the safe implementation
-// slides the fixed sidebar and offsets the pane using ordinary CSS lengths.
+// Reserve the final desktop column width immediately. Neither grid-track nor
+// pane-width interpolation may repeatedly rewrap the reader's paragraphs.
 const layoutCss = readFileSync(resolve(process.cwd(), "src/index.css"), "utf8");
 assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
-assert.match(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*margin-left[^}]*width/s);
+assert.doesNotMatch(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*\bwidth/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
 assert.doesNotMatch(layoutCss, /\.scard\.has-profile-ribbon\s*\{[^}]*padding-top/,
   "profile stamps must not add a second row to every session card");
@@ -17821,6 +17820,186 @@ function assertAutomaticPreviewReads() {
 }
 assertAutomaticPreviewReads();
 
+function assertDshCommandsNeverReplay() {
+  const commandRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  assert.equal(commandRelay.sendDshControl("dsh@s", "command", "/run"), null,
+    "offline native commands must not be queued for later execution");
+  commandRelay.start();
+  const commandSocket = FakeWebSocket.instances.at(-1)!;
+  commandSocket.onopen?.();
+  try {
+    const files = [{ filename: "note.txt", data: "aGk=" }];
+    const id = commandRelay.sendDshControl("dsh@s", "command", "/run", undefined, files);
+    assert.ok(id);
+    const sent = commandSocket.sent.map(raw => JSON.parse(raw));
+    assert.deepEqual(sent.find(frame => frame.cmd_id === id)?.files, files);
+    // Re-run the actual reconnect preamble without acknowledging the write.
+    commandSocket.onopen?.();
+    assert.equal(commandSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === id).length, 1,
+      "lost ACKs must not replay a native command on reconnect");
+    commandSocket.readyState = 3;
+    assert.equal(commandRelay.sendDshControl("dsh@s", "command", "/run"), null);
+  } finally { commandRelay.stop(); }
+}
+assertDshCommandsNeverReplay();
+
+function assertDshMutationsNeverReplay() {
+  const cases: Array<[string, (relay: RelayWs) => string | null]> = [];
+  for (const action of ["create", "edit", "pause", "resume", "complete", "clear"] as const) {
+    cases.push([`goal/${action}`, relay => relay.sendActDshGoal("dsh@s", {
+      action, ...(action === "create" ? {} : { goal_id: "goal", revision: 3 }),
+      ...(["create", "edit"].includes(action) ? { objective: "finish", max_rounds: 64 } : {}),
+    })]);
+  }
+  for (const kind of ["permission", "effort", "command", "job_stop", "plugin_enable", "plugin_disable", "terminal"] as const) {
+    cases.push([kind, relay => relay.sendDshControl("dsh@s", kind, "value")]);
+  }
+  for (const action of ["settings", "preset_default", "schedule_create", "schedule_update", "schedule_delete",
+    "bundle_install", "bundle_enable", "bundle_disable", "bundle_remove"]) {
+    cases.push([action, relay => relay.sendDshControl("dsh@s", "manage", JSON.stringify({ action }))]);
+  }
+  cases.push(["child/stop", relay => relay.sendActDshSubagent("dsh@s", "dsh@child", "stop", "")]);
+  for (const [name, send] of cases) {
+    const mutationRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+    assert.equal(send(mutationRelay), null, `${name}: offline writes must not be queued`);
+    mutationRelay.start();
+    const mutationSocket = FakeWebSocket.instances.at(-1)!;
+    mutationSocket.onopen?.();
+    try {
+      const id = send(mutationRelay);
+      assert.ok(id, name);
+      const frame = mutationSocket.sent.map(raw => JSON.parse(raw)).find(row => row.cmd_id === id);
+      assert.ok(frame?.client_id, `${name}: preserve response correlation`);
+      assert.equal(frame.sid, "dsh@s");
+      // No ACK: reconnect to the same or a restarted Wrapper must not resubmit.
+      mutationSocket.onopen?.();
+      assert.equal(mutationSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.cmd_id === id).length, 1, name);
+      mutationSocket.readyState = 3;
+      assert.equal(send(mutationRelay), null, `${name}: disconnected writes must not be queued`);
+    } finally { mutationRelay.stop(); }
+  }
+}
+assertDshMutationsNeverReplay();
+
+function assertSessionSetterRecoveryIsEngineScoped() {
+  const controls: Array<{
+    type: string;
+    focused: (relay: RelayWs) => void;
+    target: (relay: RelayWs, sid: string) => void;
+  }> = [
+    { type: "interrupt", focused: relay => relay.sendInterrupt(),
+      target: (relay, sid) => relay.sendInterruptTo(sid) },
+    { type: "set_model", focused: relay => relay.sendSetModel("selected-model"),
+      target: (relay, sid) => relay.sendSetModelTo(sid, "selected-model") },
+    { type: "set_effort", focused: relay => relay.sendSetEffort("max"),
+      target: (relay, sid) => relay.sendSetEffortTo(sid, "max") },
+  ];
+  for (const control of controls) {
+    for (const engine of ["dsh", "claude", "codex"] as const) {
+      for (const focused of [false, true]) {
+        const controlRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+        const sid = engine === "dsh" ? "dsh@session" : `${engine}-session`;
+        const label = `${engine}/${control.type}`;
+        controlRelay.setFocusedSid(sid, engine, "code");
+        // Explicit targets retain their own engine after surface navigation.
+        if (!focused) controlRelay.setSurface(engine === "dsh" ? "claude" : "dsh", "code");
+        const send = () => focused ? control.focused(controlRelay) : control.target(controlRelay, sid);
+        send(); // Offline: preserve the existing Claude/Codex reliable behavior.
+        controlRelay.start();
+        const controlSocket = FakeWebSocket.instances.at(-1)!;
+        const frames = () => controlSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.type === control.type);
+        controlSocket.onopen?.();
+        try {
+          assert.equal(frames().length, engine === "dsh" ? 0 : 1, `${label}: offline write`);
+          send();
+          const firstCount = frames().length;
+          const frame = frames().at(-1)!;
+          assert.equal(frame.sid, sid);
+          assert.ok(frame.cmd_id && frame.client_id, "preserve error correlation");
+          if (control.type === "set_model") assert.equal(frame.model, "selected-model");
+          if (control.type === "set_effort") assert.equal(frame.effort, "max");
+          controlSocket.onopen?.(); // Lost ACK / Wrapper restart.
+          assert.equal(frames().length, engine === "dsh" ? firstCount : firstCount * 2,
+            `${label}: DSH native writes must stay out of recovery`);
+          controlSocket.readyState = 3;
+          send();
+          controlSocket.readyState = FakeWebSocket.OPEN;
+          const before = frames().length;
+          controlSocket.onopen?.();
+          assert.equal(frames().length, engine === "dsh" ? before : before + firstCount + 1,
+            `${label}: disconnected write`);
+        } finally { controlRelay.stop(); }
+      }
+    }
+    const noFocus = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+    noFocus.setSurface("dsh", "code");
+    noFocus.start();
+    const noFocusSocket = FakeWebSocket.instances.at(-1)!;
+    noFocusSocket.onopen?.();
+    try {
+      control.focused(noFocus);
+      assert.ok(!noFocusSocket.sent.some(raw => JSON.parse(raw).type === control.type),
+        "DSH controls must have an exact session target");
+    } finally { noFocus.stop(); }
+  }
+}
+assertSessionSetterRecoveryIsEngineScoped();
+
+function assertSessionMetadataRecoveryIsEngineScoped() {
+  const mutations: Array<{
+    type: string;
+    send: (relay: RelayWs, sid: string, engine?: "claude" | "codex" | "dsh") => void;
+  }> = [
+    { type: "rename_session", send: (relay, sid, engine) => relay.sendRenameSession(sid, "new title", engine) },
+    { type: "archive_session", send: (relay, sid, engine) => relay.sendArchiveSession(sid, true, engine) },
+    { type: "archive_session", send: (relay, sid, engine) => relay.sendArchiveSession(sid, false, engine) },
+  ];
+  for (const mutation of mutations) {
+    for (const engine of ["dsh", "claude", "codex"] as const) {
+      for (const route of ["explicit", "catalog", "prefix"] as const) {
+        if (route === "prefix" && engine !== "dsh") continue;
+        const events: Array<{ event: ServerEvent; ownership?: EventOwnership }> = [];
+        const metadataRelay = new RelayWs({
+          onEvent: (event, ownership) => events.push({ event, ownership }), onConnState: () => {},
+        });
+        const sid = engine === "dsh" ? "dsh@metadata" : `${engine}-metadata`;
+        if (route === "catalog") metadataRelay.setSessionEngines([{ session_id: sid, engine, space: "code" }]);
+        metadataRelay.setSurface(engine === "dsh" ? "claude" : "dsh", "code");
+        const send = () => mutation.send(metadataRelay, sid, route === "explicit" ? engine : undefined);
+        send();
+        metadataRelay.start();
+        const metadataSocket = FakeWebSocket.instances.at(-1)!;
+        const frames = () => metadataSocket.sent.map(raw => JSON.parse(raw)).filter(row => row.type === mutation.type);
+        metadataSocket.onopen?.();
+        try {
+          const label = `${engine}/${route}/${mutation.type}`;
+          assert.equal(frames().length, engine === "dsh" ? 0 : 1, `${label}: offline writes`);
+          send();
+          const frame = frames().at(-1)!;
+          assert.equal(frame.session_id, sid);
+          assert.ok(frame.cmd_id && frame.client_id, `${label}: response correlation`);
+          // A delayed list response must retain the mutation's engine even
+          // while the user views another surface.
+          metadataSocket.receive({ type: "session_list", engine, space: "code",
+            request_id: frame.cmd_id, sessions: [{ session_id: sid, engine, space: "code" }] });
+          assert.equal(events.at(-1)?.ownership?.engine, engine, `${label}: list ownership`);
+          const sent = frames().length;
+          metadataSocket.onopen?.(); // Lost ACK, including a restarted Wrapper.
+          assert.equal(frames().length, engine === "dsh" ? sent : sent * 2, `${label}: reconnect replay`);
+          metadataSocket.readyState = 3;
+          send();
+          metadataSocket.readyState = FakeWebSocket.OPEN;
+          const before = frames().length;
+          metadataSocket.onopen?.();
+          assert.equal(frames().length, engine === "dsh" ? before : before + sent + 1,
+            `${label}: disconnected writes`);
+        } finally { metadataRelay.stop(); }
+      }
+    }
+  }
+}
+assertSessionMetadataRecoveryIsEngineScoped();
+
 const observed: ServerEvent[] = [];
 let wrapperGenerationChanges = 0;
 const relay = new RelayWs({
@@ -18942,6 +19121,26 @@ relay.stop();
 
 // A separate socket exercises the v15 control watermark without perturbing
 // the narrative generation assertions above.
+function checkTerminalNonReplay() {
+  const terminalRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  assert.equal(terminalRelay.sendDshControl("dsh@pty", "terminal", '{"action":"input"}'), null);
+  terminalRelay.start();
+  const terminalSocket = FakeWebSocket.instances.at(-1)!;
+  terminalSocket.onopen?.();
+  const terminalCommand = terminalRelay.sendDshControl("dsh@pty", "terminal", '{"action":"input","lease":"once"}');
+  assert.ok(terminalCommand);
+  assert.equal(terminalSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === terminalCommand).length, 1);
+  terminalSocket.onopen?.(); // recovery must never resend the physical input
+  assert.equal(terminalSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === terminalCommand).length, 1);
+  terminalRelay.stop();
+  terminalRelay.start();
+  const reopenedTerminalSocket = FakeWebSocket.instances.at(-1)!;
+  reopenedTerminalSocket.onopen?.();
+  assert.equal(reopenedTerminalSocket.sent.map(raw => JSON.parse(raw)).some(frame => frame.kind === "terminal"), false);
+  terminalRelay.stop();
+}
+checkTerminalNonReplay();
+
 const controlObserved: ServerEvent[] = [];
 const controlRelay = new RelayWs({
   onEvent: (event) => { controlObserved.push(event); },

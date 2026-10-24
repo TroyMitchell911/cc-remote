@@ -16,6 +16,8 @@ import sqlite3
 import sys
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -79,7 +81,7 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v46 restores native commands, source clocks and closed segment envelopes.
 # v47 preserves native cross-thread provenance and outgoing message receipts.
 # v48 retains Codex async task receipt boundaries in compact summaries.
-# v49 retains native Claude/Codex child/task return identities.
+# v49 retains native child/task return identities for all engines.
 # v50 keeps return-link metadata out of process counts and timing.
 _SCHEMA_VERSION = 50
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
@@ -573,6 +575,7 @@ def materialize_history_turns(
             continue
         prompt = ""
         has_user = False
+        continuation = None
         client_msg_id = None
         source_thread_id = None
         session_messages: dict[str, dict] = {}
@@ -694,7 +697,7 @@ def materialize_history_turns(
                     task_receipts.pop(next(iter(task_receipts)))
                     receipts_truncated = True
                 if (event.get("server") == "cc_remote"
-                        and event["item_id"].startswith("return-")):
+                        and event["item_id"].startswith(("return-", "dsh-return-"))):
                     # Link metadata is already in the summary. It must not add
                     # a process disclosure, count or duration to the parent.
                     continue
@@ -815,6 +818,8 @@ def materialize_history_turns(
                         text_last_ms[message_id] = stamp
                         text_done_ms[message_id] = stamp
             elif event_type == "turn_binding":
+                if event.get("autonomous") and event.get("continuation") == "subagent":
+                    continuation = event["continuation"]
                 if isinstance(event.get("turn_id"), str):
                     fork_point = event["turn_id"]
                 if started_ms is None:
@@ -1289,6 +1294,7 @@ def materialize_history_turns(
             "clientMsgId": client_msg_id,
             "sourceThreadId": source_thread_id,
             "sessionMessages": list(session_messages.values()) or None,
+            "continuation": continuation if not has_user else None,
             "forkPointId": fork_point,
             "checkpointId": checkpoint_id,
             "imageRefs": image_refs or None,
@@ -1331,17 +1337,22 @@ class HistoryIndexStore:
         self._compact_memory_lock = RLock()
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.path.parent, 0o700)
         except OSError:
             pass
         connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=5000")
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA journal_mode=WAL")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _select_page_row(
         self,
@@ -1742,7 +1753,7 @@ class HistoryIndexStore:
                 # Only rebuild chat projections; preserve binary/image assets,
                 # child detail and the raw Claude compact ancestry index.
                 for table in ("history_pages", "history_turn_details"):
-                    connection.execute(f"DELETE FROM {table} WHERE engine IN ('claude', 'codex')")
+                    connection.execute(f"DELETE FROM {table} WHERE engine IN ('claude', 'codex', 'dsh')")
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:

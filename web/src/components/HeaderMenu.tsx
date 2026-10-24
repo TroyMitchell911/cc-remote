@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from 
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
 import { SideChatIcon } from "./SideChatIcon";
+import { DSH_SIDECHAT_UNAVAILABLE } from "../data";
 import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
 import { themeLabel } from "../themes";
@@ -11,7 +12,7 @@ import type { AppearanceController } from "../use-theme";
 const ThemePicker = lazy(() => import("./ThemePicker"));
 
 interface Props {
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   appearance: AppearanceController;
   boldText: boolean;
   onBoldText: (enabled: boolean) => void;
@@ -24,6 +25,7 @@ interface Props {
   onOpenUsageActivity: () => void;
   onOpenBtw?: () => void;
   onOpenViewer?: () => void;
+  onOpenDshTools?: () => void;
   onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
   onLogout: () => void;
@@ -56,6 +58,7 @@ export function HeaderMenu({
   onOpenViewer,
   onOpenFiles,
   onOpenArtifacts,
+  onOpenDshTools,
   onLogout,
 }: Props) {
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -164,6 +167,11 @@ export function HeaderMenu({
             onPointerDown={(event) => event.stopPropagation()}>
             {page === "main" ? (
               <div className="header-menu-items">
+                {engine === "dsh" && <button type="button" className="header-menu-item"
+                  disabled aria-label="侧边聊天暂未开放" title={DSH_SIDECHAT_UNAVAILABLE}>
+                  <SideChatIcon size={18} />
+                  <span><b>侧边聊天 · 暂未开放</b><small>等待官方提供会话删除能力后再接入</small></span>
+                </button>}
                 {onOpenBtw && <button ref={firstRef} type="button"
                   className="header-menu-item" aria-label="打开侧边聊天" onClick={() => {
                     close();
@@ -181,6 +189,7 @@ export function HeaderMenu({
                   <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
                   <Icon name="chevron-right" size={16} />
                 </button>}
+                {onOpenDshTools && <button type="button" className="header-menu-item" onClick={() => { close(); onOpenDshTools(); }}><Icon name="plan" size={18} /><span><b>DSH 会话工具</b><small>子代理、任务、插件与导出</small></span><Icon name="chevron-right" size={16} /></button>}
                 {onOpenArtifacts && <button type="button" className="header-menu-item" aria-label="打开 Artifacts" onClick={() => {
                   close(); onOpenArtifacts();
                 }}><Icon name="archive" size={18} />

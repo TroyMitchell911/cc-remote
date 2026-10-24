@@ -16,6 +16,11 @@ export interface NormalizedSessionList {
   defaultCodexProfileId: string | null;
 }
 
+/** DSH prefixes its native UUIDs; retain the distinguishing part in the UI. */
+export function shortSessionId(engine: Engine, nativeId: string): string {
+  return (engine === "dsh" ? nativeId.replace(/^session-(?=.)/, "") : nativeId).slice(0, 8);
+}
+
 /** Apply one authoritative/partial-success catalog response exactly once.
  * Every consumer (React state, surface caches, RelayWs ownership maps) must use
  * this same projection or A→B→A can resurrect a list that dropped the rows of
@@ -75,7 +80,7 @@ export function normalizeSessionList(
 }
 
 export function shouldAcceptSessionList(
-  activeEngine: "claude" | "codex",
+  activeEngine: "claude" | "codex" | "dsh",
   activeSpace: Space,
   event: SessionList,
 ): boolean {

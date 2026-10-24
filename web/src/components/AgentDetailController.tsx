@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   acceptAgentDetail,
@@ -11,6 +11,9 @@ import { uuid } from "../util";
 import { AgentDetailPanel } from "./AgentDetailPanel";
 import { HISTORY_DETAIL_REQUEST_TIMEOUT_MS } from "../history-requests";
 
+import type { DshApiClient } from "../dsh-api";
+const DshChildControl = lazy(() => import("./DshChildControl").then(m => ({ default: m.DshChildControl })));
+
 export interface AgentDetailSelection {
   sid: string;
   revision: string;
@@ -21,7 +24,8 @@ export interface AgentDetailSelection {
 }
 
 export function AgentDetailController({ selection, ws, onListen, onClose,
-  onOpenFile }: {
+  onOpenFile, dshApi }: {
+  dshApi?: DshApiClient;
   selection: AgentDetailSelection;
   ws: RelayWs | null;
   onListen: (listener: ((message: AgentDetail) => void) | null) => void;
@@ -145,6 +149,7 @@ export function AgentDetailController({ selection, ws, onListen, onClose,
     onBack={() => setPanel((value) => ({
       ...value, stack: value.stack.slice(0, -1),
     }))}
+    controls={selection.engine === "dsh" && dshApi ? <Suspense fallback={null}><DshChildControl key={run.runId} api={dshApi} target={run.runId} parent={run.parentRunId ?? selection.sid} /></Suspense> : undefined}
     onClose={onClose}
     onRetry={() => request(run.runId, run.title)}
     onLoadEarlier={() => {

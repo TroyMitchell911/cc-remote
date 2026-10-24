@@ -20,7 +20,8 @@ export default function SessionFilesPanel({ browser, preview, showingPreview, on
         <Icon name="chevron-left" size={14} />返回目录
       </button>
       <Suspense fallback={<p role="status">加载预览…</p>}>
-        <ArtifactPanel {...preview} artifact={preview.artifact} active="diff" hasBtw={false} onTab={() => {}} />
+        <ArtifactPanel key={`${preview.artifact.sid}:${preview.artifact.file}:${preview.artifact.requestId}`}
+          {...preview} artifact={preview.artifact} active="diff" hasBtw={false} onTab={() => {}} />
       </Suspense>
     </>}
   </PanelFrame>;

@@ -417,11 +417,33 @@ class SessionArtifactStore:
         for path in local_links(text, cwd):
             self.add(scope, "path:" + path, Path(path).name, path, "delivered", created_at=created_at)
 
-    def history(self, scope, history, cwd):
+    def native_outputs(self, scope, files, cwd):
+        """Replace legacy DSH prose references with verified output provenance.
+
+        Native metadata is bounded: retain previously verified outputs. Remove
+        only legacy path references, never uploads, other scopes or files.
+        """
+        paths = []
+        for file in files[:256]:
+            path = file.get("path")
+            if not isinstance(path, str) or not path or len(path) > 4096:
+                raise ValueError("invalid native artifact path")
+            paths.append(os.path.abspath(os.path.join(cwd, os.path.expanduser(path))))
+        with self.lock, self.connect() as db:
+            scope = self.canonical_scope(db, scope)
+            for path in paths:
+                old = db.execute("SELECT created_at FROM artifacts WHERE scope=? AND identity=?",
+                                 (scope, "path:" + path)).fetchone()
+                self._add(db, scope, "dsh-output:" + path, Path(path).name, path,
+                          "delivered", created_at=old[0] if old else None)
+            db.execute("""DELETE FROM artifacts WHERE scope=? AND source='delivered'
+                       AND identity LIKE 'path:%' AND image_id IS NULL""", (scope,))
+
+    def history(self, scope, history, cwd, *, discover_text=True):
         for turn in history.turns:
             stamp = turn.ts / 1000 if turn.ts else None
             for block in turn.blocks:
-                if block.get("kind") == "text":
+                if block.get("kind") == "text" and discover_text:
                     self.text(scope, block.get("text", ""), cwd, created_at=stamp)
                 elif block.get("kind") == "process" and block.get("tool") == "image_generation" and block.get("status") == "succeeded":
                     item = block.get("input") or {}

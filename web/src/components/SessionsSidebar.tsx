@@ -1,7 +1,10 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent } from "react";
 import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
+import type { DshRead } from "../dsh-api";
+const DshSearch = lazy(() => import("./DshSearch"));
 import { Icon, EngineIcon } from "../icons";
+const NO_ACCOUNT_PROFILES: never[] = [];
 import {
   compareSessionsByActivity,
   orderCodeDirectoryGroups,
@@ -24,6 +27,8 @@ const SessionCardMenu = lazy(() => import("./SessionCardMenu").then(module => ({
 const TimedTaskIndicator = lazy(() => import("./TimedTaskIndicator").then(module => ({ default: module.TimedTaskIndicator })));
 
 interface Props {
+  readDsh?: DshRead;
+  onDshSearch?: (sid: string, query: string) => void;
   open: boolean;
   engine: Engine;
   space: Space;
@@ -75,7 +80,7 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
   return { key: "older", label: "更早" };
 }
 
-export function SessionsSidebar({ open, engine, space,
+export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
   profileScopeKey, machineId, claudeProfiles = [], defaultClaudeProfileId,
   codexProfiles = [], defaultCodexProfileId,
   onSpaceChange, sessions, liveStates,
@@ -102,7 +107,7 @@ export function SessionsSidebar({ open, engine, space,
     pressStart.current = null;
   }, []);
 
-  const accountProfiles = engine === "codex" ? codexProfiles : claudeProfiles;
+  const accountProfiles = engine === "dsh" ? NO_ACCOUNT_PROFILES : engine === "codex" ? codexProfiles : claudeProfiles;
   const defaultAccountProfileId = engine === "codex"
     ? defaultCodexProfileId : defaultClaudeProfileId;
   const showProfileManagement = accountProfiles.length > 1;
@@ -263,7 +268,7 @@ export function SessionsSidebar({ open, engine, space,
     const capabilities = sessionMenuCapabilities(s);
     if (renaming && renaming.id === s.session_id) {
       return (
-        <div key={s.session_id} className={"scard" + (isActive ? " active" : "")}>
+        <div key={s.session_id} className={"scard" + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "")}>
           <div className="scard-top">
             <input
               ref={renameIme.inputRef}
@@ -318,13 +323,13 @@ export function SessionsSidebar({ open, engine, space,
       : visibleCompletion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
     const migrationBlocked = isSessionMigrationBlockedByState(st);
-    const archiveBlocked = !isArchived && engine === "codex"
+    const archiveBlocked = !isArchived && (engine === "codex" || engine === "dsh")
       && isSessionArchiveBlockedByState(st);
     const profilePresentation = profilePresentationFor(s);
     return (
       <div
         key={s.session_id}
-        className={"scard" + (profilePresentation ? " has-profile-ribbon" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
+        className={"scard" + (profilePresentation ? " has-profile-ribbon" : "") + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
         onTouchStart={(e) => onCardTouchStart(s, e)}
         onTouchMove={onCardTouchMove}
         onTouchEnd={cancelPress}
@@ -354,7 +359,7 @@ export function SessionsSidebar({ open, engine, space,
             <span className="pill completed"><span className="sd" />{completionLabel}</span>
           )}
         </div>
-        {showLocation && s.cwd && (
+        {(showLocation || engine === "dsh") && s.cwd && (
           <div className="scard-location" title={s.cwd}>
             <Icon name="folder" size={12} />
             <span>{basename(s.cwd)}</span>
@@ -485,8 +490,10 @@ export function SessionsSidebar({ open, engine, space,
           <div className="space-switch" role="tablist" aria-label="切换工作空间">
             <button role="tab" aria-selected={space === "work"}
               className={space === "work" ? "active" : ""}
-              onClick={() => onSpaceChange("work")}>
+              onClick={() => onSpaceChange("work")} disabled={engine === "dsh"}
+              title={engine === "dsh" ? "DSH 暂不支持 Work" : undefined}>
               <Icon name="work" size={17} />Work
+              {engine === "dsh" && <span className="space-lock" aria-hidden="true"><Icon name="lock" size={13} /></span>}
             </button>
             <button role="tab" aria-selected={space === "code"}
               className={space === "code" ? "active" : ""}
@@ -525,6 +532,7 @@ export function SessionsSidebar({ open, engine, space,
               aria-label={space === "work" ? "搜索工作" : "搜索会话"} />
           </div>
           <div className="s-scroll" onClick={closeMenu} onScrollCapture={cancelPress}>
+            {engine === "dsh" && q.trim() && readDsh && onDshSearch && (activeSessionId || sessions.length > 0) && <Suspense fallback={null}><DshSearch key={profileScopeKey} query={q} sid={activeSessionId ?? sessions[0].session_id} read={readDsh} onSelect={onDshSearch} /></Suspense>}
             {filtered.length === 0 && <div className="s-group">{sessions.length === 0 ? "暂无会话" : "无匹配"}</div>}
             {pinned.length > 0 && renderGroup("__pinned__", pinned, "置顶")}
             {groupKeys.map((k) => renderGroup(k, groups[k]))}

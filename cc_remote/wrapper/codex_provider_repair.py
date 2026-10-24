@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import closing
 from dataclasses import dataclass
 from importlib import import_module
 import json
@@ -628,7 +629,7 @@ def _backup_repair_set(
     backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(backup_dir, 0o700)
     backup_db = backup_dir / db_path.name
-    with sqlite3.connect(backup_db) as target:
+    with closing(sqlite3.connect(backup_db)) as target, target:
         connection.backup(target)
     first_lines = []
     for candidate in report.candidates:
@@ -842,11 +843,11 @@ def canonical_thread_provider_is_restored(
     home = _codex_home(codex_home)
     try:
         db_path = _state_db_path(home)
-        with sqlite3.connect(
+        with closing(sqlite3.connect(
             f"file:{db_path.as_posix()}?mode=ro",
             uri=True,
             timeout=1.0,
-        ) as connection:
+        )) as connection:
             row = connection.execute(
                 "SELECT rollout_path, model_provider, archived "
                 "FROM threads WHERE id=?",

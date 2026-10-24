@@ -30,6 +30,9 @@ from cc_remote.protocol import (
     AssistantMsgEnd(
         message_id="comment-1", turn_id="turn-1",
         background=True, channel="commentary"),
+    AssistantMsgEnd(
+        message_id="stream-envelope:thinking", turn_id="turn-1",
+        canonical_message_id="transcript-record:thinking", channel="thinking"),
     ToolUse(
         message_id="comment-1",
         tool_use_id="command-1",

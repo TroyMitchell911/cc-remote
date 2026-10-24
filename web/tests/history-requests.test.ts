@@ -7,11 +7,54 @@ import {
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
 } from "../src/history-requests.ts";
+import { HistoryPagePrefetch } from "../src/history-prefetch.ts";
 import { RecoverableReadCoordinator } from "../src/recoverable-read.ts";
 import {
   HistoryImageAssetCache,
   historyImageAssetKey,
 } from "../src/history-image-assets.ts";
+import { PROTOCOL_VERSION, type History } from "../src/protocol.ts";
+
+{
+  const warm = new HistoryPagePrefetch();
+  const requests = new HistoryRequestCoordinator();
+  const browse = { scopeKey: "machine/claude/code/sid/rev", viewId: "",
+    windowEpoch: 0, pendingBefore: "t21", sourcePageKey: null, cacheOnly: true };
+  const request = { sid: "sid", before: "t21", limit: 12,
+    generation: "gen", revision: "rev", browse };
+  const response: History = { v: PROTOCOL_VERSION, ts: 1, type: "history", session_id: "sid",
+    before: "t21", generation: "gen", revision: "rev", detail: "summary",
+    events: [], turns: [], has_more: true, oldest_id: "t9" };
+  let sent = 0;
+  const sendPage = () => { sent++; return true; };
+  assert.equal(warm.begin(request, 0), true);
+  assert.equal(warm.begin(request, 100), false);
+  requests.request(request, sendPage);
+  const foreground = { ...browse, cacheOnly: false };
+  assert.equal(requests.request({ ...request, browse: foreground }, sendPage), true);
+  assert.equal(sent, 1, "reaching the edge shares the speculative request");
+  const completed = requests.complete(response);
+  assert.equal(completed.matched.length, 2, "cache and display have separate waiters");
+  warm.complete({ ...response, authoritative: false }, completed.matched);
+  assert.equal(warm.take(request), null, "provisional pages cannot be cached");
+  warm.complete(response, []);
+  assert.equal(warm.take(request), null, "unsolicited responses cannot warm a page");
+  warm.complete(response, completed.matched);
+  assert.equal(warm.begin(request, 60_000), false, "a ready page is not fetched repeatedly");
+  for (const changed of [
+    { sid: "another" }, { before: "t9" }, { generation: "next" }, { revision: "next" },
+    { browse: { ...browse, scopeKey: "another-device" } },
+    { browse: { ...browse, viewId: "another-view" } },
+    { browse: { ...browse, windowEpoch: 1 } },
+  ]) assert.equal(warm.take({ ...request, ...changed }), null);
+  assert.equal(warm.take(request), response);
+  assert.equal(warm.take(request), null, "only one page is retained");
+  warm.begin(request, 0);
+  assert.equal(warm.begin(request, 15_001), true, "timed-out prefetch can retry on a later gesture");
+  warm.clear();
+  warm.complete(response, completed.matched);
+  assert.equal(warm.take(request), null, "late responses after navigation/reconnect stay discarded");
+}
 
 let now = 1_000;
 const coordinator = new HistoryRequestCoordinator(() => now, 500);

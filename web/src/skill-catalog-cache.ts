@@ -1,5 +1,5 @@
 import type {
-  Engine,
+  Engine, DshCommandInfo,
   EngineCapabilities,
   EngineCapabilityItem,
   Space,
@@ -9,6 +9,7 @@ export const SKILL_CATALOG_TTL_MS = 5 * 60_000;
 export const MAX_SKILL_CATALOGS = 32;
 
 export interface SkillCatalogCacheEntry {
+  dshCommands?: DshCommandInfo[];
   items: EngineCapabilityItem[];
   fetchedAt: number;
 }
@@ -21,6 +22,8 @@ export interface SkillCatalogRequest {
   skillsOnly: boolean;
   claudeProfileId?: string | null;
   codexProfileId?: string | null;
+  sid?: string | null;
+  dshPreset?: string | null;
 }
 
 export interface SkillCatalogReadIdentity extends SkillCatalogRequest {
@@ -48,6 +51,7 @@ export const skillCatalogKey = (
   cwd: string,
   codexProfileId?: string | null,
   claudeProfileId?: string | null,
+  sid?: string | null,
 ): string => [
   machineId,
   engine,
@@ -56,7 +60,7 @@ export const skillCatalogKey = (
     ? (codexProfileId || "__default__")
     : engine === "claude"
       ? (claudeProfileId || "__default__")
-      : "",
+      : (sid || "__new__"),
   cwd || ".",
 ].join("\u0000");
 
@@ -77,6 +81,7 @@ export const skillCatalogResponseMatches = (
   // before the request. Explicit cwd scopes still require exact equality.
   && (!read.cwd || response.cwd === read.cwd)
   && response.skills_only === read.skillsOnly
+  && (read.engine !== "dsh" || (response.sid ?? null) === (read.sid ?? null))
   && (read.engine !== "codex"
     || (response.codex_profile_id ?? null)
       === (read.codexProfileId ?? null))
@@ -111,8 +116,9 @@ export function cacheSkillCatalog(
   key: string,
   items: EngineCapabilityItem[],
   fetchedAt = Date.now(),
+  dshCommands?: DshCommandInfo[],
 ): Record<string, SkillCatalogCacheEntry> {
-  const next = { ...current, [key]: { items, fetchedAt } };
+  const next = { ...current, [key]: { items, fetchedAt, ...(dshCommands ? {dshCommands} : {}) } };
   const keys = Object.keys(next);
   if (keys.length <= MAX_SKILL_CATALOGS) return next;
   keys.sort((a, b) => next[a].fetchedAt - next[b].fetchedAt);

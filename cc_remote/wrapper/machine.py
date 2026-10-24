@@ -161,6 +161,7 @@ from cc_remote.protocol import (
     ERR_QUEUE_FULL,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.dsh_runtime import DshRuntime
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
 from cc_remote.wrapper.session_plans import (
     SessionPlanStore,
@@ -2020,7 +2021,7 @@ class WrapperMachine:
     }
     SAFE_RETRY_COMMANDS = frozenset({
         "list_sessions", "get_history", "get_turn_detail", "get_agent_detail",
-        "get_history_image",
+        "get_history_image", "read_dsh",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_session_artifacts", "get_session_artifact_preview",
         "get_context", "get_status", "get_diff", "get_turn_file_changes", "get_file_preview",
@@ -2040,7 +2041,7 @@ class WrapperMachine:
         "set_service_tier", "set_collaboration_mode", "open_btw", "close_btw",
         "sync_btw",
         "set_perm", "get_permission_profiles", "set_permission_profile",
-        "set_web_search",
+        "set_web_search", "set_dsh_control", "read_dsh", "act_dsh_subagent", "act_dsh_goal", "download_dsh",
         "get_context", "get_status", "consume_rate_limit_reset_credit",
         "get_session_artifacts", "get_session_artifact_preview",
         "get_diff", "get_turn_file_changes", "get_file_preview", "save_markdown", "browse_files",
@@ -2075,6 +2076,7 @@ class WrapperMachine:
         self._command_router = CommandRouter(self)
         self._command_scheduler = CommandScheduler(
             self._process_command_safely, self._command_target_identity)
+        self._dsh = DshRuntime(self)
         self.instance_id = uuid4().hex
         # Each configured CLAUDE_CONFIG_DIR is an independent account/session
         # boundary. Keep implicit single-account mode source-compatible and
@@ -3627,7 +3629,7 @@ class WrapperMachine:
         )
         display_name = self._notification_titles.get(route_sid or "")
         return TurnNotificationContext(
-            engine="codex" if ctx.engine == "codex" else "claude",
+            engine=ctx.engine,
             space="work" if ctx.space == "work" else "code",
             display_name=display_name,
             parent_session_id=ctx.parent_sid if ctx.btw else None,
@@ -6687,34 +6689,31 @@ class WrapperMachine:
         return cls._store_claude_followup(ctx, key, "active")
 
     @classmethod
-    def _retire_claude_followup(
+    def _claude_followup_result_keys(
         cls, ctx: SessionContext, message: ResultMessage,
-    ) -> bool:
-        """Retire only the autonomous turn closed by this exact Result."""
+    ) -> tuple[str, ...]:
+        """Resolve this Result without releasing ownership during projection."""
         identities = getattr(message, "_cc_background_ends", ())
         if identities:
-            retired = False
-            for identity in identities:
-                retired = ctx.claude_background_followups.pop(identity, None) is not None or retired
-            return retired
+            return tuple(identity for identity in identities
+                         if identity in ctx.claude_background_followups)
         identity = getattr(message, "_cc_background_end", None)
         if identity is not None:
-            return ctx.claude_background_followups.pop(identity, None) is not None
+            return (identity,) if identity in ctx.claude_background_followups else ()
         origin = getattr(message, "origin", None)
         origin_kind = origin.get("kind") if isinstance(origin, dict) else None
         if origin_kind == "human":
             # A human Result can be routed through the idle/background path
             # during recovery, but it never owns an autonomous continuation.
-            return False
+            return ()
         key = cls._claude_followup_origin_key(origin)
         if key is not None:
             if key in ctx.claude_background_followups:
-                ctx.claude_background_followups.pop(key, None)
-                return True
+                return (key,)
             # Once Claude supplies an exact origin identity, a mismatch is
             # authoritative. Falling back to insertion order here could retire
             # a different task whose autonomous turn is still running.
-            return False
+            return ()
 
         candidates = tuple(ctx.claude_background_followups.items())
         if origin_kind == "task-notification":
@@ -6728,9 +6727,18 @@ class WrapperMachine:
                 if pending_phase == phase
             ), None)
             if match is not None:
-                ctx.claude_background_followups.pop(match, None)
-                return True
-        return False
+                return (match,)
+        return ()
+
+    @classmethod
+    def _retire_claude_followup(
+        cls, ctx: SessionContext, message: ResultMessage,
+    ) -> bool:
+        """Retire only the autonomous turn closed by this exact Result."""
+        identities = cls._claude_followup_result_keys(ctx, message)
+        for identity in identities:
+            ctx.claude_background_followups.pop(identity, None)
+        return bool(identities)
 
     @staticmethod
     def _claude_injected_user_boundary(message: object) -> bool:
@@ -9498,6 +9506,7 @@ class WrapperMachine:
                     *followup_recovery_tasks, return_exceptions=True)
             for c in self.sessions.values():
                 c.claude_followup_recovery_task = None
+            await self._dsh.close()
             await self.transport.stop()
             for c in list(self.sessions.values()):
                 disconnected = False
@@ -10722,7 +10731,7 @@ class WrapperMachine:
             msg.model_copy(update={
                 "notification_context": self._notification_context(ctx),
             })
-            if isinstance(msg, TurnEnd)
+            if isinstance(msg, TurnEnd) and not (ctx.engine == "dsh" and msg.result.subtype == "steered")
             else msg
         )
         await self.transport.send(live)
@@ -10735,7 +10744,7 @@ class WrapperMachine:
 
     def _archive_turn_change_event(self, ctx: SessionContext, msg, source=None):
         """Called under emit_lock, in a worker thread, after the source frame."""
-        if (not ctx.btw and isinstance(msg, (ToolUse, ToolResult, TurnDiff, TurnEnd, TurnSteered))
+        if (ctx.engine != "dsh" and not ctx.btw and isinstance(msg, (ToolUse, ToolResult, TurnDiff, TurnEnd, TurnSteered))
                 and getattr(self, "_turn_change_archive", None) is not None):
             update = None
             try:
@@ -10810,6 +10819,7 @@ class WrapperMachine:
                 and not msg.result.is_error
                 and msg.result.subtype != "steered"
                 and not ctx.btw
+                and not (ctx.engine == "dsh" and msg.result.subtype == "interrupted")
                 and self._session_presentation is not None
             ):
                 sid = self._ctx_wire_sid(ctx) or ctx.key
@@ -11097,6 +11107,7 @@ class WrapperMachine:
                     if replace_index is not None:
                         ctx.queued_queries.pop(replace_index)
                         ctx.queued_query_errors.pop(replaced.msg_id, None)
+                        ctx.queued_query_blocked.discard(replaced.msg_id)
                         ctx.queued_query_bytes -= replaced_size
                         self._queued_query_count -= 1
                         self._queued_query_bytes -= replaced_size
@@ -11183,6 +11194,7 @@ class WrapperMachine:
                     ):
                         removed = ctx.queued_queries.pop(index)
                         ctx.queued_query_errors.pop(removed.msg_id, None)
+                        ctx.queued_query_blocked.discard(removed.msg_id)
                         size = self._queued_query_size(removed)
                         ctx.queued_query_bytes -= size
                         self._queued_query_count -= 1
@@ -11300,8 +11312,8 @@ class WrapperMachine:
                             )
                         else:
                             ctx.queued_queries[index] = replacement
-                            ctx.queued_query_errors.pop(
-                                previous.msg_id, None)
+                            if previous.msg_id not in ctx.queued_query_blocked:
+                                ctx.queued_query_errors.pop(previous.msg_id, None)
                             ctx.queued_query_bytes += (
                                 replacement_size - previous_size)
                             self._queued_query_bytes = projected_bytes
@@ -11402,6 +11414,12 @@ class WrapperMachine:
                 # another preflight.  If this attempt fails and nobody changes
                 # anything, wait instead of emitting the same error in a loop.
                 ctx.queued_query_wakeup.clear()
+                if (ctx.queued_queries
+                        and ctx.queued_queries[0].msg_id in ctx.queued_query_blocked):
+                    # Keep failed attachment uploads inspectable. Neither timer
+                    # retries nor unrelated terminal/wakeup events may repeat them.
+                    await ctx.queued_query_wakeup.wait()
+                    continue
                 try:
                     # The browser command lane and this worker share query_lock:
                     # once an item starts preflight, no later immediate query can
@@ -11473,6 +11491,7 @@ class WrapperMachine:
                                     self._queued_query_bytes -= size
                                 ctx.queued_query_errors.pop(
                                     command.msg_id, None)
+                                ctx.queued_query_blocked.discard(command.msg_id)
                                 if (
                                     ctx.queued_query_starting_msg_id
                                     == command.msg_id
@@ -11524,6 +11543,10 @@ class WrapperMachine:
                             ):
                                 ctx.queued_query_errors[
                                     command.msg_id] = launch_error
+                                if (isinstance(result, Error) and result.code in {
+                                    "dsh_upload_unknown", "dsh_upload_failed",
+                                }):
+                                    ctx.queued_query_blocked.add(command.msg_id)
                             if (
                                 ctx.queued_query_starting_msg_id
                                 == command.msg_id
@@ -11538,6 +11561,8 @@ class WrapperMachine:
                                     session_id=self._ctx_wire_sid(ctx),
                                     error_type=type(exc).__name__,
                                 )
+                    if command.msg_id in ctx.queued_query_blocked:
+                        continue
                     try:
                         await asyncio.wait_for(
                             ctx.queued_query_wakeup.wait(),
@@ -11587,6 +11612,7 @@ class WrapperMachine:
                 ctx.queued_queries = []
                 ctx.queued_query_bytes = 0
                 ctx.queued_query_errors = {}
+                ctx.queued_query_blocked.clear()
                 ctx.queued_query_starting_msg_id = None
                 if publish:
                     await self._emit_locked(
@@ -11771,14 +11797,20 @@ class WrapperMachine:
         if cmd.type == "list_sessions":
             self._start_session_list_command(cmd)
             return
-        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes"}
+        # DSH streams/export packaging can wait on native I/O. Independent read
+        # tasks keep focus/create commands and export cancellation responsive.
+        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes", "read_dsh", "download_dsh"}
                 or (cmd.type == "get_diff" and getattr(cmd, "turn_id", None))):
             self._start_history_command(cmd)
             return
         if cmd.type in {"get_models", "get_permission_profiles"}:
             self._start_models_command(cmd)
             return
-        if cmd.type == "steer":
+        if (cmd.type == "steer" and not self._dsh.targets(cmd)
+                or cmd.type == "set_dsh_control"
+                and cmd.kind in {"terminal", "job_stop"}):
+            # Session settings must precede later prompt admission. Only
+            # interactive input/cancellation bypasses the ordered mutation lane.
             self._start_interactive_control_command(cmd)
             return
         if cmd.type in {"get_status", "consume_rate_limit_reset_credit"}:
@@ -11808,7 +11840,7 @@ class WrapperMachine:
         if creation:
             target = None
         serial = not urgent and not (
-            target and cmd.type in {"query", "get_context", "interrupt"})
+            target and cmd.type in {"query", "steer", "get_context", "interrupt"})
         await self._command_scheduler.submit(
             cmd, target=target, serial=serial,
             barrier=not target and not creation and not urgent,
@@ -11874,7 +11906,7 @@ class WrapperMachine:
         task.add_done_callback(self._session_list_command_tasks.discard)
 
     def _start_history_command(self, cmd) -> None:
-        """Read one history page without blocking query/interrupt intake."""
+        """Read history or export chunks without blocking command intake."""
         client_id = getattr(cmd, "client_id", None) or ""
         cmd_id = getattr(cmd, "cmd_id", None) or f"untracked-{id(cmd)}"
         key = (client_id, cmd_id)
@@ -12133,7 +12165,9 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
-        result = await self._command_router.dispatch(cmd)
+        result = await self._dsh.dispatch(cmd)
+        if result is UNHANDLED_COMMAND:
+            result = await self._command_router.dispatch(cmd)
         if result is UNHANDLED_COMMAND:
             log.warning(
                 "unexpected command",
@@ -12237,7 +12271,7 @@ class WrapperMachine:
         return BtwSessionInfo(
             btw_sid=ctx.key,
             parent_sid=ctx.parent_sid,
-            engine="codex" if ctx.engine == "codex" else "claude",
+            engine=ctx.engine,
             created_at=max(0.0, ctx.btw_created_at),
             state=ctx.buffer.latest_state() or ctx.state,
         )
@@ -12256,6 +12290,9 @@ class WrapperMachine:
                 and ctx.parent_sid
             )
         ]
+        if self._dsh.sidechats.rows is not None:
+            known = {entry.btw_sid for entry in sessions}
+            sessions.extend(entry for entry in self._dsh.sidechats.catalog(owner_id) if entry.btw_sid not in known)
         sessions.sort(key=lambda item: (item.created_at, item.btw_sid))
         return sessions
 
@@ -12544,6 +12581,10 @@ class WrapperMachine:
                 # Permission/collaboration modes are live control state, not
                 # transcript history. Always seed them on hello even when the
                 # browser's replay cursor is already at the ring tail.
+                if ctx.engine == "dsh":
+                    await self.transport.send(ctx.sdk.state.model_copy(deep=True, update={
+                        "sid": sid, "to": cmd.client_id, "seq": None,
+                        "route_id": getattr(cmd, "route_id", None)}))
                 permission_mode = _session_permission_mode(ctx)
                 ctx.announced_perm = permission_mode
                 await self.transport.send(Perm(
@@ -18478,6 +18519,8 @@ class WrapperMachine:
         *,
         launch_receipt: asyncio.Future[bool] | None = None,
     ):
+        if ctx.engine == "dsh":
+            return await self._dsh.query(ctx, cmd, launch_receipt=launch_receipt)
         if await self._refresh_btw_availability(ctx):
             error = Error(code=ERR_NOT_RUNNING, message=self.BTW_DESTROYED_MESSAGE,
                           msg_id=getattr(cmd, "msg_id", None))
@@ -20915,7 +20958,7 @@ class WrapperMachine:
 
             if ctx.engine == "claude":
                 await send(self._claude_auto_compact_event(ctx))
-            else:
+            elif ctx.engine == "codex":
                 permission_profile = _session_permission_profile(ctx)
                 ctx.announced_permission_profile = permission_profile
                 await send(PermissionProfile(profile=permission_profile))
@@ -20927,6 +20970,8 @@ class WrapperMachine:
                     mode=getattr(ctx.sdk, "collaboration_mode", "default")))
                 await send(_codex_speed_event(
                     getattr(ctx.sdk, "service_tier", None)))
+            elif ctx.engine == "dsh":
+                await send(ctx.sdk.state.model_copy(deep=True))
         return None
 
     async def _handle_set_perm(self, cmd):
@@ -22430,9 +22475,9 @@ class WrapperMachine:
         for injected turns even when a browser prompt is already queued behind
         them. Translator state survives from the injected UserMessage through
         its Result so streamed text and assembled tools remain identical to a
-        normal managed turn; only the duplicate TurnEnd is suppressed because
-        the autonomous work extends its origin turn rather than creating a new
-        visible human turn.
+        normal managed turn. A post-turn main response publishes its own real
+        terminal and completion receipt. Shared human terminals arrive as
+        ClaudeBackgroundBoundary and must never be published a second time.
         """
         if isinstance(message, ClaudeBackgroundBoundary):
             for identity in message.identities:
@@ -22510,8 +22555,25 @@ class WrapperMachine:
                             events = []
                     for event in events:
                         if isinstance(event, TurnEnd):
-                            # Persist the real autonomous boundary without
-                            # inventing another visible main-turn completion.
+                            managed = ctx.turn_task
+                            if (is_result and event.turn_id
+                                    and not (managed is not None and not managed.done())
+                                    and any(ctx.claude_background_followups[key] == "active"
+                                            for key in self._claude_followup_result_keys(ctx, message))):
+                                # This is the main Claude response to a consumed
+                                # task input, not the child's completion. Its
+                                # native assistant UUID gives the continuation
+                                # a distinct receipt without a fake user row or
+                                # completing an active managed human query.
+                                if turn_id:
+                                    await self._emit(ctx, TurnBinding(
+                                        msg_id=turn_id, turn_id=event.turn_id,
+                                        ts=event.ts,
+                                    ))
+                                await self._emit(ctx, event)
+                                continue
+                            # Child/task-only or unbound terminals can still pin
+                            # changes, but cannot complete a human response.
                             async with ctx.emit_lock:
                                 change = await asyncio.to_thread(self._archive_turn_change_event, ctx, event)
                                 if change is not None:
@@ -24856,6 +24918,12 @@ class WrapperMachine:
             if ctx.engine != scope.engine or ctx.space != scope.space:
                 raise ValueError("session scope mismatch")
             return scope.model_copy(update={"sid": self._ctx_wire_sid(ctx)}), ctx.cwd
+        if scope.engine == "dsh":
+            if scope.space != "code":
+                raise ValueError("DSH has no Work session")
+            await self._dsh.connection()
+            cwd = await self._dsh.session_cwd(sid)
+            return scope.model_copy(update={"sid": sid}), cwd
         # History-only/cold sessions remain browsable without creating an engine.
         # A transcript proves identity, not Code/Work ownership. In particular,
         # callers must not relabel a cold Work session to obtain Code file grants.
@@ -36064,6 +36132,42 @@ class WrapperMachine:
 
     # ---- spawn (build a ctx: SdkHandle + connect + history) ----
 
+    def _session_can_evict(self, key: str, ctx: SessionContext) -> bool:
+        """One residency policy for every engine and ordinary/side-chat spawn."""
+        if (key == self.focused_sid or ctx.state != "idle" or ctx.btw
+                or ctx.queued_queries or ctx.pending_asks
+                or self._query_queue_task_active(ctx)
+                or self._command_scheduler.owns_target(key)
+                or ctx.query_lock.locked()
+                or ctx.claude_control_persist_lock.locked()
+                or any(task is not None and not task.done() for task in (
+                    ctx.turn_task, ctx.auto_compact_apply_task,
+                    ctx.claude_followup_recovery_task))):
+            return False
+        if ctx.engine == "claude" and self._claude_has_background_work(ctx):
+            return False
+        if ctx.engine == "dsh":
+            return not (
+                any(job.status in {"running", "stopping"} for job in ctx.sdk.state.jobs)
+                or any(child.get("activity") == "running" for child in ctx.sdk.children))
+        return True
+
+    async def _ensure_session_capacity(self) -> bool:
+        if len(self.sessions) < self.cfg.max_concurrent_sessions:
+            return True
+        victim = next((key for key, ctx in self.sessions.items()
+                       if self._session_can_evict(key, ctx)), None)
+        if victim is None:
+            return False
+        ctx = self.sessions.pop(victim)
+        self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+        try:
+            await ctx.sdk.disconnect()
+        except Exception:
+            log.exception("idle session detach failed during eviction", key=victim)
+        log.info("evicted idle session for cap", key=victim)
+        return True
+
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
                      claude_profile_id: Optional[str] = None,
@@ -36242,29 +36346,10 @@ class WrapperMachine:
         # non-focused session (tear down its subprocess; the client keeps its
         # runtime and re-spawns on re-focus). Only reject if ALL are running —
         # so merely browsing between sessions never wedges you.
-        if not bootstrap and not _service_recovering and len(self.sessions) >= self.cfg.max_concurrent_sessions:
-            victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)
-                           and not self._command_scheduler.owns_target(k)
-                           and not c.query_lock.locked()
-                           and not c.claude_control_persist_lock.locked()
-                           and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())
-                           and (c.claude_followup_recovery_task is None
-                                or c.claude_followup_recovery_task.done())), None)
-            if victim is None:
-                await reject(
-                    ERR_BUSY, "所有会话都在运行,先中断一个再切换")
-                return None
-            vc = self.sessions.pop(victim)
-            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
-            try:
-                await vc.sdk.disconnect()
-            except Exception:
-                pass
-            log.info("evicted idle session for cap", key=victim)
+        if (not bootstrap and not _service_recovering
+                and not await self._ensure_session_capacity()):
+            await reject(ERR_BUSY, "所有会话都在运行,先中断一个再切换")
+            return None
         # Resolve the target cwd.
         if resume_id and engine == "codex":
             # Codex sessions live in ~/.codex/sessions (not the Claude SDK's store),
@@ -37425,27 +37510,8 @@ class WrapperMachine:
                     _claude_preflight_user_message(exc),
                 ) from exc
         # btw counts toward the cap; evict an idle, non-focused, non-btw victim.
-        if len(self.sessions) >= self.cfg.max_concurrent_sessions:
-            victim = next((k for k, c in self.sessions.items()
-                           if k != self.focused_sid and c.state == "idle"
-                           and not c.btw and not c.queued_queries
-                           and not self._query_queue_task_active(c)
-                           and not self._command_scheduler.owns_target(k)
-                           and not c.query_lock.locked()
-                           and not c.claude_control_persist_lock.locked()
-                           and (c.auto_compact_apply_task is None
-                                or c.auto_compact_apply_task.done())
-                           and (c.claude_followup_recovery_task is None
-                                or c.claude_followup_recovery_task.done())), None)
-            if victim is None:
-                raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
-            vc = self.sessions.pop(victim)
-            self._purge_preview_image_snapshots(vc.preview_snapshot_token)
-            try:
-                await vc.sdk.disconnect()
-            except Exception:
-                pass
-            log.info("evicted idle session for btw", key=victim)
+        if not await self._ensure_session_capacity():
+            raise _BtwSpawnFailure(ERR_BUSY, "会话已满,先关闭一个再开 btw")
         if engine == "codex":
             codex_handle_kwargs = {
                 "cwd": parent.cwd,

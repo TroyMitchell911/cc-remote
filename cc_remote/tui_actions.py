@@ -39,6 +39,11 @@ ACTION_CLASSES = (
     p.ManageEngineSkill,
     p.ManageEngineHook,
     p.GetContext,
+    p.ReadDsh,
+    p.ActDshSubagent,
+    p.ActDshGoal,
+    p.DownloadDsh,
+    p.SetDshControl,
     p.GetStatus,
     p.ConsumeRateLimitResetCredit,
     p.GetGoal,
@@ -81,7 +86,7 @@ HIDDEN = set(p._Command.model_fields) | {"type", "request_id"}
 
 
 def is_read(name: str) -> bool:
-    return name.startswith(("get_", "list_")) or name == "browse_files"
+    return name.startswith(("get_", "list_")) or name in {"browse_files", "read_dsh", "download_dsh"}
 
 
 def defaults(

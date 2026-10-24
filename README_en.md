@@ -4,7 +4,7 @@
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v4.0.29** · Wire protocol v79
+**Product version: v4.0.29** · Wire protocol v82
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -66,6 +66,13 @@ item has its own directory; add material through attachments or the project
 library. Work sessions and material are separate from Code.
 
 ## Engines and features
+
+This development branch adds **DSH 0.2.1-rc.2**, using the current Code chat UI
+and a separate white/blue default palette. It supports native commands, Skills,
+questions and approvals, steering/queueing, Goals, subagents, jobs and artifact
+previews. See [DSH integration](docs/dsh-integration.md) for pairing, verification
+and capability boundaries. DSH retains model authentication; connecting does
+not automatically upgrade or migrate existing DSH data.
 
 This table describes **capabilities connected in cc-remote**. Models, permissions
 and extensions still depend on the native installation on the selected device.
@@ -450,6 +457,12 @@ npm --prefix web run test:reliability
 npm --prefix web run lint
 npm --prefix web run build
 ```
+
+Local and CI Python tests default to two parallel workers, configured in
+`pytest.ini`. Pytest reports the slowest 20 phases, and CI retains a JUnit
+timing report. Use `.venv/bin/python -m pytest -n 0` for serial debugging.
+During development, run small affected modules without worker startup overhead,
+for example `.venv/bin/python -m pytest -n 0 tests/test_dsh_upload_recovery.py`.
 
 Maintainers run the complete local gate before submitting a PR; see
 [AGENTS.md](AGENTS.md#commit-and-pr-gate). Other contributors may submit a PR

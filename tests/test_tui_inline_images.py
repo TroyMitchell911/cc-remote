@@ -212,18 +212,35 @@ async def test_no_auto_read_from_tool_code_or_remote_link(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_folded_history_and_modal_remove_pixels(monkeypatch):
-    app, view, _ = setup(monkeypatch)
+    app, view, calls = setup(monkeypatch)
+    set_interval = app.set_interval
+
+    def without_paint_poll(interval, callback, **kwargs):
+        timer = set_interval(interval, callback, **kwargs)
+        if callback == app.paint:
+            timer.pause()
+        return timer
+
+    # Screen transitions must restore pixels without either 100 ms polling
+    # timer. Waiting for CPU idle in Pilot does not wait for a future timer.
+    monkeypatch.setattr(app, "set_interval", without_paint_poll)
+    monkeypatch.setattr(TranscriptViewport, "on_mount", lambda self: None)
     async with app.run_test(size=(90, 40)) as pilot:
         await pilot.pause()
         await pilot.pause()
         viewport = app.query_one(TranscriptViewport)
         assert viewport.pictures
-        await pilot.press("space", "h")
-        await pilot.pause(0.15)
-        assert not viewport.pictures
-        await pilot.press("escape")
-        await pilot.pause()
-        assert viewport.pictures
+        pictures = dict(viewport.pictures)
+        for _ in range(3):
+            await pilot.press("space", "h")
+            await pilot.pause()
+            assert len(app.screen_stack) == 2
+            assert not viewport.pictures
+            await pilot.press("escape")
+            await pilot.pause()
+            assert len(app.screen_stack) == 1
+            assert viewport.pictures == pictures
+        assert len(calls) == 1  # Reuse cached widgets/pixels, no image re-fetch.
         view.blocks.clear()
         view.version += 1
         app.paint()

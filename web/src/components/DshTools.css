@@ -1,0 +1,130 @@
+/* DSH-only tools: leave the shared conversation and other engines untouched. */
+.dsh-panel .dsh-panel-header { position:relative; padding:16px 18px; gap:10px; flex:none; }
+.dsh-panel-header > .engine-brand-icon { flex:none; color:var(--text); }
+.dsh-panel-header > strong { font-size:16px; font-weight:var(--font-weight-600); }
+.dsh-panel .dsh-tools-trigger { display:flex; align-items:center; gap:7px; border:1px solid var(--border); border-radius:8px; padding:7px 10px; background:var(--raised); font-size:12px; cursor:pointer; flex:none; }
+.dsh-tools-menu { position:absolute; top:calc(100% - 2px); left:12px; right:12px; z-index:5; display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:16px; background:var(--surface); border:1px solid var(--border-strong); border-radius:14px; box-shadow:var(--shadow-lg); }
+.dsh-tools-menu > div + div { border-left:1px solid var(--border); padding-left:14px; }
+.dsh-tools-menu small { display:block; margin:0 8px 8px; color:var(--dim); font-size:11px; }
+.dsh-tools-menu [role=group] > div { display:grid; gap:3px; }
+.dsh-tools-menu button { display:flex; gap:9px; align-items:center; width:100%; min-height:38px; padding:8px; border:0; border-radius:7px; background:transparent; text-align:left; font-size:13px; cursor:pointer; }
+.dsh-tools-menu button[aria-current] { color:var(--accent-ink); background:var(--accent-weak); }
+.dsh-tools-menu button svg { flex:none; color:var(--dim); }
+.dsh-tools-menu button[aria-current] svg { color:inherit; }
+.dsh-panel button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.dsh-management-actions:empty { display:none; }
+.dsh-management .dsh-primary { border-radius:9px; }
+.dsh-settings-scope { display:flex; align-items:center; justify-content:space-between; padding:14px 22px 0; gap:12px; color:var(--dim); font-size:12px; }
+.dsh-management .iconbtn { display:grid; place-items:center; flex:none; padding:7px; border:0; background:transparent; }
+.dsh-settings .dsh-management-content { padding:12px 22px 24px; }
+.dsh-settings-section { border:0; padding:0; margin:14px 0 28px; min-width:0; }
+.dsh-settings-section legend { color:var(--dim); font-size:12px; padding:0 0 4px; }
+.dsh-setting-row { display:flex; align-items:flex-start; gap:20px; padding:20px 0; border-bottom:1px solid var(--border); font-size:14px; }
+.dsh-setting-row > span { flex:1; min-width:0; line-height:1.5; }
+.dsh-setting-row small { display:block; color:var(--dim); font-size:12px; margin-top:7px; font-weight:normal; }
+.dsh-management .dsh-setting-row input:not([type=checkbox]) { width:76px; flex:none; text-align:center; }
+.dsh-setting-row input[type=checkbox] { flex:none; }
+.dsh-settings-footer { display:flex; align-items:center; gap:10px; flex:none; border-top:1px solid var(--border); padding:16px 22px; }
+.dsh-settings-footer > span { margin-right:auto; color:var(--dim); font-size:12px; }
+.dsh-settings-footer button { white-space:nowrap; }
+.dsh-settings-footer button[type=button] { border:0; background:transparent; color:var(--dim); }
+.dsh-bundles .dsh-management-content { padding:0 20px 20px; }
+.dsh-catalog-tabs { display:flex; align-items:center; gap:20px; border-bottom:1px solid var(--border); margin-bottom:18px; }
+.dsh-catalog-tabs button { border:0; border-radius:0; background:transparent; color:var(--dim); padding:17px 0 13px; white-space:nowrap; }
+.dsh-catalog-tabs button[aria-pressed=true] { color:var(--accent-ink); box-shadow:inset 0 -2px var(--accent); }
+.dsh-catalog-tabs .iconbtn { margin-left:auto; }
+.dsh-market-unavailable { display:flex; flex-direction:column; align-items:center; text-align:center; padding:48px 8px; }
+.dsh-market-unavailable > span { display:grid; place-items:center; width:54px; height:54px; border:1px solid var(--border); border-radius:15px; background:var(--raised); color:var(--dim); }
+.dsh-market-unavailable h3 { margin:18px 0 8px; font-size:15px; font-weight:var(--font-weight-600); line-height:1.5; }
+.dsh-market-unavailable p { margin:0; color:var(--dim); font-size:12px; line-height:1.7; }
+.dsh-catalog-search { display:flex; align-items:center; gap:8px; position:relative; }
+.dsh-catalog-search > svg { position:absolute; left:12px; color:var(--dim); pointer-events:none; }
+.dsh-management .dsh-catalog-search input { flex:1; padding-left:38px; height:40px; }
+.dsh-catalog-search button { flex:none; white-space:nowrap; }
+.dsh-catalog-search .iconbtn { width:40px; height:40px; border:1px solid var(--border); border-radius:9px; }
+.dsh-bundle-row { padding:22px 0 16px; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
+.dsh-bundle-summary { display:flex; align-items:center; gap:12px; }
+.dsh-bundle-icon { width:42px; height:42px; flex:none; display:grid; place-items:center; border-radius:10px; background:var(--raised); color:var(--accent-ink); }
+.dsh-bundle-copy { min-width:0; flex:1; }
+.dsh-bundle-copy strong { display:block; font-size:14px; line-height:1.5; font-weight:var(--font-weight-600); }
+.dsh-bundle-copy small { display:block; margin-top:4px; color:var(--dim); font-size:11px; }
+.dsh-bundle-state { display:flex; align-items:center; gap:5px; color:var(--ok,#46a779); font-size:11px; white-space:nowrap; flex:none; }
+.dsh-bundle-state i,.dsh-terminal-select i { width:6px; height:6px; background:currentColor; border-radius:50%; flex:none; }
+.dsh-bundle-lock { color:var(--dim); display:flex; }
+.dsh-bundle-row .dsh-bundle-enable { border-color:var(--accent); color:var(--accent-ink); font-size:12px; padding:7px 12px; white-space:nowrap; }
+.dsh-bundle-description { margin:10px 0 8px 54px; color:var(--dim); font-size:12px; line-height:1.65; }
+.dsh-bundle-details { margin-left:54px; color:var(--dim); font-size:12px; line-height:1.6; }
+.dsh-bundle-details summary { cursor:pointer; width:fit-content; font-size:11px; }
+.dsh-bundle-details p { margin:8px 0; }
+.dsh-management .dsh-install-link { display:flex; align-items:center; gap:7px; border:0; padding:17px 0 0; color:var(--accent-ink); background:none; }
+.dsh-install { margin-top:16px; padding:14px; border:1px solid var(--border); border-radius:10px; }
+.dsh-install button { flex:none; white-space:nowrap; }
+.dsh-install input { flex:1; }
+.dsh-terminal-toolbar { display:flex; align-items:center; gap:7px; padding:16px; }
+.dsh-terminal button:not(.iconbtn) { display:inline-flex; align-items:center; justify-content:center; gap:6px; background:var(--raised); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:12px; white-space:nowrap; cursor:pointer; }
+.dsh-terminal-toolbar .iconbtn { flex:none; width:28px; height:32px; }
+ .dsh-terminal-picker { min-width:0; max-width:200px; }
+.dsh-terminal-picker span { overflow:hidden; text-overflow:ellipsis; }
+.dsh-terminal-picker i { width:6px; height:6px; flex:none; background:var(--dim); border-radius:50%; }
+.dsh-terminal-picker i[data-connected=true] { background:var(--ok,#46a779); }
+.dsh-terminal-viewport { width:100%; height:100%; min-height:0; padding:0; border:0; touch-action:pinch-zoom; overscroll-behavior:contain; }
+.dsh-terminal-cwd { flex:1; min-width:0; font:11px var(--mono); color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dsh-terminal-screen { min-height:0; margin:0 16px; border:1px solid var(--border); border-radius:9px; }
+.dsh-terminal-actions { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:12px 16px 0; }
+.dsh-terminal .dsh-terminal-close { color:var(--danger); margin-left:auto; background:transparent; border-color:transparent; }
+.dsh-terminal-status { display:flex; justify-content:space-between; gap:10px; padding:10px 16px 14px; font-size:11px; }
+.dsh-terminal-empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; color:var(--dim); }
+.dsh-terminal-empty p { font-size:14px; margin:16px 0 7px; }
+.dsh-terminal-empty small { font-size:12px; }
+.dsh-terminal-confirm > p { margin:0; padding:8px 22px 20px; font-size:14px; color:var(--dim); }
+.dsh-terminal-confirm > div:last-child { display:flex; justify-content:flex-end; gap:8px; padding:0 22px 20px; }
+.dsh-terminal-confirm > div:last-child button { border:1px solid var(--border); background:var(--raised); border-radius:8px; padding:9px 17px; color:var(--text); font:inherit; font-size:13px; }
+.dsh-terminal-confirm > div:last-child .danger { color:white; background:var(--danger); border-color:transparent; }
+@media(max-width:600px) {
+  .dsh-panel .dsh-panel-header { padding-top:max(14px,env(safe-area-inset-top)); }
+  .dsh-panel .dsh-tools-trigger,.dsh-tools-menu button { min-height:40px; }
+  .dsh-settings .dsh-management-content,.dsh-settings-scope { padding-inline:18px; }
+  .dsh-settings-footer { padding:14px 18px max(14px,env(safe-area-inset-bottom)); }
+  .dsh-bundles .dsh-management-content { padding-inline:16px; }
+  .dsh-management .dsh-catalog-search input { font-size:16px; }
+  .dsh-terminal-toolbar { padding:12px; gap:5px; }
+  .dsh-terminal-toolbar > .iconbtn { display:none; }
+  .dsh-terminal-cwd { font-size:10px; }
+  .dsh-terminal-screen { margin-inline:12px; }
+  .dsh-terminal-actions { padding-inline:12px; gap:4px; }
+  .dsh-terminal-actions button { min-height:40px; padding-inline:8px; }
+  .dsh-terminal-status { padding-bottom:max(12px,env(safe-area-inset-bottom)); }
+}
+.dsh-terminal-toolbar,.dsh-terminal-actions,.dsh-terminal-status { flex-shrink:0; }
+.dsh-schedules-heading { display:flex; align-items:center; gap:10px; padding:18px 20px; flex-shrink:0; }
+.dsh-schedules-heading > span { margin-right:auto; color:var(--dim); font-size:13px; }
+.dsh-schedules .dsh-primary { display:inline-flex; align-items:center; justify-content:center; gap:6px; white-space:nowrap; }
+.dsh-schedule-empty { display:flex; flex-direction:column; align-items:center; text-align:center; padding:60px 10px; }
+.dsh-schedule-empty > span { display:grid; place-items:center; width:64px; height:64px; border:1px solid var(--border); border-radius:18px; color:var(--accent-ink); background:var(--accent-weak); }
+.dsh-schedule-empty h3 { margin:22px 0 10px; font-size:17px; font-weight:600; }
+.dsh-schedule-empty p { color:var(--dim); font-size:13px; line-height:1.7; margin:0 0 24px; }
+.dsh-schedule-empty .dsh-schedule-converse { border:0; background:none; color:var(--dim); margin-top:12px; font-size:12px; }
+.dsh-schedule-row { border-bottom:1px solid var(--border); padding:18px 0 24px; }
+.dsh-schedule-title { display:flex; align-items:center; gap:10px; }
+.dsh-schedule-symbol { display:grid; place-items:center; width:36px; height:36px; border-radius:10px; background:var(--raised); color:var(--accent-ink); flex:none; }
+.dsh-schedule-title > div { flex:1; min-width:0; }
+.dsh-schedule-title strong { font-size:14px; overflow-wrap:anywhere; }
+.dsh-schedule-title small { display:block; color:var(--dim); font-size:11px; margin-top:6px; }
+.dsh-schedule-state { font-size:11px; color:var(--dim); white-space:nowrap; }
+.dsh-schedule-state[data-active=true] { color:var(--accent-ink); }
+.dsh-schedule-row > p { font-size:13px; color:var(--dim); line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; }
+.dsh-schedule-meta { display:flex; flex-wrap:wrap; gap:8px 18px; font-size:11px; color:var(--dim); }
+.dsh-schedule-meta > span { display:flex; align-items:center; gap:5px; }
+.dsh-schedule-menu { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+.dsh-schedule-editor { display:flex; flex-direction:column; gap:20px; padding:6px 0; }
+.dsh-schedule-editor > label { display:grid; gap:9px; font-size:13px; }
+.dsh-schedule-editor textarea { min-height:120px; resize:vertical; line-height:1.7; }
+.dsh-schedule-editor small { color:var(--dim); font-size:11px; }
+.dsh-schedule-field { display:flex; align-items:center; gap:15px; font-size:13px; }
+.dsh-schedule-field > span { white-space:nowrap; }
+.dsh-schedule-field > button { margin-left:auto; display:flex; align-items:center; gap:8px; min-width:0; max-width:75%; text-align:right; }
+.dsh-schedule-field > button svg { flex-shrink:0; }
+.dsh-schedule-week { display:flex; gap:6px; }
+.dsh-schedule-week button { flex:1; padding:10px 0; }
+.dsh-schedule-week [aria-pressed=true] { border-color:var(--accent); background:var(--accent-weak); color:var(--accent-ink); }
+.dsh-schedule-form-actions { display:flex; justify-content:flex-end; gap:10px; padding-top:8px; }

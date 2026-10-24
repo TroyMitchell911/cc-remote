@@ -18,7 +18,7 @@ export type BusySubmitAction =
 export function classifyBusySubmit(
   state: State,
   mode: SendMode,
-  _engine: "claude" | "codex",
+  _engine: "claude" | "codex" | "dsh",
   hasPayload: boolean,
 ): BusySubmitAction {
   if (state === "idle") return "noop";

@@ -1,5 +1,6 @@
 """File-index pagination reads immutable native evidence, never the worktree."""
 import asyncio
+from contextlib import contextmanager
 import json
 import sqlite3
 
@@ -44,10 +45,11 @@ def test_all_321_files_are_paged_with_one_file_diff_read(tmp_path, monkeypatch):
     archive.put(*scope[:2], payload, final=True)
     statements = []
     connect = archive._connect
+    @contextmanager
     def traced():
-        db = connect()
-        db.set_trace_callback(statements.append)
-        return db
+        with connect() as db:
+            db.set_trace_callback(statements.append)
+            yield db
     monkeypatch.setattr(archive, "_connect", traced)
     files, offset = [], 0
     while offset is not None:

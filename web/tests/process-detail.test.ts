@@ -10,7 +10,7 @@ import {
   mergeInitialHistory,
   restoreCachedTurnDetails,
 } from "../src/history-merge.ts";
-import type { ServerEvent } from "../src/protocol.ts";
+import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
 import type { ProcessBlock, Turn } from "../src/reducer.ts";
 import {
   acceptAgentDetail,
@@ -261,6 +261,72 @@ const harness = await createServer({
 try {
   const { createRuntime, initialState, reduce } =
     await harness.ssrLoadModule("/src/reducer.ts");
+  for (const channel of ["thinking", "commentary"] as const) {
+    for (const historyFirst of [true, false]) {
+      for (const spilled of [false, true]) {
+        const sid = "claude-message-binding";
+        const text = "Repeated prose is not evidence of repeated identity.";
+        let state = { ...initialState, focusedSid: "another-session",
+          sessions: [{ session_id: sid, engine: "claude" }],
+          runtimes: { [sid]: { ...createRuntime(), historyRevision: "r1",
+            turns: [{ id: "user-turn", prompt: "inspect", blocks: [], done: false }] } } };
+        const event = (body: object) => ({ v: PROTOCOL_VERSION, ts: 1, sid,
+          turn_id: "user-turn", ...body } as ServerEvent);
+        const send = (body: object) => {
+          state = reduce(state, { type: "event", event: event(body) });
+        };
+        const binding = { type: "assistant_msg_end", message_id: "stream-id",
+          canonical_message_id: "native-id", channel };
+        send({ type: "assistant_msg_start", message_id: "stream-id", channel });
+        send({ type: "delta", message_id: "stream-id", channel, text });
+        if (spilled) {
+          const turn = state.runtimes[sid].turns[0];
+          turn.liveSpillBlocks = turn.blocks;
+          turn.blocks = [];
+        }
+        if (!historyFirst) send(binding);
+        send({ type: "turn_detail", session_id: sid, turn_id: "user-turn", revision: "r1",
+          has_more: false, has_newer: false, events: [
+            event({ type: "user_msg", msg_id: "user-turn", prompt: "inspect" }),
+            event({ type: "assistant_msg_start", message_id: "native-id", channel }),
+            event({ type: "delta", message_id: "native-id", channel, text }),
+            event({ type: "assistant_msg_end", message_id: "native-id", channel }),
+          ] });
+        if (historyFirst) send(binding);
+        const visible = () => {
+          const turn = state.runtimes[sid].turns[0];
+          return mergeDetailWithLiveTail(turn.detailProjection?.blocks ?? [],
+            mergeDetailWithLiveTail(turn.liveSpillBlocks ?? [], turn.blocks));
+        };
+        assert.equal(visible().length, 1,
+          `${channel}: detail/live arrival order and spill must not duplicate a bound record`);
+        const bound = visible()[0];
+        assert.equal(bound.kind === "text" && bound.text, text);
+        assert.equal(bound.kind === "text" && bound.message_id, "native-id");
+        assert.equal(state.focusedSid, "another-session");
+        // Late stream replay and the final Result's channel correction still
+        // address the provisional envelope after the canonical id is installed.
+        send({ type: "assistant_msg_start", message_id: "stream-id", channel });
+        send({ type: "delta", message_id: "stream-id", text, channel });
+        send(binding);
+        assert.equal(visible().length, 1);
+        const afterReplay = visible()[0];
+        assert.equal(afterReplay.kind === "text" && afterReplay.text, text);
+        // The same words in another native item are intentionally retained.
+        send({ type: "assistant_msg_start", message_id: "second-stream", channel });
+        send({ type: "delta", message_id: "second-stream", channel, text });
+        send({ ...binding, message_id: "second-stream", canonical_message_id: "second-native" });
+        assert.equal(visible().length, 2, "never deduplicate distinct native items by their prose");
+        if (channel === "commentary") {
+          send({ type: "assistant_msg_end", message_id: "stream-id", channel: "final" });
+          assert.equal(visible().filter(b => b.kind === "text" && b.channel === "final").length, 1);
+        }
+        const rehydrated = JSON.parse(JSON.stringify(state));
+        const replayed = reduce(rehydrated, { type: "event", event: event(binding) });
+        assert.equal(replayed.runtimes[sid].turns.length, 1);
+      }
+    }
+  }
   const { ChatView } = await harness.ssrLoadModule(
     "/src/components/ChatView.tsx");
   const { ProcessTimeline } = await harness.ssrLoadModule(

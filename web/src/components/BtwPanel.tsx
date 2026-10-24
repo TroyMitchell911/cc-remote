@@ -77,10 +77,10 @@ interface Props {
   onOpenArtifacts?: () => void;
   sid?: string;
   rt: SessionRuntime | undefined;
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   chats: Array<{
     sid: string;
-    engine: "claude" | "codex";
+    engine: "claude" | "codex" | "dsh";
     title: string;
     state: "idle" | "running" | "interrupting" | "draining";
     needsAnswer: boolean;
@@ -368,7 +368,7 @@ export function BtwPanel(p: Props) {
       resetTaHeight();
       return;
     }
-    if (command?.slash === "autocompact") {
+    if (command?.slash === "autocompact" && p.engine !== "dsh") {
       if (p.engine === "codex") {
         flash("请在 Codex 主会话设置压缩阈值。");
         setInput("");
@@ -411,7 +411,7 @@ export function BtwPanel(p: Props) {
     if (runtimeBusy) {
       const action = classifyBusySubmit(
         submitState, p.sendMode,
-        p.engine === "codex" ? "codex" : "claude",
+        p.engine,
         prompt.length > 0 || hasAttachments);
       if (action === "noop") return;
       if (action === "steer") {
@@ -490,7 +490,7 @@ export function BtwPanel(p: Props) {
               <SideChatIcon />
               <span className="btw-title">侧边聊天</span>
               <span className="btw-engine-badge">
-                {p.engine === "codex" ? "Codex" : "Claude"}
+                {p.engine === "dsh" ? "DSH" : p.engine === "codex" ? "Codex" : "Claude"}
               </span>
             </div>}
         {p.onOpenArtifacts && <button className="iconbtn" onClick={p.onOpenArtifacts}
@@ -525,11 +525,11 @@ export function BtwPanel(p: Props) {
                   </span>
                 )}
               </button>
-              <button className="btw-chat-close"
-                aria-label={`关闭 ${chat.title}`}
-                title="关闭并丢弃这个侧边对话"
+              <button className={"btw-chat-close" + (chat.engine === "dsh" ? " btw-chat-release" : "")}
+                aria-label={chat.engine === "dsh" ? `移至会话列表：${chat.title}` : `关闭 ${chat.title}`}
+                title={chat.engine === "dsh" ? "移至会话列表，保留工作" : "关闭并丢弃这个侧边对话"}
                 onClick={() => p.onCloseChat(chat.sid)}>
-                <Icon name="close" size={12} />
+                <Icon name={chat.engine === "dsh" ? "logout" : "close"} size={12} />
               </button>
             </div>
           ))}
@@ -735,7 +735,7 @@ export function BtwPanel(p: Props) {
       <CommandSheet
         open={sheetKind !== null}
         kind={sheetKind ?? "models"}
-        engine={p.engine === "codex" ? "codex" : "claude"}
+        engine={p.engine}
         catalog={p.catalog}
         currentModel={p.rt?.model}
         currentEffort={p.rt?.effort}

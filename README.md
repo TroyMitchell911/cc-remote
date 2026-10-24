@@ -4,7 +4,7 @@
 
 自托管 · 多会话 · 多设备 · 实时工具过程 · Code / Work · Web / PWA / TUI
 
-**产品版本：v4.0.29** · Wire protocol v79
+**产品版本：v4.0.29** · Wire protocol v82
 
 [English](README_en.md) · [Release 安装（推荐）](#安装与升级) · [功能对照](#引擎与功能) · [源码体验](#快速开始) ·
 [终端工作台](#terminal-workspace) · [文档](#文档) · [更新记录](CHANGELOG_zh.md)
@@ -51,6 +51,11 @@ cc-remote 把本机 agent 的会话、工具过程、文件和运行控制带到
 分开。
 
 ## 引擎与功能
+
+当前开发分支新增 **DSH 0.2.1-rc.2** 接入，使用现有 Code 聊天界面与独立的白蓝默认配色。
+支持原生命令、Skills、询问与审批、引导/排队、Goal、子代理、后台任务和产物预览。
+安装配对、验证方式与原生功能边界见 [DSH 接入说明](docs/dsh-integration.md)；
+模型认证仍由 DSH 管理，接入不会自动升级或迁移现有 DSH 数据。
 
 下表描述 **cc-remote 已接入的能力**。模型、权限和扩展目录仍以所选设备上的原生
 引擎为准。
@@ -373,6 +378,12 @@ npm --prefix web run test:reliability
 npm --prefix web run lint
 npm --prefix web run build
 ```
+
+本地与 CI 的 Python 回归都默认使用两个进程并行，配置统一放在 `pytest.ini`。
+Pytest 输出最慢的 20 项，CI 另保存 JUnit 耗时报告。
+需要串行排查时使用 `.venv/bin/python -m pytest -n 0`；开发时可用
+`.venv/bin/python -m pytest -n 0 tests/test_dsh_upload_recovery.py`
+等命令运行相关小模块，省去并行进程启动开销。
 
 维护者提交 PR 前执行完整本地检查，见 [AGENTS.md](AGENTS.md#commit-and-pr-gate)。
 其他贡献者可直接提交 PR，并说明已做的验证和未验证部分。PR 和推送到 `master` 会

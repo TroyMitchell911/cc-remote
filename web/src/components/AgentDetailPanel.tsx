@@ -1,5 +1,5 @@
 import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
-import { useState } from "react";
+import { lazy, Suspense, useState, type ReactNode } from "react";
 import type { AgentDetailRun } from "../agent-detail";
 import type { Engine } from "../protocol";
 import { finalTextBlocks, presentableProcessBlocks } from "../process-blocks";
@@ -7,6 +7,8 @@ import { EngineDone, EngineWorking, Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ProcessTimeline } from "./ProcessTimeline";
 import { PanelResizer } from "./PanelResizer";
+
+const DshAgentConversation = lazy(() => import("./DshAgentConversation").then(m => ({ default: m.DshAgentConversation })));
 
 function statusLabel(run: AgentDetailRun): string {
   if (run.status === "running" || run.status === "pending") return "运行中";
@@ -17,7 +19,8 @@ function statusLabel(run: AgentDetailRun): string {
 }
 
 export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, onClose, onRetry,
-  onLoadEarlier, onOpenAgent, onOpenFile }: {
+  onLoadEarlier, onOpenAgent, onOpenFile, controls }: {
+  controls?: ReactNode;
   run: AgentDetailRun;
   engine?: Engine;
   canGoBack: boolean;
@@ -70,6 +73,7 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
             {run.loading ? "正在加载…" : "加载更早过程"}
           </button>
         )}
+        {engine === "dsh" ? <Suspense fallback={null}><DshAgentConversation events={run.events} done={done} onOpenAgent={onOpenAgent} onOpenFile={onOpenFile} /></Suspense> : <>
         {process.length > 0 && (
           <ProcessTimeline key={run.runId} blocks={run.blocks} done={done}
             active={!done} engine={engine}
@@ -83,6 +87,7 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
           <MessageBlock key={block.message_id} text={block.text}
             done={block.done} onOpenFile={onOpenFile} />
         ))}
+        </>}
         {!done && <div className="turn-working agent-detail-working" role="status"
           aria-live="polite">
           <EngineWorking engine={engine} size={24} />
@@ -91,13 +96,14 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
         {run.status === "succeeded" && run.blocks.length > 0 && (
           <div className="turn-done-mark">
             <EngineDone engine={engine} size={22}
-              label={engine === "codex" ? "Codex 子代理已完成" : "Claude 子代理已完成"} />
+              label={`${engine === "codex" ? "Codex" : engine === "dsh" ? "DSH" : "Claude"} 子代理已完成`} />
           </div>
         )}
         {!run.loading && !run.error && run.blocks.length === 0 && (
           <div className="agent-detail-empty">这个协作代理暂时没有可展示的过程。</div>
         )}
       </div>
+      {controls}
     </PanelFrame>
   );
 }

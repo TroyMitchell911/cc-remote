@@ -17,6 +17,7 @@ from textual.binding import BindingsMap
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.geometry import Offset
+from textual.screen import Screen
 from textual.widgets import Static, TextArea
 from textual.widgets.text_area import Selection
 
@@ -1441,6 +1442,21 @@ class Transcript(VimArea):
         self.app.mode = "NORMAL"
 
 
+class WorkspaceScreen(Screen):
+    """Synchronize the transcript when modal screens cover or reveal it."""
+
+    def on_screen_suspend(self) -> None:
+        for viewport in self.query(TranscriptViewport):
+            viewport.sync()
+
+    def on_screen_resume(self) -> None:
+        # Screen lifecycle events do not bubble to App. Restore cached pixels
+        # on this event instead of waiting for the next polling interval.
+        self.app.on_screen_resume()
+        self.app.paint()
+        self.call_after_refresh(self.app.paint)
+
+
 class WorkspaceApp(App, inherit_bindings=False):
     TITLE = "cc-remote"
     ENABLE_COMMAND_PALETTE = False
@@ -1488,6 +1504,9 @@ class WorkspaceApp(App, inherit_bindings=False):
         self.read_position_signature = None
         self.pending_jump = None
         self.graphics = None
+
+    def get_default_screen(self) -> Screen:
+        return WorkspaceScreen(id="_default")
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="workspace-body"):

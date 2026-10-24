@@ -13,7 +13,7 @@ export interface AssistantContinuation {
 
 /** Native receipt order for Codex, background main-agent output for Claude.
  * Source order and native message IDs keep live, replay and detail identical. */
-export function assistantContinuations(blocks: Block[], answers: TextBlock[], engine: "claude" | "codex" = "claude") {
+export function assistantContinuations(blocks: Block[], answers: TextBlock[], engine: "claude" | "codex" | "dsh" = "claude") {
   const original: Block[] = [];
   const continuations: AssistantContinuation[] = [];
   const codex = engine === "codex";

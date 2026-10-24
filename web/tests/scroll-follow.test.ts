@@ -15,11 +15,23 @@ import {
   measureBottom,
   NEAR_BOTTOM_PX,
   shouldAutoLoadOlderHistory,
+  shouldPrefetchOlderHistory,
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
 } from "../src/scroll-follow.ts";
 import { ScrollCoordinator } from "../src/scroll-coordinator.ts";
 import { updateTurnKeySnapshot } from "../src/virtual-turn-keys.ts";
+
+{
+  const long = { scrollHeight: 10_600, clientHeight: 600, scrollTop: 5_000 };
+  assert.equal(shouldPrefetchOlderHistory(long, true, true), true);
+  assert.equal(shouldPrefetchOlderHistory({ ...long, scrollTop: 5_001 }, true, true), false);
+  assert.equal(shouldPrefetchOlderHistory(long, false, true), false);
+  assert.equal(shouldPrefetchOlderHistory(long, true, false), false);
+  assert.equal(shouldPrefetchOlderHistory({ ...long, scrollHeight: 2_600, scrollTop: 1_100 }, true, true), true);
+  assert.equal(shouldPrefetchOlderHistory({ ...long, scrollTop: 0 }, false, true), false,
+    "a stationary viewport must not start fetching history");
+}
 
 assert.deepEqual(measureBottom({
   scrollHeight: 1_000,
@@ -599,7 +611,7 @@ assert.match(threadRule, /overflow-anchor:none/,
   "the keyed layout transaction must be the only history scroll owner");
 assert.match(threadRule, /padding:0/,
   "the keyed offset coordinate system requires a padding-free scroll container");
-assert.match(chatViewSource, /el\.scrollTop = target/,
+assert.match(chatViewSource, /el\.scrollTop \+= delta/,
   "WebKit history prepends must restore their keyed row before paint");
 const threadInRule = css.match(/\.thread-in\{[^}]+\}/)?.[0] ?? "";
 assert.match(threadInRule, /padding:0 16px/,

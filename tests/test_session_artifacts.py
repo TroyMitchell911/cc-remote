@@ -947,3 +947,30 @@ async def test_claude_steering_upload_outlives_its_temporary_prompt_files(tmp_pa
         return
     row = rows[0]
     assert row["name"] == "notes.txt" and Path(row["path"]).read_text() == "hi"
+
+
+@pytest.mark.asyncio
+async def test_dsh_uses_native_provenance_and_repairs_only_legacy_session_references(tmp_path):
+    from tests.test_dsh_runtime import setup_runtime
+    machine, _, runtime, _ = setup_runtime()
+    ctx = _mk_ctx("dsh@root", "dsh@root")
+    ctx.engine, ctx.cwd = "dsh", str(tmp_path)
+    service = machine._artifacts
+    scope = service.context_scope(ctx)
+    text = f"只读取了 [代码](<{tmp_path}/source.cpp>)，没有修改。"
+    await service.observe(ctx, Delta(message_id="answer", text=text))
+    await service.observe(ctx, AssistantMsgEnd(message_id="answer", channel="final"))
+    assert service.store.page(scope)[0] == []
+    service.store.text(scope, text, ctx.cwd)  # old index from the deployed version
+    service.store.text("other", text, ctx.cwd)
+    service.store.add(scope, "upload:1", "notes.md", "/notes.md", "upload")
+    history = History(session_id=ctx.key, revision="test", detail="summary", turns=[
+        {"id": "turn", "blocks": [{"kind": "text", "text": text}]}])
+    service.store.history(scope, history, ctx.cwd, discover_text=False)
+    service.store.native_outputs(scope, [], ctx.cwd)
+    assert [r["source"] for r in service.store.page(scope)[0]] == ["upload"]
+    assert len(service.store.page("other")[0]) == 1
+    service.store.native_outputs(scope, [{"path": str(tmp_path / "output.png")}], ctx.cwd)
+    service.store.native_outputs(scope, [], ctx.cwd)  # bounded metadata must retain older verified files
+    assert {r["name"] for r in service.store.page(scope)[0]} == {"notes.md", "output.png"}
+    await runtime.close()

@@ -11,6 +11,8 @@ import { createRoot } from "react-dom/client";
 import { TurnUsageFixture } from "./fixtures/turn-usage";
 import { BackgroundTasksFixture } from "./fixtures/background-tasks";
 import { MermaidArtifactFixture } from "./fixtures/mermaid-artifact";
+import { MediaLayoutFixture } from "./fixtures/media-layout";
+import { ReadingNavigationFixture } from "./fixtures/reading-navigation";
 
 import "../src/index.css";
 import "../src/App.css";
@@ -880,6 +882,8 @@ function CodexLiveBurstFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const composerLive = params.has("composer-live");
   const composerPaste = params.has("composer-paste");
+  const stagedLive = params.has("staged-live");
+  const mixedTools = params.has("mixed-tools");
   const [lastComposerPrompt, setLastComposerPrompt] = useState<string | null>(null);
   const [lastComposerImageCount, setLastComposerImageCount] = useState(0);
   const [composerDraft, setComposerDraft] = useState("a");
@@ -919,6 +923,63 @@ function CodexLiveBurstFixture() {
       msg_id: "burst-turn",
       prompt: "连续检查工具调用，并保持实时页面稳定。",
     });
+    if (mixedTools) {
+      // Native command batches mix read/search/shell tools in one assistant
+      // message. Each result changes the same summary from running to idle.
+      const schedule = (delay: number, event: Record<string, unknown>) => {
+        timersRef.current.push(window.setTimeout(() => emit(event), delay));
+      };
+      emit({ type: "assistant_msg_start", message_id: "mixed-commentary", channel: "commentary" });
+      emit({ type: "delta", message_id: "mixed-commentary", channel: "commentary",
+        text: "正在检查页面的实时输出和工具状态，继续核对当前实现。" });
+      schedule(120, { type: "assistant_msg_end", message_id: "mixed-commentary", channel: "commentary" });
+      schedule(240, { type: "assistant_msg_start", message_id: "mixed-exec", channel: "commentary" });
+      const names = ["shell", "readFile", "search", "readFile", "shell", "search", "readFile", "shell", "search", "readFile", "shell", "search"];
+      names.forEach((tool, index) => {
+        const base = 300 + index * 450;
+        const tool_use_id = `mixed-tool-${index}`;
+        schedule(base, { type: "process", item_id: "mixed-safety", kind: "safety",
+          phase: "snapshot", status: "succeeded", title: "内容安全检查", summary: "检查完成" });
+        schedule(base + 20, { type: "tool_use", message_id: "mixed-exec", tool_use_id, tool,
+          input: { command: "cat src/example.ts", path: "src/example.ts", cwd: "/repo" },
+          category: "command", title: tool === "search" ? "搜索内容" : tool === "readFile" ? "读取文件" : "运行命令" });
+        schedule(base + 250, { type: "tool_result", tool_use_id, content: "done",
+          is_error: false, status: "succeeded", exit_code: 0 });
+      });
+      timersRef.current.push(window.setTimeout(() => {
+        document.documentElement.dataset.codexBurst = "done";
+        runningRef.current = false;
+      }, 5800));
+      return;
+    }
+    if (stagedLive) {
+      // Native turns alternate separate commentary messages and tool calls.
+      // Keep the gaps visible: a single high-frequency message hides layout
+      // changes at assistant_msg_end inside the next batch of growing text.
+      const schedule = (delay: number, event: Record<string, unknown>) => {
+        timersRef.current.push(window.setTimeout(() => emit(event), delay));
+      };
+      for (let cycle = 0; cycle < 5; cycle += 1) {
+        const message_id = `staged-commentary-${cycle}`;
+        const tool_use_id = `staged-tool-${cycle}`;
+        const base = cycle * 700;
+        schedule(base, { type: "assistant_msg_start", message_id, channel: "commentary" });
+        schedule(base + 40, { type: "delta", message_id, channel: "commentary",
+          text: `第 ${cycle + 1} 项：正在检查滚动跟随和工具状态。` });
+        schedule(base + 120, { type: "delta", message_id, channel: "commentary",
+          text: "这段内容输出完以后会继续执行工具，页面应该保持稳定。" });
+        schedule(base + 280, { type: "assistant_msg_end", message_id, channel: "commentary" });
+        schedule(base + 420, { type: "tool_use", message_id, tool_use_id, tool: "commandExecution",
+          input: { command: "git status --short", cwd: "/repo" }, category: "command" });
+        schedule(base + 570, { type: "tool_result", tool_use_id, content: "done",
+          is_error: false, status: "succeeded", exit_code: 0 });
+      }
+      timersRef.current.push(window.setTimeout(() => {
+        document.documentElement.dataset.codexBurst = "done";
+        runningRef.current = false;
+      }, 3600));
+      return;
+    }
     emit({
       type: "assistant_msg_start",
       message_id: "burst-commentary",
@@ -1026,7 +1087,7 @@ function CodexLiveBurstFixture() {
       }, tick * 12);
       timersRef.current.push(timer);
     }
-  }, [emit]);
+  }, [emit, stagedLive, mixedTools]);
 
   return (
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
@@ -1037,6 +1098,7 @@ function CodexLiveBurstFixture() {
         </button>
       </div>
       <ChatView sid={CODEX_BURST_SID} turns={runtime.turns}
+        activeTurnId={runtime.activeTurnId}
         engine="codex" historyRevision="codex-burst-r1"
         historyScopeKey="fixture-codex-burst"
         onEdit={() => {}} onGetDiff={() => {}} />
@@ -1153,7 +1215,8 @@ function HistoryConversationBrowserFixture() {
   const runtimeBrowse = params.has("runtime-browse");
   const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
-  const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
+  const timelineEngine = params.get("engine") === "claude" ? "claude"
+    : params.get("engine") === "dsh" ? "dsh" : "codex";
   const emptyFinalPage = params.has("empty-final");
   const initialA = useMemo(() => {
     if (dualImage) {
@@ -1212,8 +1275,11 @@ function HistoryConversationBrowserFixture() {
       ];
     }
     if (large) {
-      return Array.from({ length: largeCount }, (_, index) =>
-        finalTurn(`m${index + 1}`, paragraphs));
+      return [
+        ...Array.from({ length: largeCount }, (_, index) =>
+          finalTurn(`m${index + 1}`, paragraphs)),
+        ...(interactiveTimeline ? [streamingTurn("streaming", 4)] : []),
+      ];
     }
     if (deepBrowse) {
       return Array.from({ length: 20 }, (_, index) =>
@@ -2013,7 +2079,8 @@ function HistoryConversationBrowserFixture() {
         </div>
       ) : (
         <ChatView
-          key={sessionAuthorityScope}
+          key={params.has("remount-session")
+            ? `${sessionAuthorityScope}:${sid}` : sessionAuthorityScope}
           sid={sid}
           turns={active.turns}
           engine={timelineEngine}
@@ -3161,6 +3228,8 @@ function CodexFileCitationFixture() {
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
+    : rootParams.has("reading-navigation") ? <ReadingNavigationFixture />
+    : rootParams.has("media-layout") ? <MediaLayoutFixture />
     : rootParams.has("turn-usage") ? <TurnUsageFixture />
     : rootParams.has("artifact-mermaid")
     ? <MermaidArtifactFixture />

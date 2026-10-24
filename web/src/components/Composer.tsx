@@ -1,3 +1,8 @@
+import type { DshRead } from "../dsh-api";
+import type { DshItem } from "../protocol";
+import { useDshReferences } from "./DshReferences";
+import type { DshState, DshCommandResult } from "../protocol";
+import { dshCommandMatches } from "../dsh-commands";
 import {
   useCallback,
   useEffect,
@@ -23,9 +28,9 @@ import { AttachmentPicker } from "./AttachmentPicker";
 import { parseContextCapacity } from "../codex-context";
 const CodexContextControl = lazy(() => import("./CodexContextControl"));
 import {
-  clientSlashesFor, routeComposerInput, slashToken,
+  clientSlashesFor, parseSlash, routeComposerInput, slashToken,
   matchCommands, matchSkills, skillToken,
-  modelsFor, effortNameForDisplay, permsFor,
+  modelsFor, effortNameForDisplay, permsFor, dshPermissionLabel,
   permissionProfileLabel, type Catalog,
 } from "../data";
 const CommandSheet = lazy(() => import("./CommandSheet").then(m => ({ default: m.CommandSheet })));
@@ -65,10 +70,17 @@ import {
   type AutoCompactSelection,
 } from "../auto-compact";
 
+const DshReferences = lazy(() => import("./DshReferenceList"));
 const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
 const ContextPopover = lazy(() => import("./ContextPopover"));
+const DshCommandFeedback = lazy(() => import("./DshCommandFeedback"));
 
 interface Props {
+  dsh?: DshState;
+  dshSid?: string;
+  readDsh?: DshRead;
+  dshCommandResult?: DshCommandResult;
+  onDshCommand?: (line: string, images?: QueryImg[], files?: QueryFile[]) => string | null;
   draftKey: string;
   draftStore: ComposerDraftStore;
   backgroundTasks?: ReactNode;
@@ -102,7 +114,7 @@ interface Props {
   external?: boolean;
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   archived?: boolean;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   onRequestModels?: () => void;
@@ -206,6 +218,16 @@ export function Composer(p: Props) {
   const importingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const pasteGuard = useClipboardPasteGuard(taRef, p.draftKey);
+  const [referenceCaret, setReferenceCaret] = useState(0);
+  const refs = useDshReferences(p.readDsh, p.dshSid, input, referenceCaret, p.engine === "dsh" && !p.archived);
+  const pickReference = (item: DshItem) => {
+    if (!refs.token || !item.mention) return;
+    const replacement = item.mention + (item.state === "directory" ? "" : " ");
+    const next = input.slice(0, refs.token.start) + replacement + input.slice(refs.token.end);
+    const caret = refs.token.start + replacement.length;
+    setInput(next); setReferenceCaret(caret);
+    requestAnimationFrame(() => { taRef.current?.focus(); taRef.current?.setSelectionRange(caret, caret); });
+  };
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
   const requestedSkillScopeRef = useRef<string | null>(null);
@@ -350,8 +372,9 @@ export function Composer(p: Props) {
   // enabled Skill catalog. Both stop suggesting once arguments begin.
   const cmdToken = slashToken(input);
   const cmdMatches = cmdToken !== null
-    ? matchCommands(cmdToken, p.engine, p.surface ?? "code") : [];
-  const currentSkillToken = p.engine === "codex" ? skillToken(input) : null;
+    ? [...matchCommands(cmdToken, p.engine, p.surface ?? "code"), ...(p.engine === "dsh"
+      ? dshCommandMatches(cmdToken, p.dsh) : [])] : [];
+  const currentSkillToken = p.engine === "codex" || p.engine === "dsh" ? skillToken(input) : null;
   const skillMatches = currentSkillToken !== null && p.skills
     ? matchSkills(currentSkillToken, p.skills) : [];
   const skillLoading = currentSkillToken !== null && p.skills === undefined;
@@ -446,6 +469,18 @@ export function Composer(p: Props) {
     } else if (paste.acceptText && text) insertClipboardText(textarea, text, setInput);
     if (attachments) void onPickFiles(null, clipboard, paste);
   };
+
+  const dshPendingRef = useRef<{ id: string; scope: string; draft: typeof draft } | null>(null);
+  const dshResult = p.dshCommandResult;
+  useEffect(() => {
+    const pending = dshPendingRef.current;
+    if (pending && pending.scope !== p.draftKey) { dshPendingRef.current = null; return; }
+    if (!pending || pending.scope !== p.draftKey || dshResult?.request_id !== pending.id) return;
+    dshPendingRef.current = null;
+    if (dshResult.status === "success") {
+      updateDraft(current => current === pending.draft ? { ...current, input: "", images: [], files: [], pastes: [] } : current);
+    }
+  }, [dshResult, p.draftKey, updateDraft]);
 
   // Send prompt text to cc, honoring busy/queue/interrupt rules.
   const submitPrompt = (prompt: string) => {
@@ -643,6 +678,8 @@ export function Composer(p: Props) {
   // Pick a command from the palette. Client commands run now; cc skills
   // (/code-review …) fill the composer so the user can add args, then send.
   const pickCommand = (slash: string) => {
+    const command = cmdMatches.find(c => c.slash === slash);
+    if (command?.unavailable) { flash(command.ds); return; }
     // Autocompact is intentionally command-only: choosing its suggestion fills
     // the composer, and only an explicit send may apply a value or open the UI.
     if (slash === "autocompact") {
@@ -651,9 +688,9 @@ export function Composer(p: Props) {
       growTa();
       return;
     }
-    if (clientSlashesFor(p.engine).has(slash)) {
+    if (clientSlashesFor(p.engine).has(slash) || p.engine === "dsh" && slash === "goal") {
       runClientSlash(slash, "");
-      if (slash !== "btw") focusTa();
+      if (slash !== "btw" && slash !== "goal") focusTa();
       return;
     }
     setInput("/" + slash + " ");
@@ -661,15 +698,35 @@ export function Composer(p: Props) {
   };
 
   const pickSkill = (name: string) => {
-    setInput("$" + name + " ");
+    setInput((p.engine === "dsh" ? "/" : "$") + name + " ");
     focusTa(); growTa();
   };
 
   const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
     const route = routeComposerInput(value, p.engine, p.surface);
-    if (route.kind === "empty") return;
     if (route.kind === "blocked") { flash(route.message); return; }
+    const raw = value.trim();
+    const parsed = parseSlash(raw);
+    const nativeSkill = parsed && p.engine === "dsh" && p.skills?.some(skill => skill.name === parsed.slash)
+      && !p.dsh?.commands.some(command => command.name === parsed.slash);
+    if (p.engine === "dsh" && parsed && !nativeSkill && !clientSlashesFor("dsh").has(parsed.slash)) {
+      if (p.dsh?.commands.length && !p.dsh.commands.some(command => command.name === parsed.slash)) {
+        flash(`此 DSH 会话没有 /${parsed.slash} 命令`); return;
+      }
+      const command = p.dsh?.commands.find(command => command.name === parsed.slash);
+      if (parsed.slash === "goal" && !parsed.args && !hasAttachments && !pastes.length && command) {
+        runClientSlash("goal", ""); return;
+      }
+      if (hasAttachments && command && !command.attachments) { flash(`/${parsed.slash} 不接受附件`); return; }
+      if (dshPendingRef.current) { flash("正在等待 DSH 确认命令"); return; }
+      const composed = composePastePrompt(pastes, raw);
+      if (!composed.ok || composed.prompt.length > 65536) { flash("命令内容超过上限（65,536 字符）"); return; }
+      const requestId = p.onDshCommand?.(composed.prompt, images.length ? images : undefined, files.length ? files : undefined);
+      if (requestId) dshPendingRef.current = { id: requestId, scope: p.draftKey, draft };
+      return;
+    }
+    if (route.kind === "empty") return;
     if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
     submitPrompt(route.prompt);
   };
@@ -697,7 +754,9 @@ export function Composer(p: Props) {
     || isSettlingStopDisabled(p.state, hasText || hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
+  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = p.engine === "dsh"
+    ? (p.dsh?.permissions ?? []).map(option => ({ id: option.value, name: dshPermissionLabel(option.value, option.name), short: dshPermissionLabel(option.value, option.name), ds: option.description, ic: "shield", danger: option.value === "danger-full-access" }))
+    : permsFor(p.engine);
   const workSurface = p.surface === "work";
   const currentContextReport = p.contextReport?.available !== false ? p.contextReport : null;
   const retainedContextReport = p.contextExactReport?.available !== false ? p.contextExactReport : null;
@@ -770,7 +829,10 @@ export function Composer(p: Props) {
             ? "输入以引导当前任务，或选择排队…"
             : placeholder))}
       disabled={locked}
-      onChange={(e) => onInput(e.target.value)}
+      onChange={(e) => { onInput(e.target.value); setReferenceCaret(e.target.selectionStart); }}
+      onSelect={(e) => setReferenceCaret(e.currentTarget.selectionStart)}
+      aria-controls={refs.open ? "dsh-reference-list" : undefined}
+      aria-activedescendant={refs.open && refs.items.length ? `dsh-reference-${refs.selected}` : undefined}
       onCompositionStart={() => imeSubmitRef.current.startComposition()}
       onCompositionEnd={(e) => {
         imeSubmitRef.current.endComposition();
@@ -778,6 +840,15 @@ export function Composer(p: Props) {
       }}
       onPaste={onPaste}
       onKeyDown={(e) => {
+        if (refs.open && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
+          if (e.key === "Escape") { e.preventDefault(); refs.dismiss(); return; }
+          if (refs.items.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+            e.preventDefault(); refs.setSelected((refs.selected + (e.key === "ArrowDown" ? 1 : -1) + refs.items.length) % refs.items.length); return;
+          }
+          if (refs.items.length && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+            e.preventDefault(); pickReference(refs.items[refs.selected] ?? refs.items[0]); return;
+          }
+        }
         if (e.key === "Escape" && suggestionOpen) {
           setInput(""); resetTaHeight(); return;
         }
@@ -822,7 +893,7 @@ export function Composer(p: Props) {
           }
             data-lock-horizontal-swipe="true">
             {currentSkillToken === null ? cmdMatches.map((c) => (
-              <button key={c.slash} type="button" className="cmd" onClick={() => pickCommand(c.slash)}>
+              <button key={c.slash} type="button" className="cmd" disabled={c.unavailable} onClick={() => pickCommand(c.slash)}>
                 <span className="cmd-ic"><Icon name={c.ic} size={17} /></span>
                 <span className="cmd-tx">
                   <span className="cmd-nm"><span className="slash">/{c.slash}</span></span>
@@ -848,6 +919,8 @@ export function Composer(p: Props) {
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
+        {p.engine === "dsh" && <Suspense fallback={null}><DshCommandFeedback
+          scope={p.draftKey} state={p.dsh} result={dshResult} /></Suspense>}
         {(p.queue.length > 0 || p.pendingSend || p.failedDeferred.length > 0) && (
           <div className="queued show">
             {[
@@ -978,15 +1051,16 @@ export function Composer(p: Props) {
             </div>
           </div>
         ) : (<>
+          {refs.open && <Suspense fallback={null}><DshReferences value={refs} onPick={pickReference} /></Suspense>}
           <div className="inrow">
             <AttachmentPicker key={p.draftKey} onPick={onPickFiles} disabled={locked || importing} />
-            {inputControl(p.engine === "codex"
+            {inputControl(p.engine === "codex" || p.engine === "dsh"
               ? "输入 / 命令，$ Skill"
               : "输入 / 命令")}
             {sendControl}
           </div>
           <div className="hint">
-          <button
+          {(p.engine !== "dsh" || !!p.dsh?.permissions.length) && <button
             type="button"
             className={"hint-mode" + modeCls}
             aria-busy={p.permissionProfilePending || undefined}
@@ -1002,9 +1076,9 @@ export function Composer(p: Props) {
               ? externalClaudeOwner
               : p.permissionProfilePending ? "环境切换中…" : modeLabel}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
-          </button>
+          </button>}
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
-            p.engine === "codex" && <> · <kbd>$</kbd> Skills</>
+            (p.engine === "codex" || p.engine === "dsh") && <> · <kbd>$</kbd> Skills</>
           }</span>
           <div className="hint-right" ref={ctxWrapRef}>
             {deferredClaudeControls && (
@@ -1093,6 +1167,7 @@ export function Composer(p: Props) {
               <Suspense fallback={null}>
                 <ContextPopover report={exactContextReport}
                   codex={p.engine === "codex"}
+                  dsh={p.engine === "dsh"}
                   codexContext={p.engine === "codex" ? p.codexContext : null}
                   autoCompact={p.engine === "claude" ? p.autoCompact : null}
                   onAutoCompact={p.engine === "codex" && p.onSetCodexContext
@@ -1122,6 +1197,7 @@ export function Composer(p: Props) {
         kind={sheetKind ?? "models"}
         engine={p.engine}
         catalog={p.catalog}
+        dsh={p.dsh}
         onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}

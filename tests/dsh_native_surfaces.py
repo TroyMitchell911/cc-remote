@@ -1,0 +1,103 @@
+"""Explicit offline acceptance for management, child history and native PTY."""
+import asyncio
+import json
+from uuid import uuid4
+
+from cc_remote.protocol import CloseBtw, GetAgentDetail, OpenBtw, Query, ReadDsh, SetDshControl, SyncBtw
+
+
+async def exercise(machine, runtime, sid, child):
+    browser = "native-surfaces"
+    async def read(kind, **fields):
+        result = await machine._handle(ReadDsh(sid=sid, kind=kind, client_id=browser, cmd_id=uuid4().hex, **fields))
+        assert not result.error, result
+        return result
+    async def control(body):
+        result = await machine._handle(SetDshControl(sid=sid, kind="terminal", value=json.dumps(body), client_id=browser, cmd_id=uuid4().hex))
+        assert result.status == "success", result
+        return result
+    for kind in ("settings", "presets", "bundles", "schedules", "workflows", "trajectory", "terminals"):
+        result = await read(kind)
+        print("PASS native surface", kind, len(result.items), flush=True)
+    settings = await read("settings")
+    row = next(item for item in settings.items if item.id == "subagent")
+    result = await machine._handle(SetDshControl(sid=sid, kind="manage", client_id=browser, cmd_id=uuid4().hex,
+        value=json.dumps({"action": "settings", "ns": "subagent", "revision": row.data["revision"], "patch": {"maxDepth": 2}})))
+    assert result.status == "success", result
+    actual = next(item for item in (await read("settings")).items if item.id == "subagent")
+    assert actual.data["values"]["maxDepth"] == 2 and actual.data["applies"] == "live"
+    print("PASS native settings effective-value receipt and readback", flush=True)
+    detail = await machine._handle(GetAgentDetail(session_id=sid, run_id="dsh@" + child["id"],
+        request_id=uuid4().hex, client_id=browser))
+    assert detail.authoritative and not detail.error and detail.events, detail
+    print("PASS native completed child process history", flush=True)
+    schedule = await runtime.client.create_schedule(sid, {"title": "Offline schedule", "prompt": "offline probe", "daily": {"time": "09:00:00", "time_zone": "Asia/Taipei"}})
+    rows = await runtime.client.rpc("schedule/catalog")
+    saved = next(row for row in rows if row["id"] == schedule["id"])
+    assert saved["sessionId"] == sid[4:] and saved["timeZone"] == "Asia/Taipei"
+    expected = {k: saved[k] for k in ("id", "kind", "title", "prompt", "scheduledAt", "time", "timeZone")}
+    changed = await runtime.client.rpc("schedule/update", {"request": {"sessionId": sid[4:], "id": saved["id"],
+        "expected": expected, "title": "Updated offline schedule", "change": {"kind": "weekly", "weekly": {
+            "time": "10:30:00", "time_zone": "Asia/Taipei", "weekdays": [1, 5]}}}})
+    assert not changed.get("code"), changed
+    current = next(row for row in await runtime.client.rpc("schedule/catalog") if row["id"] == saved["id"])
+    assert current["kind"] == "weekly" and current["weekdays"] == [1, 5]
+    await runtime.client.rpc("schedule/delete", {"request": {"sessionId": sid[4:], "id": saved["id"]}})
+    print("PASS native direct schedule creation, timezone and deletion without conversational input", flush=True)
+    refused = await machine._handle(OpenBtw(sid=sid, client_id=browser, owner_id=browser, request_id=uuid4().hex))
+    assert refused.type == "error" and refused.code == "dsh_sidechat_unavailable"
+    # The optional isolated probe still covers the dormant implementation;
+    # browser entry points remain disabled pending native deletion support.
+    opened = await runtime.sidechats.open(OpenBtw(sid=sid, client_id=browser, owner_id=browser, request_id=uuid4().hex))
+    assert isinstance(opened, tuple), opened
+    fork_sid = opened[0].btw_sid
+    branch = machine.sessions[fork_sid]
+    parent = machine.sessions[sid]
+    assert branch.sdk.model == parent.sdk.model and branch.sdk.effort == parent.sdk.effort
+    assert branch.sdk.permission_mode == parent.sdk.permission_mode, (branch.sdk.permission_mode, parent.sdk.permission_mode)
+    await machine._handle(SyncBtw(sid=fork_sid, client_id=browser, owner_id=browser))
+    await machine._handle(Query(sid=fork_sid, prompt="hi", msg_id=uuid4().hex, client_id=browser, owner_id=browser))
+    async with asyncio.timeout(20):
+        while branch.state != "idle":
+            await asyncio.sleep(.05)
+    assert branch.state == "idle"
+    # Restore the association and native history without activating an Agent.
+    await branch.sdk.disconnect()
+    machine.sessions.pop(fork_sid)
+    await machine._handle(SyncBtw(sid=fork_sid, client_id=browser, owner_id=browser))
+    branch = machine.sessions[fork_sid]
+    assert branch.btw and branch.sdk.model == parent.sdk.model
+    assert machine._btw_history(branch).turns
+    await machine._handle(CloseBtw(sid=fork_sid, client_id=browser, owner_id=browser))
+    assert not branch.btw and any(row["sessionId"] == fork_sid[4:] for row in await runtime.client.list_sessions())
+    print("PASS native side-chat fork, inherited settings, isolated conversation and retained release", flush=True)
+    terminal = uuid4().hex
+    await control({"action": "create", "id": terminal})
+    try:
+        assert any(item.id == terminal for item in (await read("terminals")).items)
+        lease = uuid4().hex
+        await control({"action": "attach", "id": terminal, "lease": lease, "stream": True})
+        await control({"action": "input", "lease": lease, "value": {"type": "resize", "cols": 82, "rows": 25}})
+        # A shell-only harmless output marker; no model/network access.
+        await control({"action": "input", "lease": lease, "value": {"type": "write", "data": "printf 'cc_remote_pty_ok\\n'\r"}})
+        output, cursor = "", 0
+        async with asyncio.timeout(10):
+            while "cc_remote_pty_ok" not in output:
+                pages = [m for m in machine.transport.sent if m.type == "dsh_read_result" and m.request_id == lease and (m.next_seq or 0) > cursor]
+                for page in pages:
+                    assert page.to == browser and not page.error
+                    cursor = page.next_seq
+                    output += "".join(str(item.data.get("screen", item.data.get("data", ""))) for item in page.items)
+                    await control({"action": "ack", "lease": lease, "cursor": cursor})
+                await asyncio.sleep(0.05)
+        await control({"action": "detach", "lease": lease})
+        assert any(item.id == terminal for item in (await read("terminals")).items)
+        print("PASS native PTY create, resize, input, output and detach retention", flush=True)
+    finally:
+        attachment = await control({"action": "attach", "id": terminal})
+        await control({"action": "close", "id": terminal})
+        page = await read("terminal_output", query=attachment.request_id)
+        assert any(item.data.get("info", {}).get("state") == "exited" for item in page.items), page
+        print("PASS native terminal final state survives explicit close", flush=True)
+    assert not any(item.id == terminal for item in (await read("terminals")).items)
+    print("PASS explicit native PTY process close", flush=True)

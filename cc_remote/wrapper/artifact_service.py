@@ -51,7 +51,7 @@ class ArtifactService:
         if isinstance(msg, (UserMsg, TurnSteered)) and msg.images:
             if not await asyncio.to_thread(self.store.has_uploads, scope, msg.msg_id):
                 await self.uploads(ctx, msg.msg_id, images=msg.images)
-        elif isinstance(msg, Delta) and msg.channel != "thinking":
+        elif isinstance(msg, Delta) and msg.channel != "thinking" and ctx.engine != "dsh":
             # Discovery never holds full long answers or reasoning streams in RAM.
             pending = ctx.artifact_text
             pending[msg.message_id] = ("" if msg.replace else pending.get(msg.message_id, "")) + msg.text
@@ -91,15 +91,20 @@ class ArtifactService:
             response.sid = sid
             if cmd.scan_history:
                 ctx = machine._ctx_for(sid)
-                if ctx is None or not ctx.btw:
-                    history = await machine._history_page_singleflight(GetHistory(
-                        session_id=sid, before=cmd.history_before, limit=12, detail="summary",
-                        cwd=cwd), sid)
+                private_dsh = cmd.engine == "dsh" and sid in machine._dsh.sidechats.check()
+                if not private_dsh and (ctx is None or not ctx.btw):
+                    request = GetHistory(session_id=sid, before=cmd.history_before, limit=12, detail="summary", cwd=cwd)
+                    history = (await machine._dsh.handle_get_history(request, publish=False) if cmd.engine == "dsh"
+                               else await machine._history_page_singleflight(request, sid))
                     if history.error:
                         raise ValueError("历史附件整理暂时失败，请重试")
-                    await asyncio.to_thread(self.store.history, scope, history, cwd)
+                    await asyncio.to_thread(self.store.history, scope, history, cwd,
+                                            discover_text=cmd.engine != "dsh")
                     response.history_before = history.oldest_id
                     response.history_more = history.has_more
+            if cmd.engine == "dsh":
+                metadata = await machine._dsh.client.metadata(sid)
+                await asyncio.to_thread(self.store.native_outputs, scope, metadata["deliverables"], cwd)
             rows, response.next_before, response.has_more = await asyncio.to_thread(self.store.page, scope, cmd.before)
             response.entries = await asyncio.to_thread(lambda: [SessionArtifactInfo(**public_entry(row)) for row in rows])
         except Exception as exc:
@@ -124,7 +129,7 @@ class ArtifactService:
                     data=base64.b64encode(data).decode(), media_type="image/webp",
                     size=len(data), writable=False, sid=sid, to=cmd.client_id)
             elif row["image_id"]:
-                image = await machine._handle_get_history_image(GetHistoryImage(
+                image = await (machine._dsh.handle_get_history_image if cmd.engine == "dsh" else machine._handle_get_history_image)(GetHistoryImage(
                     session_id=sid, turn_id=row["turn_id"], image_id=row["image_id"],
                     variant="full", request_id=cmd.request_id, client_id=cmd.client_id), publish=False)
                 response = FilePreview(path=path, request_id=cmd.request_id, format="image",
@@ -161,7 +166,7 @@ class ArtifactService:
     async def thumbnail(self, cmd, sid, cwd, row):
         machine = self.machine
         if row["image_id"]:
-            image = await machine._handle_get_history_image(GetHistoryImage(
+            image = await (machine._dsh.handle_get_history_image if cmd.engine == "dsh" else machine._handle_get_history_image)(GetHistoryImage(
                 session_id=sid, turn_id=row["turn_id"], image_id=row["image_id"],
                 variant="thumbnail", request_id=cmd.request_id, client_id=cmd.client_id), publish=False)
             if image.error or not image.data:

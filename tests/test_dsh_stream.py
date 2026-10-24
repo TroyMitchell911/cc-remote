@@ -1,0 +1,379 @@
+"""V4 behavior regressions, including a capture from the pinned native runtime."""
+import json
+from pathlib import Path
+
+import pytest
+
+from cc_remote.protocol import deserialize, serialize
+from cc_remote.wrapper.dsh_client import DshError
+from cc_remote.wrapper.dsh_stream import DshProjection, history_events, input_tokens, model_id, model_parts
+from cc_remote.wrapper.history_store import materialize_history_turns
+
+FIXTURE = Path(__file__).parent / "fixtures/dsh/native_v4_flow.json"
+
+
+def native_flow():
+    p = DshProjection()
+    frames = []
+    for native in json.loads(FIXTURE.read_text()):
+        if native["type"] == "snapshot":
+            for record in native["records"]:
+                frames += p.record(record["event"])
+            frames += p.baseline(native.get("assistantStream", {}))
+        elif native["type"] == "event":
+            frames += p.record(native["event"])
+        else:
+            frames += p.frame(native["frame"])
+    return p, frames
+
+
+def test_actual_native_stream_settles_once_under_its_human_owner():
+    p, frames = native_flow()
+    users = [f for f in frames if f.type == "user_msg"]
+    assert len(users) == 1  # plugin/system/skill-catalog user-role records are hidden
+    owner = next(f.turn_id for f in frames if f.type == "turn_binding")
+    assert all(f.turn_id == owner for f in frames if f.type in {
+        "assistant_msg_start", "delta", "assistant_msg_end", "turn_end"})
+    rows = materialize_history_turns([f.model_dump(exclude_none=True) for f in frames])
+    assert len(rows) == 1 and rows[0]["done"]
+    assert rows[0]["blocks"][-1]["text"] == "DSH compatibility response."
+    assert p.context().total_tokens == 130
+    assert p.context().max_tokens == 64000
+
+
+def test_cold_history_and_live_stream_have_same_final_identity_and_text():
+    _, live = native_flow()
+    p = DshProjection()
+    cold = []
+    for native in json.loads(FIXTURE.read_text()):
+        records = native["records"] if native["type"] == "snapshot" else [native] if native["type"] == "event" else []
+        for record in records:
+            cold += p.record(record["event"])
+    summaries = [materialize_history_turns([e.model_dump(exclude_none=True) for e in events]) for events in (live, cold)]
+    assert summaries[0][0]["id"] == summaries[1][0]["id"]
+    assert summaries[0][0]["blocks"] == summaries[1][0]["blocks"]
+
+
+@pytest.mark.parametrize("has_tool", [False, True])
+def test_native_settlement_refines_provisional_text_without_changing_its_identity(has_tool):
+    p = DshProjection()
+    record(p, "turn/start", {"turn": 1})
+    user(p, "prompt")
+    p.frame({"type": "start", "attemptId": "a", "turn": 1, "step": 1, "revision": 1})
+    live = p.frame({"type": "chunk", "attemptId": "a", "revision": 2, "index": 0,
+        "chunk": {"type": "text-delta", "index": 0, "text": "checking"}})
+    assert all(e.channel == "commentary" for e in live)
+    blocks = [{"type": "text", "text": "checking complete"}]
+    if has_tool:
+        blocks.append({"type": "tool-call", "toolCallId": "ask", "toolName": "ask_user_question"})
+    committed = record(p, "assistant/message", {"turn": 1, "step": 1, "message": {"content": blocks}})
+    prose = [e for e in committed if e.channel != "thinking"]
+    assert all(e.channel == ("commentary" if has_tool else "final") for e in prose)
+    assert {e.message_id for e in live + prose} == {"dsh-step-1-1-unknown"}
+    assert p.running and not any(e.type == "turn_end" for e in committed)
+
+
+def test_context_without_a_route_capacity_does_not_reuse_the_previous_models_window():
+    p = DshProjection()
+    p.context_pressure({"contextWindow": 1000000, "projectedTokens": 593, "pressureTokens": 550})
+    record(p, "request/context", {"provider": "legacy", "model": "unknown"})
+    assert not p.context().available and p.context().max_tokens == 0
+    report = p.context_pressure({"contextWindow": 1000000, "pressureTokens": 550})
+    assert report.source == "recent_turn" and report.total_tokens == 550
+
+
+def test_delayed_usage_stream_cannot_overwrite_a_newer_native_context_projection():
+    p = DshProjection(cursor=39)
+    p.context_pressure({"contextWindow": 1000000, "projectedTokens": 593}, seq=42)
+    record(p, "request/context", {"contextWindow": 64000})
+    record(p, "assistant/message", {"turn": 1, "step": 1,
+        "message": {"content": []}, "usage": {"inputTokens": 9000}})
+    assert p.context().source == "native_estimate"
+    assert p.context().total_tokens == 593 and p.context().max_tokens == 1000000
+    p.context_pressure({"contextWindow": 64000, "pressureTokens": 9000}, seq=41)
+    assert p.context().total_tokens == 593
+
+
+def record(p, kind, data, **extra):
+    return p.record({"type": kind, "data": data, "seq": p.cursor+1,
+                     "time": (p.cursor+2)*1000, **extra})
+
+
+def user(p, client):
+    return record(p, "user/message", {"id": client, "role": "user",
+                  "source": {"kind": "user", "rpcId": client},
+                  "content": [{"type": "text", "text": client}]})
+
+
+@pytest.mark.parametrize("done_after_prompt", [False, True])
+def test_initial_permission_command_never_creates_a_conversation_turn(done_after_prompt):
+    p = DshProjection()
+    frames = record(p, "command/run", {"commandId": "setup", "name": "permission",
+        "args": "danger-full-access", "source": {"kind": "user"}})
+    assert frames == []
+    done = {"commandId": "setup", "kind": "success", "text": "Permission updated"}
+    if not done_after_prompt:
+        assert record(p, "command/done", done) == []
+    frames += record(p, "turn/start", {"turn": 1})
+    frames += user(p, "first-prompt")
+    if done_after_prompt:
+        assert record(p, "command/done", done) == []
+    frames += record(p, "assistant/message", {"turn": 1, "step": 1,
+        "message": {"content": [{"type": "text", "text": "answer"}]}})
+    frames += record(p, "turn/end", {"turn": 1, "reason": {"kind": "completed"}})
+    # Both live projection and cold grouping have exactly the real human turn.
+    for events in ([f.model_dump(exclude_none=True) for f in frames], history_events(frames)):
+        rows = materialize_history_turns(events)
+        assert len(rows) == 1 and rows[0]["prompt"] == "first-prompt"
+        assert not any(block["kind"] == "process" for block in rows[0]["blocks"])
+
+
+@pytest.mark.parametrize("status", ["success", "error"])
+def test_command_done_keeps_its_native_name_owner_and_error_after_steering(status):
+    p = DshProjection()
+    record(p, "turn/start", {"turn": 1})
+    owner = user(p, "first")[-1].turn_id
+    start = record(p, "command/run", {"commandId": "plan", "name": "plan",
+        "args": "", "source": {"kind": "user"}})[0]
+    user(p, "next")
+    end = record(p, "command/done", {"commandId": "plan", "kind": status,
+        "text": "Native command result"})[0]
+    assert start.title == end.title == "/plan"
+    assert start.turn_id == end.turn_id == owner != p.owner
+    assert start.item_id == end.item_id and end.phase == "end"
+    assert end.status == ("failed" if status == "error" else "succeeded")
+    assert end.summary == "Native command result"
+
+
+def test_ptc_dispatch_uses_native_root_owner_across_steering():
+    p = DshProjection()
+    record(p, "turn/start", {"turn": 1})
+    record(p, "step/start", {"turn": 1, "step": 1})
+    first = user(p, "first")[-1].turn_id
+    root = record(p, "tool/call", {"turn": 1, "step": 1, "callId": "root",
+                                  "name": "run_code", "arguments": "{}"})[-1]
+    second = user(p, "second")[-1].turn_id
+    record(p, "step/start", {"turn": 1, "step": 2})
+    dispatch = {"rootCallId": "root", "parentCallId": "root", "subCallId": "nested",
+                "name": "read_file", "arguments": {"path": "file.txt"}}
+    start = record(p, "tool/ptc-dispatch-start", dispatch)[0]
+    assert start.parent_id == root.tool_use_id and start.turn_id == first != second
+    end = record(p, "tool/ptc-dispatch", {**dispatch, "content": [{"type": "text", "text": "contents"}], "isError": False})
+    assert all(event.turn_id == first for event in end)
+    assert end[0].tool_use_id == start.tool_use_id
+    assert end[1].content == "contents" and end[1].status == "succeeded"
+    assert not record(p, "tool/ptc-dispatch-start", {**dispatch, "rootCallId": "missing"})
+
+
+def test_child_catalog_is_a_history_reference_not_live_or_completed_activity():
+    p = DshProjection()
+    user(p, "inspect")
+    event = record(p, "subagent/catalog", {"childId": "child", "mode": "one-shot", "label": "Review"})[0]
+    assert (event.phase, event.status) == ("end", "unknown")
+    assert (event.server, event.tool) == ("dsh", "subagent_reference")
+    assert event.input == {"agent_run_id": "dsh@child"}
+
+
+@pytest.mark.parametrize("native_status,wire_status", [
+    ("pending", "pending"), ("in_progress", "inProgress"), ("completed", "completed"),
+])
+def test_native_todo_status_keeps_live_and_replayed_progress_readable(native_status, wire_status):
+    p = DshProjection()
+    user(p, "prompt")
+    event = {"seq": p.cursor + 1, "time": 1000, "type": "todo/write", "data": {
+        "todos": [{"content": "Inspect logs", "status": native_status}],
+    }}
+    live = p.record(event)[0]
+    assert live.type == "turn_plan" and live.turn_id == p.owner
+    assert live.plan[0]["status"] == wire_status
+    assert deserialize(serialize(live)) == live
+
+    # Reconnect must be able to replay the same durable record, not repeatedly
+    # fail validation and leave the session read-only at its first active todo.
+    cold = DshProjection(cursor=event["seq"] - 1)
+    cold.owner = p.owner
+    assert cold.record(event) == [live]
+    following = {"seq": event["seq"] + 1, "time": 2000, "type": "tool/call", "data": {
+        "turn": 1, "step": 1, "callId": "read-logs", "name": "read", "arguments": "{}",
+    }}
+    assert p.record(following)[-1].type == "tool_use"
+    assert cold.record(following)[-1].type == "tool_use"
+
+
+def test_late_answer_keeps_pre_steer_owner_even_when_new_user_has_arrived():
+    p = DshProjection()
+    record(p, "turn/start", {"turn": 1})
+    record(p, "step/start", {"turn": 1, "step": 1})
+    first = user(p, "first")[-1].turn_id
+    p.frame({"type": "start", "attemptId": "attempt", "turn": 1, "step": 1, "revision": 1})
+    second_frames = user(p, "steer")
+    second = second_frames[-1].turn_id
+    assert second != first
+    assert not any(frame.type == "turn_end" for frame in second_frames)
+    old = record(p, "assistant/message", {"turn": 1, "step": 1,
+                 "message": {"content": [{"type": "text", "text": "old answer"}]}})
+    assert all(f.turn_id == first for f in old)
+    old_end = record(p, "step/end", {"turn": 1, "step": 1})[0]
+    assert old_end.turn_id == first and old_end.result.subtype == "steered"
+    new = record(p, "assistant/message", {"turn": 1, "step": 2,
+                 "message": {"content": [{"type": "text", "text": "new answer"}]}})
+    assert all(f.turn_id == second for f in new)
+    end = record(p, "turn/end", {"turn": 1, "reason": {"kind": "completed"}})[0]
+    assert end.turn_id == second
+
+
+def test_failed_attempt_clears_provisional_text_without_committing_it():
+    p = DshProjection()
+    user(p, "prompt")
+    p.frame({"type": "start", "attemptId": "attempt", "turn": 1, "step": 1, "revision": 1})
+    p.frame({"type": "chunk", "attemptId": "attempt", "revision": 2, "index": 0,
+             "chunk": {"type": "text-delta", "index": 0, "text": "discard this"}})
+    frames = record(p, "assistant/attempt", {"turn": 1, "step": 1, "stream": []})
+    assert any(f.type == "delta" and f.replace and not f.text for f in frames)
+    assert not any(f.type == "assistant_msg_end" for f in frames)
+    assert frames[-1].type == "process"
+    assert p.open  # an abandoned attempt is not a terminal turn
+
+
+def test_compaction_replacement_cannot_reintroduce_old_human_or_question():
+    p = DshProjection()
+    user(p, "original")
+    original_owner = p.owner
+    result = record(p, "user/message", {"source": {"kind": "user"}, "id": "replaced",
+                    "content": [{"type": "text", "text": "old context"}]},
+                    surfaceOp={"op": "replace", "startSeq": 0, "endSeq": 1})
+    assert result == [] and p.owner == original_owner
+    assert record(p, "approval/asked", {"id": "answered", "toolName": "shell"}) == []
+    assert record(p, "approval/decided", {"id": "answered", "outcome": "allowed-once"}) == []
+
+
+def test_gaps_are_explicit_and_duplicate_durable_events_are_ignored():
+    p = DshProjection()
+    event = {"seq": 0, "time": 0, "type": "turn/start", "data": {"turn": 1}}
+    p.record(event)
+    assert p.record(event) == []
+    with pytest.raises(DshError, match="缺口"):
+        p.record({**event, "seq": 2})
+    p.frame({"type": "start", "attemptId": "a", "turn": 1, "step": 1, "revision": 1})
+    with pytest.raises(DshError, match="不连续"):
+        p.frame({"type": "chunk", "attemptId": "a", "revision": 3, "index": 1, "chunk": {}})
+
+
+def test_disjoint_usage_and_opaque_model_routes():
+    assert input_tokens({"inputTokens": 100, "cacheReadTokens": 20, "cacheWriteTokens": 10, "totalTokens": 150}) == 130
+    assert model_parts(model_id("provider:custom", "org/model:v1")) == ("provider:custom", "org/model:v1")
+    assert DshProjection().context().available is False
+
+
+@pytest.mark.parametrize("kind,error", [("completed", False), ("error", True), ("max-tokens", True), ("blocked", True), ("aborted", False)])
+def test_native_terminal_reason_is_preserved(kind, error):
+    p = DshProjection()
+    user(p, "prompt")
+    frames = record(p, "turn/end", {"turn": 1, "reason": {"kind": kind}})
+    assert frames[-1].result.is_error is error
+    assert frames[-1].result.subtype != "success" or kind == "completed"
+
+
+def test_model_serialization_failure_is_not_a_user_interrupt_in_live_or_history():
+    p = DshProjection()
+    frames = record(p, "turn/start", {"turn": 1}) + user(p, "prompt")
+    failure = {"code": "UNSUPPORTED_CONTENT",
+               "message": "DeepSeek Messages cannot represent user/tool-result content reasoning"}
+    frames += record(p, "assistant/attempt", {"turn": 1, "step": 1, "stream": [
+        {"type": "chunk", "time": 1000, "chunk": {"type": "finish",
+         "reason": {"kind": "error", "failure": failure}}},
+    ]})
+    frames += record(p, "turn/end", {"turn": 1, "reason": {"kind": "error", "error": failure}})
+    terminal = frames[-1]
+    assert terminal.result.subtype == "error_model" and terminal.result.is_error
+    assert terminal.result.model_extra["error"] == failure["message"]
+    assert any(f.type == "process" and f.status == "failed" and f.summary == failure["message"] for f in frames)
+    row = materialize_history_turns(history_events(frames))[0]
+    assert row["done"] and row["error"] and not row.get("interrupted")
+
+
+def test_autonomous_goal_round_opens_its_own_owner_in_live_and_cold_views():
+    p = DshProjection()
+    frames = record(p, "turn/start", {"turn": 1}) + user(p, "human")
+    frames += record(p, "turn/end", {"turn": 1, "reason": {"kind": "completed"}})
+    frames += record(p, "turn/start", {"turn": 2})
+    assert p.running
+    opening = p.frame({"type": "start", "attemptId": "auto", "turn": 2, "step": 1, "revision": 1})
+    assert len(opening) == 1 and opening[0].autonomous
+    assert opening[0].turn_id == "dsh-turn-2"
+    frames += opening
+    frames += record(p, "assistant/message", {"turn": 2, "step": 1,
+        "message": {"content": [{"type": "text", "text": "continued"}]}})
+    frames += record(p, "turn/end", {"turn": 2, "reason": {"kind": "completed"}})
+    rows = materialize_history_turns(history_events(frames))
+    assert len(rows) == 2 and rows[1]["id"] == "dsh-turn-2"
+    assert rows[1].get("continuation") is None
+    assert rows[1]["blocks"][0]["text"] == "continued"
+    assert not p.running and not p.open
+
+
+@pytest.mark.parametrize("source", ["agent-message", "subagent-settled"])
+@pytest.mark.parametrize("live", [False, True])
+def test_child_wakeup_preserves_answer_and_continuation_in_live_and_cold_history(source, live):
+    p = DshProjection()
+    frames = record(p, "turn/start", {"turn": 1}) + user(p, "human")
+    frames += record(p, "assistant/message", {"turn": 1, "step": 1,
+        "message": {"content": [{"type": "text", "text": "initial answer"}]}})
+    frames += record(p, "turn/end", {"turn": 1, "reason": {"kind": "completed"}})
+    assert not p.running
+    frames += record(p, "turn/start", {"turn": 2})
+    # No new human question; this is the native wakeup observed in the report.
+    frames += record(p, "user/message", {"source": {"kind": source, "senderSessionId": "child"},
+        "content": [{"type": "text", "text": "private child relay"}]})
+    if live:
+        frames += p.frame({"type": "start", "attemptId": "child-return", "turn": 2, "step": 1, "revision": 1})
+    frames += record(p, "assistant/message", {"turn": 2, "step": 1,
+        "message": {"content": [{"type": "text", "text": "checked child result"}]}})
+    assert p.running
+    frames += record(p, "turn/end", {"turn": 2, "reason": {"kind": "completed"}})
+    assert not p.running
+    frames += record(p, "turn/start", {"turn": 3}) + user(p, "next-question")
+    # A child arriving during a human task does not replace the user's boundary.
+    frames += record(p, "user/message", {"source": {"kind": source}})
+    frames += record(p, "turn/end", {"turn": 3, "reason": {"kind": "aborted"}})
+    rows = materialize_history_turns(history_events(frames))
+    assert [row["id"] for row in rows] == ["human", "dsh-turn-2", "next-question"]
+    assert [row.get("continuation") for row in rows] == [None, "subagent", None]
+    assert [row["prompt"] for row in rows] == ["human", "", "next-question"]
+    assert rows[0]["blocks"][0]["text"] == "initial answer"
+    assert [b["text"] for b in rows[1]["blocks"] if b["kind"] == "text"] == ["checked child result"]
+    receipts = [b for b in rows[1]["blocks"] if b.get("tool") == "agent_return"]
+    assert bool(receipts) == (source == "subagent-settled")
+    if receipts:
+        assert receipts[0]["input"]["agent_run_id"] == "dsh@child"
+    assert rows[2]["interrupted"]
+    assert len([frame for frame in frames if frame.type == "turn_end"]) == 3
+
+
+def test_late_child_metadata_updates_same_autonomous_owner_but_surface_replay_does_not():
+    p = DshProjection()
+    frames = record(p, "turn/start", {"turn": 2})
+    frames += p.frame({"type": "start", "attemptId": "auto", "turn": 2, "step": 1, "revision": 1})
+    assert frames[-1].continuation is None
+    assert record(p, "user/message", {"source": {"kind": "agent-message"}}, surfaceOp={}) == []
+    update = record(p, "user/message", {"source": {"kind": "subagent-settled"}})
+    assert len(update) == 1 and update[0].turn_id == "dsh-turn-2"
+    assert update[0].continuation == "subagent"
+    frames += update
+    frames += record(p, "turn/end", {"turn": 2, "reason": {"kind": "completed"}})
+    rows = materialize_history_turns(history_events(frames))
+    assert len(rows) == 1 and rows[0]["continuation"] == "subagent"
+
+
+def test_late_pre_steer_answer_stays_in_its_canonical_history_row():
+    p = DshProjection()
+    frames = record(p, "turn/start", {"turn": 1}) + user(p, "first")
+    p.frame({"type": "start", "attemptId": "first", "turn": 1, "step": 1, "revision": 1})
+    frames += user(p, "steer")
+    for step, text in [(1, "old answer"), (2, "new answer")]:
+        frames += record(p, "assistant/message", {"turn": 1, "step": step,
+            "message": {"content": [{"type": "text", "text": text}]}})
+    frames += record(p, "turn/end", {"turn": 1, "reason": {"kind": "completed"}})
+    rows = materialize_history_turns(history_events(frames))
+    assert [r["id"] for r in rows] == ["first", "steer"]
+    assert [[b["text"] for b in r["blocks"] if b["kind"] == "text"] for r in rows] == [["old answer"], ["new answer"]]

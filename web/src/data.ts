@@ -10,7 +10,7 @@ import type {
 } from "./protocol";
 
 export interface CmdGroup { g: string }
-export interface Cmd { slash: string; name: string; ds: string; ic: string }
+export interface Cmd { slash: string; name: string; ds: string; ic: string; unavailable?: boolean }
 const OPEN_FILES_COMMAND: Cmd = { slash: "open", name: "打开目录或文件", ds: "/open [路径] 浏览会话文件，点击文件在侧栏预览", ic: "folder-open" };
 export type Command = CmdGroup | Cmd;
 const COMPACT_COMMAND: Cmd = {
@@ -241,6 +241,7 @@ const fromCatalog = (entries: CatalogModel[], engine: string): Model[] =>
   });
 
 export const modelsFor = (engine?: string, catalog?: Catalog): Model[] => {
+  if (engine === "dsh") return fromCatalog(catalog?.dsh ?? [], "dsh");
   const key = engine === "codex" ? "codex" : "claude";
   const live = catalog?.[key];
   return live?.length ? fromCatalog(live, key) : key === "codex" ? CODEX_MODELS : MODELS;
@@ -257,7 +258,7 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
   // them. Claude may legitimately use a custom/provider alias absent from the
   // common suggestions above, so preserve its wrapper-resolved id.
   return want && (engine !== "codex" || list.some((m) => m.id === want))
-    ? want : list[0].id;
+    ? want : (list[0]?.id ?? "");
 };
 
 /** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
@@ -266,7 +267,7 @@ export const effortsFor = (engine?: string, model?: string | null, catalog?: Cat
   const m = model ? modelsFor(engine, catalog).find((x) => x.id === model
     || (engine !== "codex" && x.id.replace(/\[1m\]$/i, "") === model.replace(/\[1m\]$/i, ""))) : undefined;
   if (m?.efforts) return m.efforts;
-  return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
+  return engine === "dsh" ? [] : engine === "codex" ? CODEX_EFFORTS : EFFORTS;
 };
 
 /** A null app-server thread effort is a real model-default state, not loading.
@@ -292,10 +293,17 @@ export function effortIsSelectable(
  *  own `default_effort`, which is `low` for sol). Also what we clamp to when the user
  *  switches to a model that lacks the current level (sol `ultra` -> luna `max`). */
 export const defaultEffortFor = (engine?: string, model?: string | null, catalog?: Catalog): string => {
+  if (engine === "dsh") return catalog?.dsh?.find(item => item.id === model)?.default_effort ?? "";
   const list = effortsFor(engine, model, catalog);
   return list.length ? list.reduce((a, b) => (rank(b.id) > rank(a.id) ? b : a)).id : "model-default";
 };
-export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
+export const permsFor = (engine?: string): Perm[] => (engine === "dsh" ? [] : engine === "codex" ? CODEX_PERMS : PERMS);
+
+/** Localized display only; selections retain the exact native permission ID. */
+export function dshPermissionLabel(value: string, fallback = value): string {
+  return ({ "read-only": "只读", "workspace-write": "工作区写入",
+    "danger-full-access": "完全访问" } as Record<string, string>)[value] ?? fallback;
+}
 
 // Map a cc-reported model id (e.g. "claude-mythos-5-1[1m]") to a MODELS entry id.
 // An id we don't know (any codex model) passes through verbatim — the codex chips
@@ -377,11 +385,13 @@ export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear",
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
-  surface === "work"
+  engine === "dsh" ? CODEX_COMMANDS.filter(c => !isCmd(c) || ["model", "context", "diff", "preview", "open", "skills"].includes(c.slash)) : surface === "work"
     ? engine === "codex" ? CODEX_WORK_COMMANDS : WORK_COMMANDS
     : engine === "codex" ? CODEX_COMMANDS : COMMANDS
 );
-export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+export const clientSlashesFor = (engine?: string): Set<string> => (engine === "dsh" ? new Set(["model", "context", "diff", "preview", "open", "skills"]) : engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+
+export const DSH_SIDECHAT_UNAVAILABLE = "DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。";
 
 /** A built-in command intentionally available on Code but absent from Work.
  * Unknown slashes return false so user-installed Claude skills remain usable. */
@@ -465,6 +475,9 @@ export function routeComposerInput(
   const raw = input.trim();
   if (raw === "/") return { kind: "empty" };
   const parsed = parseSlash(raw);
+  if (engine === "dsh" && parsed?.slash === "btw") {
+    return { kind: "blocked", message: DSH_SIDECHAT_UNAVAILABLE };
+  }
   if (surface === "work" && parsed && isKnownCodeOnlySlash(parsed.slash, engine)) {
     return { kind: "blocked", message: `/${parsed.slash} 是 Code 指令，请切换到 Code 使用` };
   }

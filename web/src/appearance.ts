@@ -19,10 +19,14 @@ export const APPEARANCE_FONTS: Record<AppearanceFont, { label: string; stack?: s
   sans: { label: "无衬线", stack: 'Arial,"Helvetica Neue","PingFang SC","Microsoft YaHei",sans-serif' },
   serif: { label: "衬线", stack: 'ui-serif,"Iowan Old Style","Songti SC","Noto Serif CJK SC",Georgia,serif' },
 };
-const CLASSIC: Record<"claude" | "codex", Record<ThemeMode, AppearanceColors>> = {
+const CLASSIC: Record<ThemeEngine, Record<ThemeMode, AppearanceColors>> = {
   claude: {
     light: { accent: "#C15F3C", background: "#F7F5EF", foreground: "#201E18" },
     dark: { accent: "#DB7C5E", background: "#1B1A17", foreground: "#ECE9DF" },
+  },
+  dsh: {
+    light: { accent: "#2E6FF0", background: "#FBFCFE", foreground: "#111726" },
+    dark: { accent: "#6BA5FF", background: "#0D0E15", foreground: "#ECEDF3" },
   },
   codex: {
     light: { accent: "#6F69D2", background: "#FAFAFC", foreground: "#252334" },
@@ -98,7 +102,7 @@ export function saveAppearanceChange(storage: Pick<Storage, "getItem" | "setItem
   return next;
 }
 export function appearanceColors(engine: ThemeEngine, mode: ThemeMode, look: AppearanceLook): AppearanceColors {
-  const base = look.preset ? PRESETS[look.preset] : CLASSIC[engine === "codex" ? "codex" : "claude"][mode];
+  const base = look.preset ? PRESETS[look.preset] : CLASSIC[engine][mode];
   return { accent: look.accent ?? base.accent, background: look.background ?? base.background,
     foreground: look.foreground ?? base.foreground };
 }

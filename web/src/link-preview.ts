@@ -13,7 +13,8 @@ const imageData = (value: unknown): string | undefined => typeof value === "stri
 
 function remember(key: string, value: LinkMetadata) {
   cache.delete(key);
-  cache.set(key, { expires: Date.now() + (Object.values(value).some(Boolean) ? 3600000 : 60000), value });
+  const complete = !!value.icon && (key.startsWith("icon:") || !!value.image);
+  cache.set(key, { expires: Date.now() + (complete ? 3600000 : 60000), value });
   while (cache.size > 64) cache.delete(cache.keys().next().value!);
 }
 

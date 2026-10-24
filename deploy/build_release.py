@@ -262,6 +262,8 @@ def build_bundle(
             _copy_file(root / "deploy" / filename, staging / "deploy" / filename)
             if filename.endswith(".sh"):
                 (staging / "deploy" / filename).chmod(0o755)
+        if role == "wrapper":
+            _copy_tree(root / "integrations" / "dsh", staging / "integrations" / "dsh")
         if role == "relay":
             _copy_tree(root / "web" / "dist", staging / "web" / "dist")
         else:
