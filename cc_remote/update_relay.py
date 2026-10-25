@@ -19,7 +19,9 @@ import uuid
 from dotenv import dotenv_values
 
 from cc_remote.update import Installation, UpdateError, version_tuple
+from cc_remote.update_errors import endpoint, network_reason, ssh_reason
 from deploy.install_cli import _atomic_file
+from deploy import relay_update_job
 from deploy.release_manifest import load_manifest
 
 
@@ -73,8 +75,11 @@ def _get_json(url: str) -> dict:
         if not isinstance(value, dict):
             raise ValueError("invalid response")
         return value
-    except (OSError, ValueError) as exc:
-        raise UpdateError("cannot verify Relay health/version; no local service was changed") from exc
+    except OSError as exc:
+        stage = "Relay health check" if urlsplit(url).path == "/healthz" else "Relay Web version check"
+        raise UpdateError(f"{stage} failed at {endpoint(url)}: {network_reason(exc)}; no local service was changed") from exc
+    except ValueError as exc:
+        raise UpdateError(f"invalid Relay JSON response from {endpoint(url)}; check the server/reverse proxy; no local service was changed") from exc
 
 
 def relay_release(origin: str) -> dict:
@@ -125,7 +130,7 @@ class RelayUpdate:
         if self.target:
             _atomic_file(self.settings, (json.dumps({"relay_ssh": self.target}) + "\n").encode(), 0o600)
 
-    def _ssh(self, command: list[str], *, timeout: int = 30) -> str:
+    def _ssh(self, command: list[str], *, timeout: int = 30, operation: str = "Relay SSH command") -> str:
         if not self.target:
             raise UpdateError(
                 "Relay also needs updating. Set CC_REMOTE_RELAY_SSH=user@host, "
@@ -147,11 +152,13 @@ class RelayUpdate:
                 args = ["runuser", "-u", user, "--", *args] if self.installation.metadata.get('linux_service') else ["sudo", "-H", "-u", user, "--", *args]
         try:
             response = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise UpdateError("Relay SSH connection unavailable; inspect the recorded upstream transaction before retrying") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise UpdateError(f"{operation} timed out; check your network and SSH access; a submitted job may still be running, so retry update to inspect the same transaction") from exc
+        except OSError as exc:
+            raise UpdateError(f"{operation}: cannot start the SSH client; check SSH installation and permissions") from exc
         if response.returncode:
-            # Do not print arbitrary remote output or credential helper output.
-            raise UpdateError("Relay SSH command failed; inspect SSH/sudo access and the recorded upstream transaction")
+            reason = ssh_reason(response.returncode, response.stderr or "")
+            raise UpdateError(f"{operation} on {self.target}: {reason}; no local activation was started; retry update to inspect any recorded transaction")
         return response.stdout
 
     def _verify_host(self) -> None:
@@ -164,7 +171,7 @@ class RelayUpdate:
         )
         try:
             info = json.loads(self._ssh(["sudo", "-n", "/opt/cc-remote/current/.venv/bin/python",
-                                         "-I", "-c", script]))
+                                         "-I", "-c", script], operation="Relay SSH host verification"))
         except (ValueError, TypeError) as exc:
             raise UpdateError("cannot verify the SSH host's managed Relay installation") from exc
         if not isinstance(info, dict) or info.get("domain") != urlsplit(self.origin).hostname:
@@ -172,6 +179,30 @@ class RelayUpdate:
 
     def _write_transaction(self, transaction: dict) -> None:
         _atomic_file(self.journal, (json.dumps(transaction, sort_keys=True) + "\n").encode(), 0o600)
+
+    def _submit(self, transaction: dict) -> None:
+        request = {key: transaction[key] for key in ("unit", "version", "protocol", "allow_protocol_change")}
+        request["domain"] = urlsplit(self.origin).hostname
+        # Send the small stdlib-only launcher so older Relays need no separate
+        # bootstrap deployment. The remote receipt serializes lost-SSH retries.
+        script = Path(relay_update_job.__file__).read_text()
+        output = self._ssh(
+            ["sudo", "-n", "/opt/cc-remote/current/.venv/bin/python", "-I", "-c",
+             script, json.dumps(request)], operation="Relay update submission",
+        )
+        try:
+            status = json.loads(output).get("status")
+        except (ValueError, AttributeError) as exc:
+            raise UpdateError("invalid Relay launch acknowledgement; retry update to inspect the same transaction") from exc
+        if not isinstance(status, str) or status not in {"submitted", "existing", "busy"}:
+            unit = transaction["unit"]
+            reason = status if isinstance(status, str) and status in {"uncertain", "launch-error", "unavailable"} else "unavailable"
+            raise UpdateError(
+                f"Relay update submission {reason}; "
+                f"inspect sudo systemctl status {unit}.service and sudo journalctl -u {unit}.service on the SSH host; "
+                f"the launch receipt is /opt/cc-remote/update-jobs/{unit}.json. "
+                "No second transaction or local activation was started"
+            )
 
     def _finish(self, transaction: dict) -> None:
         unit = transaction.get("unit")
@@ -181,13 +212,34 @@ class RelayUpdate:
         version_tuple(transaction.get("version"))
         if type(transaction.get("protocol")) is not int or transaction["protocol"] < 1:
             raise UpdateError("invalid upstream transaction protocol; inspect upstream-update.json")
+        if transaction.get("launch_receipt") is not None and (
+            type(transaction["launch_receipt"]) is not int or transaction["launch_receipt"] != 1
+            or type(transaction.get("allow_protocol_change")) is not bool
+        ):
+            raise UpdateError("invalid upstream launch receipt; inspect upstream-update.json")
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
             output = self._ssh(["sudo", "-n", "systemctl", "show", f"{unit}.service",
-                                "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus"])
+                                "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus"],
+                               operation="Relay update status check")
             state = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
             if state.get("LoadState") != "loaded":
-                raise UpdateError(f"Relay transaction outcome unknown: inspect {unit}.service; no second update was started")
+                if state.get("LoadState") == "not-found" and transaction.get("launch_receipt") == 1:
+                    # The server submits only if neither its receipt nor the unit
+                    # exists. A late first SSH request shares that same lock/id.
+                    self._submit(transaction)
+                    time.sleep(2)
+                    continue
+                explanation = (
+                    "This older transaction has no server launch receipt; "
+                    if transaction.get("launch_receipt") is None else "The remote job state could not be verified; "
+                )
+                raise UpdateError(
+                    f"Relay transaction outcome unknown: inspect sudo systemctl status {unit}.service "
+                    f"and sudo journalctl -u {unit}.service on the SSH host, plus public Relay health/version. "
+                    f"{explanation}preserve upstream-update.json "
+                    "until its outcome is reconciled. No second update was started"
+                )
             if state.get("ActiveState") == "failed":
                 raise UpdateError(f"Relay update failed: inspect journalctl -u {unit}.service and its rollback report")
             if state.get("SubState") == "exited":
@@ -231,15 +283,11 @@ class RelayUpdate:
         self.save_settings()
         unit = f"cc-remote-update-{uuid.uuid4().hex}"
         transaction = {"unit": unit, "origin": self.origin, "ssh": self.target,
-                       "version": version, "protocol": protocol, "complete": False}
+                       "version": version, "protocol": protocol, "complete": False,
+                       "launch_receipt": 1, "allow_protocol_change": allow_protocol_change}
         self._write_transaction(transaction)
-        command = ["sudo", "-n", "systemd-run", "--unit", unit,
-                   "--property=Type=oneshot", "--property=RemainAfterExit=yes", "--",
-                   "/usr/local/bin/cc-remote", "update", "--role", "relay", "--version", version]
-        if allow_protocol_change:
-            command.append("--allow-protocol-change")
         print(f"Updating Relay first; independent server transaction: {unit}", flush=True)
-        self._ssh(command)
+        self._submit(transaction)
         self._finish(transaction)
 
 

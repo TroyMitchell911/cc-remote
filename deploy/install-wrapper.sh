@@ -492,9 +492,17 @@ cleanup() {
         "$target/.venv/bin/python" "$target/deploy/release_retention.py" abort \
           --root "$appdir" --generation "$retention_generation" || true
       fi
-      echo "ERROR: wrapper activation failed; code and wrapper data were restored" >&2
+      if [ "$snapshot_created" -eq 1 ]; then
+        echo "ERROR: wrapper activation failed; code/service state and wrapper data were restored" >&2
+      elif [ "$switched" -eq 1 ] || [ "$service_changed" -eq 1 ] || [ "$service_stopped" -eq 1 ]; then
+        echo "ERROR: wrapper activation failed; code/service changes were rolled back; wrapper data was not changed" >&2
+      elif [ "$device_changed" -eq 1 ]; then
+        echo "ERROR: wrapper setup failed before activation; see device credential recovery above; service, code and wrapper data were not changed" >&2
+      else
+        echo "ERROR: wrapper preflight failed before activation; existing service, code and wrapper data were not changed" >&2
+      fi
     else
-      echo "ERROR: wrapper activation failed; manual data recovery is required" >&2
+      echo "ERROR: wrapper activation failed; automatic rollback is incomplete; manual recovery is required" >&2
     fi
   elif [ "$status" -ne 0 ]; then
     echo "WARNING: Wrapper activation was committed; inspect it before retrying." >&2

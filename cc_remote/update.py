@@ -23,6 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from cc_remote.update_errors import download_reason, endpoint, network_reason
 from deploy.release_manifest import ReleaseManifestError, load_manifest
 from deploy.install_lock import LOCK_FD_ENV, InstallLockError, acquire_install_lock
 
@@ -166,10 +167,10 @@ def latest_version(repository: str) -> str:
         version = tag[1:]
         version_tuple(version)
         return version
-    except HTTPError as exc:
-        raise UpdateError(f"GitHub release lookup failed (HTTP {exc.code}); try later or use --version") from exc
-    except (URLError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        raise UpdateError("cannot determine the latest stable release; try later or use --version") from exc
+    except (HTTPError, URLError, OSError) as exc:
+        raise UpdateError(f"GitHub release lookup failed: {network_reason(exc)}; try --version for an exact release; no service was changed") from exc
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise UpdateError("invalid GitHub release response; check the release source or use --version; no service was changed") from exc
 
 
 def release_base(repository: str, version: str) -> str:
@@ -193,11 +194,14 @@ def _download(url: str, destination: Path, limit: int) -> None:
         ["curl", "--fail", "--location", "--proto", "=https,file", "--proto-redir", "=https",
          "--tlsv1.2", "--connect-timeout", "15", "--max-time", "300",
          "--retry", "2", "--retry-max-time", "60", "--max-filesize", str(limit),
-         "--silent", "--show-error", "--output", str(destination), url],
-        check=False,
+         "--silent", "--show-error", "--write-out", "%{http_code}", "--output", str(destination), url],
+        check=False, capture_output=True, text=True,
     )
-    if result.returncode or not destination.is_file() or destination.stat().st_size > limit:
-        raise UpdateError(f"download failed for {destination.name}; no service was changed")
+    if result.returncode:
+        reason = download_reason(result.returncode, result.stdout.strip())
+        raise UpdateError(f"download failed for {destination.name} from {endpoint(url)}: {reason}; no service was changed")
+    if not destination.is_file() or destination.stat().st_size > limit:
+        raise UpdateError(f"download failed for {destination.name}: missing or oversized file; no service was changed")
 
 
 def download_bundle(installation: Installation, version: str, base: str, stage: Path) -> Path:
@@ -422,7 +426,7 @@ def update(*, role: str | None, target_version: str | None, check: bool,
                 command += ["--allow-protocol-change"]
             print("Activating with the release installer; previous release retained for rollback.", flush=True)
             if run_installer(command, lock_descriptor):
-                raise UpdateError("installer did not complete successfully; inspect its rollback report before retrying")
+                raise UpdateError("installer did not complete successfully; see the failure stage and recovery status above before retrying")
             active = read_installation(installation.root, system, machine)
             if active.manifest != target:
                 raise UpdateError("installer returned without activating the selected release; inspect current")
