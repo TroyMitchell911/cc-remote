@@ -64,6 +64,7 @@ def fold_plan(data: dict, event) -> None:
                                if isinstance(row, dict) and isinstance(row.get("content"), str)
                                and row["content"].strip()]
         if name in {"enterplanmode", "exitplanmode"}:
+            data["mode_call"] = key
             boundaries = data.setdefault("boundaries", {})
             if name == "exitplanmode" and plan and plan.get("dismissed"):
                 # Manual mode selection has no EnterPlanMode in the native
@@ -256,7 +257,14 @@ class ClaudePlanStore:
                                     and call["plan_id"] == new.id):
                                 candidate["calls"][key]["denied"] = True
                                 new.phase = "changes_requested"
-                        if old.phase == "ready" and new.phase == "draft":
+                        # Manual mode exits are not in the native transcript.
+                        # Preserve one only across the same mode call, never
+                        # over a later submission/rejection of the same plan.
+                        previous_mode_calls = ({data["mode_call"]} if data.get("mode_call")
+                            else set(data.get("calls", {})) | set(data.get("seen", [])))
+                        same_mode_call = candidate.get("mode_call") in previous_mode_calls
+                        if old.phase == "ready" and (new.phase == "draft" or (
+                                new.phase == "changes_requested" and same_mode_call)):
                             new.phase = "ready"
                         same = old.model_dump(exclude={"revision", "dismissed"}) == new.model_dump(exclude={"revision", "dismissed"})
                         new.revision = old.revision + (not same)

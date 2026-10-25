@@ -204,6 +204,85 @@ def test_native_plan_denial_is_not_reopened_by_lagging_source(tmp_path):
     assert store.recover("s", history, source=3, refresh=True) == rejected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissed", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_manual_exit_after_rejection_survives_reads_and_restart(tmp_path, native_plan_source, dismissed, legacy):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    events = [use("EnterPlanMode", "enter"), result("enter"),
+              use("ExitPlanMode", "exit", plan="# Plan"), result("exit", error=True)]
+    native_plan_source(machine, events)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
+    assert store.get(ctx.key).phase == "changes_requested"
+    await machine._emit(ctx, Perm(mode="bypassPermissions"))
+    ready = store.get(ctx.key)
+    assert ready.phase == "ready"
+    if legacy:
+        # Existing projections predate explicit mode-call tracking.
+        with store._db() as db:
+            data = store._load(db, ctx.key)
+            data.pop("mode_call", None)
+            store._save(db, ctx.key, data)
+
+    # Unrelated native appends force real recovery, including before dismissal.
+    events.extend([use("Bash", "read", command="pwd"), result("read")])
+    native_plan_source(machine, events)
+    if dismissed:
+        await machine._handle_dismiss_claude_plan(DismissClaudePlan(
+            sid=ctx.key, plan_id=ready.id, revision=ready.revision, client_id="pwa"))
+        assert store.get(ctx.key).dismissed
+    expected = store.get(ctx.key)
+    machine._claude_plans = store = ClaudePlanStore(tmp_path)
+    events.extend([use("Bash", "read-again", command="pwd"), result("read-again")])
+    native_plan_source(machine, events)
+    transport.sent.clear()
+    for client in ("desktop", "pwa"):
+        await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id=client))
+        assert transport.sent[-1].plan == expected
+    assert all(e.to is not None for e in transport.sent)
+    assert ctx.sdk.client is None
+
+
+@pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("next_activity", ["enter", "pending", "rejected", "tasks"])
+def test_manual_exit_does_not_override_subsequent_native_plan_activity(tmp_path, history_first, next_activity):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit", error=True)]
+    store.recover("s", history)
+    store.observe("s", Perm(mode="acceptEdits"))
+    ready = store.get("s")
+    if next_activity == "enter":
+        additions = [use("EnterPlanMode", "new"), result("new")]
+        expected_phase = "draft"
+    elif next_activity == "tasks":
+        store.dismiss("s", ready.id, ready.revision)
+        additions = [use("TodoWrite", "work", todos=[{"content": "New work", "status": "pending"}]), result("work")]
+        expected_phase = "ready"
+    else:
+        # The same document can be submitted and rejected again on the same plan.
+        additions = [use("ExitPlanMode", "retry", plan="# Plan")]
+        if next_activity == "rejected":
+            additions.append(result("retry", error=True))
+        expected_phase = "changes_requested" if next_activity == "rejected" else "pending"
+    if not history_first:
+        for event in additions:
+            store.observe("s", event)
+        live = store.get("s")
+    restored = store.recover("s", history + additions, refresh=True)
+    assert restored.phase == expected_phase and not restored.dismissed
+    assert restored.revision > ready.revision
+    if next_activity == "tasks":
+        assert restored.steps == [{"step": "New work", "status": "pending"}]
+    if not history_first:
+        assert restored == live
+    assert ClaudePlanStore(tmp_path).recover("s", history + additions, refresh=True) == restored
+    rewound = store.recover("s", history, rollback=True)
+    assert rewound.phase == "changes_requested" and not rewound.dismissed
+    assert rewound.revision > restored.revision
+
+
 @pytest.mark.parametrize("from_history", [False, True])
 def test_rollback_before_plan_keeps_revision_boundary_across_restart(tmp_path, from_history):
     store = ClaudePlanStore(tmp_path)
@@ -372,7 +451,7 @@ async def test_targeted_read_publishes_native_plan_changes_before_live_replay(tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("history_first", [False, True])
-@pytest.mark.parametrize("old_phase", ["approved", "ready"])
+@pytest.mark.parametrize("old_phase", ["approved", "ready", "rejected"])
 async def test_dismissed_plan_boundary_survives_refresh_restart_and_dismiss(
         tmp_path, native_plan_source, history_first, old_phase):
     machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
@@ -380,14 +459,16 @@ async def test_dismissed_plan_boundary_survives_refresh_restart_and_dismiss(
     events = [use("EnterPlanMode", "enter"), result("enter")]
     if old_phase == "approved":
         events.extend([use("ExitPlanMode", "exit", plan="# Old plan"), result("exit")])
+    elif old_phase == "rejected":
+        events.extend([use("ExitPlanMode", "exit", plan="# Old plan"), result("exit", error=True)])
     events.extend([use("TodoWrite", "done", todos=[{"content": "Old checklist", "status": "completed"}]),
                    result("done")])
     native_plan_source(machine, events)
     await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
-    if old_phase == "ready":
+    if old_phase in {"ready", "rejected"}:
         await machine._emit(ctx, Perm(mode="bypassPermissions"))
     old = store.get(ctx.key)
-    assert old.phase == old_phase
+    assert old.phase == ("ready" if old_phase == "rejected" else old_phase)
     await machine._handle_dismiss_claude_plan(DismissClaudePlan(
         sid=ctx.key, plan_id=old.id, revision=old.revision, client_id="pwa"))
     assert store.get(ctx.key).dismissed
