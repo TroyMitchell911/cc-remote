@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+## v5.1.1
+
+Explain update failures, recover undelivered Relay update submissions, and report rollback state accurately. Wire protocol v83 is unchanged. See the bilingual [release notes](docs/releases/v5.1.1.md).
+
+- Identify DNS, TLS, timeout, SSH authentication and sudo failures without changing the user's network configuration or exposing credentials.
+- Reuse the original remote update job with durable launch receipts; preserve uncertain and legacy transactions for explicit reconciliation.
+- Distinguish preflight failures that leave the existing service unchanged from completed or incomplete rollback.
+
 ## v5.1.0
 
 Add opt-in account quota windows and keep cross-session delivery receipts with their send tools. Wire protocol advances from v82 to v83. See the bilingual [release notes](docs/releases/v5.1.0.md).
