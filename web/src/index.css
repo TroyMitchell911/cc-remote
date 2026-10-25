@@ -2356,3 +2356,25 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 :root[data-palette]:not([data-palette="classic"]) :focus-visible{ outline-color:var(--accent-ink); }
 
 .engine-brand-icon.dsh{display:inline-block;flex:none;background:currentColor;mask-size:contain;mask-repeat:no-repeat;mask-position:center}
+
+/* Plan documents use the same readable Markdown in the monitor and approval. */
+.plan-document { min-width:0; margin:12px 0; color:var(--dim); font-size:13px; line-height:1.65; overflow-wrap:anywhere; }
+.plan-document h1, .plan-document h2, .plan-document h3 { color:var(--text); line-height:1.4; margin:1em 0 .5em; font-size:1.08em; }
+.plan-document h1 { font-size:1.2em; }
+.plan-document p { margin:.65em 0; }
+.plan-document ul, .plan-document ol { padding-left:1.5em; }
+.plan-document pre { overflow:auto; padding:10px; border-radius:8px; background:var(--raised); }
+.plan-document code { overflow-wrap:anywhere; }
+.plan-document img { display:none; }
+.plan-completion { display:flex; flex-direction:column; gap:7px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px; }
+.plan-completion button { align-self:flex-end; border:1px solid var(--border); border-radius:9px; background:var(--raised); color:var(--accent); padding:8px 12px; cursor:pointer; }
+.plan-completion button:disabled { opacity:.5; cursor:default; }
+.plan-completion small { color:var(--faint); font-size:11px; }
+.plan-approval label { display:flex; flex-direction:column; gap:8px; margin:18px 0; color:var(--dim); }
+.plan-approval select { width:100%; padding:10px; border:1px solid var(--border); background:var(--raised); color:var(--text); border-radius:8px; font:inherit; }
+.plan-approval-actions { display:flex; justify-content:flex-end; gap:10px; padding:8px 0; }
+.plan-approval-actions button { padding:10px 16px; border-radius:9px; border:1px solid var(--border); background:var(--raised); color:var(--text); cursor:pointer; }
+.plan-approval-actions button.primary { background:var(--accent); color:var(--on-accent,#fff); }
+
+.plan-approval-footer { flex:none; padding:0 22px 12px; border-top:1px solid var(--border); }
+.plan-approval-footer label { margin:12px 0 4px; font-size:13px; }

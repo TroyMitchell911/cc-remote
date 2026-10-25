@@ -1,5 +1,6 @@
 import type {
   AssistantChannel,
+  ClaudePlan,
   AsyncQuestionSpec,
   ConversationImageRef,
   PlanEntry,
@@ -71,6 +72,7 @@ export interface ToolBlock {
 }
 
 export interface ProcessBlock {
+  claudePlan?: ClaudePlan;
   kind: "process";
   item_id: string;
   processKind: ProcessKind;

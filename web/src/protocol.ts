@@ -575,7 +575,7 @@ export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disab
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
 export interface EngineCapabilities extends Base { dsh_commands?: DshCommandInfo[]; type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; claude_profile_id?: string | null; codex_profile_id?: string | null }
 export interface AskOption { label: string; ds?: string }
-export interface AskQuestion { header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+export interface AskQuestion { plan_document?: string | null; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
 export interface AskUser extends Base, AskQuestion { type: "ask_user"; ask_id: string; questions?: AskQuestion[] | null }
 /** Authoritative Hello baseline: following AskUser frames are the complete
  * still-open set visible to this client for the same session. */
@@ -583,6 +583,14 @@ export interface AskUserSync extends Base { type: "ask_user_sync" }
 export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
 export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer?: string | string[] | null; answers?: (string | string[])[] | null }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
+export interface ClaudePlan {
+  id: string; revision: number; turn_id?: string | null; document: string;
+  phase: "draft" | "pending" | "approved" | "changes_requested" | "ready";
+  steps: PlanEntry[]; dismissed: boolean;
+}
+export interface GetClaudePlan extends Base { type: "get_claude_plan" }
+export interface DismissClaudePlan extends Base { type: "dismiss_claude_plan"; plan_id: string; revision: number }
+export interface ClaudePlanState extends Base { type: "claude_plan_state"; plan?: ClaudePlan | null }
 export interface GetGoal extends Base { type: "get_goal" }
 export interface SetGoal extends Base {
   type: "set_goal";
@@ -759,14 +767,14 @@ export interface CodexContext extends Base {
 export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | TurnFileChangesPage
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | BtwSync | BtwClosed | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | DshState | DshCommandResult | DshReadResult | DshDownloadChunk | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserSync | AskUserClosed | ClaudePlanState | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 83;
+export const PROTOCOL_VERSION = 84;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

@@ -1,3 +1,4 @@
+import ReactMarkdown from "react-markdown";
 import { useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AskOption, AskQuestion, Engine } from "../protocol";
@@ -20,6 +21,7 @@ export interface QuestionDraft {
 interface Props {
   engine: Engine;
   question: string;
+  planDocument?: string | null;
   header?: string | null;
   options: AskOption[];
   allowText?: boolean;
@@ -38,7 +40,7 @@ export function QuestionSheet(props: Props) {
 }
 
 function SingleQuestionSheet({
-  engine, question, header, options, allowText, secret, multiSelect, onAnswer, draft,
+  engine, question, header, options, allowText, secret, multiSelect, onAnswer, draft, planDocument,
 }: Props) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const headingRef = useRef<HTMLDivElement>(null);
@@ -136,7 +138,11 @@ function SingleQuestionSheet({
         }}>
           {header && <div className="qa-header">{header}</div>}
           <div className="qa-question">{question}</div>
-          <div className="qa-options">
+          {planDocument != null && <div className="plan-approval">
+            {planDocument ? <div className="plan-document"><ReactMarkdown skipHtml>{planDocument}</ReactMarkdown></div>
+              : <p>本次请求未附带计划正文。</p>}
+          </div>}
+          {planDocument == null && <div className="qa-options">
             {options.map((o, i) => (
               <button key={i}
                 className={`qa-opt${selected.includes(o.label) ? " selected" : ""}`}
@@ -150,7 +156,7 @@ function SingleQuestionSheet({
               <button className="qa-multi-submit" disabled={selected.length === 0}
                 onClick={() => answer(selected)}>确定</button>
             )}
-          </div>
+          </div>}
           {allowText && <div className="qa-text-answer">
             <input ref={imeSubmit.inputRef} type={secret ? "password" : "text"} value={text}
               autoFocus={focusTextOnOpen.current} placeholder={secret ? "输入敏感内容" : "输入回答"}
@@ -175,6 +181,20 @@ function SingleQuestionSheet({
               onClick={imeSubmit.requestSubmit}>确定</button>
           </div>}
         </div>
+        {planDocument != null && <div className="plan-approval plan-approval-footer">
+            <label>批准后使用的权限
+              <select value={selected[0] ?? options[0]?.label} onChange={event => {
+                const next = [event.target.value]; setSelected(next); saveDraft({ selected: next });
+              }}>
+                {options.filter(option => option.label !== "继续修改").map(option =>
+                  <option key={option.label} value={option.label}>{option.label}</option>)}
+              </select>
+            </label>
+            <div className="plan-approval-actions">
+              <button type="button" onClick={() => answer("继续修改")}>继续修改</button>
+              <button type="button" className="primary" onClick={() => answer(selected[0] ?? options[0].label)}>批准计划</button>
+            </div>
+        </div>}
       </dialog>
   );
   return <>

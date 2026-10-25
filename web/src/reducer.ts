@@ -15,7 +15,7 @@ import { reduceWithRetainedArtifacts } from "./artifact-retention";
 import type { ConnState, EventOwnership } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, AskQuestion,
-  RateLimitResetResult, ThreadGoal,
+  RateLimitResetResult, ThreadGoal, ClaudePlan,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
@@ -354,6 +354,7 @@ export interface SessionRuntime {
   contextRefreshDeferred: boolean;
   contextError: string | null;
   goal: ThreadGoal | null;
+  claudePlan?: ClaudePlan | null;
   goalId: string | null;
   goalDismissed: boolean;
   completion: {
@@ -5752,13 +5753,20 @@ function reduceEvent(
     case "ask_user_sync":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = null; });
     case "ask_user":
-      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions }; });
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions, plan_document: e.plan_document }; });
     case "ask_user_closed":
       return patch(state, e.sid, (rt) => {
         if (rt.pendingQuestion?.ask_id === e.ask_id) {
           rt.pendingQuestion = null;
         }
       });
+    case "claude_plan_state":
+      return patch(state, e.sid, (rt) => {
+        // Dismissal and recovery are authoritative, independent of turn pages.
+        if (e.plan && rt.claudePlan?.id === e.plan.id
+            && rt.claudePlan.revision > e.plan.revision) return;
+        rt.claudePlan = e.plan ?? null;
+      }, true);
     case "goal_state":
       return patch(state, e.sid, (rt) => {
         rt.goal = e.goal ?? null;

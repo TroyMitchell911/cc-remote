@@ -64,6 +64,8 @@ EXPECTED_COMMAND_HANDLERS = {
     "set_goal": "_handle_set_goal",
     "clear_goal": "_handle_clear_goal",
     "dismiss_goal": "_handle_dismiss_goal",
+    "get_claude_plan": "_handle_get_claude_plan",
+    "dismiss_claude_plan": "_handle_dismiss_claude_plan",
     "acknowledge_completion": "_handle_acknowledge_completion",
     "list_sessions": "_handle_list_sessions",
     "switch_session": "_handle_switch_session",

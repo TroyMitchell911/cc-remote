@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from cc_remote.claude_permissions import native_permission_mode
 from cc_remote.claude_steering import (
     PendingSteers, background_end_ids, is_human_result, is_managed_input, steer_message,
 )
@@ -110,6 +111,8 @@ class Session:
         self.terminal_seq: int | None = None
         self.failure: str | None = None
         self.controls: dict = {}
+        self.permission_state_seq = 0
+        self.permission_revision = 0
         self.task_seeds: dict[str, dict] = {}
         self.background_turns: list[dict] = []
         self.submitted_turns: set[str] = set()
@@ -230,6 +233,11 @@ class Session:
                 # stop the sole native reader at a per-turn byte cap: an offline
                 # long turn could then never deliver the Result that frees it.
                 seq = self.journal.append(value)
+                permission = native_permission_mode(value)
+                if permission is not None:
+                    self.controls["permission_mode"] = permission
+                    self.permission_state_seq = seq
+                    self.permission_revision += 1
                 background = value.get("__cc_background_start")
                 if background and not any(t["identity"] == background["id"] for t in self.background_turns):
                     self.background_turns.append({"start_seq": seq - 1, "terminal_seq": None,
@@ -278,6 +286,7 @@ class Session:
                 if self.background_start is not None else self.ack),
             "initializers": self.initializers, "failure": self.failure,
             "head": self.journal.seq, "controls": self.controls, "pid": os.getpid(),
+            "permission_state_seq": self.permission_state_seq,
             "task_seeds": list(self.task_seeds.values()),
             "native_steering": True,
             "background_steering": True,
@@ -355,13 +364,25 @@ class Session:
         if method == "interrupt":
             return await self.steers.interrupt(self.client)
         if method == "control":
+            permission_revision = self.permission_revision
             result = await self.client._query._send_control_request(
                 params["request"], timeout=params.get("timeout", 60))
             request = params["request"]
             if request.get("subtype") == "set_model":
                 self.controls["model"] = request.get("model")
             elif request.get("subtype") == "set_permission_mode":
-                self.controls["permission_mode"] = request.get("mode")
+                # A native status received while awaiting the ACK is newer
+                # evidence than the requested value (including native fallback).
+                if self.permission_revision == permission_revision:
+                    self.controls["permission_mode"] = request.get("mode")
+                    self.permission_state_seq = self.journal.seq
+                    self.permission_revision += 1
+                # The controller may still be replaying rows from before this
+                # ACK. Send the same snapshot boundary used by reattachment.
+                return {**(result or {}), "cc_remote_permission_state": {
+                    "mode": self.controls["permission_mode"],
+                    "seq": self.permission_state_seq,
+                }}
             return result
         async with self.lock:
             if method == "steer":

@@ -1,3 +1,4 @@
+import ReactMarkdown from "react-markdown";
 import {
   useCallback,
   useEffect,
@@ -11,14 +12,16 @@ import { createPortal } from "react-dom";
 import { useAnchoredPopoverGeometry } from "../chat-dialog-geometry";
 import type { ProcessBlock } from "../domain/conversation";
 import { Icon } from "../icons";
-import { planProgressPresentation } from "../plan-progress";
+import { claudePlanDismissLabel, planProgressPresentation } from "../plan-progress";
 import {
   cancelDraggedPointer,
   PointerTapGuard,
   releaseDraggedPointer,
 } from "../pointer-tap";
 
-export function PlanProgressContent({ block, detailLoading = false }: {
+export function PlanProgressContent({ block, detailLoading = false, onDismiss, disabled }: {
+  onDismiss?: () => void;
+  disabled?: boolean;
   block: ProcessBlock;
   detailLoading?: boolean;
 }) {
@@ -33,9 +36,12 @@ export function PlanProgressContent({ block, detailLoading = false }: {
         <b>计划</b>
         <small>{presentation.stateLabel}</small>
       </span>
-      <strong>{presentation.progressLabel}</strong>
+      {presentation.progressLabel !== presentation.stateLabel
+        && <strong>{presentation.progressLabel}</strong>}
     </header>
-    {presentation.description && <p>{presentation.description}</p>}
+    {presentation.description && <div className="plan-document">
+      <ReactMarkdown skipHtml>{presentation.description}</ReactMarkdown>
+    </div>}
     {steps.length > 0 ? <ol>
       {steps.map((entry, index) => (
         <li key={`${index}-${entry.step}`} className={`plan-step-${entry.status}`}>
@@ -47,14 +53,23 @@ export function PlanProgressContent({ block, detailLoading = false }: {
       ))}
     </ol> : presentation.fallbackDetail
       ? <pre className="plan-progress-fallback">{presentation.fallbackDetail}</pre>
-      : <div className="plan-progress-empty">
-          {detailLoading ? "正在加载计划…" : "等待计划步骤…"}
+      : block.claudePlan ? null : <div className="plan-progress-empty">
+          {detailLoading ? "正在加载计划…"
+            : block.done ? "未提供计划步骤。" : "等待计划步骤…"}
         </div>}
+    {onDismiss && claudePlanDismissLabel(block.claudePlan) && <footer className="plan-completion">
+      <button type="button" disabled={disabled} onClick={onDismiss}>
+        {claudePlanDismissLabel(block.claudePlan)}
+      </button>
+      <small>收起后仍可在历史记录中查看计划。</small>
+    </footer>}
   </div>;
 }
 
 export function PlanProgressFloatingCard({ anchorRef, block, open,
-  onOpenChange, id, detailLoading = false, compact = false }: {
+  onOpenChange, id, detailLoading = false, compact = false, onDismiss, disabled }: {
+  onDismiss?: () => void;
+  disabled?: boolean;
   anchorRef: RefObject<HTMLElement | null>;
   block: ProcessBlock;
   open: boolean;
@@ -67,8 +82,8 @@ export function PlanProgressFloatingCard({ anchorRef, block, open,
   const position = useAnchoredPopoverGeometry({
     open,
     anchorRef,
-    maxWidth: compact ? 360 : 400,
-    maxHeight: compact ? 440 : 500,
+    maxWidth: block.claudePlan ? 520 : compact ? 360 : 400,
+    maxHeight: block.claudePlan ? 560 : compact ? 440 : 500,
   });
 
   useEffect(() => {
@@ -99,7 +114,7 @@ export function PlanProgressFloatingCard({ anchorRef, block, open,
       data-placement={placement}
       role="dialog" aria-modal="false" aria-label="计划进度"
       style={style}>
-      <PlanProgressContent block={block} detailLoading={detailLoading} />
+      <PlanProgressContent block={block} detailLoading={detailLoading} onDismiss={onDismiss} disabled={disabled} />
     </section>,
     document.body,
   );

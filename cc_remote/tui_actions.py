@@ -50,6 +50,8 @@ ACTION_CLASSES = (
     p.SetGoal,
     p.ClearGoal,
     p.DismissGoal,
+    p.GetClaudePlan,
+    p.DismissClaudePlan,
     p.AcknowledgeCompletion,
     p.GetQueuedQuery,
     p.UpdateQueuedQuery,
@@ -123,6 +125,8 @@ def defaults(
                 if key != "checkpoint_id" or engine == "claude"
                 else None
             )
+        elif name == "dismiss_claude_plan" and key in {"plan_id", "revision"}:
+            result[key] = (presentation.claude_plan or {}).get("id" if key == "plan_id" else key)
         elif key in {"goal_id", "completion_id"}:
             result[key] = (
                 presentation.goal_id

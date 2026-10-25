@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from claude_agent_sdk import get_session_messages
 
+from cc_remote.claude_permissions import CLAUDE_PERMISSION_MODES
 from cc_remote.wrapper.stream import (
     recover_claude_delayed_retry_tail,
     transcript_path,
@@ -26,9 +27,6 @@ from cc_remote.protocol import (
 
 
 CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-CLAUDE_PERMISSION_MODES = frozenset({
-    "default", "acceptEdits", "plan", "auto", "bypassPermissions",
-})
 CLAUDE_AUTO_COMPACT_MODES = frozenset({"inherit", "auto", "custom"})
 CLAUDE_DEFAULT_AUTO_COMPACT_MODE = "inherit"
 _V3_FORCED_AUTO_COMPACT_TOKENS = 500_000

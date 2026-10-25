@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 83
+PROTOCOL_VERSION = 84
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -934,6 +934,7 @@ class Delta(_Base):
 
 
 class ToolUse(_Base):
+    _claude_plan_input: Optional[dict] = PrivateAttr(default=None)
     # Native file evidence is consumed locally before entering the replay ring.
     _turn_change_source: Optional[dict] = PrivateAttr(default=None)
     type: Literal["tool_use"] = "tool_use"
@@ -960,6 +961,7 @@ class ToolDelta(_Base):
 
 
 class ToolResult(_Base):
+    _claude_task_id: Optional[str] = PrivateAttr(default=None)
     _turn_change_source: Optional[dict] = PrivateAttr(default=None)
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: WireId
@@ -1094,6 +1096,34 @@ class TurnPlan(_Base):
     turn_id: Optional[WireId] = None
     explanation: Optional[str] = Field(default=None, max_length=64 * 1024)
     plan: list[PlanEntry] = Field(max_length=128)
+
+
+class ClaudePlan(BaseModel):
+    """Current root plan, independent of turn completion and permission mode."""
+
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    revision: int = Field(default=1, ge=1)
+    turn_id: Optional[WireId] = None
+    document: str = Field(default="", max_length=64 * 1024)
+    phase: Literal["draft", "pending", "approved", "changes_requested", "ready"] = "draft"
+    steps: list[PlanEntry] = Field(default_factory=list, max_length=128)
+    dismissed: bool = False
+
+
+class ClaudePlanState(_Base):
+    type: Literal["claude_plan_state"] = "claude_plan_state"
+    plan: Optional[ClaudePlan] = None
+
+
+class GetClaudePlan(_Command):
+    type: Literal["get_claude_plan"] = "get_claude_plan"
+
+
+class DismissClaudePlan(_Command):
+    type: Literal["dismiss_claude_plan"] = "dismiss_claude_plan"
+    plan_id: WireId
+    revision: int = Field(ge=1)
 
 
 class TurnDiff(_Base):
@@ -3012,6 +3042,7 @@ class AskQuestion(BaseModel):
     allow_text: bool = False
     secret: bool = False
     multi_select: bool = False
+    plan_document: Optional[str] = Field(default=None, max_length=64 * 1024)
 
     @model_validator(mode="after")
     def choices_or_text(self):
@@ -3183,6 +3214,7 @@ AnyMessage = Union[
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
+    ClaudePlanState, GetClaudePlan, DismissClaudePlan,
     AcknowledgeCompletion, CompletionState,
     UserMsg, TurnSteered, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
     AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff, TurnFileChanges, TurnBinding,
@@ -3200,7 +3232,7 @@ DOWNSTREAM_TYPES = frozenset({
     "collaboration_mode", "session_control", "query_queue", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_file_changes", "turn_binding",
-    "turn_usage", "turn_end", "completion_state",
+    "turn_usage", "turn_end", "completion_state", "claude_plan_state",
     "error", "ask_user", "ask_user_closed", "history_invalidated", "artifact_invalidated",
 })
 
@@ -3342,6 +3374,9 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "set_goal": SetGoal,
     "clear_goal": ClearGoal,
     "dismiss_goal": DismissGoal,
+    "get_claude_plan": GetClaudePlan,
+    "dismiss_claude_plan": DismissClaudePlan,
+    "claude_plan_state": ClaudePlanState,
     "goal_state": GoalState,
     "acknowledge_completion": AcknowledgeCompletion,
     "completion_state": CompletionState,

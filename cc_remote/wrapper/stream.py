@@ -717,6 +717,7 @@ class StreamTranslator:
         # ordinary tool output.
         self._image_reads: dict[str, tuple[str, str | None]] = {}
         self._plan_item_id: str | None = None
+        self._plan_tools: dict[str, str] = {}
         # stop_reason can be null even for Claude's true final text. Keep the
         # last top-level no-tool candidate until the authoritative successful
         # Result boundary, where a second AssistantMsgEnd can reclassify the
@@ -876,6 +877,8 @@ class StreamTranslator:
             parent_id=parent, server=server,
             background=self._background_for_turn(tool_turn),
         ))
+        if block.name.lower() in {"enterplanmode", "exitplanmode", "todowrite", "taskcreate", "taskupdate"}:
+            events[-1]._claude_plan_input = block.input
         self.item_titles[tool_id] = title
         if category == "command":
             command = safe_input.get("command") or safe_input.get("cmd")
@@ -901,17 +904,18 @@ class StreamTranslator:
                 tool_id, phase="start", status="running", title=title,
                 summary=(f"类型：{agent_type}" if agent_type else None),
             ))
-        elif lower == "enterplanmode":
+        elif lower == "enterplanmode" and parent is None:
             self._plan_item_id = _wire_id(
-                f"plan:{self.turn_id or tool_id}", "plan")
+                f"plan:{tool_id}", "plan")
             events.append(ProcessEvent(
                 item_id=self._plan_item_id, kind="plan", phase="start",
                 status="running", turn_id=self.turn_id,
                 title="计划模式", summary="正在制定计划",
             ))
-        elif lower == "exitplanmode":
+        elif lower == "exitplanmode" and parent is None:
             plan_id = self._plan_item_id or _wire_id(
-                f"plan:{self.turn_id or tool_id}", "plan")
+                f"plan:{tool_id}", "plan")
+            self._plan_tools[tool_id] = plan_id
             plan_text = block.input.get("plan")
             if isinstance(plan_text, str) and plan_text.strip():
                 explanation, _ = bounded_text(plan_text, 64 * 1024)
@@ -920,9 +924,9 @@ class StreamTranslator:
                     explanation=explanation, plan=[],
                 ))
             events.append(ProcessEvent(
-                item_id=plan_id, kind="plan", phase="end",
-                status="succeeded", turn_id=self.turn_id,
-                title="计划模式", summary="计划已完成",
+                item_id=plan_id, kind="plan", phase="update",
+                status="running", turn_id=self.turn_id,
+                title="计划模式", summary="等待批准计划",
             ))
 
     def _emit_tool_result(self, events: list, tool_use_id: Any, content: Any,
@@ -1010,6 +1014,14 @@ class StreamTranslator:
             diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
             background=self._background_for_turn(tool_turn),
         ))
+        from .claude_plans import task_result_id
+        events[-1]._claude_task_id = task_result_id(native_result)
+        if tool_id in self._plan_tools:
+            events.append(ProcessEvent(
+                item_id=self._plan_tools.pop(tool_id), kind="plan", phase="end",
+                status="failed" if is_error else "succeeded", turn_id=tool_turn,
+                title="计划模式", summary="计划未批准" if is_error else "计划已批准",
+            ))
         if is_agent and agent_terminal is not False:
             events.append(self._agent_tool_event(
                 tool_id, phase="end",
@@ -3324,6 +3336,8 @@ def translate_history(
                             diff_source="native" if native_diff else "fragment",
                             diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
                         ))
+                        from .claude_plans import task_result_id
+                        events[-1]._claude_task_id = task_result_id(getattr(msg, "tool_use_result", None))
                         if agent_result:
                             events.append(ProcessEvent(
                                 item_id=_agent_process_id(tool_id), kind="agent",
@@ -3523,6 +3537,8 @@ def translate_history(
                             server=server,
                             background=background_followup or None,
                         ))
+                    if isinstance(events[-1], ToolUse):
+                        events[-1]._claude_plan_input = raw_input
                     history_tool_names[tool_id] = b.get("name") or ""
                     if image_path is None and category == "agent":
                         events.append(ProcessEvent(
@@ -3536,17 +3552,17 @@ def translate_history(
                     if diff:
                         history_tool_diffs[tool_id] = (diff, diff_truncated)
                     lower = str(b.get("name") or "").lower()
-                    if lower == "enterplanmode":
+                    if lower == "enterplanmode" and parent is None:
                         history_plan_id = _wire_id(
-                            f"plan:{current_turn_id or tool_id}", "plan")
+                            f"plan:{tool_id}", "plan")
                         events.append(ProcessEvent(
                             item_id=history_plan_id, kind="plan", phase="start",
                             status="running", turn_id=current_turn_id,
                             title="计划模式", summary="正在制定计划",
                         ))
-                    elif lower == "exitplanmode":
+                    elif lower == "exitplanmode" and parent is None:
                         plan_id = history_plan_id or _wire_id(
-                            f"plan:{current_turn_id or tool_id}", "plan")
+                            f"plan:{tool_id}", "plan")
                         plan_text = raw_input.get("plan")
                         if isinstance(plan_text, str) and plan_text.strip():
                             explanation, _ = bounded_text(plan_text, 64 * 1024)
@@ -3554,9 +3570,9 @@ def translate_history(
                                 item_id=plan_id, turn_id=current_turn_id,
                                 explanation=explanation, plan=[]))
                         events.append(ProcessEvent(
-                            item_id=plan_id, kind="plan", phase="end",
-                            status="succeeded", turn_id=current_turn_id,
-                            title="计划模式", summary="计划已完成"))
+                            item_id=plan_id, kind="plan", phase="update",
+                            status="running", turn_id=current_turn_id,
+                            title="计划模式", summary="等待批准计划"))
                 elif _claude_history_tool_result_block(b):
                     tool_id = _history_id(
                         b.get("tool_use_id"), "tool",
@@ -3596,6 +3612,8 @@ def translate_history(
                         diff=diff_info[0] if diff_info and not is_error else None,
                         background=background_followup or None,
                     ))
+                    from .claude_plans import task_result_id
+                    events[-1]._claude_task_id = task_result_id(getattr(msg, "tool_use_result", None))
                     if agent_result:
                         events.append(ProcessEvent(
                             item_id=_agent_process_id(tool_id), kind="agent",
@@ -3638,7 +3656,8 @@ def translate_history(
     # closed authoritatively by the next visible user message.
     if not snapshot_in_progress:
         close_turn()
-    return events
+    from .claude_plans import settle_history_plan_results
+    return settle_history_plan_results(events)
 
 
 def _parse_timestamp(value: Any) -> float | None:

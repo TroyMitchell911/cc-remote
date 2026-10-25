@@ -1328,6 +1328,16 @@ export class RelayWs {
     return this.sendTracked({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...(sid ? { sid } : this.sidObj()) });
   }
 
+  sendGetClaudePlanTo(sid: string): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "get_claude_plan",
+      sid, client_id: this.clientId, ts: nowTs() });
+  }
+
+  sendDismissClaudePlanTo(sid: string, planId: string, revision: number): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "dismiss_claude_plan",
+      sid, plan_id: planId, revision, client_id: this.clientId, ts: nowTs() });
+  }
+
   sendDismissGoalTo(sid: string, goalId: string): string | null {
     return this.sendTracked({
       v: PROTOCOL_VERSION,

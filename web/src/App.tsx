@@ -258,6 +258,7 @@ import {
   type SkillCatalogRequest,
 } from "./skill-catalog-cache";
 import {
+  claudePlanProgress,
   completedGoalHasNewerUserTurn,
   latestPlanProgress,
   planFollowsCompletedGoal,
@@ -1254,18 +1255,20 @@ export default function App() {
         historyTurns: historyView.turns,
         recovering: historyView.recovering,
         runtimeLoading: rt.loading === true,
+        permissionMode: rt.perm,
       })
     : null;
   // An unfinished snapshot from the completed Goal must not briefly become the
   // standalone monitor for the next task. Keep only a Plan whose owning user
   // turn starts after the authoritative Goal completion boundary.
-  if (completedGoalRetired && planProgress
+  if (focusedEngine !== "claude" && completedGoalRetired && planProgress
       && !planFollowsCompletedGoal(rt.goal, planProgress)) {
     planProgressCacheRef.current.clear({
       machineId, engine: focusedEngine, space, sid: focusedSid!,
     });
     planProgress = null;
   }
+  if (focusedEngine === "claude") planProgress = claudePlanProgress(rt.claudePlan);
   const planProgressSource = planProgress?.source ?? null;
   const capabilityCwd = focusedSession?.cwd || currentCwd;
   const requestFocusedModels = () => wsRef.current?.sendGetModels(
@@ -1369,6 +1372,13 @@ export default function App() {
         : current
     ));
   }, [activeBtwSid, focusedSid]);
+
+  useEffect(() => {
+    if (focusedEngine === "claude" && authed && focusedSid && !state.newChat
+        && state.connState === "connected" && state.wrapperOnline) {
+      wsRef.current?.sendGetClaudePlanTo(focusedSid);
+    }
+  }, [authed, focusedEngine, focusedSid, machineId, state.connState, state.wrapperOnline, state.newChat]);
 
   useEffect(() => {
     if (focusedEngine === "dsh" || !authed || !focusedSid || !focusedGoalScopeKey || state.newChat
@@ -6296,6 +6306,9 @@ export default function App() {
                 loading={!!goalUi?.loading}
                 completedGoalRetired={completedGoalRetired}
                 plan={planProgress}
+                onDismissPlan={focusedEngine === "claude" && rt.claudePlan && focusedSid
+                  ? () => { wsRef.current?.sendDismissClaudePlanTo(focusedSid,
+                    rt.claudePlan!.id, rt.claudePlan!.revision); } : undefined}
                 onLoadPlanDetail={planProgress?.needsDetail
                     && !planProgress.detailLoading && !historyView.recovering
                   ? () => {
@@ -6350,6 +6363,7 @@ export default function App() {
                 engine={focusedEngine}
                 header={rt.pendingQuestion.header}
                 question={rt.pendingQuestion.question}
+                planDocument={rt.pendingQuestion.plan_document}
                 options={rt.pendingQuestion.options}
                 allowText={rt.pendingQuestion.allow_text}
                 secret={rt.pendingQuestion.secret}

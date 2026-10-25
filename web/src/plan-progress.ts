@@ -1,5 +1,5 @@
 import type { Block, ProcessBlock, Turn } from "./domain/conversation.ts";
-import type { ThreadGoal } from "./protocol.ts";
+import type { ClaudePlan, ThreadGoal } from "./protocol.ts";
 import { mergeDetailWithLiveTail } from "./history-merge.ts";
 
 export interface TurnPlanProgress {
@@ -51,6 +51,32 @@ function copyProgress(
   };
 }
 
+/** Claude's plan-mode marker is not a structured task checklist. Leaving the
+ * mode ends that activity, but says nothing about whether a plan was finished.
+ * Derive this from confirmed permission state even when history/cache supplies
+ * the marker later; never alter the source transcript or a Codex task plan.
+ */
+export function settleClaudePlanMode<T extends TurnPlanProgress>(
+  progress: T | null,
+  engine: SessionPlanProgressScope["engine"],
+  permissionMode: string | undefined,
+): T | null {
+  if (!progress || engine !== "claude" || !permissionMode
+      || permissionMode === "plan" || progress.block.done
+      || progress.block.title !== "计划模式"
+      || (progress.block.plan?.length ?? 0) > 0) return progress;
+  return {
+    ...progress,
+    block: {
+      ...progress.block,
+      done: true,
+      phase: "end",
+      status: "succeeded",
+      summary: "已退出计划模式",
+    },
+  };
+}
+
 /** Keep the latest structured Plan independently for each visited session.
  *
  * Codex's full turn detail currently omits update_plan. The summary page and
@@ -79,6 +105,7 @@ export class SessionPlanProgressCache {
     historyTurns,
     recovering,
     runtimeLoading,
+    permissionMode,
   }: {
     machineId?: string;
     engine?: "claude" | "codex" | "dsh";
@@ -90,9 +117,11 @@ export class SessionPlanProgressCache {
     historyTurns: readonly Turn[];
     recovering: boolean;
     runtimeLoading: boolean;
+    permissionMode?: string;
   }): ScopedTurnPlanProgress | null {
     const cacheKey = this.key({ machineId, engine, space, sid });
-    const selected = runtime ?? history;
+    const selected = settleClaudePlanMode(
+      runtime ?? history, engine, permissionMode);
     if (selected) {
       const selectedTurns = runtime ? runtimeTurns : historyTurns;
       const newerTurns = runtime ? [] : runtimeTurns;
@@ -113,7 +142,8 @@ export class SessionPlanProgressCache {
       return entry;
     }
 
-    const retained = this.entries.get(cacheKey);
+    const retained = settleClaudePlanMode(
+      this.entries.get(cacheKey) ?? null, engine, permissionMode);
     if (!retained) return null;
     const turns = retained.source === "history" ? historyTurns : runtimeTurns;
     const owner = turns.find((turn) => turnOwnsProgress(
@@ -376,6 +406,18 @@ export function planProgressPresentation(
   const progress = steps.length > 0
     ? Math.min(100, completed / steps.length * 100)
     : 0;
+  const claude = block.claudePlan;
+  if (claude) {
+    const phaseLabel = { draft: "正在制定", pending: "待确认", approved: "已批准",
+      changes_requested: "继续修改", ready: "已退出计划模式" }[claude.phase];
+    const awaitingApproval = ["draft", "pending", "changes_requested"].includes(claude.phase);
+    const stateLabel = awaitingApproval ? phaseLabel
+      : complete ? "全部步骤已完成" : current ? "正在执行" : phaseLabel;
+    return { completed, total: steps.length, currentStep: current?.step ?? null,
+      failed: false, complete: complete && !awaitingApproval, stale: false, progress,
+      progressLabel: steps.length && !awaitingApproval ? `${completed} / ${steps.length}` : stateLabel,
+      stateLabel, description: claude.document || null, fallbackDetail: null };
+  }
   return {
     completed,
     total: steps.length,
@@ -396,4 +438,27 @@ export function planProgressPresentation(
       ? block.detail || block.output || block.progress || null
       : null,
   };
+}
+
+/** Canonical Claude state survives pagination, new turns and fresh clients. */
+export function claudePlanProgress(plan: ClaudePlan | null | undefined): ScopedTurnPlanProgress | null {
+  if (!plan || plan.dismissed
+      || (!plan.document && !plan.steps.length && plan.phase === "ready")) return null;
+  return {
+    turnId: plan.turn_id ?? plan.id, source: "runtime", needsDetail: false, detailLoading: false,
+    block: { kind: "process", processKind: "plan", item_id: plan.id,
+      phase: "snapshot", status: "running", title: "计划", done: false,
+      explanation: plan.document, plan: plan.steps, claudePlan: plan },
+  };
+}
+
+export function planDocumentTitle(document: string): string {
+  return (document.split(/\r?\n/).find(line => line.trim()) ?? "计划")
+    .replace(/^\s*#{1,6}\s*/, "").replace(/[*_`]/g, "").trim().slice(0, 160) || "计划";
+}
+
+export function claudePlanDismissLabel(plan: ClaudePlan | undefined): string | null {
+  if (!plan || ["draft", "pending", "changes_requested"].includes(plan.phase)) return null;
+  if (!plan.steps.length) return plan.document ? "确认已完成" : null;
+  return plan.steps.every(step => step.status === "completed") ? "已完成 · 收起" : null;
 }

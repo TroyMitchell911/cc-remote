@@ -7326,6 +7326,7 @@ class _ControlSdk:
                  fail_collaboration=False, fail_profile=False):
         self.approval = approval
         self.approval_policy = approval
+        self.permission_mode = approval
         self.permission_profile = ":workspace"
         self.web_search = "cached"
         self.web_search_override = None
@@ -7348,6 +7349,7 @@ class _ControlSdk:
             raise RuntimeError("apply failed")
         self.approval = mode
         self.approval_policy = mode
+        self.permission_mode = mode
 
     async def list_permission_profiles(self):
         return [

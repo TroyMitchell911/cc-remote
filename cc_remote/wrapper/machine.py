@@ -38,6 +38,7 @@ Multi-session model:
 from __future__ import annotations
 
 from cc_remote.wrapper import claude_service
+from cc_remote.claude_permissions import native_permission_mode
 from cc_remote.wrapper.claude_compaction import compact_completion_events
 
 import asyncio
@@ -48,6 +49,7 @@ import io
 import json
 import math
 import os
+import sqlite3
 import re
 import signal
 import shutil
@@ -67,7 +69,7 @@ from cc_remote.wrapper import codex_readiness
 from cc_remote.wrapper.artifact_service import ArtifactService
 
 from claude_agent_sdk import (
-    PermissionResultAllow, PermissionResultDeny, delete_session,
+    PermissionResultAllow, PermissionResultDeny, PermissionUpdate, delete_session,
     fork_session, get_session_info, get_session_messages, list_sessions,
     rename_session, tag_session,
 )
@@ -147,6 +149,7 @@ from cc_remote.protocol import (
     State, TakeoverState, SessionControl,
     UserMsg, TurnSteered, Delta,
     ToolUse, ToolResult, ProcessEvent, TurnPlan, TurnBinding, TurnEnd,
+    ClaudePlanState,
     TurnDiff, TurnFileChanges, TurnFileChangesPage,
     TurnNotificationContext,
     TurnResult, is_downstream,
@@ -2025,7 +2028,7 @@ class WrapperMachine:
         "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_session_artifacts", "get_session_artifact_preview",
         "get_context", "get_status", "get_diff", "get_turn_file_changes", "get_file_preview",
-        "get_preview_asset", "get_goal", "dismiss_goal",
+        "get_preview_asset", "get_goal", "dismiss_goal", "get_claude_plan", "dismiss_claude_plan",
         "acknowledge_completion",
         "get_queued_query", "list_dir", "browse_files",
         "get_work_dashboard", "sync_btw",
@@ -2047,7 +2050,7 @@ class WrapperMachine:
         "get_diff", "get_turn_file_changes", "get_file_preview", "save_markdown", "browse_files",
         "get_preview_asset", "authorize_preview",
         "answer_question", "get_goal", "set_goal", "clear_goal",
-        "dismiss_goal", "acknowledge_completion",
+        "dismiss_goal", "get_claude_plan", "dismiss_claude_plan", "acknowledge_completion",
     })
     BTW_DESTROYED_MESSAGE = "当前临时对话已经销毁，请创建新的临时对话"
     BTW_DESTROYED_ALLOWED_COMMANDS = frozenset({
@@ -2521,6 +2524,13 @@ class WrapperMachine:
         except SessionPinStoreError:
             self._session_pins = None
             log.exception("session pin store unavailable")
+        from .claude_plans import ClaudePlanStore
+        self._claude_plan_lock = asyncio.Lock()
+        try:
+            self._claude_plans = ClaudePlanStore(self.cfg.state_dir)
+        except (OSError, ValueError, sqlite3.Error):
+            self._claude_plans = None
+            log.exception("Claude plan store unavailable")
         try:
             self._session_plans: SessionPlanStore | None = SessionPlanStore(
                 self.cfg.state_dir)
@@ -2841,6 +2851,8 @@ class WrapperMachine:
         self._claude_forks.migrate_profile_sessions(
             transform, profile_revision=revision)
         self._migrate_private_btw_sessions(transition)
+        if self._claude_plans is not None:
+            self._claude_plans.migrate_profile_sessions(transform, profile_revision=revision)
 
     def _migrate_codex_core_profile_state(
         self, transition: CodexProfileTopologyTransition,
@@ -10601,6 +10613,22 @@ class WrapperMachine:
             if ctx.engine == "claude"
             else False
         )
+        plan_update = None
+        plan_store = getattr(self, "_claude_plans", None)
+        if (ctx.engine == "claude" and not ctx.btw and plan_store is not None
+                and isinstance(msg, (ToolUse, ToolResult, TurnPlan, Perm))):
+            from .claude_plans import PLAN_TOOLS
+            relevant = (isinstance(msg, (TurnPlan, Perm, ToolResult))
+                        or msg.tool.lower() in PLAN_TOOLS)
+            if relevant:
+                try:
+                    async with self._claude_plan_lock:
+                        await self._recover_claude_plan(msg.sid)
+                        changed, plan = await asyncio.to_thread(plan_store.observe, msg.sid, msg)
+                    if changed:
+                        plan_update = ClaudePlanState(plan=plan)
+                except (OSError, ValueError, sqlite3.Error):
+                    log.warning("Claude plan projection unavailable", session_id=msg.sid)
         if isinstance(msg, GoalState) and msg.sid:
             goal_id = self._goal_identity(msg.goal)
             dismissed = False
@@ -10735,6 +10763,8 @@ class WrapperMachine:
             else msg
         )
         await self.transport.send(live)
+        if plan_update is not None:
+            await self._emit_locked(ctx, plan_update)
         if background_membership_changed:
             # Keep one explicit level after a membership edge.  Clients which
             # miss either edge still converge, and Hello can always seed the
@@ -16851,6 +16881,77 @@ class WrapperMachine:
         # awaiting the same immutable page keep the shared read alive.
         return await asyncio.shield(task)
 
+    async def _recover_claude_plan(self, sid: str, *, refresh=False) -> None:
+        """Caller owns _claude_plan_lock. Read local history, never resume."""
+        store = self._claude_plans
+        if store is None:
+            raise ValueError("Claude plan store unavailable")
+        known = await asyncio.to_thread(store.known, sid)
+        if known and not refresh:
+            return
+        if sid.startswith("tmp-"):
+            return
+        profile, native_sid = self._claude_target(sid)
+        path = await asyncio.to_thread(self._claude_transcript_path, profile, native_sid)
+        if path is None:
+            return
+        source_stat = await asyncio.to_thread(os.stat, path)
+        source = [path, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns]
+        if known and await asyncio.to_thread(store.source, sid) == source:
+            return
+        def read():
+            # Reuse the native active-chain reader (including compaction and
+            # UUID aliases), rather than guessing from the newest four turns.
+            compact = transcript_compact_snapshot(native_sid, path=path, index_store=self._history_index)
+            if compact is not None:
+                messages, timestamps, internal = compact
+            else:
+                if os.path.getsize(path) > self.cfg.history_source_max_bytes:
+                    raise ValueError("plan source exceeds safe history read limit")
+                messages = self._claude_catalog_messages(profile, native_sid)
+                timestamps = transcript_timestamps(native_sid, path=path)
+                internal = {}
+            messages = recover_claude_native_metadata(
+                native_sid, messages, path=path, timestamps=timestamps,
+                internal_events=internal, index_store=self._history_index)
+            return translate_history(messages, self.cfg.tool_result_max, timestamps=timestamps,
+                                     internal_user_events=internal)
+        events = await asyncio.to_thread(read)
+        await asyncio.to_thread(store.recover, sid, events, source=source, refresh=refresh)
+
+    async def _handle_get_claude_plan(self, cmd) -> None:
+        sid = self._resolve_session_alias(cmd.sid) or cmd.sid
+        ctx = self._ctx_by_sid(sid)
+        if not sid or (ctx and (ctx.engine != "claude" or ctx.btw)):
+            return await self.transport.send(Error(code=ERR_BAD_PROMPT,
+                message="该会话不支持计划查询", sid=sid, to=cmd.client_id))
+        async with self._claude_plan_lock:
+            await self._recover_claude_plan(sid, refresh=True)
+            plan = await asyncio.to_thread(self._claude_plans.get, sid)
+            await self.transport.send(ClaudePlanState(plan=plan, sid=sid, to=cmd.client_id))
+
+    async def _handle_dismiss_claude_plan(self, cmd) -> None:
+        sid = self._resolve_session_alias(cmd.sid) or cmd.sid
+        ctx = self._ctx_by_sid(sid)
+        if not sid or (ctx and (ctx.engine != "claude" or ctx.btw)):
+            return
+        async def dismiss():
+            async with self._claude_plan_lock:
+                await self._recover_claude_plan(sid, refresh=True)
+                plan = await asyncio.to_thread(self._claude_plans.dismiss, sid, cmd.plan_id, cmd.revision)
+                # Broadcast the authoritative receipt, including a rejected
+                # stale click. No optimistic hide, no deletion of native files.
+                event = ClaudePlanState(plan=plan, sid=sid)
+                if ctx:
+                    await self._emit_locked(ctx, event)
+                else:
+                    await self.transport.send(event)
+        if ctx:
+            async with ctx.emit_lock:
+                await dismiss()
+        else:
+            await dismiss()
+
     async def _handle_get_history(self, cmd) -> None:
         """Client opened a session: return its history as ONE bulk frame, routed to
         the requester — like a web chat's GET /conversation. Opening it also starts
@@ -21008,6 +21109,8 @@ class WrapperMachine:
                        or cmd.mode)
             await self._persist_claude_session_controls(ctx)
             await self._persist_codex_session_controls(ctx)
+            if ctx.engine == "claude":
+                return await self._publish_claude_permission(ctx, force=True)
             ctx.announced_perm = applied
             event = Perm(mode=applied)
             await self._emit(ctx, event)
@@ -21406,8 +21509,7 @@ class WrapperMachine:
         try:
             await ctx.sdk.set_permission_mode(mode)
             await self._persist_claude_session_controls(ctx)
-            ctx.announced_perm = mode
-            await self._emit(ctx, Perm(mode=mode))
+            await self._publish_claude_permission(ctx, force=True)
             log.info("agent set permission mode", sid=ctx.session_id, mode=mode)
         except Exception as e:
             log.exception("agent set_mode failed", error=str(e))
@@ -22451,6 +22553,32 @@ class WrapperMachine:
                     await self._emit(target, update.model_copy(deep=True))
         return True
 
+    async def _publish_claude_permission(self, ctx: SessionContext, *, force=False):
+        async with ctx.emit_lock:
+            # Read after acquiring the publisher lock: native status may have
+            # changed again while a command was persisting its confirmation.
+            mode = ctx.sdk.permission_mode
+            if not force and ctx.announced_perm == mode:
+                return None
+            ctx.announced_perm = mode
+            event = Perm(mode=mode)
+            await self._emit_locked(ctx, event)
+            return event
+
+    async def _observe_claude_permission(self, ctx: SessionContext, message) -> None:
+        if not isinstance(message, SystemMessage):
+            return
+        mode = native_permission_mode(message.data)
+        # The sole reader applies native changes before routing. A delayed
+        # consumer must not overwrite a newer status or explicit selection.
+        if (mode is None or mode != getattr(ctx.sdk, "permission_mode", None)
+                or getattr(message, "_cc_permission_revision", None)
+                != getattr(ctx.sdk, "_permission_revision", None)):
+            return
+        if ctx.announced_perm != mode:
+            await self._publish_claude_permission(ctx)
+            await self._persist_claude_session_controls(ctx)
+
     async def _observe_claude_model_fallback(self, ctx: SessionContext, message) -> None:
         if not isinstance(message, SystemMessage):
             return
@@ -22505,6 +22633,7 @@ class WrapperMachine:
             return
         if await self._observe_claude_rate_limit_message(ctx, message):
             return
+        await self._observe_claude_permission(ctx, message)
         await self._observe_claude_model_fallback(ctx, message)
         is_result = isinstance(message, ResultMessage)
         followup_was_pending = self._claude_autonomous_followup_pending(ctx)
@@ -25590,6 +25719,7 @@ class WrapperMachine:
         allow_text: bool = False,
         secret: bool = False,
         multi_select: bool = False,
+        plan_document: str | None = None,
         timeout: float = 30 * 60,
         ask_id: str | None = None,
         to: str | None = None,
@@ -25607,6 +25737,7 @@ class WrapperMachine:
                 allow_text=allow_text,
                 secret=secret,
                 multi_select=multi_select,
+                plan_document=plan_document,
                 timeout=timeout,
                 ask_id=ask_id,
                 to=to,
@@ -25622,6 +25753,7 @@ class WrapperMachine:
         allow_text: bool = False,
         secret: bool = False,
         multi_select: bool = False,
+        plan_document: str | None = None,
         timeout: float = 30 * 60,
         ask_id: str | None = None,
         to: str | None = None,
@@ -25638,10 +25770,14 @@ class WrapperMachine:
             except (AttributeError, LookupError):
                 pass
             if origin is not None:
-                stable = json.dumps([service_client.id, origin, question, options, header],
+                identity_fields = [service_client.id, origin, question, options, header]
+                if plan_document is not None:
+                    identity_fields.append(plan_document)
+                stable = json.dumps(identity_fields,
                                     ensure_ascii=False, sort_keys=True)
                 if questions is not None:
-                    stable += json.dumps([q.model_dump() for q in questions],
+                    stable += json.dumps([q.model_dump(exclude={"plan_document"}
+                                          if q.plan_document is None else set()) for q in questions],
                                          ensure_ascii=False, sort_keys=True)
                 ask_id = "ask-" + hashlib.sha256(stable.encode()).hexdigest()[:32]
                 cached = await service_client.call("question_answer", {"ask_id": ask_id})
@@ -25662,6 +25798,7 @@ class WrapperMachine:
             allow_text=allow_text,
             secret=secret,
             multi_select=multi_select,
+            plan_document=plan_document,
             questions=questions,
             to=to,
         )
@@ -25990,10 +26127,60 @@ class WrapperMachine:
             "answers": answers,
         })
 
+    async def _record_claude_plan_permission(self, ctx, tool_input, permission_context, *, denied=False):
+        """The SDK may ask permission before delivering the assembled tool block.
+
+        Seed only the private plan projection, using the native call identity;
+        the conversation still receives exactly the real SDK tool event.
+        """
+        store = getattr(self, "_claude_plans", None)
+        identity = getattr(permission_context, "tool_use_id", None)
+        if store is None or ctx.btw or not isinstance(identity, str) or not identity:
+            return
+        try:
+            async with ctx.emit_lock:
+                sid = self._ctx_wire_sid(ctx) or ctx.key
+                async with self._claude_plan_lock:
+                    await self._recover_claude_plan(sid)
+                    if denied:
+                        changed, plan = await asyncio.to_thread(store.reject, sid, identity)
+                    else:
+                        event = ToolUse(message_id=identity, tool_use_id=identity,
+                                        tool="ExitPlanMode", input=tool_input)
+                        changed, plan = await asyncio.to_thread(store.observe, sid, event)
+                if changed:
+                    await self._emit_locked(ctx, ClaudePlanState(plan=plan))
+        except (OSError, ValueError, sqlite3.Error):
+            log.warning("Claude plan permission projection unavailable", session_id=ctx.key)
+
     async def _on_claude_tool_permission(self, ctx: SessionContext,
                                          tool_name: str, tool_input: dict,
                                          permission_context):
         """Bridge Claude Agent SDK can_use_tool to the remote client."""
+        if tool_name == "ExitPlanMode" and not getattr(permission_context, "agent_id", None):
+            await self._record_claude_plan_permission(ctx, tool_input, permission_context)
+            document = tool_input.get("plan")
+            document = document[:65536] if isinstance(document, str) else ""
+            modes = {"default": "逐次确认", "acceptEdits": "自动接受编辑"}
+            # Code launches with native bypass enabled; Work deliberately does not.
+            if not ctx.sdk.work_mode:
+                modes["bypassPermissions"] = "Bypass Permissions"
+            for suggestion in getattr(permission_context, "suggestions", None) or []:
+                if suggestion.type == "setMode" and suggestion.mode == "auto":
+                    modes["auto"] = "自动权限"
+            options = [{"label": label, "ds": "批准计划后使用此权限"} for label in modes.values()]
+            options.append({"label": "继续修改", "ds": "暂不批准计划"})
+            try:
+                answer = await self._on_ask(ctx, "请确认计划及批准后的权限", options,
+                    header="批准计划", plan_document=document)
+            except AskUnavailable:
+                await self._record_claude_plan_permission(ctx, tool_input, permission_context, denied=True)
+                return PermissionResultDeny(message="计划审批未完成，请等待用户确认。")
+            selected = next((mode for mode, label in modes.items() if label == answer), None)
+            if selected is None:
+                await self._record_claude_plan_permission(ctx, tool_input, permission_context, denied=True)
+                return PermissionResultDeny(message="用户要求继续修改计划。")
+            return PermissionResultAllow(updated_permissions=[PermissionUpdate(type="setMode", mode=selected)])
         if tool_name == "AskUserQuestion":
             return await self._on_claude_ask_user_question(ctx, tool_input)
 
@@ -28511,6 +28698,12 @@ class WrapperMachine:
                 ),
             )
         if old_key and old_key != route_sid:
+            if ctx.engine == "claude" and getattr(self, "_claude_plans", None) is not None:
+                try:
+                    async with self._claude_plan_lock:
+                        await asyncio.to_thread(self._claude_plans.move, old_key, route_sid)
+                except (OSError, ValueError, sqlite3.Error):
+                    log.warning("Claude plan rekey failed", session_id=route_sid)
             if self._session_plans is not None:
                 try:
                     await asyncio.to_thread(
@@ -29765,6 +29958,12 @@ class WrapperMachine:
         else:
             await self._delete_codex_client_message_ids(codex_alias_path)
         await self._drop_preview_session(engine, sid)
+        if engine == "claude" and getattr(self, "_claude_plans", None) is not None:
+            try:
+                async with self._claude_plan_lock:
+                    await asyncio.to_thread(self._claude_plans.delete, sid)
+            except (OSError, ValueError, sqlite3.Error):
+                log.warning("stale Claude Work plan cleanup failed", session_id=sid)
         if engine == "codex" and self._session_plans is not None:
             try:
                 await asyncio.to_thread(self._session_plans.delete, sid)
@@ -32331,6 +32530,12 @@ class WrapperMachine:
                         "stale Codex controls cleanup failed",
                         session_id=deleted_sid,
                     )
+            if engine == "claude" and getattr(self, "_claude_plans", None) is not None:
+                try:
+                    async with self._claude_plan_lock:
+                        await asyncio.to_thread(self._claude_plans.delete, deleted_sid)
+                except (OSError, ValueError, sqlite3.Error):
+                    log.warning("stale Claude plan cleanup failed", session_id=deleted_sid)
             if engine == "codex" and self._session_plans is not None:
                 try:
                     await asyncio.to_thread(
@@ -32719,6 +32924,15 @@ class WrapperMachine:
 
         if invalidate_conversation:
             ctx.active_msg_id = None
+            if ctx.engine == "claude" and getattr(self, "_claude_plans", None) is not None:
+                try:
+                    async with self._claude_plan_lock:
+                        await asyncio.to_thread(self._claude_plans.delete, sid)
+                        await self._recover_claude_plan(sid)
+                        restored_plan = await asyncio.to_thread(self._claude_plans.get, sid)
+                    await self._emit(ctx, ClaudePlanState(plan=restored_plan))
+                except (OSError, ValueError, sqlite3.Error):
+                    log.warning("Claude plan cleanup after rollback failed", session_id=sid)
             if ctx.engine == "codex" and self._session_plans is not None:
                 try:
                     await asyncio.to_thread(self._session_plans.delete, sid)
@@ -39532,6 +39746,7 @@ class WrapperMachine:
                 # cc-only path (the codex branch continues above). Only announce
                 # Claude-branded models so a cc-switch proxy's raw upstream name
                 # (e.g. glm-5.2) never replaces the user's Claude alias in the chip.
+                await self._observe_claude_permission(ctx, msg)
                 await self._observe_claude_model_fallback(ctx, msg)
                 mdl = extract_model(msg)
                 selected_mdl = (
