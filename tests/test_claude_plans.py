@@ -332,6 +332,105 @@ async def test_read_and_dismiss_do_not_resume_and_broadcast_receipt(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("old_phase", ["approved", "ready"])
+async def test_dismissed_plan_boundary_survives_refresh_restart_and_dismiss(
+        tmp_path, native_plan_source, history_first, old_phase):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    events = [use("EnterPlanMode", "enter"), result("enter")]
+    if old_phase == "approved":
+        events.extend([use("ExitPlanMode", "exit", plan="# Old plan"), result("exit")])
+    events.extend([use("TodoWrite", "done", todos=[{"content": "Old checklist", "status": "completed"}]),
+                   result("done")])
+    native_plan_source(machine, events)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
+    if old_phase == "ready":
+        await machine._emit(ctx, Perm(mode="bypassPermissions"))
+    old = store.get(ctx.key)
+    assert old.phase == old_phase
+    await machine._handle_dismiss_claude_plan(DismissClaudePlan(
+        sid=ctx.key, plan_id=old.id, revision=old.revision, client_id="pwa"))
+    assert store.get(ctx.key).dismissed
+
+    # Selecting plan mode manually has no native EnterPlanMode tool call.
+    # Each subsequent plan must retain its own boundary across full replay.
+    for index in range(2):
+        await machine._emit(ctx, Perm(mode="plan"))
+        additions = [use("ExitPlanMode", f"new-{index}", plan=f"# New plan {index}"), result(f"new-{index}")]
+        events.extend(additions)
+        native_plan_source(machine, events)
+        if not history_first:
+            for event in additions:
+                await machine._emit(ctx, event)
+            live = store.get(ctx.key)
+            assert live.id == f"plan:new-{index}" and not live.steps
+        await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
+        plan = transport.sent[-1].plan
+        assert plan.id == f"plan:new-{index}" and plan.document == f"# New plan {index}"
+        assert plan.phase == "approved" and not plan.steps and not plan.dismissed
+        if not history_first:
+            assert plan == live
+
+        machine._claude_plans = store = ClaudePlanStore(tmp_path)
+        # Advance the native fingerprint so both reads really rebuild history.
+        events.extend([use("Bash", f"unrelated-{index}", command="pwd"), result(f"unrelated-{index}")])
+        native_plan_source(machine, events)
+        await machine._handle_dismiss_claude_plan(DismissClaudePlan(
+            sid=ctx.key, plan_id=plan.id, revision=plan.revision, client_id="pwa"))
+        receipt = transport.sent[-1]
+        assert receipt.plan.id == plan.id and receipt.plan.dismissed and receipt.to is None
+        assert not receipt.plan.steps
+    assert ctx.sdk.client is None
+
+
+def test_plan_boundary_rollback_keeps_only_retained_native_calls(tmp_path):
+    store = ClaudePlanStore(tmp_path)
+    old_events = [use("EnterPlanMode", "enter"), result("enter"),
+                  use("ExitPlanMode", "exit", plan="# Old"), result("exit"),
+                  use("TodoWrite", "done", todos=[{"content": "Old task", "status": "completed"}]),
+                  result("done")]
+    old = store.recover("s", old_events)
+    store.dismiss("s", old.id, old.revision)
+    new_events = [use("ExitPlanMode", "new", plan="# New"), result("new")]
+    for event in new_events:
+        store.observe("s", event)
+    new = store.get("s")
+    # Compatibility with a stored live plan from before boundary persistence.
+    with store._db() as db:
+        legacy = store._load(db, "s")
+        legacy.pop("boundaries", None)
+        store._save(db, "s", legacy)
+    store = ClaudePlanStore(tmp_path)
+    restored = store.recover("s", old_events + new_events, rollback=True)
+    assert restored.id == new.id and restored.revision > new.revision and not restored.steps
+    restored = store.recover("s", old_events, rollback=True)
+    assert restored.id == old.id and restored.steps == old.steps and not restored.dismissed
+    # The rewound dismissal and new boundary no longer exist. A reused tool
+    # identity now revises the restored, visible plan instead of resetting it.
+    for event in new_events:
+        store.observe("s", event)
+    revised = store.get("s")
+    assert revised.id == old.id and revised.steps == old.steps
+    assert store.recover("s", old_events + new_events, refresh=True) == revised
+
+
+def test_native_task_update_reopens_dismissed_plan_before_next_exit(tmp_path):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    old = store.recover("s", history)
+    store.dismiss("s", old.id, old.revision)
+    history.extend([use("TodoWrite", "tasks", todos=[{"content": "New work", "status": "pending"}]),
+                    result("tasks"), result("exit"),
+                    use("ExitPlanMode", "revision", plan="# Revised"), result("revision")])
+    revised = store.recover("s", history, refresh=True)
+    assert revised.id == old.id and not revised.dismissed
+    assert revised.steps == [{"step": "New work", "status": "pending"}]
+    assert store.recover("s", history, refresh=True) == revised
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("phase", "first_result"), [("draft", False), ("draft", True), ("approved", False)])
 async def test_initial_recovery_publishes_plan_for_deduplicated_live_event(
         tmp_path, native_plan_source, phase, first_result):

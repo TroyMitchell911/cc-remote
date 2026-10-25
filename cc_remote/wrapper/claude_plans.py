@@ -64,7 +64,13 @@ def fold_plan(data: dict, event) -> None:
                                if isinstance(row, dict) and isinstance(row.get("content"), str)
                                and row["content"].strip()]
         if name in {"enterplanmode", "exitplanmode"}:
-            if name == "enterplanmode" or plan is None or plan.get("dismissed"):
+            boundaries = data.setdefault("boundaries", {})
+            if name == "exitplanmode" and plan and plan.get("dismissed"):
+                # Manual mode selection has no EnterPlanMode in the native
+                # transcript. Keep the resulting start by native call identity;
+                # later replay must not depend on the old plan's visibility.
+                boundaries[key] = True
+            if name == "enterplanmode" or plan is None or key in boundaries:
                 plan = ClaudePlan(id=f"plan:{key}"[:256], turn_id=event.turn_id).model_dump()
                 data["plan"] = plan
                 data["tasks"] = {}
@@ -195,9 +201,31 @@ class ClaudePlanStore:
             data = self._load(db, sid)
             if data is None or refresh or rollback:
                 old = self._plan(data)
-                candidate = {"revision": max((data or {}).get("revision", 0), old.revision if old else 0)}
+                boundaries = dict((data or {}).get("boundaries", {}))
+                if old:
+                    # Older projections already identify their current start,
+                    # even if they did not persist implicit boundaries yet.
+                    boundaries[old.id.removeprefix("plan:")] = True
+                candidate = {"revision": max((data or {}).get("revision", 0), old.revision if old else 0),
+                             "boundaries": boundaries}
+                retained = set()
+                dismissed_after = ((data or {}).get("seen") or [None])[-1] if old and old.dismissed and not rollback else None
                 for event in events:
+                    hidden = self._plan(candidate) if (candidate.get("plan") or {}).get("dismissed") else None
                     fold_plan(candidate, event)
+                    if hidden and self._plan(candidate) != hidden:
+                        # Match observe(): new native work reopens the old plan
+                        # before a later exit can be classified as a new one.
+                        candidate["plan"]["dismissed"] = False
+                    if isinstance(event, ToolUse) and not event.parent_id and event.tool.lower() in {"enterplanmode", "exitplanmode"}:
+                        retained.add(event.tool_use_id)
+                    if (isinstance(event, ToolResult) and event.tool_use_id == dismissed_after
+                            and (candidate.get("plan") or {}).get("id") == old.id):
+                        # A native append can be read before its live events.
+                        # Apply the current receipt at its known native frontier,
+                        # never to an earlier plan or after the appended work.
+                        candidate["plan"]["dismissed"] = True
+                        dismissed_after = None
                 new = self._plan(candidate)
                 known = set(candidate.get("calls", {})) | set(candidate.get("seen", []))
                 # A sampled transcript can lag the reader. Replace a live
@@ -213,6 +241,7 @@ class ClaudePlanStore:
                         # not a lagging read. Discard removed calls/receipts but
                         # advance the boundary already published to clients.
                         candidate["revision"] += 1
+                        candidate["boundaries"] = {key: True for key in boundaries if key in retained}
                         if new:
                             new.revision = candidate["revision"]
                             if old and old.id == new.id:
