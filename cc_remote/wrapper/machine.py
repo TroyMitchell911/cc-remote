@@ -12619,7 +12619,9 @@ class WrapperMachine:
                         "sid": sid, "to": cmd.client_id, "seq": None,
                         "route_id": getattr(cmd, "route_id", None)}))
                 permission_mode = _session_permission_mode(ctx)
-                ctx.announced_perm = permission_mode
+                # This targeted baseline is not a broadcast acknowledgement.
+                # A queued native status must still reach existing clients and
+                # persist its controls after Hello releases the publisher lock.
                 await self.transport.send(Perm(
                     mode=permission_mode,
                     sid=sid,
@@ -16961,10 +16963,29 @@ class WrapperMachine:
         if not sid or (ctx and (ctx.engine != "claude" or ctx.btw)):
             return await self.transport.send(Error(code=ERR_BAD_PROMPT,
                 message="该会话不支持计划查询", sid=sid, to=cmd.client_id))
-        async with self._claude_plan_lock:
-            await self._recover_claude_plan(sid, refresh=True)
-            plan = await asyncio.to_thread(self._claude_plans.get, sid)
-            await self.transport.send(ClaudePlanState(plan=plan, sid=sid, to=cmd.client_id))
+        async def read():
+            async with self._claude_plan_lock:
+                current_sid = (self._ctx_wire_sid(ctx) or sid) if ctx else sid
+                before = await asyncio.to_thread(self._claude_plans.get, current_sid)
+                await self._recover_claude_plan(current_sid, refresh=True)
+                plan = await asyncio.to_thread(self._claude_plans.get, current_sid)
+                # Native writes can precede their live events. Recovery updates
+                # the shared projection, so publish its change before those
+                # events are deduplicated by the live consumer.
+                if before != plan:
+                    event = ClaudePlanState(plan=plan, sid=current_sid)
+                    if ctx:
+                        await self._emit_locked(ctx, event)
+                    else:
+                        await self.transport.send(event)
+                await self.transport.send(ClaudePlanState(plan=plan, sid=current_sid, to=cmd.client_id))
+        if ctx:
+            # Same lock order as live events, mirroring and dismissal. Keep the
+            # read, broadcast and targeted reply ordered with native updates.
+            async with ctx.emit_lock:
+                await read()
+        else:
+            await read()
 
     async def _handle_dismiss_claude_plan(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.sid) or cmd.sid

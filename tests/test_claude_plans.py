@@ -332,6 +332,45 @@ async def test_read_and_dismiss_do_not_resume_and_broadcast_receipt(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resident", [False, True])
+async def test_targeted_read_publishes_native_plan_changes_before_live_replay(tmp_path, native_plan_source, resident):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    if not resident:
+        machine.sessions.pop(ctx.key)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit"),
+               use("TodoWrite", "tasks", todos=[{"content": "Verify", "status": "pending"}]), result("tasks")]
+    native_plan_source(machine, history)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="first"))
+    before = store.get(ctx.key)
+    cursor = ctx.seq
+    transport.sent.clear()
+    additions = [use("TodoWrite", "done", todos=[{"content": "Verify", "status": "completed"}]), result("done")]
+    native_plan_source(machine, history + additions)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="second"))
+    updates = [e for e in transport.sent if isinstance(e, ClaudePlanState)]
+    assert [e.to for e in updates] == [None, "second"]
+    assert all(e.sid == ctx.key and e.plan == store.get(ctx.key) for e in updates)
+    assert updates[0].plan.steps == [{"step": "Verify", "status": "completed"}]
+    assert updates[0].plan.revision > before.revision
+    assert updates[1].seq is None
+    if resident:
+        assert updates[0].seq > cursor
+        for event in additions:
+            await machine._emit(ctx, event)
+        replay = ctx.buffer.replay_from(cursor, cc_session_id=ctx.key, state=ctx.state)
+        assert [e.plan for e in replay if isinstance(e, ClaudePlanState)] == [updates[0].plan]
+    else:
+        assert updates[0].seq is None
+    # Duplicate live events and unchanged reads must not rebroadcast the update.
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="third"))
+    broadcasts = [e for e in transport.sent if isinstance(e, ClaudePlanState) and e.to is None]
+    assert broadcasts == [updates[0]]
+    assert ctx.sdk.client is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("history_first", [False, True])
 @pytest.mark.parametrize("old_phase", ["approved", "ready"])
 async def test_dismissed_plan_boundary_survives_refresh_restart_and_dismiss(

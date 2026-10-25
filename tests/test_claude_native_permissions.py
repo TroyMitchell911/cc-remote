@@ -93,6 +93,39 @@ async def test_native_modes_publish_persist_and_reseed_without_changing_focus(pe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("previous,mode", [("bypassPermissions", "plan"), ("plan", "bypassPermissions")])
+async def test_targeted_hello_cannot_acknowledge_pending_permission_broadcast(previous, mode):
+    sdk = SdkHandle(WrapperConfig())
+    sdk.permission_mode = previous
+    machine, transport, ctx = _machine_with_sdk(sdk)
+    await machine._publish_claude_permission(ctx)
+    await machine._persist_claude_session_controls(ctx)
+    cursor = ctx.seq
+    transport.sent.clear()
+    native = message(mode)
+    sdk._observe_permission_mode(native)
+
+    # The sole reader has the new mode; its consumer has not published it yet.
+    for client_id, cursors in [("fresh", {}), ("reconnected", {ctx.key: cursor})]:
+        await machine._handle_client_hello(Hello(
+            role="client", client_id=client_id, cursors=cursors,
+            generations={ctx.key: machine.instance_id}))
+        targeted = [e for e in transport.sent if e.type == "perm" and e.to == client_id]
+        assert len(targeted) == 1 and targeted[0].mode == mode
+        assert ctx.announced_perm == previous
+        assert machine._claude_controls.get(ctx.session_id).permission_mode == previous
+
+    await machine._observe_claude_permission(ctx, native)
+    await machine._observe_claude_permission(ctx, native)
+    broadcasts = [e for e in transport.sent if e.type == "perm" and e.to is None]
+    assert len(broadcasts) == 1 and broadcasts[0].mode == mode
+    assert broadcasts[0].sid == ctx.key and broadcasts[0].seq > cursor
+    assert ctx.announced_perm == mode
+    assert machine._claude_controls.get(ctx.session_id).permission_mode == mode
+    assert sdk.client is None
+
+
+@pytest.mark.asyncio
 async def test_offline_permission_snapshot_survives_pruning_and_skips_older_replay():
     async with environment() as (service, attach):
         first = await attach()
