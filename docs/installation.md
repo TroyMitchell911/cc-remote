@@ -133,6 +133,17 @@ cc-remote update --relay-ssh operator@relay-host
 `upstream-update.json` 记录的同一事务，不重复启动安装。失败时按记录中的 unit 查看
 日志与回滚结果。
 
+更新错误会标明失败阶段（发布文件下载、Relay 健康/版本检查或 SSH 提交），并区分
+DNS、TLS、连接超时、SSH 认证和 sudo 权限等原因。按提示检查自己的网络、代理、
+证书或管理权限；更新器不会修改代理规则、选择节点或关闭 TLS 校验。
+预检查失败会明确显示旧服务和数据未改变；实际进入激活后，才报告回滚结果。
+
+新版远端启动器在 `/opt/cc-remote/update-jobs/` 保存私有启动回执。同一个任务的首次
+提交和重试共用锁与任务 ID：SSH 在送达前失败，可以再次执行更新完成提交；任务已收到
+则只继续跟踪。启动回执存在但 systemd 任务消失时，仍须检查原任务日志和回滚状态。
+旧版生成、没有服务端回执的未完成记录也不能仅凭任务不存在就自动清除；按错误中给出
+的 `systemctl`、`journalctl` 和公网版本检查核实后再处理，保留原记录供追溯。
+
 从 v4.0.1 首次升级时，旧命令尚不认识 `--relay-ssh`，但下载的新安装器同样会先
 检查 VPS。交互终端缺少 SSH 配置时会提示输入已有管理主机；自动化可在 Mac 使用
 `CC_REMOTE_RELAY_SSH=operator@relay-host cc-remote update`，Linux 使用

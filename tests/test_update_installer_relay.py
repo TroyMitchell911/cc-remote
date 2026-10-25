@@ -10,6 +10,7 @@ import pytest
 
 from cc_remote import update_relay
 from tests.test_update import _installation, _manifest
+from tests.test_update_relay import launch_request
 
 
 @pytest.mark.parametrize("registered", [False, True])
@@ -32,11 +33,12 @@ def test_bundle_preflight_updates_relay_before_touching_local_service(
         assert (installation.root / "current").resolve() == installation.release
         assert (installation.root / "native-service-alive").read_text() == "still running\n"
         calls.append(command)
+        if request := launch_request(command):
+            assert request["version"] == "4.0.2"
+            remote["version"] = "4.0.2"
+            return '{"status":"submitted"}'
         if "-c" in command:
             return '{"domain":"remote.example.test"}'
-        if "systemd-run" in command:
-            assert command[-2:] == ["--version", "4.0.2"]
-            remote["version"] = "4.0.2"
         return "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n"
 
     monkeypatch.setattr(update_relay.RelayUpdate, "_ssh", ssh)
@@ -114,7 +116,7 @@ def test_first_upgrade_can_request_an_existing_ssh_target(tmp_path, monkeypatch)
     def verify():
         assert relay.target == "operator@relay"
     monkeypatch.setattr(relay, "_verify_host", verify)
-    monkeypatch.setattr(relay, "_ssh", lambda *args, **kwargs: "")
+    monkeypatch.setattr(relay, "_ssh", lambda *args, **kwargs: '{"status":"submitted"}')
     monkeypatch.setattr(relay, "_finish", lambda _: remote.update(version="4.0.1"))
     relay.ensure("4.0.1", 72, allow_protocol_change=False)
     assert json.loads(relay.settings.read_text()) == {"relay_ssh": "operator@relay"}

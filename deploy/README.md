@@ -315,8 +315,14 @@ Quarantine is temporary transaction state, not another retained backup or Trash.
   skipped. Otherwise `--relay-ssh` selects an existing administrator's SSH target
   (saved in private `update.json`). After verifying its managed domain, an OS-owned
   systemd job invokes the remote role installer. The private upstream transaction
-  records that exact job before launch; an unknown outcome is inspected on retry,
-  never blindly resubmitted. Public readiness precedes device activation. Pairing
+  records that exact job before launch. The client sends a stdlib-only guarded
+  launcher to the existing Relay Python, so the first upgrade also gets durable
+  server receipts in `/opt/cc-remote/update-jobs/`. A per-job lock serializes a
+  delayed first submission with retries. Only absence of both the receipt and
+  unit permits submission; intent is persisted before calling systemd. An existing
+  receipt without a unit remains unknown, including after reboot. Older pending
+  client records without this contract still require explicit reconciliation.
+  Never delete a receipt to force another launch. Public readiness precedes device activation. Pairing
   credentials do not authorize this operation. Other devices update individually.
   The new Wrapper role installer repeats upstream verification before stopping
   the local service, covering the first upgrade launched by v4.0.1's older

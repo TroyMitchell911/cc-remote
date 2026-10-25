@@ -152,6 +152,22 @@ systemd job; after a lost connection, the next invocation checks the same record
 `upstream-update.json` transaction instead of launching another. Inspect the
 recorded unit's logs and rollback report on failure.
 
+Update errors identify the failing stage (release download, Relay health/version
+check, or SSH submission) and distinguish DNS, TLS, timeouts, SSH authentication
+and sudo access problems. Check your network, proxy, certificates or administrator
+access as indicated. The updater never changes proxy rules, selects proxy nodes,
+or disables TLS verification. Preflight failures report that the existing service
+and data were unchanged; rollback results are reported only after actual changes.
+
+The new remote launcher stores private launch receipts under
+`/opt/cc-remote/update-jobs/`. First submissions and retries use the same job ID
+and lock: a request lost before delivery can be submitted on the next update;
+an accepted job is only followed. A receipt whose systemd unit has disappeared
+still requires inspection of the original job and rollback state. Older pending
+records without server receipts cannot be cleared merely because their unit is
+missing. Follow the reported `systemctl`, `journalctl` and public-version checks,
+and preserve the original record when reconciling its outcome.
+
 When upgrading from v4.0.1, the old command does not recognize `--relay-ssh`, but
 the downloaded installer still checks the Relay before local activation. An
 interactive terminal asks for the existing SSH admin host when needed. For

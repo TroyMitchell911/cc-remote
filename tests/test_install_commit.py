@@ -14,6 +14,56 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('phase', ['preflight', 'service-stopped', 'snapshot-restored', 'restore-failed'])
+def test_wrapper_cleanup_reports_only_recovery_that_actually_happened(tmp_path, phase):
+    target = tmp_path / 'release'
+    (target / '.venv/bin').mkdir(parents=True)
+    (target / '.venv/bin/python').symlink_to(sys.executable)
+    (target / 'deploy').mkdir()
+    data = tmp_path / 'wrapper-data'
+    data.write_text('original' if phase in ('preflight', 'service-stopped') else 'changed')
+    (target / 'deploy/work_registry_snapshot.py').write_text(
+        'from pathlib import Path\n'
+        f'if {phase == "restore-failed"!r}: raise SystemExit(1)\n'
+        f'Path({str(data)!r}).write_text("original")\n'
+    )
+    settings = {
+        'snapshot_created': '1' if phase in ('snapshot-restored', 'restore-failed') else '0',
+        'service_stopped': '0' if phase == 'preflight' else '1',
+        'activation_committed': '0', 'switched': '0', 'service_changed': '0',
+        'device_changed': '0', 'retention_generation': '', 'stage': '',
+        'service_backup': '', 'device_backup': '', 'unit_verify_dir': '',
+        'rollback_snapshot': str(tmp_path / 'snapshot'), 'target': str(target),
+    }
+    source = (ROOT / 'deploy/install-wrapper.sh').read_text()
+    cleanup = source[source.index('cleanup() {'):source.index('if [ -e "$service_file" ]; then')]
+    calls = tmp_path / 'service-calls'
+    harness = 'set -euo pipefail\n' + '\n'.join(
+        f'{k}={shlex.quote(v)}' for k, v in settings.items()
+    ) + '\n' + cleanup + f'''
+stop_wrapper_service() {{ echo stop >> {shlex.quote(str(calls))}; }}
+restart_after_rollback() {{ echo restart >> {shlex.quote(str(calls))}; }}
+exit 42
+'''
+    result = subprocess.run(['bash', '-c', harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 42, result.stderr
+    if phase == 'preflight':
+        assert 'preflight failed before activation' in result.stderr
+        assert 'were restored' not in result.stderr and 'rolled back' not in result.stderr
+        assert not calls.exists()
+    elif phase == 'service-stopped':
+        assert 'code/service changes were rolled back; wrapper data was not changed' in result.stderr
+        assert calls.read_text().splitlines() == ['restart']
+    elif phase == 'snapshot-restored':
+        assert 'code/service state and wrapper data were restored' in result.stderr
+        assert calls.read_text().splitlines() == ['stop', 'restart']
+    else:
+        assert 'automatic rollback is incomplete; manual recovery is required' in result.stderr
+        assert 'were restored' not in result.stderr
+        assert calls.read_text().splitlines() == ['stop']
+    assert data.read_text() == ('changed' if phase == 'restore-failed' else 'original')
+
+
 @pytest.mark.parametrize("shell", ["/bin/bash", "bash"], ids=["system-bash", "path-bash"])
 @pytest.mark.parametrize("backend", ["darwin", "systemd", "supervisor", "adopt-supervisor"])
 @pytest.mark.parametrize("installation", ["fresh", "upgrade", "same-release"])
@@ -154,13 +204,13 @@ exit 42
         assert not service_file.exists()
         assert loaded.exists() == remove_fails
         assert operations == ['stop', 'remove']
-        assert ('manual data recovery' in result.stderr) == remove_fails
+        assert ('manual recovery' in result.stderr) == remove_fails
     else:
         assert current.resolve() == previous
         assert service_file.read_text() == 'old wrapper definition'
         assert loaded.exists()
         assert operations == (['restore', 'start', 'state'] if prior == 'running' else ['restore', 'stop'])
-        assert 'code and wrapper data were restored' in result.stderr
+        assert 'code/service changes were rolled back; wrapper data was not changed' in result.stderr
     assert native.read_text() == 'unchanged native process'
 
 
