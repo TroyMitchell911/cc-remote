@@ -9,7 +9,7 @@ from claude_agent_sdk.types import ToolUseBlock, ToolResultBlock, UserMessage
 
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
-    ClaudePlanState, DismissClaudePlan, GetClaudePlan, Perm, ToolResult, ToolUse,
+    ClaudePlanState, DismissClaudePlan, GetClaudePlan, History, Perm, RollbackResult, ToolResult, ToolUse,
     TurnEnd, TurnResult, UserMsg, deserialize, serialize,
 )
 from cc_remote.wrapper.claude_plans import ClaudePlanStore
@@ -178,6 +178,40 @@ def test_native_plan_denial_is_not_reopened_by_lagging_source(tmp_path):
     assert store.recover("s", history, source=3, refresh=True) == rejected
 
 
+@pytest.mark.parametrize("from_history", [False, True])
+def test_rollback_before_plan_keeps_revision_boundary_across_restart(tmp_path, from_history):
+    store = ClaudePlanStore(tmp_path)
+    plan = approve(store)
+    dismissed = store.dismiss("session", plan.id, plan.revision)
+    assert store.recover("session", [], rollback=True) is None
+    restarted = ClaudePlanStore(tmp_path)
+    assert restarted.get("session") is None
+    events = [use("EnterPlanMode", "enter"), result("enter"),
+              use("ExitPlanMode", "exit", plan="# Plan\n\n1. Implement"), result("exit")]
+    if from_history:
+        reopened = restarted.recover("session", events, refresh=True)
+    else:
+        for event in events:
+            restarted.observe("session", event)
+        reopened = restarted.get("session")
+    assert reopened.id == dismissed.id and reopened.revision > dismissed.revision
+    assert not reopened.dismissed
+    assert restarted.dismiss("session", plan.id, plan.revision) == reopened
+
+
+def test_failed_rollback_recovery_preserves_last_durable_plan(tmp_path):
+    store = ClaudePlanStore(tmp_path)
+    before = approve(store)
+
+    def unreadable():
+        yield use("EnterPlanMode", "older-plan")
+        raise OSError("history read failed")
+
+    with pytest.raises(OSError, match="history read failed"):
+        store.recover("session", unreadable(), rollback=True)
+    assert ClaudePlanStore(tmp_path).get("session") == before
+
+
 def test_profile_migration_is_idempotent_and_preserves_dismissal(tmp_path):
     store = ClaudePlanStore(tmp_path)
     plan = approve(store)
@@ -269,6 +303,74 @@ async def test_read_and_dismiss_do_not_resume_and_broadcast_receipt(tmp_path):
     assert receipt.plan.dismissed and receipt.to is None
     assert ctx.sdk.client is None
     assert deserialize(serialize(receipt)).plan.dismissed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissed", [False, True])
+async def test_conversation_rollback_restores_plan_for_connected_clients(tmp_path, monkeypatch, dismissed):
+    import cc_remote.wrapper.machine as machine_module
+    from cc_remote.tui_presentation import SessionPresentation
+
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("{}\n")
+    source_stat = path.stat()
+    source = [str(path), source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns]
+    retained = [use("EnterPlanMode", "enter"), result("enter"),
+                use("ExitPlanMode", "exit", plan="# Plan"), result("exit"),
+                use("TodoWrite", "tasks", todos=[{"content": "Verify", "status": "pending"}]),
+                result("tasks")]
+    store.recover(ctx.key, retained, source=source)
+    store.observe(ctx.key, use("TodoWrite", "completed", todos=[{"content": "Verify", "status": "completed"}]))
+    store.observe(ctx.key, result("completed"))
+    before = store.get(ctx.key)
+    if dismissed:
+        before = store.dismiss(ctx.key, before.id, before.revision)
+    tui = SessionPresentation(engine="claude")
+    tui.event(ClaudePlanState(plan=before).model_dump(), "")
+
+    # Supply the native active chain after rewind through the real recovery
+    # and translation path. Its fingerprint can match a previously read page.
+    messages = [SimpleNamespace(uuid="user", type="user", message={"role": "user", "content": "plan"})]
+    for index, event in enumerate(retained):
+        if isinstance(event, ToolUse):
+            kind = "assistant"
+            content = {"type": "tool_use", "id": event.tool_use_id, "name": event.tool, "input": event.input}
+        else:
+            kind = "user"
+            content = {"type": "tool_result", "tool_use_id": event.tool_use_id, "content": event.content}
+        messages.append(SimpleNamespace(uuid=f"message-{index}", type=kind,
+                                        message={"role": kind, "content": [content]}))
+    monkeypatch.setattr(machine, "_claude_transcript_path", lambda *_: str(path))
+    monkeypatch.setattr(machine_module, "transcript_compact_snapshot", lambda *a, **kw: (messages, {}, {}))
+    monkeypatch.setattr(machine_module, "recover_claude_native_metadata", lambda sid, rows, **kw: rows)
+    monkeypatch.setattr(machine, "_resync_watch", lambda _: None)
+    machine._build_history = AsyncMock(return_value=History(
+        session_id=ctx.key, revision="after-rollback", events=[], has_more=False))
+    await machine._publish_rollback_outcome(ctx, RollbackResult(
+        session_id=ctx.key, engine="claude", restore="conversation",
+        conversation="succeeded", files="skipped", restored_turns=1),
+        invalidate_conversation=True, invalidate_files=False)
+    restored_event = next(event for event in transport.sent if isinstance(event, ClaudePlanState))
+    restored = restored_event.plan
+    assert restored.id == before.id and restored.revision > before.revision
+    assert restored.steps == [{"step": "Verify", "status": "pending"}]
+    assert not restored.dismissed and restored_event.to is None
+    assert ClaudePlanStore(tmp_path).get(ctx.key) == restored
+    tui.event(restored_event.model_dump(), "")
+    tui.event(ClaudePlanState(plan=before).model_dump(), "")
+    assert tui.claude_plan == restored.model_dump()
+
+    # The removed tool identity can be used again on the restored branch;
+    # its next result must reach clients immediately, not catch up from 1.
+    await machine._emit(ctx, use("TodoWrite", "completed", todos=[{"content": "Verify", "status": "in_progress"}]))
+    await machine._emit(ctx, result("completed"))
+    advanced = [event for event in transport.sent if isinstance(event, ClaudePlanState)][-1]
+    assert advanced.plan.revision > restored.revision
+    tui.event(advanced.model_dump(), "")
+    assert tui.claude_plan["steps"] == [{"step": "Verify", "status": "inProgress"}]
+    assert ctx.sdk.client is None
 
 
 @pytest.mark.asyncio

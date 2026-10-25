@@ -154,6 +154,9 @@ class ClaudePlanStore:
 
     @staticmethod
     def _save(db, sid, data):
+        # Keep the session's revision boundary even when rollback removes the
+        # entire plan. Native tool IDs may reappear on the restored branch.
+        data["revision"] = max(data.get("revision", 0), (data.get("plan") or {}).get("revision", 0))
         db.execute("INSERT OR REPLACE INTO plans VALUES (?,?)", (sid, json.dumps(data, ensure_ascii=False)))
 
     @staticmethod
@@ -187,14 +190,14 @@ class ClaudePlanStore:
         with self.lock, self._db() as db:
             return (self._load(db, sid) or {}).get("source")
 
-    def recover(self, sid: str, events, *, source=None, refresh=False) -> ClaudePlan | None:
+    def recover(self, sid: str, events, *, source=None, refresh=False, rollback=False) -> ClaudePlan | None:
         with self.lock, self._db() as db:
             data = self._load(db, sid)
-            if data is None or refresh:
-                candidate = {}
+            if data is None or refresh or rollback:
+                old = self._plan(data)
+                candidate = {"revision": max((data or {}).get("revision", 0), old.revision if old else 0)}
                 for event in events:
                     fold_plan(candidate, event)
-                old = self._plan(data)
                 new = self._plan(candidate)
                 known = set(candidate.get("calls", {})) | set(candidate.get("seen", []))
                 # A sampled transcript can lag the reader. Replace a live
@@ -204,8 +207,18 @@ class ClaudePlanStore:
                 caught_up = data is None or (
                     set(data.get("calls", {})).issubset(known)
                     and (not data.get("seen") or data["seen"][-1] in candidate.get("seen", [])))
-                if caught_up and (new is not None or old is None):
-                    if old and new and old.id == new.id:
+                if rollback or (caught_up and (new is not None or old is None)):
+                    if rollback:
+                        # This source is the authoritative post-rewind chain,
+                        # not a lagging read. Discard removed calls/receipts but
+                        # advance the boundary already published to clients.
+                        candidate["revision"] += 1
+                        if new:
+                            new.revision = candidate["revision"]
+                            if old and old.id == new.id:
+                                new.turn_id = old.turn_id or new.turn_id
+                            candidate["plan"] = new.model_dump()
+                    elif old and new and old.id == new.id:
                         new.turn_id = old.turn_id or new.turn_id
                         # A denied permission callback can precede its native
                         # tool result. A lagging transcript must not reopen it.
@@ -219,6 +232,9 @@ class ClaudePlanStore:
                         same = old.model_dump(exclude={"revision", "dismissed"}) == new.model_dump(exclude={"revision", "dismissed"})
                         new.revision = old.revision + (not same)
                         new.dismissed = old.dismissed if same else False
+                        candidate["plan"] = new.model_dump()
+                    elif new:
+                        new.revision = candidate["revision"] + 1
                         candidate["plan"] = new.model_dump()
                     data = candidate
                 data = data or {}
@@ -234,8 +250,8 @@ class ClaudePlanStore:
             fold_plan(data, event)
             after = self._plan(data)
             changed = before != after
-            if changed and before and after and before.id == after.id:
-                after.revision = before.revision + 1
+            if changed and after:
+                after.revision = max(data.get("revision", 0), before.revision if before else 0) + 1
                 # New native work reopens a manually hidden plan.
                 after.dismissed = False
                 data["plan"] = after.model_dump()

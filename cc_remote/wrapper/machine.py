@@ -16881,13 +16881,13 @@ class WrapperMachine:
         # awaiting the same immutable page keep the shared read alive.
         return await asyncio.shield(task)
 
-    async def _recover_claude_plan(self, sid: str, *, refresh=False) -> None:
+    async def _recover_claude_plan(self, sid: str, *, refresh=False, rollback=False) -> None:
         """Caller owns _claude_plan_lock. Read local history, never resume."""
         store = self._claude_plans
         if store is None:
             raise ValueError("Claude plan store unavailable")
         known = await asyncio.to_thread(store.known, sid)
-        if known and not refresh:
+        if known and not refresh and not rollback:
             return
         if sid.startswith("tmp-"):
             return
@@ -16897,7 +16897,7 @@ class WrapperMachine:
             return
         source_stat = await asyncio.to_thread(os.stat, path)
         source = [path, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns]
-        if known and await asyncio.to_thread(store.source, sid) == source:
+        if known and not rollback and await asyncio.to_thread(store.source, sid) == source:
             return
         def read():
             # Reuse the native active-chain reader (including compaction and
@@ -16917,7 +16917,7 @@ class WrapperMachine:
             return translate_history(messages, self.cfg.tool_result_max, timestamps=timestamps,
                                      internal_user_events=internal)
         events = await asyncio.to_thread(read)
-        await asyncio.to_thread(store.recover, sid, events, source=source, refresh=refresh)
+        await asyncio.to_thread(store.recover, sid, events, source=source, refresh=refresh, rollback=rollback)
 
     async def _handle_get_claude_plan(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.sid) or cmd.sid
@@ -32927,8 +32927,7 @@ class WrapperMachine:
             if ctx.engine == "claude" and getattr(self, "_claude_plans", None) is not None:
                 try:
                     async with self._claude_plan_lock:
-                        await asyncio.to_thread(self._claude_plans.delete, sid)
-                        await self._recover_claude_plan(sid)
+                        await self._recover_claude_plan(sid, rollback=True)
                         restored_plan = await asyncio.to_thread(self._claude_plans.get, sid)
                     await self._emit(ctx, ClaudePlanState(plan=restored_plan))
                 except (OSError, ValueError, sqlite3.Error):

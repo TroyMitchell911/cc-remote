@@ -236,6 +236,26 @@ try {
   }) });
   assert.equal(claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan), null);
 
+  const restoredPlan = { ...canonicalPlan, revision: 5,
+    steps: [{ step: "Verify", status: "pending" as const }] };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: restoredPlan,
+  }) });
+  assert.ok(claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan),
+    "rollback reopens the retained plan using a newer revision");
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid,
+    plan: { ...canonicalPlan, revision: 4, dismissed: true },
+  }) });
+  assert.deepEqual(claudeState.runtimes[claudeSid].claudePlan, restoredPlan,
+    "a pre-rollback dismissal cannot hide the restored checklist");
+  const continuedPlan = { ...restoredPlan, revision: 6,
+    steps: [{ step: "Verify", status: "inProgress" as const }] };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: continuedPlan,
+  }) });
+  assert.deepEqual(claudeState.runtimes[claudeSid].claudePlan, continuedPlan);
+
   let reducerState = reduce({
     ...initialState,
     focusedSid: reducerSid,
