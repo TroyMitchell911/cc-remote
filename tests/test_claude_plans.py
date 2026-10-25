@@ -42,7 +42,6 @@ def native_plan_source(tmp_path, monkeypatch):
 
     def install(machine, events):
         path = tmp_path / "transcript.jsonl"
-        path.write_text("{}\n")
         messages = [SimpleNamespace(uuid="user", type="user", message={"role": "user", "content": "plan"})]
         for index, event in enumerate(events):
             if isinstance(event, ToolUse):
@@ -54,9 +53,11 @@ def native_plan_source(tmp_path, monkeypatch):
                            "content": event.content, "is_error": event.is_error}
             messages.append(SimpleNamespace(uuid=f"message-{index}", type=kind,
                                             message={"role": kind, "content": [content]}))
+        path.write_text("".join(json.dumps(vars(message)) + "\n" for message in messages))
         monkeypatch.setattr(machine, "_claude_transcript_path", lambda *_: str(path))
         monkeypatch.setattr(machine_module, "transcript_compact_snapshot", lambda *a, **kw: (messages, {}, {}))
         monkeypatch.setattr(machine_module, "recover_claude_native_metadata", lambda sid, rows, **kw: rows)
+        return path
 
     return install
 
@@ -392,6 +393,102 @@ async def test_initial_recovery_publishes_pending_plan_before_permission_prompt(
     assert store.get(ctx.key) == updates[-1].plan
     assert len([event for event in transport.sent if isinstance(event, ClaudePlanState)]) == 2
     assert ctx.sdk.client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resident", [False, True])
+async def test_native_watch_publishes_plan_progress_and_retains_dismissal(tmp_path, native_plan_source, resident):
+    from cc_remote.wrapper.codex_external import ProcessIdentity
+    from tests.test_claude_external import _watch
+
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    sid = ctx.key
+    if not resident:
+        machine.sessions.pop(sid)
+    path = native_plan_source(machine, [])
+    watch = machine._watch[sid] = _watch(path)
+    machine._build_requested_history = AsyncMock(return_value=History(
+        session_id=sid, revision="native", detail="summary", external=True))
+    # Opening the session can seed an empty plan before the CLI starts work.
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=sid, client_id="desktop"))
+    assert store.known(sid) and store.get(sid) is None
+    events = []
+
+    async def append_and_mirror(additions, *, fetch_first=False):
+        events.extend(additions)
+        native_plan_source(machine, events)
+        if fetch_first:
+            # Another client's targeted read may refresh the shared projection
+            # before the watcher. Every already-connected client still needs it.
+            await machine._handle_get_claude_plan(GetClaudePlan(sid=sid, client_id="new-client"))
+        transport.sent.clear()
+        await machine._poll_claude_watch(sid, watch, {ProcessIdentity(101, 1001)}, 1000.0,
+                                        ownership_scan_complete=True)
+        histories = [event for event in transport.sent if isinstance(event, History)]
+        updates = [event for event in transport.sent if isinstance(event, ClaudePlanState)]
+        assert len(histories) == 1 and histories[0].external
+        assert len(updates) == 1
+        assert updates[0].sid == sid and updates[0].to is None
+        assert updates[0].plan == store.get(sid)
+        assert machine._is_external(sid)
+        assert ctx.sdk.client is None and ctx.turn_task is None
+        return updates[0].plan
+
+    draft = await append_and_mirror([use("EnterPlanMode", "enter"), result("enter")])
+    assert draft.phase == "draft"
+    active = await append_and_mirror([
+        use("ExitPlanMode", "exit", plan="# Native plan"), result("exit"),
+        use("TodoWrite", "tasks", todos=[{"content": "Verify", "status": "in_progress"}]), result("tasks"),
+    ])
+    assert active.phase == "approved" and active.document == "# Native plan"
+    assert active.steps == [{"step": "Verify", "status": "inProgress"}]
+    assert active.revision > draft.revision
+    completed = await append_and_mirror([
+        use("TodoWrite", "done", todos=[{"content": "Verify", "status": "completed"}]), result("done"),
+    ], fetch_first=True)
+    assert completed.steps == [{"step": "Verify", "status": "completed"}]
+    assert completed.revision > active.revision
+    await machine._handle_dismiss_claude_plan(DismissClaudePlan(
+        sid=sid, plan_id=completed.id, revision=completed.revision, client_id="desktop"))
+    dismissed = store.get(sid)
+    assert dismissed.dismissed
+    unchanged = await append_and_mirror([use("Bash", "other", command="pwd"), result("other")])
+    assert unchanged == dismissed
+    cleared = await append_and_mirror([use("TodoWrite", "clear", todos=[]), result("clear")])
+    assert cleared.steps == [] and cleared.document == "# Native plan"
+    assert cleared.revision > dismissed.revision
+    machine._build_requested_history.assert_awaited_with(
+        sid, before=None, limit=machine.MIRROR_LIMIT, cwd=None, detail="summary")
+
+
+@pytest.mark.asyncio
+async def test_mirrored_history_survives_unavailable_plan_projection(tmp_path):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    plan = approve(store, ctx.key)
+    history = History(session_id=ctx.key, revision="native", detail="summary")
+    machine._build_requested_history = AsyncMock(return_value=history)
+    machine._recover_claude_plan = AsyncMock(side_effect=OSError("transcript unavailable"))
+    assert await machine._push_mirrored_history(ctx.key) is history
+    machine._recover_claude_plan.assert_awaited_once_with(ctx.key, refresh=True)
+    assert transport.sent == [history]
+    assert store.get(ctx.key) == plan and ctx.sdk.client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("engine", "btw"), [("codex", False), ("claude", True)])
+async def test_mirrored_history_does_not_publish_other_engine_or_private_plan(engine, btw):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    ctx.engine = engine
+    ctx.btw = btw
+    machine._watch[ctx.key] = {"engine": engine}
+    history = History(session_id=ctx.key, revision="native", detail="summary")
+    machine._build_requested_history = AsyncMock(return_value=history)
+    machine._recover_claude_plan = AsyncMock()
+    assert await machine._push_mirrored_history(ctx.key) is history
+    machine._recover_claude_plan.assert_not_awaited()
+    assert transport.sent == [history]
 
 
 @pytest.mark.asyncio

@@ -13630,7 +13630,40 @@ class WrapperMachine:
         )
         hist.sid = sid
         await self.transport.send(hist)
+        await self._push_mirrored_claude_plan(sid)
         return hist
+
+    async def _push_mirrored_claude_plan(self, sid: str) -> None:
+        """Mirror the canonical plan without attaching to the native owner."""
+        ctx = self._ctx_by_sid(sid)
+        watch = self._watch.get(sid) or {}
+        engine = ctx.engine if ctx is not None else watch.get("engine")
+        store = self._claude_plans
+        if engine != "claude" or (ctx is not None and ctx.btw) or store is None:
+            return
+
+        async def publish():
+            async with self._claude_plan_lock:
+                await self._recover_claude_plan(sid, refresh=True)
+                plan = await asyncio.to_thread(store.get, sid)
+                # A targeted client read may already have refreshed the store.
+                # Every watcher still needs this snapshot, even if unchanged.
+                event = ClaudePlanState(plan=plan, sid=sid)
+                if ctx is not None:
+                    await self._emit_locked(ctx, event)
+                else:
+                    await self.transport.send(event)
+
+        try:
+            if ctx is not None:
+                async with ctx.emit_lock:
+                    await publish()
+            else:
+                await publish()
+        except (OSError, ValueError, sqlite3.Error):
+            # A failed optional projection must not interrupt history mirroring
+            # or replace a retained plan with an invented empty state.
+            log.warning("Claude mirrored plan unavailable", session_id=sid)
 
     async def _repair_codex_projection_after_overflow(
         self, ctx: SessionContext, turn_id: str,
