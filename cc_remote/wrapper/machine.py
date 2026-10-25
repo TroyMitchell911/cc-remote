@@ -10623,9 +10623,12 @@ class WrapperMachine:
             if relevant:
                 try:
                     async with self._claude_plan_lock:
+                        before = await asyncio.to_thread(plan_store.get, msg.sid)
                         await self._recover_claude_plan(msg.sid)
-                        changed, plan = await asyncio.to_thread(plan_store.observe, msg.sid, msg)
-                    if changed:
+                        _, plan = await asyncio.to_thread(plan_store.observe, msg.sid, msg)
+                    # Recovery can already contain the incoming native event.
+                    # Publish its change even when observe deduplicates it.
+                    if before != plan:
                         plan_update = ClaudePlanState(plan=plan)
                 except (OSError, ValueError, sqlite3.Error):
                     log.warning("Claude plan projection unavailable", session_id=msg.sid)
@@ -26141,14 +26144,15 @@ class WrapperMachine:
             async with ctx.emit_lock:
                 sid = self._ctx_wire_sid(ctx) or ctx.key
                 async with self._claude_plan_lock:
+                    before = await asyncio.to_thread(store.get, sid)
                     await self._recover_claude_plan(sid)
                     if denied:
-                        changed, plan = await asyncio.to_thread(store.reject, sid, identity)
+                        _, plan = await asyncio.to_thread(store.reject, sid, identity)
                     else:
                         event = ToolUse(message_id=identity, tool_use_id=identity,
                                         tool="ExitPlanMode", input=tool_input)
-                        changed, plan = await asyncio.to_thread(store.observe, sid, event)
-                if changed:
+                        _, plan = await asyncio.to_thread(store.observe, sid, event)
+                if before != plan:
                     await self._emit_locked(ctx, ClaudePlanState(plan=plan))
         except (OSError, ValueError, sqlite3.Error):
             log.warning("Claude plan permission projection unavailable", session_id=ctx.key)

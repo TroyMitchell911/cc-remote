@@ -36,6 +36,31 @@ def approve(store, sid="session"):
     return store.get(sid)
 
 
+@pytest.fixture
+def native_plan_source(tmp_path, monkeypatch):
+    import cc_remote.wrapper.machine as machine_module
+
+    def install(machine, events):
+        path = tmp_path / "transcript.jsonl"
+        path.write_text("{}\n")
+        messages = [SimpleNamespace(uuid="user", type="user", message={"role": "user", "content": "plan"})]
+        for index, event in enumerate(events):
+            if isinstance(event, ToolUse):
+                kind = "assistant"
+                content = {"type": "tool_use", "id": event.tool_use_id, "name": event.tool, "input": event.input}
+            else:
+                kind = "user"
+                content = {"type": "tool_result", "tool_use_id": event.tool_use_id,
+                           "content": event.content, "is_error": event.is_error}
+            messages.append(SimpleNamespace(uuid=f"message-{index}", type=kind,
+                                            message={"role": kind, "content": [content]}))
+        monkeypatch.setattr(machine, "_claude_transcript_path", lambda *_: str(path))
+        monkeypatch.setattr(machine_module, "transcript_compact_snapshot", lambda *a, **kw: (messages, {}, {}))
+        monkeypatch.setattr(machine_module, "recover_claude_native_metadata", lambda sid, rows, **kw: rows)
+
+    return install
+
+
 def test_approval_is_not_completion_and_next_turn_does_not_retire(tmp_path):
     store = ClaudePlanStore(tmp_path)
     store.observe("session", use("EnterPlanMode", "enter"))
@@ -303,6 +328,70 @@ async def test_read_and_dismiss_do_not_resume_and_broadcast_receipt(tmp_path):
     assert receipt.plan.dismissed and receipt.to is None
     assert ctx.sdk.client is None
     assert deserialize(serialize(receipt)).plan.dismissed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("phase", "first_result"), [("draft", False), ("draft", True), ("approved", False)])
+async def test_initial_recovery_publishes_plan_for_deduplicated_live_event(
+        tmp_path, native_plan_source, phase, first_result):
+    from cc_remote.tui_presentation import SessionPresentation
+
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    events = [use("EnterPlanMode", "enter"), result("enter")]
+    if phase == "approved":
+        events.extend([use("ExitPlanMode", "exit", plan="# Plan"), result("exit")])
+    native_plan_source(machine, events)
+    assert not store.known(ctx.key)
+
+    # Native writes can lead the consumer, including an entire approval. The
+    # first live call or result is already recorded and will be deduplicated.
+    await machine._emit(ctx, events[1 if first_result else 0])
+    plan = store.get(ctx.key)
+    assert plan.phase == phase
+    updates = [event for event in transport.sent if isinstance(event, ClaudePlanState)]
+    assert len(updates) == 1
+    assert updates[0].plan == plan and updates[0].sid == ctx.key and updates[0].to is None
+    tui = SessionPresentation(engine="claude")
+    tui.event(deserialize(serialize(updates[0])).model_dump(), "")
+    assert tui.claude_plan == plan.model_dump()
+
+    for event in events:
+        await machine._emit(ctx, event)
+    assert store.get(ctx.key) == plan
+    assert len([event for event in transport.sent if isinstance(event, ClaudePlanState)]) == 1
+    assert ctx.sdk.client is None
+
+
+@pytest.mark.asyncio
+async def test_initial_recovery_publishes_pending_plan_before_permission_prompt(tmp_path, native_plan_source):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    events = [use("EnterPlanMode", "enter"), result("enter"),
+              use("ExitPlanMode", "exit", plan="# Review")]
+    native_plan_source(machine, events)
+    assert not store.known(ctx.key)
+
+    async def ask(*args, **kwargs):
+        updates = [event for event in transport.sent if isinstance(event, ClaudePlanState)]
+        assert len(updates) == 1
+        assert updates[0].plan.phase == "pending" and updates[0].plan.document == "# Review"
+        assert updates[0].sid == ctx.key and updates[0].to is None
+        return "继续修改"
+
+    machine._on_ask = ask
+    context = SimpleNamespace(agent_id=None, suggestions=[], tool_use_id="exit")
+    answer = await machine._on_claude_tool_permission(ctx, "ExitPlanMode", {"plan": "# Review"}, context)
+    assert answer.behavior == "deny"
+    assert all(event.type != "tool_use" for event in transport.sent)
+    updates = [event for event in transport.sent if isinstance(event, ClaudePlanState)]
+    assert len(updates) == 2 and updates[-1].plan.phase == "changes_requested"
+    assert updates[-1].plan.revision > updates[0].plan.revision
+    for event in [*events, result("exit", error=True)]:
+        await machine._emit(ctx, event)
+    assert store.get(ctx.key) == updates[-1].plan
+    assert len([event for event in transport.sent if isinstance(event, ClaudePlanState)]) == 2
+    assert ctx.sdk.client is None
 
 
 @pytest.mark.asyncio
