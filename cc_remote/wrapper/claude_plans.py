@@ -64,14 +64,24 @@ def fold_plan(data: dict, event) -> None:
                                if isinstance(row, dict) and isinstance(row.get("content"), str)
                                and row["content"].strip()]
         if name in {"enterplanmode", "exitplanmode"}:
-            data["mode_call"] = key
+            if name == "enterplanmode":
+                # A pending replacement must not invalidate a manual exit of
+                # the retained plan when history is read before live delivery.
+                data["entry_call"] = key
+                if plan is None:
+                    data["mode_call"] = key
+            else:
+                data.pop("entry_call", None)
+                data["mode_call"] = key
             boundaries = data.setdefault("boundaries", {})
             if name == "exitplanmode" and plan and plan.get("dismissed"):
                 # Manual mode selection has no EnterPlanMode in the native
                 # transcript. Keep the resulting start by native call identity;
                 # later replay must not depend on the old plan's visibility.
                 boundaries[key] = True
-            if name == "enterplanmode" or plan is None or key in boundaries:
+            # A requested entry can still be denied. Keep an existing plan
+            # and its checklist until the native entry result succeeds.
+            if plan is None or (name == "exitplanmode" and key in boundaries):
                 plan = ClaudePlan(id=f"plan:{key}"[:256], turn_id=event.turn_id).model_dump()
                 data["plan"] = plan
                 data["tasks"] = {}
@@ -80,7 +90,8 @@ def fold_plan(data: dict, event) -> None:
                 plan["phase"] = "pending"
                 if isinstance(values.get("plan"), str) and values["plan"].strip():
                     plan["document"] = values["plan"][:65536]
-        calls[key] = {"name": name, "input": values, "plan_id": plan["id"] if plan else None}
+        calls[key] = {"name": name, "input": values, "plan_id": plan["id"] if plan else None,
+                      "turn_id": event.turn_id}
         while len(calls) > 256:
             del calls[next(iter(calls))]
     elif isinstance(event, TurnPlan):
@@ -102,8 +113,20 @@ def fold_plan(data: dict, event) -> None:
         name, values = call["name"], call["input"]
         if name == "exitplanmode":
             plan["phase"] = "changes_requested" if event.is_error else "approved"
-        elif name == "enterplanmode" and event.is_error:
-            plan["phase"] = "ready"
+        elif name == "enterplanmode":
+            if data.get("entry_call", data.get("mode_call")) != event.tool_use_id:
+                return
+            data.pop("entry_call", None)
+            identity = f"plan:{event.tool_use_id}"[:256]
+            if event.is_error:
+                if plan["id"] == identity:
+                    plan["phase"] = "ready"
+            else:
+                data["mode_call"] = event.tool_use_id
+                if plan["id"] != identity:
+                    data["plan"] = ClaudePlan(id=identity, turn_id=call.get("turn_id")).model_dump()
+                    data["tasks"] = {}
+                    data["tasks_overflow"] = False
         elif not event.is_error:
             tasks = data.setdefault("tasks", {})
             if name == "todowrite" and isinstance(values.get("todos"), list):

@@ -90,6 +90,116 @@ def test_manual_mode_change_and_rejection_are_not_approval(tmp_path):
     assert store.get("s").phase == "changes_requested"
 
 
+@pytest.mark.parametrize("error", [False, True])
+@pytest.mark.parametrize("dismissed", [False, True])
+def test_reenter_plan_waits_for_success_and_preserves_failed_entry(tmp_path, error, dismissed):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Retained plan"), result("exit"),
+               use("TodoWrite", "tasks", todos=[{
+                   "content": "Verify", "status": "completed" if dismissed else "pending",
+               }]), result("tasks")]
+    old = store.recover("s", history)
+    if dismissed:
+        old = store.dismiss("s", old.id, old.revision)
+    entry = use("EnterPlanMode", "retry").model_copy(update={"turn_id": "next-turn"})
+    changed, pending = store.observe("s", entry)
+    assert not changed and pending == old
+    history.append(entry)
+    store = ClaudePlanStore(tmp_path)
+    assert store.recover("s", history, refresh=True) == old
+    settled = result("retry", error=error)
+    changed, plan = store.observe("s", settled)
+    history.append(settled)
+    assert changed is not error
+    if error:
+        assert plan == old
+    else:
+        assert plan.id == "plan:retry" and plan.turn_id == "next-turn"
+        assert plan.phase == "draft" and not plan.document and not plan.steps
+        assert not plan.dismissed and plan.revision > old.revision
+    assert store.recover("s", history, refresh=True) == plan
+    assert ClaudePlanStore(tmp_path).recover("s", history, refresh=True) == plan
+    cold = ClaudePlanStore(tmp_path / "cold").recover("s", history)
+    assert cold.model_dump(exclude={"revision", "dismissed"}) == plan.model_dump(exclude={"revision", "dismissed"})
+    # Replayed calls/results never reset a settled projection.
+    assert store.observe("s", entry) == (False, plan)
+    assert store.observe("s", settled) == (False, plan)
+    if error and not dismissed:
+        store.observe("s", use("TaskUpdate", "finish", taskId="0", status="completed"))
+        _, completed = store.observe("s", result("finish"))
+        assert completed.steps == [{"step": "Verify", "status": "completed"}]
+
+
+@pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("dismissed", [False, True])
+def test_failed_reentry_preserves_manual_exit_during_recovery(tmp_path, history_first, dismissed):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Retained plan"), result("exit", error=True)]
+    store.recover("s", history)
+    _, old = store.observe("s", Perm(mode="bypassPermissions"))
+    if dismissed:
+        old = store.dismiss("s", old.id, old.revision)
+    for event in [use("EnterPlanMode", "retry"), result("retry", error=True)]:
+        history.append(event)
+        if history_first:
+            assert store.recover("s", history, refresh=True) == old
+        assert store.observe("s", event) == (False, old)
+        assert store.recover("s", history, refresh=True) == old
+        store = ClaudePlanStore(tmp_path)
+        assert store.recover("s", history, refresh=True) == old
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_late_entry_result_cannot_replace_subsequent_submission(tmp_path, error):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Retained plan"), result("exit"),
+               use("EnterPlanMode", "retry"),
+               use("ExitPlanMode", "submit", plan="# Updated plan"), result("submit")]
+    expected = store.recover("s", history)
+    settled = result("retry", error=error)
+    assert store.observe("s", settled) == (False, expected)
+    assert store.recover("s", history + [settled], refresh=True) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("error", [False, True])
+async def test_reenter_plan_publishes_only_confirmed_replacement(
+        tmp_path, native_plan_source, history_first, error):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Retained plan"), result("exit"),
+               use("TodoWrite", "tasks", todos=[{"content": "Verify", "status": "pending"}]),
+               result("tasks")]
+    native_plan_source(machine, history)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="pwa"))
+    old = store.get(ctx.key)
+    transport.sent.clear()
+    for event in [use("EnterPlanMode", "retry"), result("retry", error=error)]:
+        history.append(event)
+        if history_first:
+            native_plan_source(machine, history)
+        await machine._emit(ctx, event)
+        if isinstance(event, ToolUse) or error:
+            assert store.get(ctx.key) == old
+            assert not any(isinstance(e, ClaudePlanState) for e in transport.sent)
+    updates = [e for e in transport.sent if isinstance(e, ClaudePlanState)]
+    if not error:
+        assert len(updates) == 1 and updates[0].to is None
+        assert updates[0].plan.id == "plan:retry" and updates[0].plan.phase == "draft"
+        assert not updates[0].plan.document and not updates[0].plan.steps
+    expected = store.get(ctx.key)
+    machine._claude_plans = ClaudePlanStore(tmp_path)
+    native_plan_source(machine, history)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
+    assert transport.sent[-1].plan == expected and transport.sent[-1].to == "desktop"
+    assert ctx.sdk.client is None
+
+
 def test_checklist_only_changes_after_success_and_empty_is_not_completion(tmp_path):
     store = ClaudePlanStore(tmp_path)
     approve(store)
@@ -134,6 +244,8 @@ def test_dismissal_is_durable_exact_revision_and_replay_safe(tmp_path):
     restarted.observe("session", result("exit"))
     assert restarted.get("session") == dismissed
     restarted.observe("session", use("EnterPlanMode", "new"))
+    assert restarted.get("session") == dismissed
+    restarted.observe("session", result("new"))
     assert not restarted.get("session").dismissed
     assert restarted.get("session").id != old.id
 
