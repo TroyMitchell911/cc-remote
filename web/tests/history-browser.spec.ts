@@ -2194,6 +2194,43 @@ test("Claude resumes a separate live process after an idle background task", asy
   await expect(turn.locator(".turn-working")).toHaveCount(1);
 });
 
+test("Claude return link survives refresh and a later detail window", async ({ page }) => {
+  const sid = "layout-parent", turnId = "return-parent";
+  const seedTurns = [{ id: turnId, prompt: "检查三个子代理", done: true,
+    processDetailState: "present" as const, detailEventCount: 10, blocks: [
+      { kind: "text" as const, message_id: "return-before", channel: "final" as const,
+        text: "三个检查已启动。", done: true },
+      { kind: "process" as const, item_id: "return-child", processKind: "agent" as const,
+        phase: "end" as const, status: "succeeded" as const, done: true,
+        title: "接口检查", server: "cc_remote", tool: "agent_return",
+        input: { agent_run_id: "child-review" } },
+      { kind: "text" as const, message_id: "return-after", channel: "final" as const,
+        text: "接口检查完成，继续处理。", done: true, background: true },
+    ] }];
+  const relay = await mockRightPanelRelay(page, { engine: "claude", seedTurns });
+  for (let round = 0; round < 2; round++) {
+    const start = relay.commands.length;
+    if (round) await page.reload(); else await page.goto("/");
+    await expect.poll(() => relay.commands.slice(start).some(c => c.type === "get_history")).toBe(true);
+    const link = page.locator(".background-followup .agent-return-link");
+    await expect(link).toHaveText("代理返回 · 接口检查");
+    relay.emit({ type: "turn_detail", session_id: sid, turn_id: turnId,
+      revision: "layout-history", authoritative: true, has_more: true,
+      oldest_cursor: "earlier-detail", has_newer: false, events: [
+        { v: PROTOCOL_VERSION, ts: 1, type: "user_msg", msg_id: turnId, prompt: "检查三个子代理" },
+        { v: PROTOCOL_VERSION, ts: 3, type: "assistant_msg_start", message_id: "return-after", channel: "final", background: true },
+        { v: PROTOCOL_VERSION, ts: 3, type: "delta", message_id: "return-after", text: "接口检查完成，继续处理。", channel: "final", background: true },
+        { v: PROTOCOL_VERSION, ts: 3, type: "assistant_msg_end", message_id: "return-after", channel: "final", background: true },
+      ] });
+    await expect(link).toHaveText("代理返回 · 接口检查");
+    await expect(page.locator(".background-followup")).toHaveCount(1);
+    const clicked = relay.commands.length;
+    await link.click();
+    await expect.poll(() => relay.commands.slice(clicked).some(c => c.type === "get_agent_detail"
+      && c.run_id === "child-review")).toBe(true);
+  }
+});
+
 test("Codex agent detail expands parent reports and still opens nested children", async ({ page }) => {
   const relay = await mockRightPanelRelay(page, { engine: "codex" });
   await page.goto("/");

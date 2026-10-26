@@ -528,6 +528,10 @@ const recoveryKey = recoveryCache.pageKey(claudeScope, recoveryPage.pageKey);
 (recoveryStorage.records.get(recoveryKey) as { version: number }).version = 9;
 assert.equal(await recoveryCache.getPage(claudeScope, recoveryPage.pageKey), null,
   "cached native recovery prompts must not return as human turns after upgrade");
+assert.equal((await recoveryCache.putPage(claudeScope, recoveryPage)).ok, true);
+(recoveryStorage.records.get(recoveryKey) as { version: number }).version = 11;
+assert.equal(await recoveryCache.getPage(claudeScope, recoveryPage.pageKey), null,
+  "pages which discarded child-return links must be rebuilt from canonical history");
 const legacyClaudeStorage = new MemoryStorage();
 const legacyClaudeCache = new HistoryPageCache({ storage: legacyClaudeStorage });
 assert.equal((await legacyClaudeCache.putPage(claudeScope, {
