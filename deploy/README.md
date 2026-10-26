@@ -446,11 +446,11 @@ Quarantine is temporary transaction state, not another retained backup or Trash.
   migration transaction, restores matching pre-release data before an older
   wrapper is restarted, and verifies both engines' Work ownership backfills.
 
-Protocol v83 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v84 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v83 relay/web release; then start the v83 wrapper.
+activate the v84 relay/web release; then start the v84 wrapper.
 
 The wrapper installer treats local Work data and versioned private control state
 as part of the release
@@ -463,14 +463,19 @@ the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v83, and retain that snapshot with the previous release. To roll back,
-stop v83, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v84, and retain that snapshot with the previous release. To roll back,
+stop v84, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state
 created after activation will no longer be registered (their private files are
 not deleted). Use this for immediate failed activation; after normal use,
 prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
+
+Snapshot format v4 adds the durable Claude plan database, including manual
+dismissal receipts, to the activation snapshot. It uses SQLite backup rather
+than copying a possibly incomplete database file, and still reads v1–v3
+snapshots without expanding their original restore scope.
 
 Snapshot format v3 includes an explicit allowlist of Claude/Codex controls,
 turn leases, pins, aliases, fork/BTW records, plans, presentation receipts,

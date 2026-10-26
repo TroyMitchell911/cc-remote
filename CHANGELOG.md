@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- Keep Claude plans until manually dismissed, synchronize native permission changes, and distinguish plan approval from task completion. Wire protocol v84 adds durable cross-client plan state and requires Relay, Wrapper and Web to upgrade together.
+
 ## v5.1.1
 
 Explain update failures, recover undelivered Relay update submissions, and report rollback state accurately. Wire protocol v83 is unchanged. See the bilingual [release notes](docs/releases/v5.1.1.md).

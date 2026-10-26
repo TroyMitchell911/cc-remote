@@ -34,6 +34,7 @@ from claude_agent_sdk.types import (
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
+from cc_remote.claude_permissions import CLAUDE_PERMISSION_MODES, native_permission_mode
 from cc_remote.claude_steering import (
     ClaudeSteerRejected, PendingSteers, background_end_ids, is_human_result, is_managed_input,
     is_synthetic_user, steer_message,
@@ -274,6 +275,8 @@ class SdkHandle:
         # only after the CLI accepts them; every later reconnect passes the same
         # value back through ClaudeAgentOptions instead of silently reverting.
         self.permission_mode = "bypassPermissions"
+        self._permission_revision = 0
+        self._permission_service_seq = 0
         self.work_mode = False
         self.work_settings_path: str | None = None
         # Captured once, before the first Work turn.  The UI can subtract this
@@ -645,6 +648,11 @@ class SdkHandle:
             self._service_owner_identity = self.client.owner_identity
         self.service_recovery = getattr(self.client, "recovery", None)
         description = getattr(self.client, "description", {})
+        self._permission_service_seq = description.get("permission_state_seq", 0)
+        observed_permission = description.get("controls", {}).get("permission_mode")
+        if (self._permission_service_seq and isinstance(observed_permission, str)
+                and observed_permission in CLAUDE_PERMISSION_MODES):
+            self.permission_mode = observed_permission
         self.needs_message_tools_refresh = bool(
             description.get("attached") and self.ask_server is not None
             and not self.work_mode)
@@ -1281,8 +1289,21 @@ class SdkHandle:
         """Switch the permission mode for the live cc subprocess (runtime, no reconnect)."""
         async with self._permission_reconnect_lock:
             assert self.client is not None
-            await self.client.set_permission_mode(mode)
-            self.permission_mode = mode
+            revision = self._permission_revision
+            response = await self.client.set_permission_mode(mode)
+            snapshot = (response.get("cc_remote_permission_state")
+                        if isinstance(response, dict) else None)
+            if (isinstance(snapshot, dict)
+                    and isinstance(snapshot.get("mode"), str)
+                    and snapshot.get("mode") in CLAUDE_PERMISSION_MODES
+                    and type(snapshot.get("seq")) is int):
+                if snapshot["seq"] >= self._permission_service_seq:
+                    self.permission_mode = snapshot["mode"]
+                    self._permission_service_seq = snapshot["seq"]
+                    self._permission_revision += 1
+            elif self._permission_revision == revision:
+                self.permission_mode = mode
+                self._permission_revision += 1
         log.info("permission mode set", mode=mode)
 
     def set_auto_compact(
@@ -1611,6 +1632,7 @@ class SdkHandle:
         query = getattr(self.client, "_query", None)
         if query is None or not hasattr(query, "receive_messages"):
             async for message in self.client.receive_response():
+                self._observe_permission_mode(message)
                 self._observe_model_fallback(message)
                 yield message
             return
@@ -1620,6 +1642,7 @@ class SdkHandle:
                 continue
             self._observe_recent_context_usage(message)
             self._observe_context_boundary(message)
+            self._observe_permission_mode(message)
             self._observe_model_fallback(message)
             if (isinstance(message, ResultMessage)
                     and not bool(getattr(message, "is_error", False))):
@@ -1630,6 +1653,23 @@ class SdkHandle:
             yield message
             if isinstance(message, ResultMessage):
                 return
+
+    def _observe_permission_mode(self, message) -> None:
+        if not isinstance(message, SystemMessage):
+            return
+        mode = native_permission_mode(message.data)
+        if mode is None:
+            return
+        seq = getattr(message, "_cc_service_seq", None)
+        if seq is not None:
+            # A reattached worker's control snapshot already includes these
+            # journal rows. Rebuild the transcript without reverting controls.
+            if seq <= self._permission_service_seq:
+                return
+            self._permission_service_seq = seq
+        self.permission_mode = mode
+        self._permission_revision += 1
+        message._cc_permission_revision = self._permission_revision
 
     def _observe_model_fallback(self, message) -> None:
         if isinstance(message, SystemMessage):
@@ -1731,6 +1771,7 @@ class SdkHandle:
                     message._cc_background_ends = background_end_ids(data)
                 self._observe_recent_context_usage(message)
                 self._observe_context_boundary(message)
+                self._observe_permission_mode(message)
                 self._observe_model_fallback(message)
                 if (isinstance(message, ResultMessage)
                         and not bool(getattr(message, "is_error", False))):

@@ -10,7 +10,7 @@ import {
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 import { generatedImageIdentity, generatedOutputImages } from "./process-blocks.ts";
 import { codexTransportInterruption } from "./problem-presentation.ts";
-import { isSyntheticReturnReceipt } from "./agent-returns.ts";
+import { isSyntheticReturnReceipt, restoreReturnReceipts } from "./agent-returns.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
@@ -488,7 +488,13 @@ export function mergeDetailWithLiveTail(
       });
     return [...ordered, ...byId.values()];
   }
-  return merged;
+  // A summary retains return links even when the selected detail window starts
+  // after them. Reinsert only missing metadata before its shared native anchor;
+  // appending it after the answer would silently lose continuation attribution.
+  if (!filteredLive.some(isSyntheticReturnReceipt)) return merged;
+  const detailIds = new Set(filteredDetail.map(blockIdentity));
+  return restoreReturnReceipts(merged.filter(block => !isSyntheticReturnReceipt(block)
+    || detailIds.has(blockIdentity(block))), filteredLive);
 }
 
 type TurnIdentity = Pick<
@@ -1353,6 +1359,7 @@ export function installAuthoritativeTurnDetailPage(
     newerCursor?: string | null;
   },
   projection?: TurnDetailProjection,
+  preserveLiveTail = false,
 ): Turn {
   const summaryFinals = summary.blocks.filter(isFinalTextBlock);
   const pageFinals = detail.blocks.filter(isFinalTextBlock);
@@ -1402,6 +1409,7 @@ export function installAuthoritativeTurnDetailPage(
     summaryFinals.slice(summaryStart),
     pageFinals.slice(pageStart),
   ));
+  const canonicalNarrative = restoreReturnReceipts(canonicalFinals, summary.blocks);
   const detailWithoutFinals = detail.blocks.filter(
     (block) => !isFinalTextBlock(block));
   const canonicalImageRefs = detail.imageRefs ?? summary.imageRefs;
@@ -1425,7 +1433,7 @@ export function installAuthoritativeTurnDetailPage(
   // already received on the live stream. Keep the bounded live row while its
   // native turn is open; rendering merges it with detail by item identity.
   // A later completed detail read can retire this provisional tail.
-  const liveCandidates = summary.done ? [] : summary.blocks.filter(
+  const liveCandidates = summary.done && !preserveLiveTail ? [] : summary.blocks.filter(
     (block) => !isFinalTextBlock(block));
   const liveIds = new Set(liveCandidates.map(blockIdentity));
   const liveProcess = mergeBlocks(
@@ -1468,10 +1476,13 @@ export function installAuthoritativeTurnDetailPage(
     // ordinary live-turn 256 item / 16 MiB cap cannot evict them. Legacy
     // callers without a projection retain the pre-v21 behavior.
     blocks: detailProjection
-      ? [...mergeDetailWithLiveTail(outputImages, liveProcess), ...canonicalFinals]
+      ? [...mergeDetailWithLiveTail(outputImages, liveProcess),
+          ...canonicalNarrative.filter(block => !liveProcess.some(
+            existing => blockIdentity(existing) === blockIdentity(block)))]
       : [...retainedProcess,
           ...outputImages.filter(image => !detailImageIds.has(generatedImageIdentity(image))),
-          ...canonicalFinals],
+          ...canonicalNarrative.filter(block => !retainedProcess.some(
+            existing => blockIdentity(existing) === blockIdentity(block)))],
     done: summary.done,
     doneTs: summary.doneTs,
     durationMs: summary.durationMs,
@@ -1496,7 +1507,7 @@ export function installAuthoritativeTurnDetailPage(
       !!summary.detailAutoLoad && hasMore && !detailProjection?.capped,
     detailRestorePending: false,
     detailRestoreIncomplete: restoreIncomplete,
-    liveSpillBlocks: summary.done && !hasMore && !hasNewer
+    liveSpillBlocks: summary.done && !preserveLiveTail && !hasMore && !hasNewer
       ? undefined : summary.liveSpillBlocks,
   };
 }

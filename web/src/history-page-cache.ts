@@ -1,6 +1,7 @@
 import type { HistoryBrowsePage } from "./history-browse.ts";
 import type { Block, Turn } from "./domain/conversation.ts";
 import { mergeHistoryPageCopies } from "./history-merge.ts";
+import { compactReturnReceipt, isReturnReceipt } from "./agent-returns.ts";
 
 /** Deliberately independent from cache.ts. Deep-history browsing is best-effort
  * page storage and must never make an upgrade/failure of the replay/session
@@ -23,7 +24,8 @@ const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
 // v9 discards old official-summary pages which omitted their file lists.
 // v10 removes internal Claude recovery prompts cached as human page boundaries.
 // v11 preserves native Codex cross-thread provenance and sender receipts.
-const RECORD_VERSION = 11;
+// v12 retains child-return links which older cache sanitization discarded.
+const RECORD_VERSION = 12;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;
@@ -119,6 +121,9 @@ function sanitizeTurn(turn: Turn): Turn {
   const summaryBlocks = turn.blocks.flatMap((block): Block[] => {
     if (block.kind === "text" && block.channel === "final") {
       return [{ ...block }];
+    }
+    if (block.kind === "process" && isReturnReceipt(block)) {
+      return [compactReturnReceipt(block)];
     }
     // Context compaction is lightweight narrative metadata, and its native
     // turn id is the proof used to repair the historical standalone-row bug.

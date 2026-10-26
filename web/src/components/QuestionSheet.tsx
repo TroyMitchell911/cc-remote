@@ -1,4 +1,5 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AskOption, AskQuestion, Engine } from "../protocol";
 import { EngineIcon } from "../icons";
@@ -20,6 +21,7 @@ export interface QuestionDraft {
 interface Props {
   engine: Engine;
   question: string;
+  planDocument?: string | null;
   header?: string | null;
   options: AskOption[];
   allowText?: boolean;
@@ -38,7 +40,7 @@ export function QuestionSheet(props: Props) {
 }
 
 function SingleQuestionSheet({
-  engine, question, header, options, allowText, secret, multiSelect, onAnswer, draft,
+  engine, question, header, options, allowText, secret, multiSelect, onAnswer, draft, planDocument,
 }: Props) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const headingRef = useRef<HTMLDivElement>(null);
@@ -51,6 +53,10 @@ function SingleQuestionSheet({
   const focusTextOnOpen = useRef(!initialDraft && allowText && options.length === 0);
   const [text, setText] = useState(initialDraft?.text ?? "");
   const [selected, setSelected] = useState<string[]>(initialDraft?.selected ?? []);
+  const permissionGroup = useId();
+  const permissionOptions = options.filter(option => option.label !== "继续修改");
+  const selectedPermission = permissionOptions.find(option => option.label === selected[0])?.label
+    ?? permissionOptions[0]?.label;
   const saveDraft = (next: Partial<QuestionDraft>) => {
     if (!draft) return;
     const value: QuestionDraft = { text, selected,
@@ -136,7 +142,11 @@ function SingleQuestionSheet({
         }}>
           {header && <div className="qa-header">{header}</div>}
           <div className="qa-question">{question}</div>
-          <div className="qa-options">
+          {planDocument != null && <div className="plan-approval">
+            {planDocument ? <div className="plan-document"><ReactMarkdown skipHtml>{planDocument}</ReactMarkdown></div>
+              : <p>本次请求未附带计划正文。</p>}
+          </div>}
+          {planDocument == null && <div className="qa-options">
             {options.map((o, i) => (
               <button key={i}
                 className={`qa-opt${selected.includes(o.label) ? " selected" : ""}`}
@@ -150,7 +160,7 @@ function SingleQuestionSheet({
               <button className="qa-multi-submit" disabled={selected.length === 0}
                 onClick={() => answer(selected)}>确定</button>
             )}
-          </div>
+          </div>}
           {allowText && <div className="qa-text-answer">
             <input ref={imeSubmit.inputRef} type={secret ? "password" : "text"} value={text}
               autoFocus={focusTextOnOpen.current} placeholder={secret ? "输入敏感内容" : "输入回答"}
@@ -175,6 +185,27 @@ function SingleQuestionSheet({
               onClick={imeSubmit.requestSubmit}>确定</button>
           </div>}
         </div>
+        {planDocument != null && <div className="plan-approval plan-approval-footer">
+            <fieldset className="plan-permission-picker">
+              <legend>批准后使用的权限</legend>
+              <div className="plan-permission-options">
+                {permissionOptions.map(option => <label key={option.label}
+                  className={`plan-permission-option${selectedPermission === option.label ? " selected" : ""}`}>
+                  <input type="radio" name={permissionGroup} value={option.label}
+                    checked={selectedPermission === option.label} onChange={() => {
+                      const next = [option.label]; setSelected(next); saveDraft({ selected: next });
+                    }} />
+                  <span className="plan-permission-indicator" aria-hidden="true" />
+                  <span>{option.label}</span>
+                </label>)}
+              </div>
+            </fieldset>
+            <div className="plan-approval-actions">
+              <button type="button" onClick={() => answer("继续修改")}>继续修改</button>
+              <button type="button" className="primary" disabled={!selectedPermission}
+                onClick={() => { if (selectedPermission) answer(selectedPermission); }}>批准计划</button>
+            </div>
+        </div>}
       </dialog>
   );
   return <>

@@ -217,6 +217,7 @@ class SessionPresentation:
     active: str = ""
     plan: dict | None = None
     retired_plans: set[str] = field(default_factory=set)
+    claude_plan: dict | None = None
     goal: dict | None = None
     goal_id: str | None = None
     goal_dismissed: bool = False
@@ -328,6 +329,11 @@ class SessionPresentation:
                     "turn_id": tid,
                     "done": bool(turn and turn.status != "running"),
                 }
+        elif kind == "claude_plan_state":
+            incoming = e.get("plan")
+            if (not incoming or not self.claude_plan or incoming.get("id") != self.claude_plan.get("id")
+                    or incoming.get("revision", 0) >= self.claude_plan.get("revision", 0)):
+                self.claude_plan = bounded(incoming)
         elif kind == "goal_state":
             self.goal = bounded(e.get("goal"))
             self.goal_id = e.get("goal_id")
@@ -490,7 +496,13 @@ class SessionPresentation:
                 for key in ("iterations", "lastReason"):
                     if g.get(key) is not None:
                         parts.append(f"{key}: {g[key]}")
-            if self.plan:
+            if self.claude_plan:
+                cp = self.claude_plan
+                parts += [f"\nPlan — {cp.get('phase')}", cp.get("document", ""),
+                          "Hidden on other surfaces" if cp.get("dismissed") else ""]
+                for entry in cp.get("steps", []):
+                    parts.append(f"{entry.get('status')}: {entry.get('step')}")
+            elif self.plan:
                 parts += ["\nPlan", self.plan.get("explanation") or ""]
                 for entry in self.plan.get("plan", []):
                     mark = {"completed": "✓", "inProgress": "→"}.get(

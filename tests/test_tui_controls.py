@@ -14,7 +14,7 @@ from cc_remote.tui_app import (
 )
 from cc_remote.tui_keys import KeyConfig
 from cc_remote.tui_modal import ModalEditor
-from cc_remote.tui_panels import ActionForm, DetailPanel, ActionPicker
+from cc_remote.tui_panels import ActionForm, DetailPanel, ActionPicker, PanelReader
 from cc_remote.tui_presentation import SessionPresentation
 from cc_remote.tui_settings import SettingsForm, ValuePicker, TextValue
 
@@ -302,14 +302,58 @@ async def test_catalog_responses_bound_to_requested_directory_and_profile():
 
 
 @pytest.mark.asyncio
-async def test_configured_panel_refresh_and_main_keys_do_not_leak():
+@pytest.mark.parametrize(
+    "engine,sid", [("claude", "s"), ("codex", "s"), ("dsh", "s"), ("claude", "btw-s")]
+)
+async def test_idle_snapshot_fetches_retained_claude_plan(engine, sid):
+    c = WorkspaceClient("ws://localhost:8766/ws", "", "", engine, sid)
+    c._handle(json.loads(p.serialize(p.Snapshot(sid=sid, state="idle"))))
+    await c._flush_history_refreshes()
+    assert [m["sid"] for m in sent(c, "get_goal")] == [sid]
+    assert [m["sid"] for m in sent(c, "get_claude_plan")] == (
+        [sid] if engine == "claude" and sid == "s" else []
+    )
+    assert not sent(c, "query")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["codex", "claude"])
+async def test_configured_panel_refresh_and_main_keys_do_not_leak(engine):
     app, c = setup()
+    c.workspace.catalog["s"]["engine"] = engine
     c.keys = KeyConfig({"panel": {"refresh": ["z"]}})
     async with app.run_test() as pilot:
         await pilot.press("space", "g")
+        assert [m["sid"] for m in sent(c, "get_claude_plan")] == (
+            ["s"] if engine == "claude" else []
+        )
+        if engine == "claude":
+            # The owning turn is outside loaded history; only the canonical
+            # reply can restore its document, checklist and dismissal receipt.
+            c._handle(json.loads(p.serialize(p.ClaudePlanState(
+                sid="s", plan=p.ClaudePlan(
+                    id="older-plan", turn_id="older-turn", revision=5,
+                    phase="ready", document="Retained implementation plan",
+                    steps=[p.PlanEntry(step="Verify behavior", status="completed")],
+                    dismissed=True,
+                ),
+            ))))
+            app.screen.paint()
+            await pilot.pause()
+            text = app.screen.query_one(PanelReader).text
+            assert "Retained implementation plan" in text
+            assert "completed: Verify behavior" in text
+            assert "Hidden on other surfaces" in text
+        c._handle(json.loads(p.serialize(p.SessionRekey(old_key="s", session_id="real"))))
+        c.attached_sid = "other"
+        c.engine = "claude" if engine == "codex" else "codex"
         before = len(sent(c, "get_goal"))
         await pilot.press("z")
         assert len(sent(c, "get_goal")) == before + 1
+        assert sent(c, "get_goal")[-1]["sid"] == "real"
+        assert [m["sid"] for m in sent(c, "get_claude_plan")] == (
+            ["real", "real"] if engine == "claude" else []
+        )
         assert "z: Refresh" in str(
             app.screen.query_one(".key-hints", Static).render()
         )

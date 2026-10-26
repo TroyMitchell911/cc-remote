@@ -4,7 +4,7 @@ import { goalStatusName as statusName } from "../goal-presentation";
 import type { GoalStatus, ThreadGoal } from "../protocol";
 import { Icon } from "../icons";
 import type { TurnPlanProgress } from "../plan-progress";
-import { planProgressPresentation } from "../plan-progress";
+import { planDocumentTitle, planProgressPresentation } from "../plan-progress";
 import {
   PlanProgressContent,
   PlanProgressFloatingCard,
@@ -19,6 +19,7 @@ interface Props {
   completedGoalRetired?: boolean;
   plan?: TurnPlanProgress | null;
   onLoadPlanDetail?: () => void;
+  onDismissPlan?: () => void;
   onOpen: () => void;
   onClose: () => void;
   onDismiss: () => void;
@@ -55,7 +56,9 @@ export function GoalPanel(p: Props) {
   const visualProgress = progress;
   const planPresentation = p.plan
     ? planProgressPresentation(p.plan.block, p.plan.detailLoading) : null;
-  const planHeadline = planPresentation?.stale
+  const planHeadline = p.plan?.block.claudePlan
+    ? planDocumentTitle(p.plan.block.claudePlan.document)
+    : planPresentation?.stale
     ? planPresentation.stateLabel
     : planPresentation?.currentStep ?? planPresentation?.description
       ?? planPresentation?.stateLabel;
@@ -85,7 +88,7 @@ export function GoalPanel(p: Props) {
         <PlanProgressFloatingCard anchorRef={planChipRef}
           block={standalonePlan.block} open={planOpen}
           onOpenChange={setPlanOpen} id={planPopoverId}
-          detailLoading={standalonePlan.detailLoading} compact />
+          detailLoading={standalonePlan.detailLoading} onDismiss={p.onDismissPlan} disabled={p.disabled} compact />
       </div>
     )}
     {goalRevealed && !goal &&
@@ -144,13 +147,11 @@ export function GoalPanel(p: Props) {
                 <small>{planHeadline}</small>
               </span>
               <strong>{planPresentation.progressLabel}</strong>
-              <span className={`goal-plan-entry-chev${planOpen ? " open" : ""}`}
-                aria-hidden="true"><Icon name="chev" size={15} /></span>
             </button>
             {planOpen && <div className="goal-plan-expanded"
               aria-label="计划执行状态">
               <PlanProgressContent block={p.plan.block}
-                detailLoading={p.plan.detailLoading} />
+                detailLoading={p.plan.detailLoading} onDismiss={p.onDismissPlan} disabled={p.disabled} />
             </div>}
           </section>}
     </EngineGoalDialog>}

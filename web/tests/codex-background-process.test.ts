@@ -4,7 +4,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 import type { Block, ProcessBlock, TextBlock } from "../src/domain/conversation.ts";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
-import { mergeDetailWithLiveTail } from "../src/history-merge.ts";
+import { installAuthoritativeTurnDetailPage, mergeDetailWithLiveTail } from "../src/history-merge.ts";
+import { sanitizeHistoryPageForCache } from "../src/history-page-cache.ts";
 import { projectAgentEvents } from "../src/agent-detail.ts";
 
 const childText = projectAgentEvents([
@@ -125,6 +126,52 @@ try {
     assert.equal(consumed.continuations[0]?.returns.length, 0,
       "an in-flight result cannot be attributed to a later unrelated continuation");
   }
+
+  // Refresh restores lightweight narrative first; detail can be a later source
+  // window which no longer contains the child return that caused this reply.
+  const returned: ProcessBlock = { ...receipt("return-restored-child"),
+    processKind: "agent", server: "cc_remote", tool: "agent_return", title: "检查结构",
+    input: { agent_run_id: "restored-child", private: "do not cache" },
+    output: "private child output", detail: "private child detail" };
+  const resumed = { ...after, background: true, startedTs: 21_000 };
+  const summary = { id: "restore-parent", prompt: "Inspect", done: true,
+    blocks: [before, returned, resumed] };
+  const cached = sanitizeHistoryPageForCache({ pageKey: "latest", turns: [summary],
+    isLatest: true, hasOlder: false, olderCursor: null }).turns[0]!;
+  assert.equal(assistantContinuations(cached.blocks, [before, resumed]).continuations[0]?.returns.length, 1,
+    "page-cache hydration must retain the native child link");
+  assert.doesNotMatch(JSON.stringify(cached), /private child|do not cache/,
+    "return links keep identity and display metadata without child output");
+  for (const pageBlocks of [[resumed], [{ ...thinking, background: true, startedTs: 20_500 }, resumed],
+    [before, returned, { ...thinking, background: true, startedTs: 20_500 }, resumed]]) {
+    const projection = { segments: [], blocks: pageBlocks, capped: false,
+      hasMore: true, oldestCursor: "older", hasNewer: false, newerCursor: null };
+    const installed = installAuthoritativeTurnDetailPage(cached,
+      { ...summary, blocks: pageBlocks }, projection, projection);
+    const timeline = mergeDetailWithLiveTail(projection.blocks, installed.blocks, true);
+    const restored = assistantContinuations(timeline, [before, resumed]);
+    assert.equal(restored.continuations[0]?.returns[0]?.input?.agent_run_id, "restored-child",
+      "a detail page after the receipt must keep its link beside the continuation");
+    assert.equal(restored.continuations.length, 1);
+    assert.deepEqual(mergeDetailWithLiveTail(projection.blocks, installed.blocks, true), timeline,
+      "repeat rendering cannot mutate or duplicate return metadata");
+    assert.equal(timeline.filter(block => block.kind === "process"
+      && block.item_id === returned.item_id).length, 1);
+  }
+
+  const alreadyWorking = { ...thinking, background: true, startedTs: 19_000 };
+  const alreadyWorkingTimeline = mergeDetailWithLiveTail([alreadyWorking, resumed], cached.blocks, true);
+  assert.equal(assistantContinuations(alreadyWorkingTimeline, [before, resumed])
+    .continuations[0]?.returns.length, 0,
+    "a receipt cannot move ahead of native parent work which started before it");
+  const liveSummary = { ...cached, done: false };
+  const liveProjection = { segments: [], blocks: [returned, resumed], capped: false,
+    hasMore: true, oldestCursor: "older", hasNewer: false, newerCursor: null };
+  const liveInstalled = installAuthoritativeTurnDetailPage(liveSummary,
+    { ...liveSummary, blocks: liveProjection.blocks }, liveProjection, liveProjection);
+  assert.equal(liveInstalled.blocks.filter(block => block.kind === "process"
+    && block.item_id === returned.item_id).length, 1,
+    "an open parent must not retain the same receipt in both live and narrative blocks");
 
   const sid = "codex-session", otherSid = "another-account-session";
   let state = { ...initialState, focusedSid: sid, runtimes: {

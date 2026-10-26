@@ -4,7 +4,10 @@ import { createServer } from "vite";
 import type { ProcessBlock, Turn } from "../src/domain/conversation.js";
 import {
   latestPlanProgress,
+  claudePlanProgress, claudePlanDismissLabel, planDocumentTitle,
   planProgressPresentation,
+  SessionPlanProgressCache,
+  settleClaudePlanMode,
 } from "../src/plan-progress.js";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.js";
 
@@ -101,6 +104,160 @@ const reducerHarness = await createServer({
 try {
   const { createRuntime, initialState, reduce } =
     await reducerHarness.ssrLoadModule("/src/reducer.ts");
+  const claudeSid = "echo@claude-planning";
+  const otherSid = "iris@other-session";
+  const modePlan: ProcessBlock = {
+    kind: "process", item_id: "claude-plan", processKind: "plan",
+    title: "计划模式", summary: "正在制定计划", phase: "start",
+    status: "running", done: false,
+  };
+  const owner: Turn = {
+    id: "claude-plan-turn", prompt: "出计划", done: false,
+    blocks: [modePlan],
+  };
+  let claudeState = {
+    ...initialState, focusedSid: otherSid,
+    runtimes: {
+      [claudeSid]: { ...createRuntime(), turns: [owner] },
+      [otherSid]: { ...createRuntime(), perm: "acceptEdits" },
+    },
+  };
+  const cache = new SessionPlanProgressCache();
+  const resolve = (mode: string, fromHistory = false) => cache.resolve({
+    engine: "claude", sid: claudeSid, permissionMode: mode,
+    runtime: fromHistory ? null : latestPlanProgress([owner]),
+    history: fromHistory ? latestPlanProgress([owner]) : null,
+    runtimeTurns: fromHistory ? [] : [owner],
+    historyTurns: fromHistory ? [owner] : [],
+    recovering: false, runtimeLoading: false,
+  });
+  assert.equal(resolve("")?.block.done, false,
+    "unknown permission must not close a live plan while reconnecting");
+  for (const mode of ["plan", "bypassPermissions", "plan", "default", "acceptEdits", "auto"]) {
+    claudeState = reduce(claudeState, { type: "event", event: event({
+      type: "perm", sid: claudeSid, mode,
+    }) });
+    assert.equal(claudeState.runtimes[claudeSid].perm, mode);
+    assert.equal(claudeState.runtimes[otherSid].perm, "acceptEdits");
+    assert.equal(claudeState.focusedSid, otherSid);
+    for (const fromHistory of [false, true]) {
+      const progress = resolve(claudeState.runtimes[claudeSid].perm, fromHistory)!;
+      assert.equal(progress.block.done, mode !== "plan");
+      if (mode !== "plan") {
+        assert.equal(progress.block.summary, "已退出计划模式");
+        assert.equal(planProgressPresentation(progress.block).complete, false,
+          "leaving plan mode is not proof that a plan was completed");
+        assert.notEqual(planProgressPresentation(progress.block).progressLabel, "执行中");
+      }
+    }
+  }
+  assert.equal(modePlan.done, false, "display correction preserves original history");
+  assert.equal(cache.resolve({
+    engine: "claude", sid: claudeSid, permissionMode: "bypassPermissions",
+    runtime: latestPlanProgress([owner]), history: null,
+    runtimeTurns: [owner, { id: "next", prompt: "继续", blocks: [], done: false }],
+    historyTurns: [], recovering: false, runtimeLoading: false,
+  }), null, "the next user turn retires an exited plan-mode marker");
+  assert.equal(settleClaudePlanMode(
+    { turnId: owner.id, block: activePlanBlock, detailLoading: false, needsDetail: false },
+    "codex", "never",
+  )?.block, activePlanBlock, "Codex checklists are independent from permission mode");
+  const { PlanProgressContent } = await reducerHarness.ssrLoadModule(
+    "/src/components/PlanProgressPopover.tsx");
+  const React = await import("react");
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const closedPlan = resolve("bypassPermissions")!;
+  const html = renderToStaticMarkup(React.createElement(PlanProgressContent, {
+    block: closedPlan.block,
+  }));
+  assert.ok(html.includes("已退出计划模式"));
+  assert.ok(!html.includes("等待计划步骤"));
+
+  const canonicalPlan = {
+    id: "native-plan", revision: 3, turn_id: "old-owner",
+    document: "# Migration plan\n\n## Verify\n\n- Run tests\n- Review changes",
+    phase: "approved" as const, steps: [], dismissed: false,
+  };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: canonicalPlan,
+  }) });
+  const canonical = claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan)!;
+  assert.equal(canonical.block.explanation, canonicalPlan.document);
+  assert.equal(canonical.needsDetail, false);
+  assert.equal(claudeState.focusedSid, otherSid);
+  assert.equal(planDocumentTitle(canonicalPlan.document), "Migration plan");
+  assert.equal(planProgressPresentation(canonical.block).stateLabel, "已批准");
+  assert.equal(planProgressPresentation(canonical.block).complete, false);
+  assert.equal(claudePlanDismissLabel(canonicalPlan), "确认已完成");
+  assert.equal(claudePlanDismissLabel({ ...canonicalPlan, phase: "pending" }), null);
+  assert.equal(claudePlanDismissLabel({ ...canonicalPlan,
+    steps: [{ step: "Test", status: "pending" }] }), null);
+  assert.equal(claudePlanDismissLabel({ ...canonicalPlan,
+    steps: [{ step: "Test", status: "completed" }] }), "已完成 · 收起");
+  assert.equal(claudePlanDismissLabel({ ...canonicalPlan, document: "",
+    steps: [{ step: "Test", status: "completed" }] }), "已完成 · 收起");
+  const pendingWithOldSteps = claudePlanProgress({ ...canonicalPlan, phase: "pending",
+    steps: [{ step: "Previous draft", status: "completed" }] })!;
+  assert.equal(planProgressPresentation(pendingWithOldSteps.block).progressLabel, "待确认");
+  assert.equal(planProgressPresentation(pendingWithOldSteps.block).complete, false);
+  const planHtml = renderToStaticMarkup(React.createElement(PlanProgressContent, {
+    block: canonical.block, onDismiss() {},
+  }));
+  assert.ok(planHtml.includes("<h1>Migration plan</h1>"));
+  assert.ok(planHtml.includes("<h2>Verify</h2>"));
+  assert.ok(planHtml.includes("<li>Run tests</li>"));
+  assert.ok(planHtml.includes("确认已完成"));
+  assert.ok(!planHtml.includes("等待计划步骤"));
+  const { QuestionSheet } = await reducerHarness.ssrLoadModule("/src/components/QuestionSheet.tsx");
+  const approvalHtml = renderToStaticMarkup(React.createElement(QuestionSheet, {
+    engine: "claude", question: "请确认计划及批准后的权限", header: "批准计划",
+    planDocument: canonicalPlan.document, options: [
+      { label: "逐次确认" }, { label: "自动接受编辑" }, { label: "继续修改" },
+    ], onAnswer() {},
+  }));
+  assert.ok(approvalHtml.includes("<h1>Migration plan</h1>"));
+  assert.ok(approvalHtml.includes("批准后使用的权限"));
+  assert.ok(approvalHtml.includes('type="radio"'));
+  assert.ok(approvalHtml.includes('checked="" value="逐次确认"'));
+  assert.ok(!approvalHtml.includes("<select"));
+  assert.ok(approvalHtml.includes("plan-approval-footer"));
+  assert.ok(approvalHtml.includes(">继续修改</button>"));
+  assert.ok(approvalHtml.includes(">批准计划</button>"));
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "user_msg", sid: claudeSid, msg_id: "later", prompt: "Continue",
+  }) });
+  assert.ok(claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan),
+    "new user messages cannot retire a retained document");
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid,
+    plan: { ...canonicalPlan, revision: 4, dismissed: true },
+  }) });
+  // A delayed read from before the receipt cannot reopen the monitor.
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: canonicalPlan,
+  }) });
+  assert.equal(claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan), null);
+
+  const restoredPlan = { ...canonicalPlan, revision: 5,
+    steps: [{ step: "Verify", status: "pending" as const }] };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: restoredPlan,
+  }) });
+  assert.ok(claudePlanProgress(claudeState.runtimes[claudeSid].claudePlan),
+    "rollback reopens the retained plan using a newer revision");
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid,
+    plan: { ...canonicalPlan, revision: 4, dismissed: true },
+  }) });
+  assert.deepEqual(claudeState.runtimes[claudeSid].claudePlan, restoredPlan,
+    "a pre-rollback dismissal cannot hide the restored checklist");
+  const continuedPlan = { ...restoredPlan, revision: 6,
+    steps: [{ step: "Verify", status: "inProgress" as const }] };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "claude_plan_state", sid: claudeSid, plan: continuedPlan,
+  }) });
+  assert.deepEqual(claudeState.runtimes[claudeSid].claudePlan, continuedPlan);
+
   let reducerState = reduce({
     ...initialState,
     focusedSid: reducerSid,

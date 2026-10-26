@@ -25,6 +25,49 @@ export function returnRunId(block: ProcessBlock): string | undefined {
     ? block.input.agent_run_id : undefined;
 }
 
+/** Return attribution is narrative metadata; child output remains in detail. */
+export function compactReturnReceipt(block: ProcessBlock): ProcessBlock {
+  return {
+    kind: "process", item_id: block.item_id, processKind: block.processKind,
+    phase: block.phase, status: block.status, done: block.done,
+    title: block.title.slice(0, 4096), summary: block.summary?.slice(0, 4096),
+    server: block.server, tool: block.tool, turn_id: block.turn_id,
+    parent_id: block.parent_id, input: { agent_run_id: returnRunId(block) ?? null },
+    background: block.background, startedTs: block.startedTs,
+    updatedTs: block.updatedTs, terminalTs: block.terminalTs,
+    liveOrder: block.liveOrder,
+  };
+}
+
+/** Restore metadata omitted by a bounded detail window, using shared native
+ * blocks as ordering anchors. Never infer a child from prose or timestamps. */
+export function restoreReturnReceipts(target: readonly Block[], source: readonly Block[]): Block[] {
+  const identity = (block: Block) => block.kind === "text" ? `text:${block.message_id}`
+    : block.kind === "tool" ? `tool:${block.tool_use_id}` : `process:${block.item_id}`;
+  const restored = [...target];
+  const present = new Set(restored.map(identity));
+  source.forEach((block, index) => {
+    if (!isReturnReceipt(block) || block.kind !== "process" || present.has(identity(block))) return;
+    const next = source.slice(index + 1).find(candidate => present.has(identity(candidate)));
+    let at = next ? restored.findIndex(candidate => identity(candidate) === identity(next)) : restored.length;
+    // Summary contains the final answer, while detail may add the preceding
+    // detached thinking/tools. The link belongs at that same native continuation.
+    if (next?.background === true) {
+      while (at > 0) {
+        const previous = restored[at - 1];
+        if (previous.background !== true || isReturnReceipt(previous)
+            || block.startedTs == null || previous.startedTs == null
+            || previous.startedTs < block.startedTs
+            || previous.kind === "text" && previous.channel === "final") break;
+        at -= 1;
+      }
+    }
+    restored.splice(at, 0, compactReturnReceipt(block));
+    present.add(identity(block));
+  });
+  return restored;
+}
+
 /** A child status/result is not evidence that the parent resumed execution. */
 export function hasParentContinuation(blocks: Block[]): boolean {
   return blocks.some(block => block.kind === "tool"

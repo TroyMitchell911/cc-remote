@@ -15,7 +15,7 @@ import { reduceWithRetainedArtifacts } from "./artifact-retention";
 import type { ConnState, EventOwnership } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, AskQuestion,
-  RateLimitResetResult, ThreadGoal,
+  RateLimitResetResult, ThreadGoal, ClaudePlan,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
@@ -354,6 +354,7 @@ export interface SessionRuntime {
   contextRefreshDeferred: boolean;
   contextError: string | null;
   goal: ThreadGoal | null;
+  claudePlan?: ClaudePlan | null;
   goalId: string | null;
   goalDismissed: boolean;
   completion: {
@@ -1768,12 +1769,14 @@ function finishOpenDetailBlocks(
   turn: Turn,
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
+  preserveContinuation = false,
 ): void {
   if (turn.detailProjection) {
     // Exact terminal translations already close their Plan. Preserve an open
     // one because it identifies a neutral Codex steer segment.
     finishOpenBlockList(
-      turn.detailProjection.blocks, status, isError, true);
+      turn.detailProjection.blocks.filter(block =>
+        !preserveContinuation || block.background !== true), status, isError, true);
   }
 }
 
@@ -5094,6 +5097,8 @@ function reduceEvent(
               && canonicalTurnId(turn) !== e.turn_id) return turn;
           const refreshAfterInFlight =
             turn.done && turn.detailRestorePending === true;
+          const activeContinuation = rt.state !== "idle"
+            && !!rt.liveOwner && turnHasIdentityAlias(turn, rt.liveOwner.turnId);
           const next = installAuthoritativeTurnDetailPage(
             turn,
             detailed,
@@ -5104,12 +5109,13 @@ function reduceEvent(
               newerCursor: e.newer_cursor,
             },
             installed.projection,
+            activeContinuation,
           );
           if (next.done) {
             const status = next.interrupted
               ? "interrupted" : next.error ? "failed" : "succeeded";
             finishOpenDetailBlocks(
-              next, status, status !== "succeeded");
+              next, status, status !== "succeeded", activeContinuation);
           }
           if (continuedLiveSpillRefreshDue(next)
               && next.detailLoading !== true) {
@@ -5442,6 +5448,12 @@ function reduceEvent(
           rt.liveOwner = e.state !== "idle" && owner
               && (!owner.done || e.continuation === true)
             ? { turnId: owner.id, seq: rt.lastLiveSeq } : null;
+        } else if (boundCompletedTurns && e.msg_id && e.continuation === true
+            && seq == null && !rt.replaying && e.state !== "idle") {
+          // Hello seeds the exact autonomous main owner after replay, even
+          // when its completed human row has not arrived from History yet.
+          // A plain running Snapshot or a child job cannot claim this owner.
+          rt.liveOwner = { turnId: turn?.id ?? e.msg_id, seq: rt.lastLiveSeq };
         } else if (boundCompletedTurns && e.msg_id && seq === rt.lastLiveSeq
             && (!turn?.done || e.continuation === true)) {
           rt.liveOwner = { turnId: turn?.id ?? e.msg_id, seq };
@@ -5456,7 +5468,8 @@ function reduceEvent(
           // old row before its own UserMsg/TurnBinding establishes ownership.
           rt.liveOwner = null;
           rt.pendingLiveBinding = null;
-          rt.pendingQuestion = null;
+          // A background tool can still be awaiting approval while the parent
+          // is idle. Focus also re-emits idle; neither closes that callback.
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
           for (const candidate of turns) {
             if (!candidate.done
@@ -5750,15 +5763,25 @@ function reduceEvent(
         }
       });
     case "ask_user_sync":
+      // Pending callbacks have their own lifecycle, independent of turn end,
+      // errors and idle snapshots. Only the explicit baseline/close (or the
+      // user's answer) can retire a restored question during normal operation.
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = null; });
     case "ask_user":
-      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions }; });
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions, plan_document: e.plan_document }; });
     case "ask_user_closed":
       return patch(state, e.sid, (rt) => {
         if (rt.pendingQuestion?.ask_id === e.ask_id) {
           rt.pendingQuestion = null;
         }
       });
+    case "claude_plan_state":
+      return patch(state, e.sid, (rt) => {
+        // Dismissal and recovery are authoritative, independent of turn pages.
+        if (e.plan && rt.claudePlan?.id === e.plan.id
+            && rt.claudePlan.revision > e.plan.revision) return;
+        rt.claudePlan = e.plan ?? null;
+      }, true);
     case "goal_state":
       return patch(state, e.sid, (rt) => {
         rt.goal = e.goal ?? null;
@@ -6163,7 +6186,6 @@ function reduceEvent(
           doneTs: Date.now() });
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
-        rt.pendingQuestion = null;
       }, true);
     }
     case "user_msg": {
@@ -7041,7 +7063,6 @@ function reduceEvent(
         // draining an interrupt, finishing a checkpoint, or releasing its
         // app-server consumer. Only the following authoritative State(idle)
         // unlocks the composer and queued/pending sends.
-        rt.pendingQuestion = null;
       });
     case "pong":
     case "command_ack":

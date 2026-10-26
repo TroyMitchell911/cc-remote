@@ -2194,6 +2194,150 @@ test("Claude resumes a separate live process after an idle background task", asy
   await expect(turn.locator(".turn-working")).toHaveCount(1);
 });
 
+test("Claude continuation survives device round trips without another model token", async ({ page }) => {
+  const sid = "shared-session", turnId = "native-parent";
+  const commands: { machine: string; type: string; [key: string]: unknown }[] = [];
+  const emitters = new Map<string, (event: Record<string, unknown>) => void>();
+  let running = true;
+  let build = 0;
+  await page.addInitScript(() => {
+    if (!localStorage.getItem("cc_remote_machine")) {
+      localStorage.setItem("cc_remote_machine", "desktop");
+    }
+    localStorage.setItem("cc_remote_engine", "claude");
+  });
+  await page.route("**/api/**", route => route.fulfill({ status: 404 }));
+  await page.route("**/api/session", route => route.fulfill({ json: {} }));
+  await page.route("**/api/devices", route => route.fulfill({ json: {
+    devices: ["desktop", "us-vps"].map(machine_id => ({
+      machine_id, label: machine_id, online: true,
+    })),
+  } }));
+  await page.routeWebSocket(/\/ws(?:\?|$)/, socket => {
+    const machine = new URL(socket.url()).searchParams.get("machine")!;
+    const local = machine === "desktop";
+    const generation = `generation-${machine}`;
+    const emit = (event: Record<string, unknown>) => socket.send(JSON.stringify({
+      v: PROTOCOL_VERSION, ts: 10, sid, ...event,
+    }));
+    emitters.set(machine, emit);
+    const seed = () => {
+      emit({ type: "snapshot", cc_session_id: sid,
+        state: local && running ? "running" : "idle", generation, tail_text: "" });
+      emit({ type: "replay_start", generation, from_seq: 101, to_seq: 100, truncated: true });
+      emit({ type: "replay_end", to_seq: 100, truncated: true });
+      if (local && running) emit({ type: "state", state: "running",
+        msg_id: "browser-parent", continuation: true });
+    };
+    socket.onMessage(raw => {
+      const command = JSON.parse(String(raw));
+      commands.push({ ...command, machine });
+      if (command.type === "hello") seed();
+      else if (command.type === "list_sessions") emit({ type: "session_list",
+        engine: command.engine, space: command.space, request_id: command.cmd_id,
+        sessions: command.space === "code" && command.engine === "claude" ? [{
+          session_id: sid, summary: `${machine} session`, engine: "claude",
+          space: "code", cwd: "/tmp/restore", state: local && running ? "running" : "idle",
+        }] : [],
+      });
+      else if (command.type === "switch_session") {
+        emit({ type: "session_focus", session_id: sid });
+      } else if (command.type === "get_history") emit({ type: "history",
+        session_id: sid, revision: `revision-${machine}`, generation,
+        build_seq: ++build, live_seq: 100, authoritative: true,
+        in_progress: local && running, newest_id: turnId, has_more: false,
+        detail: "summary", events: [], turns: [{ id: turnId,
+          clientMsgId: "browser-parent", prompt: `${machine} request`, done: true,
+          detailLoaded: false, processDetailState: "present", detailEventCount: 165,
+          blocks: [{ kind: "text", message_id: "initial-answer", channel: "final",
+            text: local ? "原回复已经结束，等待子代理。" : "VPS 的历史回复", done: true }],
+        }],
+      });
+      else if (command.type === "get_turn_detail") emit({ type: "turn_detail",
+        session_id: sid, turn_id: turnId, revision: `revision-${machine}`,
+        authoritative: true, has_more: true, oldest_cursor: "older-detail",
+        has_newer: false, events: [
+          { v: PROTOCOL_VERSION, ts: 1, type: "user_msg", msg_id: turnId,
+            prompt: `${machine} request` },
+          { v: PROTOCOL_VERSION, ts: 8, type: "assistant_msg_start",
+            message_id: "continuation-thinking", turn_id: turnId,
+            channel: "thinking", background: true },
+          { v: PROTOCOL_VERSION, ts: 8, type: "delta",
+            message_id: "continuation-thinking", turn_id: turnId,
+            channel: "thinking", background: true, text: "正在续办，检查剩余文件。" },
+        ],
+      });
+      else if (command.type === "get_goal") emit({ type: "goal_state",
+        request_id: command.cmd_id, goal: null });
+      else if (command.type === "ping") emit({ type: "pong", n: command.n });
+    });
+  });
+  const checkContinuation = async () => {
+    await expect(page.getByText("正在续办，检查剩余文件。", { exact: true })).toBeVisible();
+    await expect(page.locator(".turn-working")).toHaveCount(1);
+    await expect(page.getByText("VPS 的历史回复", { exact: true })).toHaveCount(0);
+  };
+  const switchDevice = async (name: string) => {
+    await page.getByRole("button", { name: "设备中心", exact: true }).click();
+    await page.locator(".device-main").filter({ hasText: name }).click();
+  };
+  await page.goto("/");
+  await checkContinuation();
+  await page.reload();
+  await checkContinuation();
+  for (let round = 0; round < 2; round++) {
+    await switchDevice("us-vps");
+    await expect(page.getByText("VPS 的历史回复", { exact: true })).toBeVisible();
+    await expect(page.getByText("正在续办，检查剩余文件。", { exact: true })).toHaveCount(0);
+    await expect(page.locator(".turn-working")).toHaveCount(0);
+    await switchDevice("desktop");
+    await checkContinuation();
+  }
+  running = false;
+  emitters.get("desktop")!({ type: "state", state: "idle", seq: 101 });
+  await expect(page.locator(".turn-working")).toHaveCount(0);
+  expect(commands.filter(c => c.type === "get_turn_detail").every(c =>
+    c.machine === "desktop" && !c.before)).toBe(true);
+  expect(commands.some(c => ["query", "steer", "interrupt"].includes(c.type))).toBe(false);
+});
+
+test("Claude return link survives refresh and a later detail window", async ({ page }) => {
+  const sid = "layout-parent", turnId = "return-parent";
+  const seedTurns = [{ id: turnId, prompt: "检查三个子代理", done: true,
+    processDetailState: "present" as const, detailEventCount: 10, blocks: [
+      { kind: "text" as const, message_id: "return-before", channel: "final" as const,
+        text: "三个检查已启动。", done: true },
+      { kind: "process" as const, item_id: "return-child", processKind: "agent" as const,
+        phase: "end" as const, status: "succeeded" as const, done: true,
+        title: "接口检查", server: "cc_remote", tool: "agent_return",
+        input: { agent_run_id: "child-review" } },
+      { kind: "text" as const, message_id: "return-after", channel: "final" as const,
+        text: "接口检查完成，继续处理。", done: true, background: true },
+    ] }];
+  const relay = await mockRightPanelRelay(page, { engine: "claude", seedTurns });
+  for (let round = 0; round < 2; round++) {
+    const start = relay.commands.length;
+    if (round) await page.reload(); else await page.goto("/");
+    await expect.poll(() => relay.commands.slice(start).some(c => c.type === "get_history")).toBe(true);
+    const link = page.locator(".background-followup .agent-return-link");
+    await expect(link).toHaveText("代理返回 · 接口检查");
+    relay.emit({ type: "turn_detail", session_id: sid, turn_id: turnId,
+      revision: "layout-history", authoritative: true, has_more: true,
+      oldest_cursor: "earlier-detail", has_newer: false, events: [
+        { v: PROTOCOL_VERSION, ts: 1, type: "user_msg", msg_id: turnId, prompt: "检查三个子代理" },
+        { v: PROTOCOL_VERSION, ts: 3, type: "assistant_msg_start", message_id: "return-after", channel: "final", background: true },
+        { v: PROTOCOL_VERSION, ts: 3, type: "delta", message_id: "return-after", text: "接口检查完成，继续处理。", channel: "final", background: true },
+        { v: PROTOCOL_VERSION, ts: 3, type: "assistant_msg_end", message_id: "return-after", channel: "final", background: true },
+      ] });
+    await expect(link).toHaveText("代理返回 · 接口检查");
+    await expect(page.locator(".background-followup")).toHaveCount(1);
+    const clicked = relay.commands.length;
+    await link.click();
+    await expect.poll(() => relay.commands.slice(clicked).some(c => c.type === "get_agent_detail"
+      && c.run_id === "child-review")).toBe(true);
+  }
+});
+
 test("Codex agent detail expands parent reports and still opens nested children", async ({ page }) => {
   const relay = await mockRightPanelRelay(page, { engine: "codex" });
   await page.goto("/");
@@ -2768,6 +2912,9 @@ test("generated image live snapshot survives canonical item identity handoff", a
   await expect(image).toHaveAttribute("src", src!);
   await expect(page.locator(".generated-output .history-image-placeholder")).toHaveCount(0);
   expect(relay.commands.filter(c => c.type === "get_preview_asset")).toHaveLength(1);
+  expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(0);
+  await page.getByRole("button", { name: "查看大图" }).click();
+  await expect(page.locator(".image-lightbox-image")).toHaveAttribute("src", src!);
   expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(0);
 });
 
@@ -5332,6 +5479,36 @@ test("native question batch keeps choices across pages and reconnects until atom
   relay.emit({ type: "ask_user_closed", sid: "layout-parent", seq: 3, ask_id: "batch-ask", reason: "answered" });
   await expect(dialog).toHaveCount(0);
   await expect(pendingResume).toHaveCount(0);
+});
+
+test("async question tool approval survives idle focus after each page refresh", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", retained: false });
+  await page.goto("/");
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  let commandCursor = 0;
+  for (let reload = 0; reload < 2; reload++) {
+    const seq = reload * 3 + 1;
+    if (reload) await page.reload();
+    await expect.poll(() => relay.commands.slice(commandCursor).some(command =>
+      command.type === "get_history" && command.session_id === "layout-parent")).toBe(true);
+    // Hello restores a still-pending background tool while its parent is idle.
+    relay.emit({ type: "ask_user_sync", sid: "layout-parent" });
+    relay.emit({ type: "ask_user", sid: "layout-parent", ask_id: "pending-tool",
+      question: "Claude 请求使用工具：Bash", options: [{ label: "允许一次" }, { label: "拒绝" }] });
+    await expect(dialog).toBeVisible();
+    // Selecting that resident session publishes its current idle state again.
+    relay.emit({ type: "session_focus", sid: "layout-parent", session_id: "layout-parent" });
+    relay.emit({ type: "state", sid: "layout-parent", state: "idle", seq });
+    await expect(dialog.getByRole("button", { name: "允许一次", exact: true })).toBeVisible();
+    relay.emit({ type: "turn_end", sid: "layout-parent", turn_id: "finished-parent", seq: seq + 1,
+      result: { subtype: "success", duration_ms: 1000, is_error: false } });
+    await expect(dialog).toBeVisible();
+    expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(0);
+    relay.emit({ type: "ask_user_closed", sid: "layout-parent", ask_id: "pending-tool",
+      reason: "cancelled", seq: seq + 2 });
+    await expect(dialog).toHaveCount(0);
+    commandCursor = relay.commands.length;
+  }
 });
 
 test("native question batch scrolls long text with fixed navigation and routes side chat answers", async ({ page }, testInfo) => {
@@ -14429,3 +14606,139 @@ for (const engine of ["claude", "codex", "dsh"]) {
     });
   }
 }
+
+async function swipeImageGallery(page: import("@playwright/test").Page,
+  dx: number, dy = 0, cancel = false) {
+  await page.locator(".image-lightbox").evaluate(async (node, input) => {
+    const stage = node as HTMLElement;
+    Object.defineProperties(stage, {
+      setPointerCapture: { configurable: true, value: () => {} },
+      releasePointerCapture: { configurable: true, value: () => {} },
+      hasPointerCapture: { configurable: true, value: () => false },
+    });
+    const x = stage.clientWidth / 2;
+    const y = stage.clientHeight / 2;
+    const emit = (type: string, x: number, y: number) => stage.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 91, pointerType: "touch", clientX: x, clientY: y,
+      buttons: type === "pointerdown" || type === "pointermove" ? 1 : 0,
+    }));
+    emit("pointerdown", x, y);
+    emit("pointermove", x + input.dx, y + input.dy);
+    await new Promise(requestAnimationFrame);
+    emit(input.cancel ? "pointercancel" : "pointerup", x + input.dx, y + input.dy);
+    stage.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true,
+      clientX: x + input.dx, clientY: y + input.dy }));
+  }, { dx, dy, cancel });
+}
+
+test("image gallery browses uploads and generated images with lazy originals and retry", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?image-gallery=1");
+  const first = page.locator('[data-turn-id="uploads"] .ubub-imgs button').first();
+  await first.click();
+  const counter = page.locator(".image-lightbox-navigation [role=status]");
+  const image = page.locator(".image-lightbox-image");
+  await expect(counter).toHaveText("1 / 5");
+  const firstSource = await image.getAttribute("src");
+  await expect(page.getByRole("button", { name: "上一张图片" })).toBeDisabled();
+  await expect(page.getByTestId("image-requests")).toHaveText("");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 5");
+  await expect(image).not.toHaveAttribute("src", firstSource!);
+  await expect(page.getByTestId("image-requests")).toHaveText("");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("3 / 5");
+  await expect(page.getByTestId("image-requests")).toHaveText("history-native/upload/full");
+  // Keep the cached thumbnail visible until its original arrives.
+  await expect(image).toHaveAttribute("src", firstSource!);
+  await expect(image).not.toHaveAttribute("src", firstSource!);
+  await expect(counter).toHaveText("3 / 5");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("4 / 5");
+  await expect(image).toBeVisible();
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("5 / 5");
+  await expect(page.getByRole("button", { name: "下一张图片" })).toBeDisabled();
+  await expect(page.getByText("图片加载失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(image).toBeVisible();
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("5 / 5");
+  await swipeImageGallery(page, 120);
+  await expect(counter).toHaveText("4 / 5");
+  // Session focus must never leave another session's gallery on screen.
+  await page.getByRole("button", { name: "Switch session" }).evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+for (const failure of ["error", "timeout"]) {
+  test(`image gallery retries an original after ${failure} while retaining its thumbnail`, async ({ page }) => {
+    await page.clock.install();
+    await page.goto(`/tests/history-browser.html?image-gallery=1&original-failure=${failure}`);
+    await page.locator('[data-turn-id="history"] .ubub-imgs button').click();
+    const preview = page.getByRole("dialog", { name: "图片预览" });
+    const image = preview.locator(".image-lightbox-image");
+    const requests = page.getByTestId("image-requests");
+    await expect(image).toBeVisible();
+    const thumbnail = await image.getAttribute("src");
+    await expect(requests).toHaveText("history-native/upload/full");
+    if (failure === "timeout") await page.clock.fastForward(15_001);
+    await expect(preview.getByText("图片加载失败", { exact: true })).toBeVisible();
+    await expect(image).toHaveAttribute("src", thumbnail!);
+    const retry = preview.getByRole("button", { name: "重试", exact: true });
+    await retry.click();
+    // Retrying must neither dismiss the gallery nor change its selected image.
+    await expect(preview).toBeVisible();
+    await expect(preview.locator(".image-lightbox-navigation [role=status]")).toHaveText("3 / 5");
+    await expect(requests).toHaveText("history-native/upload/full,history-native/upload/full");
+    await expect(image).not.toHaveAttribute("src", thumbnail!);
+    await expect(retry).toHaveCount(0);
+    await expect(preview.getByText(/图片加载失败|正在加载图片/)).toHaveCount(0);
+    await page.keyboard.press("ArrowLeft");
+    await expect(preview.locator(".image-lightbox-navigation [role=status]")).toHaveText("2 / 5");
+    await expect(preview.getByText(/图片加载失败|正在加载图片/)).toHaveCount(0);
+  });
+}
+
+test("pending composer image gallery separates swiping from zoom, vertical drag and cancellation", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?image-gallery=1");
+  await page.getByRole("button", { name: "预览待发送图片 1", exact: true }).click();
+  const counter = page.locator(".image-lightbox-navigation [role=status]");
+  await expect(counter).toHaveText("1 / 3");
+  for (const [dx, dy, cancel] of [[-20, 0, false], [-100, 150, false], [-120, 0, true]] as const) {
+    await swipeImageGallery(page, dx, dy, cancel);
+    await expect(counter).toHaveText("1 / 3");
+  }
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 3");
+  const gesture = await pinchThenPanPreview(page);
+  expect(gesture.afterPinch.scale).toBeGreaterThan(1);
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 3");
+  await page.getByRole("button", { name: "下一张图片" }).click();
+  await expect(counter).toHaveText("3 / 3");
+  await expect.poll(() => page.locator(".image-lightbox-image").evaluate((node: HTMLElement) => {
+    const matrix = new DOMMatrix(node.style.transform);
+    return [matrix.a, matrix.e, matrix.f];
+  })).toEqual([1, 0, 0]);
+  await page.keyboard.press("ArrowLeft");
+  await expect(counter).toHaveText("2 / 3");
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(page.locator(".attach-image-preview")).toHaveCount(3);
+});
+
+test("Claude plan completion action fits beside the header on narrow phones", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.goto("/tests/history-browser.html?image-gallery=1&plan-header=1");
+  const button = page.getByRole("button", { name: "确认已完成" });
+  await expect(button).toBeVisible();
+  const layout = await page.locator(".plan-progress-content > header").evaluate((header) => {
+    const button = header.querySelector("button")!;
+    const title = header.querySelector("b")!;
+    const b = button.getBoundingClientRect(), h = header.getBoundingClientRect(), t = title.getBoundingClientRect();
+    return { rightOfTitle: b.left > t.right, fits: b.right <= h.right + 1 && b.bottom <= h.bottom + 1,
+      rounded: getComputedStyle(button).borderRadius === "999px", scrollTop: header.parentElement!.parentElement!.scrollTop };
+  });
+  expect(layout).toEqual({ rightOfTitle: true, fits: true, rounded: true, scrollTop: 0 });
+  await button.click();
+  await expect(page.locator(".plan-progress-popover")).toHaveCount(0);
+});

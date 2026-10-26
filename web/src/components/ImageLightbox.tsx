@@ -1,15 +1,18 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
 import {
   panImageTransform,
+  imageSwipeDirection,
   pinchImageTransform,
   zoomImageTransform,
   type ImagePoint,
@@ -40,10 +43,13 @@ interface CommonLightboxProps {
   onClose: () => void;
   dialogLabel?: string;
   closeLabel?: string;
+  imageKey?: string;
+  navigation?: { index: number; count: number; onSelect: (index: number) => void };
+  status?: ReactNode;
 }
 
 type ImageLightboxProps = CommonLightboxProps & (
-  | { src: string; sanitizedSvg?: never }
+  | { src: string | undefined; sanitizedSvg?: never }
   | { src?: never; sanitizedSvg: string }
 );
 
@@ -63,9 +69,12 @@ export function ImageLightbox(props: ImageLightboxProps) {
     onClose,
     dialogLabel = "图片预览",
     closeLabel = "关闭图片预览",
+    navigation,
+    status,
   } = props;
   const sanitizedSvg = "sanitizedSvg" in props ? props.sanitizedSvg : undefined;
   const src = "src" in props ? props.src : undefined;
+  const imageKey = props.imageKey ?? src ?? sanitizedSvg;
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const vectorRef = useRef<HTMLDivElement>(null);
@@ -77,6 +86,9 @@ export function ImageLightbox(props: ImageLightboxProps) {
   const transformFrame = useRef<number | null>(null);
   const wheelEndTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
+  const swipe = useRef<{ start: ImagePoint; axis: "horizontal" | "vertical" | null } | null>(null);
+  const navigationRef = useRef(navigation);
+  navigationRef.current = navigation;
   const closeTimer = useRef<number | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -116,6 +128,26 @@ export function ImageLightbox(props: ImageLightboxProps) {
     commitTransform();
   }, [commitTransform]);
 
+  useLayoutEffect(() => {
+    pointers.current.clear();
+    gestureStart.current = null;
+    swipe.current = null;
+    if (wheelEndTimer.current !== null) {
+      window.clearTimeout(wheelEndTimer.current);
+      wheelEndTimer.current = null;
+    }
+    scheduleTransform({ scale: 1, x: 0, y: 0 });
+    flushTransform();
+    setInteracting(false);
+  }, [imageKey, scheduleTransform, flushTransform]);
+
+  const selectAdjacent = useCallback((direction: -1 | 1) => {
+    const current = navigationRef.current;
+    if (!current || closeTimer.current !== null) return;
+    const index = current.index + direction;
+    if (index >= 0 && index < current.count) current.onSelect(index);
+  }, []);
+
   const requestClose = useCallback(() => {
     if (closeTimer.current !== null) return;
     setEntered(false);
@@ -128,6 +160,11 @@ export function ImageLightbox(props: ImageLightboxProps) {
     closeRef.current?.focus({ preventScroll: true });
     const keydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") requestClose();
+      if (navigationRef.current && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+        event.preventDefault();
+        event.stopPropagation();
+        selectAdjacent(event.key === "ArrowLeft" ? -1 : 1);
+      }
     };
     window.addEventListener("keydown", keydown);
     return () => {
@@ -141,7 +178,7 @@ export function ImageLightbox(props: ImageLightboxProps) {
         window.clearTimeout(wheelEndTimer.current);
       }
     };
-  }, [requestClose]);
+  }, [requestClose, selectAdjacent]);
 
   const sizes = useCallback(() => {
     const visual = visualElement();
@@ -231,6 +268,7 @@ export function ImageLightbox(props: ImageLightboxProps) {
   };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
     if (pointers.current.size === 0) {
       suppressClick.current = false;
       if (wheelEndTimer.current !== null) {
@@ -238,10 +276,16 @@ export function ImageLightbox(props: ImageLightboxProps) {
         wheelEndTimer.current = null;
       }
       setInteracting(true);
+      swipe.current = navigation && navigation.count > 1 && transformRef.current.scale === 1
+        ? { start: { x: event.clientX, y: event.clientY }, axis: null } : null;
     }
     pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     event.currentTarget.setPointerCapture(event.pointerId);
-    if (pointers.current.size > 1) suppressClick.current = true;
+    if (pointers.current.size > 1) {
+      suppressClick.current = true;
+      if (swipe.current) scheduleTransform({ scale: 1, x: 0, y: 0 });
+      swipe.current = null;
+    }
     resetGestureStart();
   };
 
@@ -269,6 +313,15 @@ export function ImageLightbox(props: ImageLightboxProps) {
     const deltaX = current[0].point.x - start.points[0].point.x;
     const deltaY = current[0].point.y - start.points[0].point.y;
     if (Math.hypot(deltaX, deltaY) > DRAG_THRESHOLD) suppressClick.current = true;
+    if (swipe.current && navigation) {
+      if (!swipe.current.axis && Math.hypot(deltaX, deltaY) > DRAG_THRESHOLD) {
+        swipe.current.axis = Math.abs(deltaX) > Math.abs(deltaY) * 1.25 ? "horizontal" : "vertical";
+      }
+      if (swipe.current.axis === "horizontal") {
+        const atEdge = deltaX > 0 ? navigation.index === 0 : navigation.index === navigation.count - 1;
+        scheduleTransform({ scale: 1, x: deltaX * (atEdge ? 0.2 : 1), y: 0 });
+      }
+    }
     if (start.transform.scale > 1) {
       scheduleTransform(panImageTransform(
         start.transform,
@@ -282,6 +335,13 @@ export function ImageLightbox(props: ImageLightboxProps) {
 
   const finishPointer = (event: ReactPointerEvent<HTMLDivElement>, cancelled: boolean) => {
     if (!pointers.current.has(event.pointerId)) return;
+    const swipeStart = swipe.current;
+    const direction = !cancelled && swipeStart?.axis === "horizontal"
+      ? imageSwipeDirection(event.clientX - swipeStart.start.x, event.clientY - swipeStart.start.y,
+          sizes().viewport.width, transformRef.current.scale)
+      : 0;
+    swipe.current = null;
+    if (swipeStart) scheduleTransform({ scale: 1, x: 0, y: 0 });
     pointers.current.delete(event.pointerId);
     if (cancelled) suppressClick.current = true;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
@@ -293,6 +353,7 @@ export function ImageLightbox(props: ImageLightboxProps) {
       flushTransform();
       setInteracting(false);
     }
+    if (direction) selectAdjacent(direction);
   };
 
   const onStageClick = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -312,8 +373,8 @@ export function ImageLightbox(props: ImageLightboxProps) {
   };
 
   return createPortal(<div ref={stageRef}
-    className={`image-lightbox${entered ? " entered" : ""}${interacting ? " interacting" : ""}`}
-    role="dialog" aria-modal="true" aria-label={dialogLabel}
+    className={`image-lightbox${entered ? " entered" : ""}${interacting ? " interacting" : ""}${navigation && navigation.count > 1 ? " gallery" : ""}`}
+    role="dialog" aria-modal="true" aria-label={dialogLabel} data-lock-horizontal-swipe
     onPointerDown={onPointerDown} onPointerMove={onPointerMove}
     onPointerUp={(event) => finishPointer(event, false)}
     onPointerCancel={(event) => finishPointer(event, true)}
@@ -325,11 +386,23 @@ export function ImageLightbox(props: ImageLightboxProps) {
             className="image-lightbox-visual image-lightbox-vector"
             role="img" aria-label={alt}
             dangerouslySetInnerHTML={{ __html: sanitizedSvg }} />
-        : <img ref={imageRef}
+        : src ? <img key={imageKey} ref={imageRef}
             className="image-lightbox-visual image-lightbox-image"
             src={src} alt={alt} draggable={false}
-            onDragStart={(event) => event.preventDefault()} />}
+            onDragStart={(event) => event.preventDefault()} /> : null}
     </div>
+    {status && <div className="image-lightbox-notice"
+      onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+      {status}
+    </div>}
+    {navigation && navigation.count > 1 && <div className="image-lightbox-navigation"
+      onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+      <button type="button" aria-label="上一张图片" disabled={navigation.index === 0}
+        onClick={() => selectAdjacent(-1)}><Icon name="back" size={20} /></button>
+      <span role="status" aria-live="polite" aria-atomic="true">{navigation.index + 1} / {navigation.count}</span>
+      <button type="button" aria-label="下一张图片" disabled={navigation.index === navigation.count - 1}
+        onClick={() => selectAdjacent(1)}><Icon name="back" size={20} /></button>
+    </div>}
     <button ref={closeRef} type="button" className="image-lightbox-close"
       aria-label={closeLabel}
       onPointerDown={(event) => event.stopPropagation()}

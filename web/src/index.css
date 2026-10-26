@@ -1437,6 +1437,23 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   right:max(14px,env(safe-area-inset-right)); width:42px; height:42px; border:0; border-radius:50%;
   display:inline-flex; align-items:center; justify-content:center; color:#fff;
   background:rgba(255,255,255,.16); cursor:pointer; }
+.image-lightbox-navigation{ position:absolute; bottom:max(18px,env(safe-area-inset-bottom));
+  left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:12px;
+  border-radius:999px; padding:4px; color:#fff; background:rgba(40,40,40,.88); }
+.image-lightbox-navigation button{ display:grid; place-items:center; width:44px; height:44px;
+  border:0; border-radius:50%; color:inherit; background:transparent; cursor:pointer; }
+.image-lightbox-navigation button:disabled{ opacity:.3; cursor:default; }
+.image-lightbox-navigation button:last-child svg{ transform:rotate(180deg); }
+.image-lightbox-navigation span{ min-width:48px; text-align:center; font-size:13px; font-variant-numeric:tabular-nums; }
+.image-lightbox.gallery .image-lightbox-image{ max-height:calc(100dvh - 150px); }
+.image-lightbox-notice{ position:absolute; max-width:calc(100% - 36px);
+  padding:16px 20px; border-radius:16px; background:rgba(40,40,40,.92); }
+.image-lightbox-status{ display:flex; flex-direction:column; align-items:center; gap:12px; color:#fff; }
+.image-lightbox-status button{ padding:9px 18px; border:0; border-radius:999px; color:#fff;
+  background:rgba(255,255,255,.16); cursor:pointer; }
+.image-lightbox-navigation button:focus-visible,.image-lightbox-close:focus-visible,
+.image-lightbox-status button:focus-visible{
+  outline:2px solid #fff; outline-offset:2px; }
 @media (hover:hover) and (pointer:fine){
   .image-lightbox-close:hover{ background:rgba(255,255,255,.28); }
 }
@@ -2356,3 +2373,40 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 :root[data-palette]:not([data-palette="classic"]) :focus-visible{ outline-color:var(--accent-ink); }
 
 .engine-brand-icon.dsh{display:inline-block;flex:none;background:currentColor;mask-size:contain;mask-repeat:no-repeat;mask-position:center}
+
+/* Plan documents use the same readable Markdown in the monitor and approval. */
+.plan-document { min-width:0; margin:12px 0; color:var(--dim); font-size:13px; line-height:1.65; overflow-wrap:anywhere; }
+.plan-document h1, .plan-document h2, .plan-document h3 { color:var(--text); line-height:1.4; margin:1em 0 .5em; font-size:1.08em; }
+.plan-document h1 { font-size:1.2em; }
+.plan-document p { margin:.65em 0; }
+.plan-document ul, .plan-document ol { padding-left:1.5em; }
+.plan-document pre { overflow:auto; padding:10px; border-radius:8px; background:var(--raised); }
+.plan-document code { overflow-wrap:anywhere; }
+.plan-document img { display:none; }
+.plan-completion { display:flex; flex-direction:column; gap:7px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px; }
+.plan-completion-action { flex:none; min-height:34px; padding:6px 12px; border:1px solid var(--accent-line);
+  border-radius:999px; background:var(--accent-weak); color:var(--accent-text,var(--accent));
+  font-size:12px; font-weight:var(--font-weight-600); line-height:1.4; white-space:nowrap; cursor:pointer; }
+.plan-completion-action:hover:not(:disabled) { border-color:var(--accent); }
+.plan-completion-action:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.plan-completion-action:disabled { opacity:.5; cursor:default; }
+@media (pointer:coarse) {
+  .plan-completion-action { min-height:44px; }
+}
+.plan-completion small { color:var(--faint); font-size:11px; }
+.plan-permission-picker { min-width:0; margin:12px 0 4px; padding:0; border:0; }
+.plan-permission-picker legend { padding:0; margin-bottom:8px; color:var(--dim); font-size:13px; }
+.plan-permission-options { display:flex; flex-wrap:wrap; gap:8px; }
+.plan-permission-option { position:relative; display:flex; flex:1 1 auto; align-items:center; justify-content:center;
+  gap:8px; min-height:44px; padding:8px 12px; border:1px solid var(--border); border-radius:12px;
+  background:var(--raised); color:var(--text); font-size:13px; line-height:1.4; cursor:pointer; }
+.plan-permission-option input { position:absolute; width:1px; height:1px; opacity:0; }
+.plan-permission-option:has(input:focus-visible) { outline:2px solid var(--accent); outline-offset:2px; }
+.plan-permission-option.selected { border-color:var(--accent-line); background:var(--accent-weak); color:var(--accent-text,var(--accent)); }
+.plan-permission-indicator { flex:none; width:14px; height:14px; border:1px solid var(--faint); border-radius:50%; }
+.plan-permission-option.selected .plan-permission-indicator { border:4px solid var(--accent); }
+.plan-approval-actions { display:flex; justify-content:flex-end; gap:10px; padding:8px 0; }
+.plan-approval-actions button { padding:10px 16px; border-radius:9px; border:1px solid var(--border); background:var(--raised); color:var(--text); cursor:pointer; }
+.plan-approval-actions button.primary { background:var(--accent); color:var(--on-accent,#fff); }
+
+.plan-approval-footer { flex:none; padding:0 22px 12px; border-top:1px solid var(--border); }

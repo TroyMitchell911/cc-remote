@@ -5,6 +5,17 @@ export interface ImageTransform { scale: number; x: number; y: number }
 export const MIN_IMAGE_SCALE = 1;
 export const MAX_IMAGE_SCALE = 4;
 
+/** A deliberate horizontal drag at fitted size turns the page. Zoomed images
+ * reserve the same gesture for panning; short/vertical drags stay on the image. */
+export function imageSwipeDirection(
+  deltaX: number, deltaY: number, viewportWidth: number, scale: number,
+): -1 | 0 | 1 {
+  const threshold = Math.max(48, Math.min(80, viewportWidth * 0.15));
+  if (scale > MIN_IMAGE_SCALE || Math.abs(deltaX) < threshold
+      || Math.abs(deltaX) < Math.abs(deltaY) * 1.25) return 0;
+  return deltaX < 0 ? 1 : -1;
+}
+
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }

@@ -27,8 +27,8 @@ import time
 from typing import Any
 
 
-SNAPSHOT_VERSION = 3
-_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, 2, SNAPSHOT_VERSION})
+SNAPSHOT_VERSION = 4
+_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, 2, 3, SNAPSHOT_VERSION})
 _ENGINES = ("claude", "codex")
 _ROOT_KEYS = {
     "claude": "CLAUDE_WORK_ROOT",
@@ -52,6 +52,7 @@ _STATE_FILES = {
     "codex-forks.json": 4 * 1024 * 1024,
     "private-btw-sessions.json": 2 * 1024 * 1024,
     "session-plans.json": 16 * 1024 * 1024,
+    "claude-plans.sqlite3": 64 * 1024 * 1024,
     "session-presentation.json": 16 * 1024 * 1024,
     "viewer-pages.json": 4 * 1024 * 1024,
     "claude-profile-transition.json": 64 * 1024,
@@ -564,8 +565,16 @@ def create_snapshot(
             except FileNotFoundError:
                 state_entry["exists"] = False
             else:
-                state_entry.update(_backup_private_file(
-                    state_path, destination / filename, max_bytes=max_bytes))
+                if filename == "claude-plans.sqlite3":
+                    info = state_path.lstat()
+                    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & ~0o700
+                            or info.st_size > max_bytes):
+                        raise WorkRegistrySnapshotError("Claude plans must be a private bounded database")
+                    state_entry.update(_backup_database(state_path, destination / filename))
+                    _validate_private_backup(destination / filename, state_entry, max_bytes=max_bytes)
+                else:
+                    state_entry.update(_backup_private_file(
+                        state_path, destination / filename, max_bytes=max_bytes))
             files[filename] = state_entry
         manifest["wrapper_state"] = {
             "directory": str(state_dir),
@@ -697,7 +706,10 @@ def _state_entries(snapshot: Path, manifest: dict[str, Any]):
         entries = {_CLAUDE_CONTROLS_FILENAME: state}
     else:
         entries = state.get("files")
-        if not isinstance(entries, dict) or set(entries) != set(_STATE_FILES):
+        expected = set(_STATE_FILES)
+        if version == 3:
+            expected.remove("claude-plans.sqlite3")
+        if not isinstance(entries, dict) or set(entries) != expected:
             raise WorkRegistrySnapshotError("incomplete profile transaction snapshot")
     result = []
     for filename in _STATE_FILES:
@@ -711,6 +723,12 @@ def _state_entries(snapshot: Path, manifest: dict[str, Any]):
             raise WorkRegistrySnapshotError("inconsistent wrapper state directory")
         if entry["exists"]:
             _validate_private_backup(backup, entry, max_bytes=_STATE_FILES[filename])
+            if filename == "claude-plans.sqlite3":
+                db = sqlite3.connect(_sqlite_uri(backup), uri=True, timeout=5)
+                try:
+                    _check_database(db, label=str(backup))
+                finally:
+                    db.close()
         result.append((path, backup, entry, _STATE_FILES[filename]))
     if version >= 3:
         _validate_checkpoints(snapshot, state.get("checkpoints"))
@@ -853,6 +871,18 @@ def restore_snapshot(snapshot: Path) -> None:
         state = manifest["wrapper_state"]
         _restore_checkpoints(Path(state["directory"]), snapshot, state["checkpoints"])
     for state_path, backup, state_entry, max_bytes in state_entries:
+        if state_path.name == "claude-plans.sqlite3":
+            # A failed activation may have left SQLite sidecars behind. Restore
+            # the checked standalone image, never apply a newer hot journal.
+            for suffix in ("-wal", "-shm", "-journal"):
+                _unlink_database_file(Path(f"{state_path}{suffix}"))
+            if state_entry["exists"]:
+                _restore_database(backup, state_path, state_entry)
+            else:
+                _unlink_database_file(state_path)
+                if state_path.parent.exists():
+                    _fsync_directory(state_path.parent)
+            continue
         if state_entry["exists"]:
             _restore_private_file(backup, state_path, state_entry, max_bytes=max_bytes)
         else:

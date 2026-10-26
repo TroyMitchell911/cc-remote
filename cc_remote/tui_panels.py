@@ -33,7 +33,7 @@ PANELS = (
 
 # Only the explicit main action palette exposes the complete command inventory.
 PANEL_ACTIONS = {
-    "Goal / Plan": {"get_goal", "set_goal", "clear_goal", "dismiss_goal"},
+    "Goal / Plan": {"get_goal", "set_goal", "clear_goal", "dismiss_goal", "get_claude_plan", "dismiss_claude_plan"},
     "Usage / Context": {
         "get_context",
         "set_codex_context",
@@ -538,6 +538,8 @@ class QuestionDialog(QuestionLayout):
     def body(self):
         question = self.questions[self.index]
         labels = [question.get("question", ""), ""]
+        if question.get("plan_document") is not None:
+            labels += [question["plan_document"], "批准后使用的权限：", ""]
         for index, option in enumerate(question.get("options", []), 1):
             labels.append(f"{index}. {option['label']}\n   {option.get('ds', '')}")
         if question.get("multi_select"):

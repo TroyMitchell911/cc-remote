@@ -28,6 +28,7 @@ from cc_remote.protocol import (
     ListSessions,
     PROTOCOL_VERSION,
     GetGoal,
+    GetClaudePlan,
     GetContext,
     GetStatus,
     GetModels,
@@ -832,6 +833,7 @@ class WorkspaceClient(Tui):
     async def refresh_panel(
         self, sid: str, name: str, *, explicit: bool = True
     ) -> None:
+        sid = self.workspace.rekeys.get(sid, sid)
         row = self.workspace.catalog.get(sid, {})
         messages = {
             "Goal / Plan": lambda: [GetGoal(sid=sid)],
@@ -866,6 +868,12 @@ class WorkspaceClient(Tui):
                 )
             ],
         }.get(name, lambda: [])()
+        if (
+            name == "Goal / Plan"
+            and self._history_backed(sid)
+            and self.session_engines.get(sid, row.get("engine") or self.engine) == "claude"
+        ):
+            messages.append(GetClaudePlan(sid=sid))
         if name == "Usage / Context" and (
             explicit or self.session_engines.get(sid, self.engine) == "codex"
         ):
