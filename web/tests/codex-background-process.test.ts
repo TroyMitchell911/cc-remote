@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 import type { Block, ProcessBlock, TextBlock } from "../src/domain/conversation.ts";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol.ts";
-import { installAuthoritativeTurnDetailPage, mergeDetailWithLiveTail } from "../src/history-merge.ts";
+import { installAuthoritativeTurnDetailPage, mergeDetailWithLiveTail, mergeInitialHistory } from "../src/history-merge.ts";
 import { sanitizeHistoryPageForCache } from "../src/history-page-cache.ts";
 import { projectAgentEvents } from "../src/agent-detail.ts";
 
@@ -172,6 +172,43 @@ try {
   assert.equal(liveInstalled.blocks.filter(block => block.kind === "process"
     && block.item_id === returned.item_id).length, 1,
     "an open parent must not retain the same receipt in both live and narrative blocks");
+
+  // A and B finish before the parent has answered A. Legacy live state placed
+  // both links before A; native consumption history places B before its reply.
+  const returnA = { ...returned, item_id: "return-A", title: "Review A",
+    input: { agent_run_id: "child-A" }, startedTs: 30_000 };
+  const returnB = { ...returned, item_id: "return-B", title: "Review B",
+    input: { agent_run_id: "child-B" }, startedTs: 40_000 };
+  const replyA = { ...after, background: true, startedTs: 35_000 };
+  const replyB = { ...later, background: true, startedTs: 45_000 };
+  const canonical = { id: "overlapping-returns", prompt: "Review", done: true,
+    blocks: [before, returnA, replyA, returnB, replyB] };
+  const legacy = { ...canonical, blocks: [before,
+    { ...returnA, title: "Running last command" }, returnB, replyA, replyB]
+    .map((block, index) => ({ ...block, liveOrder: index })) };
+  const corrected = mergeInitialHistory([canonical], [legacy])[0]!;
+  const cachedCorrection = sanitizeHistoryPageForCache({ pageKey: "latest", turns: [corrected],
+    isLatest: true, hasOlder: false, olderCursor: null }).turns[0]!;
+  for (const restored of [corrected, cachedCorrection,
+    mergeInitialHistory([canonical], [cachedCorrection])[0]!]) {
+    // A stale detail/spill page must not override the corrected source anchor,
+    // even when its complete liveOrder still puts both links before reply A.
+    for (const detail of [[], legacy.blocks]) {
+      const timeline = mergeDetailWithLiveTail(detail, restored.blocks, true);
+      const segments = assistantContinuations(timeline, [before, replyA, replyB]).continuations;
+      assert.deepEqual(segments.map(segment => segment.returns.map(item => item.title)),
+        [["Review A"], ["Review B"]]);
+      assert.deepEqual(segments.map(segment => segment.answers.map(item => item.message_id)),
+        [[replyA.message_id], [replyB.message_id]], "correction does not re-segment parent replies");
+    }
+  }
+  assert.equal(legacy.blocks[1]?.kind === "process" && legacy.blocks[1].title,
+    "Running last command", "history correction must not mutate the retained live input");
+  const pendingAnchor = corrected.blocks.find(block => block.kind === "process"
+    && block.item_id === "return-B")!;
+  assert.equal(assistantContinuations([before, pendingAnchor, replyA], [before, replyA])
+    .continuations[0]?.returns.length, 0,
+    "a missing source anchor cannot fall back to a different visible reply");
 
   const sid = "codex-session", otherSid = "another-account-session";
   let state = { ...initialState, focusedSid: sid, runtimes: {

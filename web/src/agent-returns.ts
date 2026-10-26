@@ -25,6 +25,26 @@ export function returnRunId(block: ProcessBlock): string | undefined {
     ? block.input.agent_run_id : undefined;
 }
 
+export function returnAnchorIds(block: Block): string[] {
+  return block.kind === "text"
+    ? [block.message_id, block.stream_message_id].filter((id): id is string => !!id)
+      .map(id => `text:${id}`)
+    : [block.kind === "tool" ? `tool:${block.tool_use_id}` : `process:${block.item_id}`];
+}
+
+/** Canonical summaries contain consumption order, whereas old live receipts
+ * were emitted at task completion. Bind only metadata to an exact native block;
+ * never reorder the parent's text/tools or infer causality from arrival time. */
+export function anchorClaudeReturnReceipts(blocks: readonly Block[]): Block[] {
+  return blocks.map((block, index) => {
+    if (!isSyntheticReturnReceipt(block) || block.kind !== "process"
+        || !block.item_id.startsWith("return-") || block.tool !== "agent_return"
+        || block.returnAnchorId || block.liveOrder != null) return block;
+    const next = blocks.slice(index + 1).find(candidate => hasParentContinuation([candidate]));
+    return next ? { ...block, returnAnchorId: returnAnchorIds(next)[0] } : block;
+  });
+}
+
 /** Return attribution is narrative metadata; child output remains in detail. */
 export function compactReturnReceipt(block: ProcessBlock): ProcessBlock {
   return {
@@ -36,6 +56,7 @@ export function compactReturnReceipt(block: ProcessBlock): ProcessBlock {
     background: block.background, startedTs: block.startedTs,
     updatedTs: block.updatedTs, terminalTs: block.terminalTs,
     liveOrder: block.liveOrder,
+    returnAnchorId: block.returnAnchorId,
   };
 }
 

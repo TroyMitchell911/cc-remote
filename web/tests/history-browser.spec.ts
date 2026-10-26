@@ -2302,6 +2302,82 @@ test("Claude continuation survives device round trips without another model toke
   expect(commands.some(c => ["query", "steer", "interrupt"].includes(c.type))).toBe(false);
 });
 
+test("Claude overlapping return links recover from legacy live order across refresh and session switches", async ({ page }, info) => {
+  const sid = "layout-parent", turnId = "overlapping-parent";
+  let sourceReady = false;
+  const returned = (id: string) => ({ kind: "process" as const, item_id: `return-${id}`,
+    processKind: "agent" as const, phase: "end" as const, status: "succeeded" as const,
+    done: true, title: `检查 ${id}`, server: "cc_remote", tool: "agent_return",
+    input: { agent_run_id: `child-${id}` }, startedTs: id === "A" ? 20_000 : 40_000 });
+  const answer = (id: string) => ({ kind: "text" as const, message_id: `answer-${id}`,
+    channel: "final" as const, text: `检查 ${id} 的回复。`, done: true, background: true,
+    startedTs: id === "A" ? 30_000 : 50_000 });
+  const source = () => ({ type: "history" as const, sid, session_id: sid,
+    revision: "overlapping-history", generation: "layout-generation", authoritative: true,
+    detail: "summary" as const, newest_id: turnId, events: [], has_more: false, turns: [{
+      id: turnId, prompt: "并行检查", done: true, detailLoaded: false,
+      processDetailState: "none" as const, detailEventCount: 0,
+      blocks: [returned("A"), answer("A"), returned("B"), answer("B")],
+    }] });
+  const relay = await mockRightPanelRelay(page, { engine: "claude", secondParent: true,
+    historyReply: command => command.session_id === sid
+      ? sourceReady ? source() : null
+      : { type: "history", session_id: String(command.session_id),
+        revision: "other-history", events: [], turns: [], has_more: false } });
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(command => command.type === "get_history")).toBe(true);
+  relay.emit({ type: "user_msg", sid, msg_id: turnId, prompt: "并行检查" });
+  relay.emit({ type: "turn_binding", sid, msg_id: turnId, turn_id: turnId });
+  // Replay the old client's arrival-ordered metadata, before either reply.
+  for (const id of ["A", "B"]) relay.emit({ type: "process", sid, turn_id: turnId,
+    item_id: `return-${id}`, kind: "agent", phase: "end", status: "succeeded",
+    title: `Running ${id}`, server: "cc_remote", tool: "agent_return",
+    input: { agent_run_id: `child-${id}` }, background: true });
+  for (const id of ["A", "B"]) {
+    relay.emit({ type: "assistant_msg_start", sid, turn_id: turnId,
+      message_id: `answer-${id}`, channel: "final", background: true });
+    relay.emit({ type: "delta", sid, turn_id: turnId, message_id: `answer-${id}`,
+      channel: "final", text: `检查 ${id} 的回复。`, background: true });
+    relay.emit({ type: "assistant_msg_end", sid, turn_id: turnId,
+      message_id: `answer-${id}`, channel: "final", background: true });
+  }
+  relay.emit({ type: "turn_end", sid, turn_id: "answer-B", checkpoint_id: turnId,
+    result: { subtype: "success", duration_ms: 1000, is_error: false } });
+  const followups = page.locator(`.turn[data-turn-id="${turnId}"] .background-followup`);
+  await expect(followups.first().locator(".agent-return-link")).toHaveCount(2);
+  sourceReady = true;
+  relay.emit(source());
+  const check = async () => {
+    await expect(followups).toHaveCount(2);
+    for (const [index, id] of ["A", "B"].entries()) {
+      await expect(followups.nth(index).locator(".agent-return-link")).toHaveText(`代理返回 · 检查 ${id}`);
+      await expect(followups.nth(index)).toContainText(`检查 ${id} 的回复。`);
+    }
+  };
+  await check();
+  await page.reload();
+  await check();
+  if (!(await page.locator(".shell").evaluate(el => el.classList.contains("sidebar-open")))) {
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+  }
+  await page.getByText("Second parent", { exact: true }).click();
+  if (!(await page.locator(".shell").evaluate(el => el.classList.contains("sidebar-open")))) {
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+  }
+  await page.getByText("Layout parent", { exact: true }).click();
+  if (await page.locator(".shell").evaluate(el => el.classList.contains("sidebar-open"))) {
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+  }
+  await check();
+  await page.locator(".code-pane").evaluate(el => Promise.all(
+    el.getAnimations().map(animation => animation.finished)));
+  await page.screenshot({ path: info.outputPath("corrected-claude-return-links.png") });
+  await followups.last().locator(".agent-return-link").click();
+  await expect.poll(() => relay.commands.some(command => command.type === "get_agent_detail"
+    && command.run_id === "child-B")).toBe(true);
+  expect(relay.commands.some(command => ["query", "steer", "interrupt"].includes(String(command.type)))).toBe(false);
+});
+
 test("Claude return link survives refresh and a later detail window", async ({ page }) => {
   const sid = "layout-parent", turnId = "return-parent";
   const seedTurns = [{ id: turnId, prompt: "检查三个子代理", done: true,

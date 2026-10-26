@@ -1,6 +1,6 @@
 import type { Block, ProcessBlock, TextBlock, Turn } from "./domain/conversation";
 import { finalTextBlocks } from "./process-blocks";
-import { isReturnReceipt, isSyntheticReturnReceipt, returnedAgents, hasParentContinuation } from "./agent-returns.ts";
+import { isReturnReceipt, isSyntheticReturnReceipt, returnedAgents, hasParentContinuation, returnAnchorIds } from "./agent-returns.ts";
 
 export interface AssistantContinuation {
   id: string;
@@ -98,12 +98,19 @@ export function assistantContinuations(blocks: Block[], answers: TextBlock[], en
   }));
   let pending: Block[] = [];
   for (const block of blocks) {
-    if (isReturnReceipt(block)) pending.push(block);
+    if (isReturnReceipt(block) && !(block.kind === "process" && block.returnAnchorId)) pending.push(block);
     if (hasParentContinuation([block])) {
       const segment = firstParentBlocks.get(block);
       if (segment) segment.returns = returnedAgents(pending);
       pending = [];
     }
+  }
+  const anchoredSegments = new Map(continuations.flatMap(segment => segment.blocks.flatMap(
+    block => returnAnchorIds(block).map(id => [id, segment] as const))));
+  for (const receipt of blocks) {
+    if (!isReturnReceipt(receipt) || receipt.kind !== "process" || !receipt.returnAnchorId) continue;
+    const segment = anchoredSegments.get(receipt.returnAnchorId);
+    if (segment) segment.returns = returnedAgents([...segment.returns, receipt]);
   }
   return {
     original,

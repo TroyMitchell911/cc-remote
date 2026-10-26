@@ -10,7 +10,7 @@ import {
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 import { generatedImageIdentity, generatedOutputImages } from "./process-blocks.ts";
 import { codexTransportInterruption } from "./problem-presentation.ts";
-import { isSyntheticReturnReceipt, restoreReturnReceipts } from "./agent-returns.ts";
+import { anchorClaudeReturnReceipts, compactReturnReceipt, isSyntheticReturnReceipt, restoreReturnReceipts } from "./agent-returns.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
@@ -284,6 +284,12 @@ function mergeBlocks(
       const existing = historyIndex == null
         ? undefined : out[historyIndex] as ProcessBlock;
       if (existing) {
+        // A source-bound return remains authoritative when an older live/spill
+        // copy still carries the title and arrival position from completion.
+        const returnSource = isSyntheticReturnReceipt(existing)
+          ? existing.returnAnchorId ? existing : block.returnAnchorId ? block : undefined
+          : undefined;
+        const returnMetadata = returnSource && compactReturnReceipt(returnSource);
         const historyLifecycle = {
           done: existing.done, phase: existing.phase, status: existing.status,
           title: existing.title, progress: existing.progress,
@@ -293,6 +299,7 @@ function mergeBlocks(
         const plan = keepHistoryPayload
           ? existing.plan : block.plan ?? existing.plan;
         if (!keepHistoryPayload) Object.assign(existing, block);
+        if (returnMetadata) Object.assign(existing, returnMetadata);
         if (plan) existing.plan = plan.map((entry) => ({ ...entry }));
         // A completed transcript is authoritative over stale cache/live state.
         // Only the explicit in-flight-tail merge may reopen a synthetic history
@@ -1056,7 +1063,7 @@ function mergeTurn(
     && history.interrupted !== true
     && history.error == null;
   const blocks = mergeBlocks(
-    history.blocks,
+    anchorClaudeReturnReceipts(history.blocks),
     live.blocks,
     preserveLiveOpen,
     false,
@@ -1546,7 +1553,8 @@ export function mergeInitialHistory(
    * This positional internal flag avoids shipping another merge-option key. */
   settledCodex = false,
 ): Turn[] {
-  const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
+  const merged = history.map((turn) => ({ ...turn,
+    blocks: anchorClaudeReturnReceipts(turn.blocks).map((b) => ({ ...b })) }));
   const matches = new Array<number>(live.length).fill(-1);
   const used = new Set<number>();
   const unmatched: Turn[] = [];

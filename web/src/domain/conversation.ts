@@ -72,6 +72,8 @@ export interface ToolBlock {
 }
 
 export interface ProcessBlock {
+  /** Source-proven parent block for a Claude return link; local metadata only. */
+  returnAnchorId?: string;
   claudePlan?: ClaudePlan;
   kind: "process";
   item_id: string;

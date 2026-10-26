@@ -1241,6 +1241,36 @@ class StreamTranslator:
 
     def _feed_user(self, msg: UserMessage) -> list:
         events: list = []
+        origin = getattr(msg, "origin", None)
+        if (not msg.parent_tool_use_id
+                and not getattr(msg, "_cc_synthetic_user", False)
+                and isinstance(origin, dict)
+                and origin.get("kind") == "task-notification"
+                and isinstance(msg.content, str)):
+            # Completion notifications can arrive while an earlier reply is
+            # still in flight. Only this native consumption echo establishes
+            # where the return belongs in the parent's conversation.
+            event = _task_notification_event(msg.content)
+            if event is not None:
+                task_id = event.item_id
+                kind, remembered_parent = self.item_meta.get(task_id, ("task", None))
+                parent = event.parent_id or remembered_parent
+                parent_kind = self.item_meta.get(
+                    _agent_process_id(parent), (None, None))[0] if parent else None
+                if parent and ((kind == "agent" and parent == remembered_parent)
+                               or parent_kind == "agent"
+                               or self._tool_names.get(parent, "").lower() in {"agent", "task"}):
+                    event.kind = "agent"
+                    event.item_id = _agent_process_id(parent)
+                    event.parent_id = parent
+                    event.title = event.summary or "协作代理"
+                # The task status belongs to its launch turn; this link belongs
+                # to the actual parent response consuming the returned result.
+                event.turn_id = self.turn_id or self.item_turns.get(event.item_id)
+                from cc_remote.wrapper.agent_returns import return_receipt
+
+                events.append(return_receipt(event, f"claude:{task_id}",
+                    event.item_id if event.kind == "agent" else None))
         content = msg.content if isinstance(msg.content, list) else []
         has_tool_result = any(isinstance(block, (
             ToolResultBlock, ServerToolResultBlock)) for block in content)
@@ -1439,8 +1469,6 @@ class StreamTranslator:
                 background=True,
             )]
         if isinstance(msg, TaskNotificationMessage):
-            from cc_remote.wrapper.agent_returns import return_receipt
-
             status = _task_status(msg.status)
             event = ProcessEvent(
                 item_id=item_id, kind=kind, phase="end",
@@ -1450,8 +1478,7 @@ class StreamTranslator:
                 command=command,
                 background=True,
             )
-            return [event, return_receipt(event, f"claude:{task_id}",
-                                         item_id if kind == "agent" and parent else None)]
+            return [event]
         return []
 
     def _feed_background_tasks_changed(
@@ -2897,6 +2924,13 @@ def _internal_user_event_from_row(
         content.encode("utf-8", "surrogatepass")
     ).hexdigest())
     if fingerprint not in queued:
+        return None
+    return _task_notification_event(content)
+
+
+def _task_notification_event(content: str) -> ProcessEvent | None:
+    """Parse a notification only after its native provenance was verified."""
+    if not content.lstrip().startswith("<task-notification>"):
         return None
     task_id = _notification_tag(content, "task-id", 128)
     tool_id = _notification_tag(content, "tool-use-id", 128)
