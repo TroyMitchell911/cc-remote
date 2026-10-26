@@ -541,6 +541,68 @@ def test_task_updates_keep_origin_turn_across_translator_instances():
     assert "must-not-forward" not in wire and "/private/task-output" not in wire
 
 
+def test_return_links_wait_for_exact_consumption_after_overlapping_completions():
+    shared = {"item_turns": {}, "item_titles": {}, "item_meta": {}}
+    translator = StreamTranslator(4096, turn_id="parent", **shared)
+    for task in ("A", "B"):
+        translator.feed(TaskStartedMessage(
+            subtype="task_started", data={}, task_id=f"task-{task}",
+            description=f"Review {task}", uuid=f"start-{task}", session_id="s1",
+            tool_use_id=f"tool-{task}", task_type="agent"))
+    translator.feed(TaskProgressMessage(
+        subtype="task_progress", data={}, task_id="task-A",
+        description="Running last command", tool_use_id="tool-A",
+        usage={"total_tokens": 1, "tool_uses": 1, "duration_ms": 1},
+        uuid="progress-A", session_id="s1"))
+    for task in ("A", "B"):
+        events = translator.feed(TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id=f"task-{task}",
+            status="completed", output_file="/private/output",
+            summary=f'Agent "Review {task}" finished', uuid=f"notice-{task}",
+            session_id="s1", tool_use_id=f"tool-{task}"))
+        assert len(events) == 1 and events[0].status == "succeeded"
+        assert events[0].tool is None, "arrival is status, not parent consumption"
+
+    ordered = []
+    for task in ("A", "B"):
+        # The background translator is recreated at each consumed native input.
+        translator = StreamTranslator(4096, turn_id="parent", **shared)
+        consumed = translator.feed(UserMessage(
+            content=(f"<task-notification><task-id>task-{task}</task-id>"
+                     f"<tool-use-id>tool-{task}</tool-use-id><status>completed</status>"
+                     f'<summary>Agent "Review {task}" finished</summary>'
+                     "<result>private child output</result></task-notification>"),
+            uuid=f"consumed-{task}", origin={"kind": "task-notification"}))
+        assert len(consumed) == 1
+        receipt = consumed[0]
+        assert receipt.tool == "agent_return"
+        assert receipt.input == {"agent_run_id": public_agent_run_id(f"tool-{task}")}
+        assert receipt.title == f'Agent "Review {task}" finished'
+        assert receipt.turn_id == "parent"
+        assert "private child output" not in _wire_json(consumed)
+        ordered.extend(consumed)
+        ordered.extend(translator.feed(_assistant(
+            [TextBlock(text=f"Reply to {task}")], stop_reason="end_turn", uuid=f"reply-{task}")))
+    assert [event.title if isinstance(event, ProcessEvent) else event.text
+            for event in ordered if isinstance(event, (ProcessEvent, Delta))] == [
+        'Agent "Review A" finished', "Reply to A",
+        'Agent "Review B" finished', "Reply to B"]
+
+
+@pytest.mark.parametrize("origin,parent,synthetic", [
+    (None, None, False), ({"kind": "human"}, None, False),
+    ({"kind": "task-notification"}, "child-tool", False),
+    ({"kind": "task-notification"}, None, True),
+])
+def test_return_link_requires_native_top_level_consumption(origin, parent, synthetic):
+    msg = UserMessage(content=("<task-notification><task-id>task-A</task-id>"
+                              "<status>completed</status></task-notification>"),
+                      origin=origin, parent_tool_use_id=parent)
+    if synthetic:
+        msg._cc_synthetic_user = True
+    assert StreamTranslator(4096).feed(msg) == []
+
+
 def test_delayed_tool_events_keep_origin_turn_across_translator_instances():
     item_turns = {}
     item_titles = {}
@@ -623,14 +685,20 @@ def test_background_bash_task_is_not_presented_as_collaborating_agent():
         summary="checks passed", uuid="bash-end", session_id="s1",
         tool_use_id="bash-tool",
     ))
-    assert len(completed) == 2
-    assert completed[1].tool == "task_return" and completed[1].kind == "task"
-    assert completed[1].input is None
+    assert len(completed) == 1
     assert completed[0].item_id == "bash-task"
     assert completed[0].kind == "task"
     assert completed[0].turn_id == "bash-turn"
     assert completed[0].status == "succeeded"
     assert completed[0].background is True
+    consumed = second.feed(UserMessage(
+        content=("<task-notification><task-id>bash-task</task-id>"
+                 "<tool-use-id>bash-tool</tool-use-id><status>completed</status>"
+                 "</task-notification>"), origin={"kind": "task-notification"}))
+    assert len(consumed) == 1
+    assert consumed[0].tool == "task_return" and consumed[0].kind == "task"
+    assert consumed[0].input is None
+    assert consumed[0].turn_id == "later-turn"
 
 
 def test_native_background_task_level_is_authoritative_and_bounded():
