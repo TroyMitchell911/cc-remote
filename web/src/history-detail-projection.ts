@@ -72,6 +72,13 @@ export function nextActiveDetailRequest(
     (!turn.done || !!activeOwnerId) && hasTurnIdentity(turn, identity));
   if (matches.length !== 1) return null;
   const turn = matches[0];
+  // A live owner also identifies a just-submitted query, before its native
+  // transcript exists. Require the canonical History head or an existing
+  // summary's explicit detailLoaded flag, including during terminal drain.
+  // Fresh live-only rows have no such flag. Never fall back to an older head
+  // while a different live owner is receiving the new response.
+  if ((!historyNewestId || !hasTurnIdentity(turn, historyNewestId))
+      && turn.detailLoaded == null) return null;
   if (turn.detailLoading === true
       || turn.detailRestorePending === true
       || turn.detailResetPending === true
