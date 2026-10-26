@@ -14496,6 +14496,35 @@ test("image gallery browses uploads and generated images with lazy originals and
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
 });
 
+for (const failure of ["error", "timeout"]) {
+  test(`image gallery retries an original after ${failure} while retaining its thumbnail`, async ({ page }) => {
+    await page.clock.install();
+    await page.goto(`/tests/history-browser.html?image-gallery=1&original-failure=${failure}`);
+    await page.locator('[data-turn-id="history"] .ubub-imgs button').click();
+    const preview = page.getByRole("dialog", { name: "图片预览" });
+    const image = preview.locator(".image-lightbox-image");
+    const requests = page.getByTestId("image-requests");
+    await expect(image).toBeVisible();
+    const thumbnail = await image.getAttribute("src");
+    await expect(requests).toHaveText("history-native/upload/full");
+    if (failure === "timeout") await page.clock.fastForward(15_001);
+    await expect(preview.getByText("图片加载失败", { exact: true })).toBeVisible();
+    await expect(image).toHaveAttribute("src", thumbnail!);
+    const retry = preview.getByRole("button", { name: "重试", exact: true });
+    await retry.click();
+    // Retrying must neither dismiss the gallery nor change its selected image.
+    await expect(preview).toBeVisible();
+    await expect(preview.locator(".image-lightbox-navigation [role=status]")).toHaveText("3 / 5");
+    await expect(requests).toHaveText("history-native/upload/full,history-native/upload/full");
+    await expect(image).not.toHaveAttribute("src", thumbnail!);
+    await expect(retry).toHaveCount(0);
+    await expect(preview.getByText(/图片加载失败|正在加载图片/)).toHaveCount(0);
+    await page.keyboard.press("ArrowLeft");
+    await expect(preview.locator(".image-lightbox-navigation [role=status]")).toHaveText("2 / 5");
+    await expect(preview.getByText(/图片加载失败|正在加载图片/)).toHaveCount(0);
+  });
+}
+
 test("pending composer image gallery separates swiping from zoom, vertical drag and cancellation", async ({ page }) => {
   await page.goto("/tests/history-browser.html?image-gallery=1");
   await page.getByRole("button", { name: "预览待发送图片 1", exact: true }).click();

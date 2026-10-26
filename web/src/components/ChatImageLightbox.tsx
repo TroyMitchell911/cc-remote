@@ -69,7 +69,8 @@ export function ChatImageLightbox({ selection, onSelect, onClose, imageAssets,
     navigation={selection.images.length > 1 ? {
       index: selection.index, count: selection.images.length, onSelect,
     } : undefined}
-    placeholder={full?.status === "authorization" && full.authorization
+    status={image.kind === "data" || full?.status === "ready" ? undefined
+      : full?.status === "authorization" && full.authorization
       ? <PreviewAuthorizationPrompt authorization={full.authorization} onDecision={onAuthorizeImage} />
       : <div className="image-lightbox-status" role="status">
           <span>{failed ? "图片加载失败" : "正在加载图片…"}</span>

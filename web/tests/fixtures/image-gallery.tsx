@@ -3,7 +3,7 @@ import { ChatView } from "../../src/components/ChatView";
 import { PendingImageAttachments } from "../../src/components/PendingImageAttachments";
 import { PlanProgressContent } from "../../src/components/PlanProgressPopover";
 import { claudePlanProgress } from "../../src/plan-progress";
-import { historyImageAssetKey, type HistoryImageAsset, type HistoryImageVariant } from "../../src/history-image-assets";
+import { historyImageAssetKey, HISTORY_IMAGE_REQUEST_TIMEOUT_MS, type HistoryImageAsset, type HistoryImageVariant } from "../../src/history-image-assets";
 import type { InlineImageAsset } from "../../src/inline-image-assets";
 import type { Turn } from "../../src/domain/conversation";
 import type { QueryImg } from "../../src/protocol";
@@ -34,14 +34,23 @@ export function ImageGalleryFixture() {
     generated: ready(2), unavailable: { status: "error", error: "fixture load failed" },
   });
   const liveAttempts = useRef(0);
+  const historyAttempts = useRef(0);
   const onLoadHistory = useCallback((turnId: string, imageId: string, variant: HistoryImageVariant) => {
     const key = historyImageAssetKey(turnId, imageId, variant);
-    if (historyRef.current[key]?.status === "ready" || historyRef.current[key]?.status === "loading") return true;
+    const previous = historyRef.current[key];
+    if (previous?.status === "ready" || (previous?.status === "loading"
+        && Date.now() - (previous.startedAt ?? 0) < HISTORY_IMAGE_REQUEST_TIMEOUT_MS)) return true;
     setRequests((values) => [...values, `${turnId}/${imageId}/${variant}`]);
-    historyRef.current = { ...historyRef.current, [key]: { status: "loading" } };
+    const attempt = ++historyAttempts.current;
+    const failure = attempt === 1 ? new URLSearchParams(location.search).get("original-failure") : null;
+    historyRef.current = { ...historyRef.current, [key]: {
+      status: "loading", startedAt: Date.now(), requestGeneration: attempt,
+    } };
     setHistoryAssets(historyRef.current);
+    if (failure === "timeout") return true;
     window.setTimeout(() => {
-      historyRef.current = { ...historyRef.current, [key]: ready(1) };
+      historyRef.current = { ...historyRef.current, [key]: failure === "error"
+        ? { status: "error", error: "fixture load failed" } : ready(1) };
       setHistoryAssets(historyRef.current);
     }, 600);
     return true;

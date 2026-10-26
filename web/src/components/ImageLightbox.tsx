@@ -45,7 +45,7 @@ interface CommonLightboxProps {
   closeLabel?: string;
   imageKey?: string;
   navigation?: { index: number; count: number; onSelect: (index: number) => void };
-  placeholder?: ReactNode;
+  status?: ReactNode;
 }
 
 type ImageLightboxProps = CommonLightboxProps & (
@@ -70,7 +70,7 @@ export function ImageLightbox(props: ImageLightboxProps) {
     dialogLabel = "图片预览",
     closeLabel = "关闭图片预览",
     navigation,
-    placeholder,
+    status,
   } = props;
   const sanitizedSvg = "sanitizedSvg" in props ? props.sanitizedSvg : undefined;
   const src = "src" in props ? props.src : undefined;
@@ -391,9 +391,9 @@ export function ImageLightbox(props: ImageLightboxProps) {
             src={src} alt={alt} draggable={false}
             onDragStart={(event) => event.preventDefault()} /> : null}
     </div>
-    {!src && sanitizedSvg === undefined && <div className="image-lightbox-placeholder"
+    {status && <div className="image-lightbox-notice"
       onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
-      {placeholder}
+      {status}
     </div>}
     {navigation && navigation.count > 1 && <div className="image-lightbox-navigation"
       onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>

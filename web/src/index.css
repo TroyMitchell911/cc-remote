@@ -1446,11 +1446,13 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .image-lightbox-navigation button:last-child svg{ transform:rotate(180deg); }
 .image-lightbox-navigation span{ min-width:48px; text-align:center; font-size:13px; font-variant-numeric:tabular-nums; }
 .image-lightbox.gallery .image-lightbox-image{ max-height:calc(100dvh - 150px); }
-.image-lightbox-placeholder{ position:absolute; max-width:calc(100% - 36px); }
+.image-lightbox-notice{ position:absolute; max-width:calc(100% - 36px);
+  padding:16px 20px; border-radius:16px; background:rgba(40,40,40,.92); }
 .image-lightbox-status{ display:flex; flex-direction:column; align-items:center; gap:12px; color:#fff; }
 .image-lightbox-status button{ padding:9px 18px; border:0; border-radius:999px; color:#fff;
   background:rgba(255,255,255,.16); cursor:pointer; }
-.image-lightbox-navigation button:focus-visible,.image-lightbox-close:focus-visible{
+.image-lightbox-navigation button:focus-visible,.image-lightbox-close:focus-visible,
+.image-lightbox-status button:focus-visible{
   outline:2px solid #fff; outline-offset:2px; }
 @media (hover:hover) and (pointer:fine){
   .image-lightbox-close:hover{ background:rgba(255,255,255,.28); }
