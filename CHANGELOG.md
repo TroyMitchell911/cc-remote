@@ -2,6 +2,13 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.2.1
+
+Fix the brief “Retry loading details” message when sending a new Claude message. Wire protocol v84 is unchanged. See the bilingual [release notes](docs/releases/v5.2.1.md).
+
+- Wait for live output on new turns instead of reading history before the native transcript exists, including the transition from reply completion to idle.
+- Preserve automatic detail recovery for historical turns and Claude continuations after refresh or device switches.
+
 ## v5.2.0
 
 Add persistent Claude plans and conversation image navigation, and repair permission and continuation recovery. Wire protocol v84 replaces v83; Relay, Wrapper and Web must upgrade together. See the bilingual [release notes](docs/releases/v5.2.0.md).
