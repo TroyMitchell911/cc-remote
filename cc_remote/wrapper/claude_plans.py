@@ -16,6 +16,7 @@ from cc_remote.protocol import ClaudePlan, Perm, ToolResult, ToolUse, TurnPlan
 
 PLAN_TOOLS = frozenset({"enterplanmode", "exitplanmode", "todowrite", "taskcreate", "taskupdate"})
 MAX_TASKS = 4096
+PROJECTION_VERSION = 1
 
 
 def task_steps(data: dict) -> list[dict]:
@@ -82,10 +83,20 @@ def fold_plan(data: dict, event) -> None:
             # A requested entry can still be denied. Keep an existing plan
             # and its checklist until the native entry result succeeds.
             if plan is None or (name == "exitplanmode" and key in boundaries):
+                inherit_tasks = plan is None and name == "exitplanmode"
                 plan = ClaudePlan(id=f"plan:{key}"[:256], turn_id=event.turn_id).model_dump()
                 data["plan"] = plan
-                data["tasks"] = {}
-                data["tasks_overflow"] = False
+                if inherit_tasks:
+                    # Manual permission selection has no EnterPlanMode in the
+                    # transcript. Materialize its already-successful checklist
+                    # only when the first native submission establishes a plan.
+                    plan["steps"] = task_steps(data)
+                    for call in calls.values():
+                        if call["plan_id"] is None:
+                            call["plan_id"] = plan["id"]
+                else:
+                    data["tasks"] = {}
+                    data["tasks_overflow"] = False
             if name == "exitplanmode":
                 plan["phase"] = "pending"
                 if isinstance(values.get("plan"), str) and values["plan"].strip():
@@ -108,7 +119,7 @@ def fold_plan(data: dict, event) -> None:
             return
         seen.append(event.tool_use_id)
         del seen[:-4096]
-        if not plan or call["plan_id"] != plan["id"]:
+        if call["plan_id"] != (plan["id"] if plan else None):
             return
         name, values = call["name"], call["input"]
         if name == "exitplanmode":
@@ -149,7 +160,9 @@ def fold_plan(data: dict, event) -> None:
                         tasks[task_id]["step"] = values["subject"][:4096]
                     if values.get("status") in {"pending", "in_progress", "completed"}:
                         tasks[task_id]["status"] = values["status"]
-            plan["steps"] = task_steps(data)
+            # Keep unbound root tasks durable without creating a plan UI.
+            if plan:
+                plan["steps"] = task_steps(data)
 
 
 class ClaudePlanStore:
@@ -218,7 +231,10 @@ class ClaudePlanStore:
 
     def source(self, sid: str):
         with self.lock, self._db() as db:
-            return (self._load(db, sid) or {}).get("source")
+            data = self._load(db, sid) or {}
+            # Older projections discarded tasks before the first plan tool.
+            # Re-read unchanged native history once with the current reducer.
+            return data.get("source") if data.get("projection_version") == PROJECTION_VERSION else None
 
     def recover(self, sid: str, events, *, source=None, refresh=False, rollback=False) -> ClaudePlan | None:
         with self.lock, self._db() as db:
@@ -231,7 +247,7 @@ class ClaudePlanStore:
                     # even if they did not persist implicit boundaries yet.
                     boundaries[old.id.removeprefix("plan:")] = True
                 candidate = {"revision": max((data or {}).get("revision", 0), old.revision if old else 0),
-                             "boundaries": boundaries}
+                             "boundaries": boundaries, "projection_version": PROJECTION_VERSION}
                 retained = set()
                 dismissed_after = ((data or {}).get("seen") or [None])[-1] if old and old.dismissed and not rollback else None
                 for event in events:

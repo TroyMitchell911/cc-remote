@@ -229,6 +229,159 @@ def test_checklist_only_changes_after_success_and_empty_is_not_completion(tmp_pa
     assert store.get("session").steps == []
 
 
+@pytest.mark.parametrize("tool", ["TodoWrite", "TaskCreate"])
+def test_manual_plan_submission_retains_earlier_checklist_after_restart(tmp_path, tool):
+    store = ClaudePlanStore(tmp_path)
+    # Manual selection has no EnterPlanMode call, and Perm is not present in
+    # native transcript replay. Task results must survive either path.
+    store.observe("s", Perm(mode="plan"))
+    task = (use(tool, "task", todos=[{"content": "Verify", "status": "pending"}])
+            if tool == "TodoWrite" else use(tool, "task", subject="Verify"))
+    identity = "0" if tool == "TodoWrite" else "1"
+    history = [task, result("task", task_id="1"),
+               use("TaskUpdate", "working", taskId=identity, status="in_progress"), result("working")]
+    for event in history:
+        assert store.observe("s", event) == (False, None)
+    store = ClaudePlanStore(tmp_path)
+    assert store.recover("s", history, refresh=True) is None
+    submission = [use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    for event in submission:
+        store.observe("s", event)
+    history += submission
+    approved = store.get("s")
+    assert approved.phase == "approved"
+    assert approved.steps == [{"step": "Verify", "status": "inProgress"}]
+    assert store.dismiss("s", approved.id, approved.revision) == approved
+    assert store.recover("s", history, refresh=True) == approved
+    cold = ClaudePlanStore(tmp_path / "cold").recover("s", history)
+    assert cold.model_dump(exclude={"revision"}) == approved.model_dump(exclude={"revision"})
+
+    store.observe("s", use("TaskUpdate", "done", taskId=identity, status="completed"))
+    store.observe("s", result("done"))
+    complete = store.get("s")
+    assert complete.steps == [{"step": "Verify", "status": "completed"}]
+    assert store.dismiss("s", complete.id, complete.revision).dismissed
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_checklist_result_after_first_submission_keeps_its_owner(tmp_path, error):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("TaskCreate", "task", subject="Verify"),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    plan = store.recover("s", history)
+    # The outstanding task still belongs to this first implicit plan.
+    assert store.dismiss("s", plan.id, plan.revision) == plan
+    settled = result("task", error=error, task_id="1")
+    _, plan = store.observe("s", settled)
+    assert plan.steps == ([] if error else [{"step": "Verify", "status": "pending"}])
+    assert store.recover("s", history + [settled], refresh=True) == plan
+
+
+def test_first_explicit_entry_does_not_inherit_unbound_or_delayed_tasks(tmp_path):
+    store = ClaudePlanStore(tmp_path)
+    history = [use("TaskCreate", "old", subject="Old work"), result("old", task_id="1"),
+               use("TaskCreate", "late", subject="Late old work"),
+               use("EnterPlanMode", "enter"), result("enter"), result("late", task_id="2"),
+               use("ExitPlanMode", "exit", plan="# New plan"), result("exit")]
+    plan = store.recover("s", history)
+    assert plan.document == "# New plan" and plan.steps == []
+
+
+def test_unbound_checklist_ignores_child_and_failed_results(tmp_path):
+    store = ClaudePlanStore(tmp_path)
+    child = use("TodoWrite", "child", todos=[{"content": "Child", "status": "pending"}])
+    child.parent_id = "agent"
+    history = [child, result("child"), use("TaskCreate", "failed", subject="Failed"),
+               result("failed", error=True, task_id="1"),
+               use("TaskCreate", "root", subject="Root"), result("root", task_id="2"),
+               use("TaskUpdate", "failed-update", taskId="2", status="completed"),
+               result("failed-update", error=True),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    plan = store.recover("s", history)
+    assert plan.steps == [{"step": "Root", "status": "pending"}]
+
+
+@pytest.mark.parametrize("clear", ["TodoWrite", "TaskUpdate"])
+def test_cleared_unbound_tasks_do_not_reappear_on_submission_or_rollback(tmp_path, clear):
+    store = ClaudePlanStore(tmp_path)
+    cleared = (use(clear, "clear", todos=[]) if clear == "TodoWrite"
+               else use(clear, "clear", taskId="1", status="deleted"))
+    history = [use("TaskCreate", "task", subject="Removed"), result("task", task_id="1"),
+               cleared, result("clear")]
+    submission = [use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    plan = store.recover("s", history + submission)
+    assert plan.steps == []
+    assert store.recover("s", history, rollback=True) is None
+    for event in submission:
+        store.observe("s", event)
+    restored = store.get("s")
+    assert restored.steps == [] and restored.revision > plan.revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_first", [False, True])
+@pytest.mark.parametrize("resident", [False, True])
+async def test_manual_plan_checklist_survives_targeted_reads_and_native_replay(
+        tmp_path, native_plan_source, history_first, resident):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    history = []
+    native_plan_source(machine, history)
+    await machine._emit(ctx, Perm(mode="plan"))
+    events = [use("TodoWrite", "task", todos=[{"content": "Verify", "status": "pending"}]),
+              result("task"), use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    for event in events:
+        history.append(event)
+        if history_first:
+            native_plan_source(machine, history)
+            await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="pwa"))
+        await machine._emit(ctx, event)
+        if len(history) <= 2:
+            assert store.get(ctx.key) is None
+        else:
+            assert store.get(ctx.key).steps == [{"step": "Verify", "status": "pending"}]
+    approved = store.get(ctx.key)
+    broadcasts = [e for e in transport.sent if isinstance(e, ClaudePlanState) and e.to is None]
+    assert broadcasts[-1].plan == approved
+    if not resident:
+        machine.sessions.pop(ctx.key)
+    machine._claude_plans = ClaudePlanStore(tmp_path)
+    native_plan_source(machine, history)
+    for client in ("desktop", "pwa"):
+        await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id=client))
+        assert transport.sent[-1].plan == approved
+    await machine._handle_dismiss_claude_plan(DismissClaudePlan(
+        sid=ctx.key, plan_id=approved.id, revision=approved.revision, client_id="pwa"))
+    assert transport.sent[-1].plan == approved and not transport.sent[-1].plan.dismissed
+    assert ctx.sdk.client is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_cache_recovers_missing_tasks_from_unchanged_source(tmp_path, native_plan_source):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    store = machine._claude_plans = ClaudePlanStore(tmp_path)
+    history = [use("TodoWrite", "task", todos=[{"content": "Verify", "status": "pending"}]),
+               result("task"), use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    native_plan_source(machine, history)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="pwa"))
+    with store._db() as db:
+        data = store._load(db, ctx.key)
+        source = data["source"]
+        data.pop("projection_version")
+        data["tasks"] = {}
+        data["plan"]["steps"] = []
+        data["plan"]["dismissed"] = True
+        store._save(db, ctx.key, data)
+    legacy = store.get(ctx.key)
+    machine._claude_plans = ClaudePlanStore(tmp_path)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop"))
+    restored = transport.sent[-1].plan
+    assert restored.id == legacy.id and restored.revision > legacy.revision
+    assert not restored.dismissed and restored.steps == [{"step": "Verify", "status": "pending"}]
+    assert machine._claude_plans.source(ctx.key) == source
+    assert ctx.sdk.client is None
+
+
 def test_dismissal_is_durable_exact_revision_and_replay_safe(tmp_path):
     store = ClaudePlanStore(tmp_path)
     old = approve(store)
