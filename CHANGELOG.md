@@ -2,9 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
-## Unreleased
+## v5.2.0
 
-- Keep Claude plans until manually dismissed, synchronize native permission changes, and distinguish plan approval from task completion. Wire protocol v84 adds durable cross-client plan state and requires Relay, Wrapper and Web to upgrade together.
+Add persistent Claude plans and conversation image navigation, and repair permission and continuation recovery. Wire protocol v84 replaces v83; Relay, Wrapper and Web must upgrade together. See the bilingual [release notes](docs/releases/v5.2.0.md).
+
+- Keep approved plan documents and native task progress across refresh, device changes and restarts. Manual completion dismisses the monitor across clients while retaining the plan in history; document-only plans keep manual completion.
+- Synchronize native permission changes and provide a styled, keyboard-accessible permission picker during plan approval. Preserve pending tool requests until answered or explicitly closed.
+- Restore running Claude continuations and child-agent return links after refresh and device switches without reopening completed human responses or sending another model prompt.
+- Browse uploaded and generated images with mobile swipes, keyboard and navigation buttons; preserve zoom panning and expose original-image retry controls over cached thumbnails.
+- Preserve plan identity, checklist and dismissal state through replay, native mirroring and rollback; include the plan database in activation snapshots and refresh canonical plans in the TUI.
 
 ## v5.1.1
 
