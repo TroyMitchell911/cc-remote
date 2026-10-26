@@ -80,6 +80,33 @@ try {
   assert.equal(staleClose.runtimes[sid].pendingQuestion?.ask_id, "current",
     "a close for an older ask_id cannot close the authoritative seed");
 
+  for (const boundary of [
+    { type: "state", state: "idle" },
+    { type: "turn_end", turn_id: "finished-parent",
+      result: { subtype: "success", duration_ms: 1000, is_error: false } },
+    { type: "error", msg_id: "finished-parent", code: "cc_crash", message: "Parent failed" },
+  ]) {
+    let restored = reduce({ ...initialState, focusedSid: backgroundSid }, {
+      type: "event", event: wire({ type: "snapshot", sid, cc_session_id: sid,
+        state: "idle", generation: "question-generation", tail_text: "" }),
+    });
+    restored = reduce(restored, { type: "event", event: wire({ type: "ask_user_sync", sid }) });
+    restored = reduce(restored, { type: "event", event: ask("background-tool") });
+    restored = reduce(restored, { type: "event", event: wire({
+      type: "session_focus", sid, session_id: sid,
+    }) });
+    restored = reduce(restored, { type: "event", event: wire({ ...boundary, sid, seq: 1 }) });
+    assert.equal(restored.runtimes[sid].pendingQuestion?.ask_id, "background-tool",
+      `${boundary.type} is not proof that the pending tool callback closed`);
+    for (const reason of ["answered", "cancelled", "timeout", "superseded"]) {
+      const closed = reduce(restored, { type: "event", event: wire({
+        type: "ask_user_closed", sid, seq: 2, ask_id: "background-tool", reason,
+      }) });
+      assert.equal(closed.runtimes[sid].pendingQuestion, null,
+        `the exact ${reason} boundary closes the restored request`);
+    }
+  }
+
   const questions = [{ title: "Where?", options: ["Mac", "Phone"] }];
   let asyncState: AppState = {
     ...initialState, focusedSid: backgroundSid,

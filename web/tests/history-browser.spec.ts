@@ -5337,6 +5337,36 @@ test("native question batch keeps choices across pages and reconnects until atom
   await expect(pendingResume).toHaveCount(0);
 });
 
+test("async question tool approval survives idle focus after each page refresh", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", retained: false });
+  await page.goto("/");
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  let commandCursor = 0;
+  for (let reload = 0; reload < 2; reload++) {
+    const seq = reload * 3 + 1;
+    if (reload) await page.reload();
+    await expect.poll(() => relay.commands.slice(commandCursor).some(command =>
+      command.type === "get_history" && command.session_id === "layout-parent")).toBe(true);
+    // Hello restores a still-pending background tool while its parent is idle.
+    relay.emit({ type: "ask_user_sync", sid: "layout-parent" });
+    relay.emit({ type: "ask_user", sid: "layout-parent", ask_id: "pending-tool",
+      question: "Claude 请求使用工具：Bash", options: [{ label: "允许一次" }, { label: "拒绝" }] });
+    await expect(dialog).toBeVisible();
+    // Selecting that resident session publishes its current idle state again.
+    relay.emit({ type: "session_focus", sid: "layout-parent", session_id: "layout-parent" });
+    relay.emit({ type: "state", sid: "layout-parent", state: "idle", seq });
+    await expect(dialog.getByRole("button", { name: "允许一次", exact: true })).toBeVisible();
+    relay.emit({ type: "turn_end", sid: "layout-parent", turn_id: "finished-parent", seq: seq + 1,
+      result: { subtype: "success", duration_ms: 1000, is_error: false } });
+    await expect(dialog).toBeVisible();
+    expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(0);
+    relay.emit({ type: "ask_user_closed", sid: "layout-parent", ask_id: "pending-tool",
+      reason: "cancelled", seq: seq + 2 });
+    await expect(dialog).toHaveCount(0);
+    commandCursor = relay.commands.length;
+  }
+});
+
 test("native question batch scrolls long text with fixed navigation and routes side chat answers", async ({ page }, testInfo) => {
   const relay = await mockRightPanelRelay(page, { engine: "claude", visible: true });
   await page.goto("/");

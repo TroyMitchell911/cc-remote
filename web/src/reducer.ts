@@ -5457,7 +5457,8 @@ function reduceEvent(
           // old row before its own UserMsg/TurnBinding establishes ownership.
           rt.liveOwner = null;
           rt.pendingLiveBinding = null;
-          rt.pendingQuestion = null;
+          // A background tool can still be awaiting approval while the parent
+          // is idle. Focus also re-emits idle; neither closes that callback.
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
           for (const candidate of turns) {
             if (!candidate.done
@@ -5751,6 +5752,9 @@ function reduceEvent(
         }
       });
     case "ask_user_sync":
+      // Pending callbacks have their own lifecycle, independent of turn end,
+      // errors and idle snapshots. Only the explicit baseline/close (or the
+      // user's answer) can retire a restored question during normal operation.
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = null; });
     case "ask_user":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions, plan_document: e.plan_document }; });
@@ -6171,7 +6175,6 @@ function reduceEvent(
           doneTs: Date.now() });
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
-        rt.pendingQuestion = null;
       }, true);
     }
     case "user_msg": {
@@ -7049,7 +7052,6 @@ function reduceEvent(
         // draining an interrupt, finishing a checkpoint, or releasing its
         // app-server consumer. Only the following authoritative State(idle)
         // unlocks the composer and queued/pending sends.
-        rt.pendingQuestion = null;
       });
     case "pong":
     case "command_ack":
