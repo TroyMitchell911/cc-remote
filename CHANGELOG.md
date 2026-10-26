@@ -2,6 +2,13 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.2.2
+
+Fix Claude child-agent return links being attached to an earlier reply when several results arrive close together. Wire protocol v84 is unchanged. See the bilingual [release notes](docs/releases/v5.2.2.md).
+
+- Attach each return link when Claude consumes the result, keeping task completion status independent.
+- Correct stale link positions and progress titles from older live/cache data, including refresh, session switches and detail expansion.
+
 ## v5.2.1
 
 Fix the brief “Retry loading details” message when sending a new Claude message. Wire protocol v84 is unchanged. See the bilingual [release notes](docs/releases/v5.2.1.md).
