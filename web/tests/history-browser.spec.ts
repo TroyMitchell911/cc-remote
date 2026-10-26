@@ -2165,9 +2165,10 @@ test("Claude resumes a separate live process after an idle background task", asy
   await expect(continuation.locator(".turn-process-head")).toHaveAttribute("aria-expanded", "true");
   await expect(continuation.locator(".turn-process-label")).toHaveClass(/is-active/);
   await expect(continuation.locator(".turn-process-label")).toContainText("正在处理");
-  const workingAnimation = turn.locator(".turn-working").locator("svg");
-  const initialFrame = await workingAnimation.innerHTML();
-  await expect.poll(() => workingAnimation.innerHTML()).not.toBe(initialFrame);
+  const workingAnimation = turn.locator(".turn-working .claude-working-mark img");
+  const frame = () => workingAnimation.evaluate(node => getComputedStyle(node).transform);
+  const initialFrame = await frame();
+  await expect.poll(frame).not.toBe(initialFrame);
   await expect(continuation.locator(".process-reasoning")).toBeVisible();
   await expect(turn.locator(".turn-process-head").first()).toHaveAttribute("aria-expanded", "false");
   await expect(continuation).not.toContainText("Raw agent report");
@@ -14741,4 +14742,57 @@ test("Claude plan completion action fits beside the header on narrow phones", as
   expect(layout).toEqual({ rightOfTitle: true, fits: true, rounded: true, scrollTop: 0 });
   await button.click();
   await expect(page.locator(".plan-progress-popover")).toHaveCount(0);
+});
+
+test("Claude fresh query waits for live output without flashing a history detail retry", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", retained: false,
+    seedTurns: [{ id: "prior", prompt: "previous", done: true,
+      detailLoaded: true, detailEventCount: 0, blocks: [{
+        kind: "text", message_id: "prior-answer", channel: "final",
+        text: "Previous answer", done: true,
+      }],
+    }],
+  });
+  await page.goto("/");
+  await expect(page.getByText("Previous answer", { exact: true })).toBeVisible();
+  await page.locator("textarea").fill("hi claude");
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await expect.poll(() => relay.commands.some(c => c.type === "query")).toBe(true);
+  const query = relay.commands.find(c => c.type === "query")!;
+  const sid = "layout-parent", turnId = String(query.msg_id);
+  const turn = page.locator(`.turn[data-turn-id="${turnId}"]`);
+  relay.emit({ type: "state", sid, state: "running", seq: 209 });
+  relay.emit({ type: "user_msg", sid, msg_id: turnId, prompt: "hi claude", seq: 210 });
+  relay.emit({ type: "turn_binding", sid, msg_id: turnId, turn_id: "native-user", seq: 211 });
+  await expect(turn.locator(".turn-working")).toContainText("思考中");
+  // A new native transcript may not yet be readable. Previously this recovery
+  // request produced a transient “重试加载详情” before the first thinking delta.
+  await page.waitForTimeout(250);
+  expect(relay.commands.filter(c => c.type === "get_turn_detail")).toEqual([]);
+  await expect(turn.locator(".turn-detail-entry")).toHaveCount(0);
+  await expect(turn.locator(".turn-process-head")).toHaveCount(0);
+
+  relay.emit({ type: "assistant_msg_start", sid, turn_id: turnId,
+    message_id: "thinking", channel: "thinking", seq: 213 });
+  relay.emit({ type: "delta", sid, turn_id: turnId, message_id: "thinking",
+    channel: "thinking", text: "Preparing a short reply.", seq: 214 });
+  await expect(turn.locator(".turn-process-head")).toContainText("正在处理");
+  await expect(turn.locator(".process-reasoning")).toContainText("Preparing a short reply.");
+  await expect(turn.locator(".turn-working")).toContainText("处理中");
+  await expect(turn.locator(".turn-detail-entry")).toHaveCount(0);
+  expect(relay.commands.filter(c => c.type === "get_turn_detail")).toEqual([]);
+
+  relay.emit({ type: "assistant_msg_end", sid, turn_id: turnId,
+    message_id: "thinking", channel: "thinking", seq: 215 });
+  relay.emit({ type: "delta", sid, turn_id: turnId, message_id: "answer",
+    channel: "final", text: "Hello!", seq: 216 });
+  relay.emit({ type: "turn_end", sid, turn_id: "native-user", seq: 217,
+    result: { subtype: "success", duration_ms: 1000, is_error: false } });
+  await page.waitForTimeout(250);
+  expect(relay.commands.filter(c => c.type === "get_turn_detail")).toEqual([]);
+  relay.emit({ type: "state", sid, state: "idle", seq: 218 });
+  await expect(turn.getByText("Hello!", { exact: true })).toBeVisible();
+  await expect(turn.locator(".turn-working")).toHaveCount(0);
+  await expect(turn.locator(".turn-detail-entry")).toHaveCount(0);
+  expect(relay.commands.filter(c => c.type === "get_turn_detail")).toEqual([]);
 });

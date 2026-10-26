@@ -191,6 +191,24 @@ const activeDetail = turn("active-native", {
   detailLoaded: false,
 });
 const completedParent = { ...activeDetail, done: true };
+const freshQuery = turn("fresh-query", {
+  done: false, forkPointId: "fresh-native-user",
+});
+for (const historyHead of [null, "active-native"]) {
+  for (const done of [false, true]) {
+    assert.equal(nextActiveDetailRequest(
+      [activeDetail, { ...freshQuery, done }], historyHead, true, freshQuery.id,
+    ), null, "a live-only query must not read history, even while its terminal is draining");
+  }
+}
+assert.deepEqual(nextActiveDetailRequest(
+  [activeDetail], "active-browser", true, "active-native",
+), { turnId: "active-native" },
+"a live owner restored from the canonical unfinished History head still loads detail");
+assert.deepEqual(nextActiveDetailRequest(
+  [completedParent], "newer-history-row", true, "active-browser",
+), { turnId: "active-native" },
+"an exact continuation can still restore its known summary behind a newer history row");
 assert.deepEqual(nextActiveDetailRequest(
   [completedParent], "active-native", true, "active-browser",
 ), { turnId: "active-native" },
