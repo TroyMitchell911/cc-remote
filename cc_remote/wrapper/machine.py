@@ -16978,6 +16978,10 @@ class WrapperMachine:
                         await self._emit_locked(ctx, event)
                     else:
                         await self.transport.send(event)
+                log.info("Claude plan read", sid=current_sid, client_id=cmd.client_id,
+                         cmd_id=cmd.cmd_id, plan_id=plan.id if plan else None,
+                         revision=plan.revision if plan else None,
+                         dismissed=plan.dismissed if plan else None)
                 await self.transport.send(ClaudePlanState(plan=plan, sid=current_sid, to=cmd.client_id))
         if ctx:
             # Same lock order as live events, mirroring and dismissal. Keep the
@@ -16996,6 +17000,11 @@ class WrapperMachine:
             async with self._claude_plan_lock:
                 await self._recover_claude_plan(sid, refresh=True)
                 plan = await asyncio.to_thread(self._claude_plans.dismiss, sid, cmd.plan_id, cmd.revision)
+                log.info("Claude plan dismissal resolved", sid=sid, client_id=cmd.client_id,
+                         cmd_id=cmd.cmd_id, requested_plan_id=cmd.plan_id,
+                         requested_revision=cmd.revision, plan_id=plan.id if plan else None,
+                         revision=plan.revision if plan else None,
+                         dismissed=plan.dismissed if plan else None)
                 # Broadcast the authoritative receipt, including a rejected
                 # stale click. No optimistic hide, no deletion of native files.
                 event = ClaudePlanState(plan=plan, sid=sid)

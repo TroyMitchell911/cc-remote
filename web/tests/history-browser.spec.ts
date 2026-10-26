@@ -2769,6 +2769,9 @@ test("generated image live snapshot survives canonical item identity handoff", a
   await expect(page.locator(".generated-output .history-image-placeholder")).toHaveCount(0);
   expect(relay.commands.filter(c => c.type === "get_preview_asset")).toHaveLength(1);
   expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(0);
+  await page.getByRole("button", { name: "查看大图" }).click();
+  await expect(page.locator(".image-lightbox-image")).toHaveAttribute("src", src!);
+  expect(relay.commands.filter(c => c.type === "get_history_image")).toHaveLength(0);
 });
 
 test("generated image uses full reply width and remains visible through process collapse", async ({ page }, testInfo) => {
@@ -14429,3 +14432,110 @@ for (const engine of ["claude", "codex", "dsh"]) {
     });
   }
 }
+
+async function swipeImageGallery(page: import("@playwright/test").Page,
+  dx: number, dy = 0, cancel = false) {
+  await page.locator(".image-lightbox").evaluate(async (node, input) => {
+    const stage = node as HTMLElement;
+    Object.defineProperties(stage, {
+      setPointerCapture: { configurable: true, value: () => {} },
+      releasePointerCapture: { configurable: true, value: () => {} },
+      hasPointerCapture: { configurable: true, value: () => false },
+    });
+    const x = stage.clientWidth / 2;
+    const y = stage.clientHeight / 2;
+    const emit = (type: string, x: number, y: number) => stage.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 91, pointerType: "touch", clientX: x, clientY: y,
+      buttons: type === "pointerdown" || type === "pointermove" ? 1 : 0,
+    }));
+    emit("pointerdown", x, y);
+    emit("pointermove", x + input.dx, y + input.dy);
+    await new Promise(requestAnimationFrame);
+    emit(input.cancel ? "pointercancel" : "pointerup", x + input.dx, y + input.dy);
+    stage.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true,
+      clientX: x + input.dx, clientY: y + input.dy }));
+  }, { dx, dy, cancel });
+}
+
+test("image gallery browses uploads and generated images with lazy originals and retry", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?image-gallery=1");
+  const first = page.locator('[data-turn-id="uploads"] .ubub-imgs button').first();
+  await first.click();
+  const counter = page.locator(".image-lightbox-navigation [role=status]");
+  const image = page.locator(".image-lightbox-image");
+  await expect(counter).toHaveText("1 / 5");
+  const firstSource = await image.getAttribute("src");
+  await expect(page.getByRole("button", { name: "上一张图片" })).toBeDisabled();
+  await expect(page.getByTestId("image-requests")).toHaveText("");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 5");
+  await expect(image).not.toHaveAttribute("src", firstSource!);
+  await expect(page.getByTestId("image-requests")).toHaveText("");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("3 / 5");
+  await expect(page.getByTestId("image-requests")).toHaveText("history-native/upload/full");
+  // Keep the cached thumbnail visible until its original arrives.
+  await expect(image).toHaveAttribute("src", firstSource!);
+  await expect(image).not.toHaveAttribute("src", firstSource!);
+  await expect(counter).toHaveText("3 / 5");
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("4 / 5");
+  await expect(image).toBeVisible();
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("5 / 5");
+  await expect(page.getByRole("button", { name: "下一张图片" })).toBeDisabled();
+  await expect(page.getByText("图片加载失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "重试", exact: true }).click();
+  await expect(image).toBeVisible();
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("5 / 5");
+  await swipeImageGallery(page, 120);
+  await expect(counter).toHaveText("4 / 5");
+  // Session focus must never leave another session's gallery on screen.
+  await page.getByRole("button", { name: "Switch session" }).evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("pending composer image gallery separates swiping from zoom, vertical drag and cancellation", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?image-gallery=1");
+  await page.getByRole("button", { name: "预览待发送图片 1", exact: true }).click();
+  const counter = page.locator(".image-lightbox-navigation [role=status]");
+  await expect(counter).toHaveText("1 / 3");
+  for (const [dx, dy, cancel] of [[-20, 0, false], [-100, 150, false], [-120, 0, true]] as const) {
+    await swipeImageGallery(page, dx, dy, cancel);
+    await expect(counter).toHaveText("1 / 3");
+  }
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 3");
+  const gesture = await pinchThenPanPreview(page);
+  expect(gesture.afterPinch.scale).toBeGreaterThan(1);
+  await swipeImageGallery(page, -120);
+  await expect(counter).toHaveText("2 / 3");
+  await page.getByRole("button", { name: "下一张图片" }).click();
+  await expect(counter).toHaveText("3 / 3");
+  await expect.poll(() => page.locator(".image-lightbox-image").evaluate((node: HTMLElement) => {
+    const matrix = new DOMMatrix(node.style.transform);
+    return [matrix.a, matrix.e, matrix.f];
+  })).toEqual([1, 0, 0]);
+  await page.keyboard.press("ArrowLeft");
+  await expect(counter).toHaveText("2 / 3");
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(page.locator(".attach-image-preview")).toHaveCount(3);
+});
+
+test("Claude plan completion action fits beside the header on narrow phones", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.goto("/tests/history-browser.html?image-gallery=1&plan-header=1");
+  const button = page.getByRole("button", { name: "确认已完成" });
+  await expect(button).toBeVisible();
+  const layout = await page.locator(".plan-progress-content > header").evaluate((header) => {
+    const button = header.querySelector("button")!;
+    const title = header.querySelector("b")!;
+    const b = button.getBoundingClientRect(), h = header.getBoundingClientRect(), t = title.getBoundingClientRect();
+    return { rightOfTitle: b.left > t.right, fits: b.right <= h.right + 1 && b.bottom <= h.bottom + 1,
+      rounded: getComputedStyle(button).borderRadius === "999px", scrollTop: header.parentElement!.parentElement!.scrollTop };
+  });
+  expect(layout).toEqual({ rightOfTitle: true, fits: true, rounded: true, scrollTop: 0 });
+  await button.click();
+  await expect(page.locator(".plan-progress-popover")).toHaveCount(0);
+});

@@ -45,6 +45,13 @@ export function PendingImageAttachments({ images, onRemove }: {
     })}
     {activePreview && (
       <ImageLightbox src={activePreview.src} alt={activePreview.alt}
+        imageKey={String(activePreview.index)}
+        navigation={images.length > 1 ? {
+          index: activePreview.index, count: images.length,
+          onSelect: (index) => setPreview({
+            index, src: imageSource(images[index]), alt: `待发送图片 ${index + 1}`,
+          }),
+        } : undefined}
         onClose={() => setPreview(null)} />
     )}
   </>;

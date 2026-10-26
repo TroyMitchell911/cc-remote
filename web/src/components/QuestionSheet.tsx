@@ -1,5 +1,5 @@
 import ReactMarkdown from "react-markdown";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { AskOption, AskQuestion, Engine } from "../protocol";
 import { EngineIcon } from "../icons";
@@ -53,6 +53,10 @@ function SingleQuestionSheet({
   const focusTextOnOpen = useRef(!initialDraft && allowText && options.length === 0);
   const [text, setText] = useState(initialDraft?.text ?? "");
   const [selected, setSelected] = useState<string[]>(initialDraft?.selected ?? []);
+  const permissionGroup = useId();
+  const permissionOptions = options.filter(option => option.label !== "继续修改");
+  const selectedPermission = permissionOptions.find(option => option.label === selected[0])?.label
+    ?? permissionOptions[0]?.label;
   const saveDraft = (next: Partial<QuestionDraft>) => {
     if (!draft) return;
     const value: QuestionDraft = { text, selected,
@@ -182,17 +186,24 @@ function SingleQuestionSheet({
           </div>}
         </div>
         {planDocument != null && <div className="plan-approval plan-approval-footer">
-            <label>批准后使用的权限
-              <select value={selected[0] ?? options[0]?.label} onChange={event => {
-                const next = [event.target.value]; setSelected(next); saveDraft({ selected: next });
-              }}>
-                {options.filter(option => option.label !== "继续修改").map(option =>
-                  <option key={option.label} value={option.label}>{option.label}</option>)}
-              </select>
-            </label>
+            <fieldset className="plan-permission-picker">
+              <legend>批准后使用的权限</legend>
+              <div className="plan-permission-options">
+                {permissionOptions.map(option => <label key={option.label}
+                  className={`plan-permission-option${selectedPermission === option.label ? " selected" : ""}`}>
+                  <input type="radio" name={permissionGroup} value={option.label}
+                    checked={selectedPermission === option.label} onChange={() => {
+                      const next = [option.label]; setSelected(next); saveDraft({ selected: next });
+                    }} />
+                  <span className="plan-permission-indicator" aria-hidden="true" />
+                  <span>{option.label}</span>
+                </label>)}
+              </div>
+            </fieldset>
             <div className="plan-approval-actions">
               <button type="button" onClick={() => answer("继续修改")}>继续修改</button>
-              <button type="button" className="primary" onClick={() => answer(selected[0] ?? options[0].label)}>批准计划</button>
+              <button type="button" className="primary" disabled={!selectedPermission}
+                onClick={() => { if (selectedPermission) answer(selectedPermission); }}>批准计划</button>
             </div>
         </div>}
       </dialog>

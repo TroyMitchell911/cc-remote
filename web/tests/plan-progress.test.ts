@@ -217,7 +217,9 @@ try {
   }));
   assert.ok(approvalHtml.includes("<h1>Migration plan</h1>"));
   assert.ok(approvalHtml.includes("批准后使用的权限"));
-  assert.ok(approvalHtml.includes('value="逐次确认" selected=""'));
+  assert.ok(approvalHtml.includes('type="radio"'));
+  assert.ok(approvalHtml.includes('checked="" value="逐次确认"'));
+  assert.ok(!approvalHtml.includes("<select"));
   assert.ok(approvalHtml.includes("plan-approval-footer"));
   assert.ok(approvalHtml.includes(">继续修改</button>"));
   assert.ok(approvalHtml.includes(">批准计划</button>"));

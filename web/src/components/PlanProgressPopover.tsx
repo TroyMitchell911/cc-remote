@@ -27,6 +27,8 @@ export function PlanProgressContent({ block, detailLoading = false, onDismiss, d
 }) {
   const presentation = planProgressPresentation(block, detailLoading);
   const steps = block.plan ?? [];
+  const dismissLabel = onDismiss ? claudePlanDismissLabel(block.claudePlan) : null;
+  const completionHintId = useId();
   return <div className={`plan-progress-content${presentation.stale ? " stale" : ""}`}>
     <header>
       <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}${presentation.stale ? " stale" : ""}`}>
@@ -38,6 +40,10 @@ export function PlanProgressContent({ block, detailLoading = false, onDismiss, d
       </span>
       {presentation.progressLabel !== presentation.stateLabel
         && <strong>{presentation.progressLabel}</strong>}
+      {dismissLabel && <button type="button" className="plan-completion-action"
+        disabled={disabled} onClick={onDismiss} aria-describedby={completionHintId}>
+        {dismissLabel}
+      </button>}
     </header>
     {presentation.description && <div className="plan-document">
       <ReactMarkdown skipHtml>{presentation.description}</ReactMarkdown>
@@ -57,11 +63,8 @@ export function PlanProgressContent({ block, detailLoading = false, onDismiss, d
           {detailLoading ? "正在加载计划…"
             : block.done ? "未提供计划步骤。" : "等待计划步骤…"}
         </div>}
-    {onDismiss && claudePlanDismissLabel(block.claudePlan) && <footer className="plan-completion">
-      <button type="button" disabled={disabled} onClick={onDismiss}>
-        {claudePlanDismissLabel(block.claudePlan)}
-      </button>
-      <small>收起后仍可在历史记录中查看计划。</small>
+    {dismissLabel && <footer className="plan-completion">
+      <small id={completionHintId}>收起后仍可在历史记录中查看计划。</small>
     </footer>}
   </div>;
 }

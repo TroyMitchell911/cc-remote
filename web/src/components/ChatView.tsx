@@ -53,7 +53,8 @@ import {
   type HistoryImageAsset,
   type HistoryImageVariant,
 } from "../history-image-assets";
-import { ImageLightbox } from "./ImageLightbox";
+import { ChatImageLightbox } from "./ChatImageLightbox";
+import { chatImageGallery, type ChatImageSelection, type ChatImageSource } from "../chat-image-gallery";
 import TurnProblem from "./TurnProblem";
 import { queryImageDimensions } from "../img";
 import {
@@ -430,11 +431,20 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   const [scrollPolicyEpoch, setScrollPolicyEpoch] = useState(0);
   const [scrollState, setScrollState] = useState<ScrollFollowSnapshot>(() =>
     controllerRef.current!.snapshot());
-  const [zoom, setZoom] = useState<
-    | { kind: "data"; src: string; alt: string }
-    | { kind: "history"; turnId: string; imageId: string; alt: string }
-    | null
-  >(null);
+  const [zoom, setZoom] = useState<ChatImageSelection | null>(null);
+  const previewImage = (image: ChatImageSource) => {
+    setZoom({ images: [{ key: "single", image }], index: 0 });
+  };
+  const previewGallery = (key: string, openedImage?: ChatImageSource) => {
+    const images = chatImageGallery(turns, turnImagePreviewCacheRef.current);
+    const index = images.findIndex((entry) => entry.key === key);
+    if (index >= 0) {
+      // Preserve the clicked preview through live -> canonical handoff. Other
+      // images keep lightweight references and load only when selected.
+      if (openedImage) images[index] = { ...images[index], image: openedImage };
+      setZoom({ images, index });
+    }
+  };
   const historyAnchorRef = useRef(new HistoryAnchorController());
   const historyPageActivityRef = useRef(new HistoryPageActivityController());
   const [historyPageActivity, setHistoryPageActivity] =
@@ -3063,7 +3073,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 historyTurnId={historyTurnId}
                 historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
-                onPreviewHistoryImage={(turnId, imageId) => setZoom({
+                onPreviewHistoryImage={(turnId, imageId) => previewImage({
                   kind: "history",
                   turnId,
                   imageId,
@@ -3084,7 +3094,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 onItemOpenChange={(key, open) => rememberProcessDisclosure(
                   `${disclosureKey}\u0000${key}`, open,
                 )}
-                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+                onPreviewImage={(src, alt) => previewImage({ kind: "data", src, alt })} />
               );
             };
             const renderAnswer = (block: TextBlock) => (
@@ -3103,7 +3113,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                     done={block.done} onOpenFile={onOpenFile}
                     imageAssets={imageAssets} onLoadImage={onLoadImage}
                     onAuthorizeImage={onAuthorizeImage}
-                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />}
+                    onPreviewImage={(src, alt) => previewImage({ kind: "data", src, alt })} />}
               </div>
             );
             const historyImagesReady = !!t.imageRefs?.length
@@ -3175,7 +3185,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                         ?? [180, 180];
                       return <UserImageButton key={i} width={width} height={height}
                         src={src} maxHeight={imageHeight}
-                        onClick={() => setZoom({ kind: "data", src, alt: "用户发送的图片" })} />;
+                        onClick={() => previewGallery(`${t.id}:upload:${i}`)} />;
                     })}
                   </div>
                 )}
@@ -3195,22 +3205,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                         maxHeight={imageHeight}
                         asset={thumbnail} fallback={fallback}
                         onLoad={onLoadHistoryImage}
-                        onPreview={() => {
-                          if (fallback) {
-                            setZoom({
-                              kind: "data",
-                              src: `data:${fallback.media_type};base64,${fallback.data}`,
-                              alt: "用户发送的图片",
-                            });
-                            return;
-                          }
-                          onLoadHistoryImage?.(
-                            historyTurnId, image.image_id, "full");
-                          setZoom({
-                            kind: "history", turnId: historyTurnId,
-                            imageId: image.image_id, alt: "用户发送的图片",
-                          });
-                        }} />;
+                        onPreview={() => previewGallery(`${t.id}:upload:${imageIndex}`)} />;
                     })}
                   </div>
                 )}
@@ -3239,10 +3234,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 onAuthorizeImage={onAuthorizeImage}
                 historyTurnId={historyTurnId} historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
-                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })}
-                onPreviewHistoryImage={(turnId, imageId) => setZoom({
-                  kind: "history", turnId, imageId, alt: "生成的图片",
-                })} />)}
+                onPreviewImage={(src, alt) => previewGallery(`${t.id}:generated:${generatedImageIdentity(block)}`, { kind: "data", src, alt })}
+                onPreviewHistoryImage={() => previewGallery(`${t.id}:generated:${generatedImageIdentity(block)}`)} />)}
             </div>}
             {(t.blocks.length > 0 || t.error) && (
               <>
@@ -3352,20 +3345,12 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
           replyMode={asyncReplyMode} onReply={onReplyAsyncQuestion}
           onClose={() => setOpenAsyncQuestion(q => q ? { ...q, messageId: null } : null)} />
       </Suspense>}
-      {zoom && (() => {
-        const asset = zoom.kind === "history" ? historyImageAssets?.[
-          historyImageAssetKey(zoom.turnId, zoom.imageId, "full")
-        ] ?? historyImageAssets?.[
-          historyImageAssetKey(zoom.turnId, zoom.imageId, "thumbnail")
-        ] : null;
-        const src = zoom.kind === "data" ? zoom.src
-          : asset?.status === "ready" && asset.data && asset.mediaType
-            ? `data:${asset.mediaType};base64,${asset.data}` : null;
-        return src ? (
-        <ImageLightbox key={sid ?? ""} src={src} alt={zoom.alt}
-          onClose={() => setZoom(null)} />
-        ) : null;
-      })()}
+      {zoom && <ChatImageLightbox key={sid ?? ""} selection={zoom}
+        imageAssets={imageAssets} historyImageAssets={historyImageAssets}
+        onLoadImage={onLoadImage} onLoadHistoryImage={onLoadHistoryImage}
+        onAuthorizeImage={onAuthorizeImage}
+        onSelect={(index) => setZoom((current) => current ? { ...current, index } : null)}
+        onClose={() => setZoom(null)} />}
     </div>
   );
 }

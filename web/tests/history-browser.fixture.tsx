@@ -1,4 +1,5 @@
 import { MobileSidebarFixture } from "./fixtures/mobile-sidebar";
+import { ImageGalleryFixture } from "./fixtures/image-gallery";
 import {
   useCallback,
   useEffect,
@@ -2223,6 +2224,7 @@ function HistoryConversationBrowserFixture() {
 
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
+  if (params.has("image-gallery")) return <ImageGalleryFixture />;
   if (params.has("background-tasks")) return <BackgroundTasksFixture />;
   const planUi = params.get("plan-ui");
   if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;

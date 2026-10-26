@@ -7,13 +7,14 @@ from unittest.mock import AsyncMock
 import pytest
 from claude_agent_sdk.types import ToolUseBlock, ToolResultBlock, UserMessage
 
-from cc_remote.config import WrapperConfig
+from cc_remote.config import RelayConfig, WrapperConfig
 from cc_remote.protocol import (
     ClaudePlanState, DismissClaudePlan, GetClaudePlan, History, Perm, RollbackResult, ToolResult, ToolUse,
     TurnEnd, TurnResult, UserMsg, deserialize, serialize,
 )
 from cc_remote.wrapper.claude_plans import ClaudePlanStore
 from cc_remote.wrapper.sdk import SdkHandle
+from cc_remote.relay.pairing import RelayHub
 from cc_remote.wrapper.stream import StreamTranslator, translate_history
 from tests.test_claude_autocompact import _machine_with_sdk
 from tests.test_claude_rich_stream import _assistant
@@ -520,6 +521,48 @@ async def test_read_and_dismiss_do_not_resume_and_broadcast_receipt(tmp_path):
     assert receipt.plan.dismissed and receipt.to is None
     assert ctx.sdk.client is None
     assert deserialize(serialize(receipt)).plan.dismissed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resident", [False, True])
+async def test_pwa_dismissal_reaches_desktop_and_survives_fresh_read(
+        tmp_path, native_plan_source, resident):
+    machine, transport, ctx = _machine_with_sdk(SdkHandle(WrapperConfig()))
+    machine._claude_plans = ClaudePlanStore(tmp_path)
+    if not resident:
+        machine.sessions.pop(ctx.key)
+    history = [use("EnterPlanMode", "enter"), result("enter"),
+               use("ExitPlanMode", "exit", plan="# Plan"), result("exit")]
+    native_plan_source(machine, history)
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="pwa"))
+    plan = transport.sent[-1].plan
+
+    hub = RelayHub(RelayConfig())
+    pwa, desktop = SimpleNamespace(send=AsyncMock()), SimpleNamespace(send=AsyncMock())
+    hub._machine_clients["device"] = {"pwa": pwa, "desktop": desktop}
+    other_device = SimpleNamespace(send=AsyncMock())
+    hub._machine_clients["other"] = {"desktop": other_device}
+    await machine._handle_dismiss_claude_plan(deserialize(serialize(DismissClaudePlan(
+        sid=ctx.key, plan_id=plan.id, revision=plan.revision, client_id="pwa"))))
+    receipt = deserialize(serialize(transport.sent[-1]))
+    assert receipt.plan.dismissed and receipt.to is None
+    await hub._on_wrapper_msg(receipt, "device")
+    pwa.send.assert_awaited_once_with(receipt)
+    desktop.send.assert_awaited_once_with(receipt)
+    other_device.send.assert_not_awaited()
+
+    # Refresh gives Desktop a new connection and a fresh state read. Reopen
+    # SQLite as well so this cannot pass using only the prior in-memory object.
+    machine._claude_plans = ClaudePlanStore(tmp_path)
+    refreshed_desktop = SimpleNamespace(send=AsyncMock())
+    hub._machine_clients["device"] = {"pwa": pwa, "desktop-refreshed": refreshed_desktop}
+    await machine._handle_get_claude_plan(GetClaudePlan(sid=ctx.key, client_id="desktop-refreshed"))
+    refreshed = deserialize(serialize(transport.sent[-1]))
+    assert refreshed.plan == receipt.plan
+    await hub._on_wrapper_msg(refreshed, "device")
+    refreshed_desktop.send.assert_awaited_once_with(refreshed)
+    assert pwa.send.await_count == desktop.send.await_count == 1
+    assert ctx.sdk.client is None
 
 
 @pytest.mark.asyncio
