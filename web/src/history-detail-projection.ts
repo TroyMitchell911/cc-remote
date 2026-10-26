@@ -61,10 +61,15 @@ export function nextActiveDetailRequest(
   turns: readonly Turn[],
   historyNewestId: string | null | undefined,
   active: boolean,
+  activeOwnerId?: string | null,
 ): { turnId: string; before?: string } | null {
-  if (!active || !historyNewestId) return null;
+  if (!active || (!historyNewestId && !activeOwnerId)) return null;
+  // A native Claude continuation keeps its human response completed. Only an
+  // explicit current owner may load that row; session-wide activity alone must
+  // not restore an unrelated completed predecessor.
+  const identity = activeOwnerId ?? historyNewestId!;
   const matches = turns.filter((turn) =>
-    !turn.done && hasTurnIdentity(turn, historyNewestId));
+    (!turn.done || !!activeOwnerId) && hasTurnIdentity(turn, identity));
   if (matches.length !== 1) return null;
   const turn = matches[0];
   if (turn.detailLoading === true

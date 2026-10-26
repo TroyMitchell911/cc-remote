@@ -4493,6 +4493,7 @@ export default function App() {
       runtime.turns,
       runtime.historyNewestId,
       runtime.state !== "idle" || runtime.mirroredRunning,
+      engineRef.current === "claude" ? runtime.liveOwner?.turnId : undefined,
     );
     if (!request) return;
     // One newest page establishes the immutable source snapshot. Older pages

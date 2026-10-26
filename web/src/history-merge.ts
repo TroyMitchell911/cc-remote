@@ -1359,6 +1359,7 @@ export function installAuthoritativeTurnDetailPage(
     newerCursor?: string | null;
   },
   projection?: TurnDetailProjection,
+  preserveLiveTail = false,
 ): Turn {
   const summaryFinals = summary.blocks.filter(isFinalTextBlock);
   const pageFinals = detail.blocks.filter(isFinalTextBlock);
@@ -1432,7 +1433,7 @@ export function installAuthoritativeTurnDetailPage(
   // already received on the live stream. Keep the bounded live row while its
   // native turn is open; rendering merges it with detail by item identity.
   // A later completed detail read can retire this provisional tail.
-  const liveCandidates = summary.done ? [] : summary.blocks.filter(
+  const liveCandidates = summary.done && !preserveLiveTail ? [] : summary.blocks.filter(
     (block) => !isFinalTextBlock(block));
   const liveIds = new Set(liveCandidates.map(blockIdentity));
   const liveProcess = mergeBlocks(
@@ -1506,7 +1507,7 @@ export function installAuthoritativeTurnDetailPage(
       !!summary.detailAutoLoad && hasMore && !detailProjection?.capped,
     detailRestorePending: false,
     detailRestoreIncomplete: restoreIncomplete,
-    liveSpillBlocks: summary.done && !hasMore && !hasNewer
+    liveSpillBlocks: summary.done && !preserveLiveTail && !hasMore && !hasNewer
       ? undefined : summary.liveSpillBlocks,
   };
 }

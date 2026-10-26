@@ -190,6 +190,20 @@ const activeDetail = turn("active-native", {
   done: false,
   detailLoaded: false,
 });
+const completedParent = { ...activeDetail, done: true };
+assert.deepEqual(nextActiveDetailRequest(
+  [completedParent], "active-native", true, "active-browser",
+), { turnId: "active-native" },
+"an exact live continuation restores detail without reopening its human response");
+assert.equal(nextActiveDetailRequest(
+  [completedParent], "active-native", true,
+), null, "a running session alone cannot revive a completed predecessor");
+assert.equal(nextActiveDetailRequest(
+  [completedParent], "active-native", true, "different-owner",
+), null, "a pending newer owner must never fall back to the last history row");
+assert.equal(nextActiveDetailRequest(
+  [completedParent], "active-native", false, "active-browser",
+), null, "a completed continuation needs no automatic restoration");
 assert.deepEqual(nextActiveDetailRequest(
   [turn("older-open", { done: false }), activeDetail],
   "active-browser",

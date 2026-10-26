@@ -1769,12 +1769,14 @@ function finishOpenDetailBlocks(
   turn: Turn,
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
+  preserveContinuation = false,
 ): void {
   if (turn.detailProjection) {
     // Exact terminal translations already close their Plan. Preserve an open
     // one because it identifies a neutral Codex steer segment.
     finishOpenBlockList(
-      turn.detailProjection.blocks, status, isError, true);
+      turn.detailProjection.blocks.filter(block =>
+        !preserveContinuation || block.background !== true), status, isError, true);
   }
 }
 
@@ -5095,6 +5097,8 @@ function reduceEvent(
               && canonicalTurnId(turn) !== e.turn_id) return turn;
           const refreshAfterInFlight =
             turn.done && turn.detailRestorePending === true;
+          const activeContinuation = rt.state !== "idle"
+            && !!rt.liveOwner && turnHasIdentityAlias(turn, rt.liveOwner.turnId);
           const next = installAuthoritativeTurnDetailPage(
             turn,
             detailed,
@@ -5105,12 +5109,13 @@ function reduceEvent(
               newerCursor: e.newer_cursor,
             },
             installed.projection,
+            activeContinuation,
           );
           if (next.done) {
             const status = next.interrupted
               ? "interrupted" : next.error ? "failed" : "succeeded";
             finishOpenDetailBlocks(
-              next, status, status !== "succeeded");
+              next, status, status !== "succeeded", activeContinuation);
           }
           if (continuedLiveSpillRefreshDue(next)
               && next.detailLoading !== true) {
@@ -5443,6 +5448,12 @@ function reduceEvent(
           rt.liveOwner = e.state !== "idle" && owner
               && (!owner.done || e.continuation === true)
             ? { turnId: owner.id, seq: rt.lastLiveSeq } : null;
+        } else if (boundCompletedTurns && e.msg_id && e.continuation === true
+            && seq == null && !rt.replaying && e.state !== "idle") {
+          // Hello seeds the exact autonomous main owner after replay, even
+          // when its completed human row has not arrived from History yet.
+          // A plain running Snapshot or a child job cannot claim this owner.
+          rt.liveOwner = { turnId: turn?.id ?? e.msg_id, seq: rt.lastLiveSeq };
         } else if (boundCompletedTurns && e.msg_id && seq === rt.lastLiveSeq
             && (!turn?.done || e.continuation === true)) {
           rt.liveOwner = { turnId: turn?.id ?? e.msg_id, seq };

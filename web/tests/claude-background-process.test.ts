@@ -336,6 +336,53 @@ try {
   assert.equal(continuationState.runtimes[sid].liveOwner, null);
   assert.equal(isComposerBusy(continuationState.runtimes[sid].state), false);
 
+  // Device switching starts with no cached turns. Hello's current owner may
+  // arrive before or after History; neither order needs another model token.
+  for (const seedFirst of [false, true]) {
+    let cold = { ...initialState, focusedSid: sid,
+      runtimes: { [sid]: createRuntime() } };
+    const seed = event({ type: "state", sid, state: "running",
+      msg_id: "browser-parent", continuation: true });
+    const history = event({ type: "history", sid, session_id: sid,
+      revision: "cold-r1", generation: "generation-1", build_seq: 1,
+      live_seq: 100, in_progress: true, detail: "summary", events: [],
+      newest_id: "native-parent", has_more: false,
+      turns: [{ id: "native-parent", clientMsgId: "browser-parent",
+        prompt: "inspect", done: true, blocks: [], detailLoaded: false }] });
+    cold = reduce(cold, { type: "event", event: event({ type: "snapshot", sid,
+      cc_session_id: sid, state: "running", generation: "generation-1" }) });
+    for (const e of seedFirst ? [seed, history] : [history, seed]) {
+      cold = reduce(cold, { type: "event", event: e });
+    }
+    assert.equal(cold.runtimes[sid].liveOwner?.turnId, "native-parent");
+    assert.equal(cold.runtimes[sid].turns[0].done, true);
+    cold = reduce(cold, { type: "event", event: event({ type: "delta", sid,
+      turn_id: "browser-parent", message_id: "unflushed-thinking", seq: 101,
+      background: true, channel: "thinking", text: "New work beyond the detail snapshot",
+    }) });
+    cold = reduce(cold, { type: "event", event: event({ type: "turn_detail", sid,
+      session_id: sid, turn_id: "native-parent", revision: "cold-r1",
+      has_more: false, has_newer: false, events: [
+        event({ type: "user_msg", msg_id: "native-parent", prompt: "inspect" }),
+        event({ type: "tool_use", turn_id: "native-parent", tool_use_id: "active-tool",
+          message_id: "continuation-tool", tool: "Bash", background: true,
+          input: { command: "sleep 1" } }),
+      ],
+    }) });
+    const recovered = cold.runtimes[sid].turns[0];
+    assert.equal(recovered.done, true);
+    assert.ok(recovered.blocks.some((b: Block) => b.kind === "text"
+      && b.message_id === "unflushed-thinking"),
+    "a detail page cannot discard newer continuation output on a completed parent");
+    assert.equal(recovered.detailProjection.blocks.find((b: Block) =>
+      b.kind === "tool" && b.tool_use_id === "active-tool")?.done, false,
+    "the parent's old completion must not falsely complete its continuation tool");
+    cold = reduce(cold, { type: "event", event: event({
+      type: "state", sid, state: "idle", seq: 102,
+    }) });
+    assert.equal(cold.runtimes[sid].liveOwner, null);
+  }
+
   // An autonomous main response has a new assistant UUID but belongs to the
   // already-completed human row. The binding must work even when streamed
   // envelope IDs differ, and must not touch another row or another engine.

@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import (
@@ -355,6 +358,55 @@ def test_turn_notification_context_protocol_roundtrip():
 
 
 # ---- focus-steal fix ----
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_hello_restores_completed_parent_continuation(warm):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session", "session")
+        machine.sessions[ctx.key] = ctx
+        ctx.state = "running"
+        ctx.claude_background_followup_pending = True
+        ctx.claude_background_translator = SimpleNamespace(turn_id="parent")
+        # The human input and continuation State have both left the ring.
+        ctx.buffer = RingBuffer(2, 100_000)
+        for event in [
+            UserMsg(msg_id="parent", prompt="inspect"),
+            StateEvent(state="running", msg_id="parent", continuation=True),
+            Delta(message_id="followup", turn_id="parent", background=True,
+                  channel="thinking", text="still "),
+            Delta(message_id="followup", turn_id="parent", background=True,
+                  channel="thinking", text="working"),
+        ]:
+            event.seq = ctx.next_seq()
+            ctx.buffer.append(event)
+        tail = ctx.seq
+        await machine._handle_client_hello(Hello(
+            role="client", client_id="reader", route_id="route",
+            cursors={"session": tail} if warm else {},
+            generations={"session": machine.instance_id} if warm else {},
+        ))
+        own = [event for event in transport.sent if event.sid == ctx.key]
+        seed = next(event for event in own
+                    if isinstance(event, StateEvent) and event.continuation)
+        assert seed.msg_id == "parent" and seed.seq is None
+        assert own.index(seed) > next(i for i, e in enumerate(own)
+                                      if isinstance(e, ReplayEnd))
+        assert seed.to == "reader" and seed.route_id == "route"
+        assert ctx.seq == tail and ctx.buffer.tail_seq == tail
+        assert not any(isinstance(event, UserMsg) for event in own)
+        # Focus repeats current ownership without touching the model lifecycle.
+        state = await machine._emit_current_state(ctx)
+        assert state.continuation and state.msg_id == "parent"
+        for state, managed in [("idle", False), ("running", True)]:
+            ctx.state, ctx.claude_write_active = state, managed
+            assert machine._claude_continuation_state(ctx) is None
+        ctx.state, ctx.claude_write_active = "running", False
+        ctx.claude_background_followup_pending = False
+        assert machine._claude_continuation_state(ctx) is None
+
+    asyncio.run(run())
+
 
 def test_capture_follows_focus_when_captured_session_is_focused():
     async def run():

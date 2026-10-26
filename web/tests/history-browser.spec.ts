@@ -2194,6 +2194,113 @@ test("Claude resumes a separate live process after an idle background task", asy
   await expect(turn.locator(".turn-working")).toHaveCount(1);
 });
 
+test("Claude continuation survives device round trips without another model token", async ({ page }) => {
+  const sid = "shared-session", turnId = "native-parent";
+  const commands: { machine: string; type: string; [key: string]: unknown }[] = [];
+  const emitters = new Map<string, (event: Record<string, unknown>) => void>();
+  let running = true;
+  let build = 0;
+  await page.addInitScript(() => {
+    if (!localStorage.getItem("cc_remote_machine")) {
+      localStorage.setItem("cc_remote_machine", "desktop");
+    }
+    localStorage.setItem("cc_remote_engine", "claude");
+  });
+  await page.route("**/api/**", route => route.fulfill({ status: 404 }));
+  await page.route("**/api/session", route => route.fulfill({ json: {} }));
+  await page.route("**/api/devices", route => route.fulfill({ json: {
+    devices: ["desktop", "us-vps"].map(machine_id => ({
+      machine_id, label: machine_id, online: true,
+    })),
+  } }));
+  await page.routeWebSocket(/\/ws(?:\?|$)/, socket => {
+    const machine = new URL(socket.url()).searchParams.get("machine")!;
+    const local = machine === "desktop";
+    const generation = `generation-${machine}`;
+    const emit = (event: Record<string, unknown>) => socket.send(JSON.stringify({
+      v: PROTOCOL_VERSION, ts: 10, sid, ...event,
+    }));
+    emitters.set(machine, emit);
+    const seed = () => {
+      emit({ type: "snapshot", cc_session_id: sid,
+        state: local && running ? "running" : "idle", generation, tail_text: "" });
+      emit({ type: "replay_start", generation, from_seq: 101, to_seq: 100, truncated: true });
+      emit({ type: "replay_end", to_seq: 100, truncated: true });
+      if (local && running) emit({ type: "state", state: "running",
+        msg_id: "browser-parent", continuation: true });
+    };
+    socket.onMessage(raw => {
+      const command = JSON.parse(String(raw));
+      commands.push({ ...command, machine });
+      if (command.type === "hello") seed();
+      else if (command.type === "list_sessions") emit({ type: "session_list",
+        engine: command.engine, space: command.space, request_id: command.cmd_id,
+        sessions: command.space === "code" && command.engine === "claude" ? [{
+          session_id: sid, summary: `${machine} session`, engine: "claude",
+          space: "code", cwd: "/tmp/restore", state: local && running ? "running" : "idle",
+        }] : [],
+      });
+      else if (command.type === "switch_session") {
+        emit({ type: "session_focus", session_id: sid });
+      } else if (command.type === "get_history") emit({ type: "history",
+        session_id: sid, revision: `revision-${machine}`, generation,
+        build_seq: ++build, live_seq: 100, authoritative: true,
+        in_progress: local && running, newest_id: turnId, has_more: false,
+        detail: "summary", events: [], turns: [{ id: turnId,
+          clientMsgId: "browser-parent", prompt: `${machine} request`, done: true,
+          detailLoaded: false, processDetailState: "present", detailEventCount: 165,
+          blocks: [{ kind: "text", message_id: "initial-answer", channel: "final",
+            text: local ? "原回复已经结束，等待子代理。" : "VPS 的历史回复", done: true }],
+        }],
+      });
+      else if (command.type === "get_turn_detail") emit({ type: "turn_detail",
+        session_id: sid, turn_id: turnId, revision: `revision-${machine}`,
+        authoritative: true, has_more: true, oldest_cursor: "older-detail",
+        has_newer: false, events: [
+          { v: PROTOCOL_VERSION, ts: 1, type: "user_msg", msg_id: turnId,
+            prompt: `${machine} request` },
+          { v: PROTOCOL_VERSION, ts: 8, type: "assistant_msg_start",
+            message_id: "continuation-thinking", turn_id: turnId,
+            channel: "thinking", background: true },
+          { v: PROTOCOL_VERSION, ts: 8, type: "delta",
+            message_id: "continuation-thinking", turn_id: turnId,
+            channel: "thinking", background: true, text: "正在续办，检查剩余文件。" },
+        ],
+      });
+      else if (command.type === "get_goal") emit({ type: "goal_state",
+        request_id: command.cmd_id, goal: null });
+      else if (command.type === "ping") emit({ type: "pong", n: command.n });
+    });
+  });
+  const checkContinuation = async () => {
+    await expect(page.getByText("正在续办，检查剩余文件。", { exact: true })).toBeVisible();
+    await expect(page.locator(".turn-working")).toHaveCount(1);
+    await expect(page.getByText("VPS 的历史回复", { exact: true })).toHaveCount(0);
+  };
+  const switchDevice = async (name: string) => {
+    await page.getByRole("button", { name: "设备中心", exact: true }).click();
+    await page.locator(".device-main").filter({ hasText: name }).click();
+  };
+  await page.goto("/");
+  await checkContinuation();
+  await page.reload();
+  await checkContinuation();
+  for (let round = 0; round < 2; round++) {
+    await switchDevice("us-vps");
+    await expect(page.getByText("VPS 的历史回复", { exact: true })).toBeVisible();
+    await expect(page.getByText("正在续办，检查剩余文件。", { exact: true })).toHaveCount(0);
+    await expect(page.locator(".turn-working")).toHaveCount(0);
+    await switchDevice("desktop");
+    await checkContinuation();
+  }
+  running = false;
+  emitters.get("desktop")!({ type: "state", state: "idle", seq: 101 });
+  await expect(page.locator(".turn-working")).toHaveCount(0);
+  expect(commands.filter(c => c.type === "get_turn_detail").every(c =>
+    c.machine === "desktop" && !c.before)).toBe(true);
+  expect(commands.some(c => ["query", "steer", "interrupt"].includes(c.type))).toBe(false);
+});
+
 test("Claude return link survives refresh and a later detail window", async ({ page }) => {
   const sid = "layout-parent", turnId = "return-parent";
   const seedTurns = [{ id: turnId, prompt: "检查三个子代理", done: true,

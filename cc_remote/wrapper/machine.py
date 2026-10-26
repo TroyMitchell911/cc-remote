@@ -11692,9 +11692,20 @@ class WrapperMachine:
     ) -> StateEvent:
         """Publish a fresh authoritative state without changing lifecycle."""
         async with ctx.emit_lock:
-            event = StateEvent(state=ctx.state)
+            event = self._claude_continuation_state(ctx) or StateEvent(state=ctx.state)
             await self._emit_locked(ctx, event)
             return event
+
+    def _claude_continuation_state(self, ctx: SessionContext) -> StateEvent | None:
+        """Restore the native main continuation's owner without reopening its parent."""
+        translator = ctx.claude_background_translator
+        if (ctx.engine != "claude" or ctx.state == "idle"
+                or ctx.claude_write_active
+                or not self._claude_autonomous_followup_pending(ctx)
+                or translator is None or not translator.turn_id):
+            return None
+        return StateEvent(
+            state=ctx.state, msg_id=translator.turn_id, continuation=True)
 
     # ---- command dispatch ----
 
@@ -12470,6 +12481,7 @@ class WrapperMachine:
                         )
                 tail = ctx.buffer.latest_tail_text()
                 st = ctx.buffer.latest_state() or ctx.state
+                continuation = self._claude_continuation_state(ctx)
                 replay_cursor: Optional[int] = None
                 same_generation = True
                 if sid in cursors:
@@ -12517,6 +12529,12 @@ class WrapperMachine:
                     cursor=replay_cursor,
                     same_generation=same_generation,
                 )
+                if continuation is not None:
+                    # A finished human response can still own autonomous main
+                    # work. Its UserMsg/state edge may have left the ring. Seed
+                    # exact current ownership after old replay, just like asks;
+                    # never advance the durable cursor or mint a new user turn.
+                    frames.append(continuation)
                 for frame in frames:
                     if not self._hello_replay_frame_visible(
                         frame, getattr(cmd, "client_id", None)

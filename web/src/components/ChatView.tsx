@@ -2863,17 +2863,17 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
             const t = turns[virtualItem.index];
             if (!t) return null;
             const ti = virtualItem.index;
+            const completedDetail = t.done && t.id !== activeTurnId
+              && !t.detailRestorePending && !t.detailRestoreIncomplete;
             const timelineWithArchive = mergeDetailWithLiveTail(
               t.detailProjection?.blocks ?? [],
               t.liveSpillBlocks ?? [],
-              t.done && !t.detailRestorePending
-                && !t.detailRestoreIncomplete,
+              completedDetail,
             );
             const timelineBlocks = mergeDetailWithLiveTail(
               timelineWithArchive,
               t.blocks,
-              t.done && !t.detailRestorePending
-                && !t.detailRestoreIncomplete,
+              completedDetail,
             );
             const processItems = presentableProcessBlocks(
               timelineBlocks, engine);
