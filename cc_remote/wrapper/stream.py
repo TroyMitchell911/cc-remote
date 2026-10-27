@@ -3049,6 +3049,7 @@ def translate_history(
     current_turn_id = None
     history_tool_diffs: dict[str, tuple[str, bool]] = {}
     history_tool_names: dict[str, str] = {}
+    history_tool_paths: dict[str, str] = {}
     history_image_reads: dict[str, tuple[str, str | None]] = {}
     history_plan_id: str | None = None
     ambiguous_final_mid: str | None = None
@@ -3227,6 +3228,14 @@ def translate_history(
             continue
         role = msg.get("role") or m.type
         content = msg.get("content")
+        # toolUseResult belongs to the transcript envelope, not message.
+        # It has no tool id: a batched result row cannot attribute it safely.
+        native_result = (
+            getattr(m, "tool_use_result", None)
+            if isinstance(content, list) and sum(
+                _claude_history_tool_result_block(block) for block in content
+            ) == 1 else None
+        )
         source_uid = m.uuid if isinstance(m.uuid, str) else ""
         message_uid = _history_id(source_uid, "msg", str(message_index))
 
@@ -3354,7 +3363,8 @@ def translate_history(
                                 history_tool_names.get(tool_id), raw_result_content),
                             tool_result_max)
                         diff_info = history_tool_diffs.pop(tool_id, None)
-                        native_diff = (native_claude_diff(getattr(msg, "tool_use_result", None))
+                        tool_path = history_tool_paths.pop(tool_id, None)
+                        native_diff = (native_claude_diff(native_result, tool_path)
                                        if not is_error else None)
                         truncated = bool(
                             was_truncated or (diff_info and diff_info[1])) or None
@@ -3379,7 +3389,7 @@ def translate_history(
                             diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
                         ))
                         from .claude_plans import task_result_id
-                        events[-1]._claude_task_id = task_result_id(getattr(msg, "tool_use_result", None))
+                        events[-1]._claude_task_id = task_result_id(native_result)
                         if agent_result:
                             events.append(ProcessEvent(
                                 item_id=_agent_process_id(tool_id), kind="agent",
@@ -3594,6 +3604,10 @@ def translate_history(
                     if diff:
                         history_tool_diffs[tool_id] = (diff, diff_truncated)
                     lower = str(b.get("name") or "").lower()
+                    if lower in {"edit", "write", "multiedit"}:
+                        path = raw_input.get("file_path") or raw_input.get("path")
+                        if isinstance(path, str) and len(path) <= 4096:
+                            history_tool_paths[tool_id] = path
                     if lower == "enterplanmode" and parent is None:
                         history_plan_id = _wire_id(
                             f"plan:{tool_id}", "plan")
@@ -3636,6 +3650,9 @@ def translate_history(
                             history_tool_names.get(tool_id), raw_result_content),
                         tool_result_max)
                     diff_info = history_tool_diffs.pop(tool_id, None)
+                    tool_path = history_tool_paths.pop(tool_id, None)
+                    native_diff = (native_claude_diff(native_result, tool_path)
+                                   if not is_error else None)
                     agent_result = (history_tool_names.get(tool_id) or "").lower() in {
                         "agent", "task"}
                     result_text = (
@@ -3651,11 +3668,13 @@ def translate_history(
                                 "running" if async_launched else "succeeded"),
                         truncated=bool(
                             was_truncated or (diff_info and diff_info[1])) or None,
-                        diff=diff_info[0] if diff_info and not is_error else None,
+                        diff=native_diff or (diff_info[0] if diff_info and not is_error else None),
+                        diff_source="native" if native_diff else "fragment",
+                        diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
                         background=background_followup or None,
                     ))
                     from .claude_plans import task_result_id
-                    events[-1]._claude_task_id = task_result_id(getattr(msg, "tool_use_result", None))
+                    events[-1]._claude_task_id = task_result_id(native_result)
                     if agent_result:
                         events.append(ProcessEvent(
                             item_id=_agent_process_id(tool_id), kind="agent",
