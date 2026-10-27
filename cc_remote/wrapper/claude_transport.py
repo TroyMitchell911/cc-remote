@@ -14,7 +14,7 @@ class AccountIsolatedSubprocessCLITransport(
 ):
     """Spawn one Claude child without inherited account selectors.
 
-    Agent SDK 0.2.157 treats ``ClaudeAgentOptions.env`` as an overlay on the
+    Agent SDK 0.2.174 treats ``ClaudeAgentOptions.env`` as an overlay on the
     Wrapper process environment. Empty strings are not equivalent to unsetting
     modern Claude authentication selectors, while mutating ``os.environ`` would
     race unrelated Codex and tool spawns. This pinned adapter mirrors the SDK's
@@ -66,6 +66,12 @@ class AccountIsolatedSubprocessCLITransport(
                     "OTEL trace context injection failed",
                     exc_info=True,
                 )
+
+            # Mirror the SDK's run-boundary handshake so a completed child
+            # task cannot close stdin before its parent continuation arrives.
+            state_key = _sdk_cli._SDK_READS_SESSION_STATE_ENV
+            if not any(key.upper() == state_key for key in process_env):
+                process_env[state_key] = "1"
 
             if self._options.enable_file_checkpointing:
                 process_env[

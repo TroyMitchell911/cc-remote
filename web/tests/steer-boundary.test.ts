@@ -3,14 +3,83 @@ import { createServer } from "vite";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
-  mergeAuthoritativeTurnDetail, mergeInitialHistory, restoreObservedLiveTurnDetails,
+  mergeAuthoritativeTurnDetail, mergeHistoryPageCopies, mergeInitialHistory,
+  restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
+import { presentAsyncQuestionReplies, supplementalAnswerPrompt } from
+  "../src/async-question-presentation.ts";
 import type { Turn } from "../src/reducer.ts";
 import type { TextBlock } from "../src/domain/conversation.ts";
 
 // A final item and a user steer can be recorded 78 ms apart inside ONE native
 // task. The native task is a routing identity, not a visible conversation row.
 const task = "native-task";
+// Native summaries initially stamp every user segment with the enclosing
+// task's start. A later source-backed page refines the accepted reply's time.
+// This fixture mirrors a cache which already persisted the reply BEFORE its
+// question after a bounded newest-page refresh.
+const asyncTitle = "要检查哪个测试入口？";
+const asyncQuestion: Turn = {
+  id: "browser-question", clientMsgId: "browser-question",
+  historyTurnId: "native-question", forkPointId: task,
+  prompt: "检查测试入口的性能", ts: 1000, done: true, doneTs: 2000,
+  blocks: [{ kind: "text", message_id: "async-question", channel: "final",
+    delivery: "async", questions: [{ title: asyncTitle }],
+    text: asyncTitle, done: true }],
+};
+const asyncReply: Turn = {
+  id: "browser-reply", clientMsgId: "browser-reply",
+  historyTurnId: "native-reply", forkPointId: task,
+  prompt: supplementalAnswerPrompt([{ question: asyncTitle, answer: "测试入口" }]),
+  ts: 1000, done: false, blocks: [],
+};
+const canonicalReply: Turn = {
+  ...asyncReply, id: "native-reply", historyTurnId: undefined, ts: 2500,
+};
+const refreshOptions = {
+  preserveLiveTailOpen: true, reconcileReplayOrphans: true,
+  activeOwnerId: asyncReply.id, newestHistoryId: canonicalReply.id,
+};
+const staleAsyncRows = [asyncReply, asyncQuestion];
+const repairedAsyncRows = mergeInitialHistory(
+  [canonicalReply], staleAsyncRows, refreshOptions);
+assert.deepEqual(repairedAsyncRows.map(turn => turn.id), [asyncQuestion.id, asyncReply.id],
+  "a source user timestamp repairs the already-inverted cached question/reply");
+assert.equal(repairedAsyncRows[1].ts, 2500);
+assert.equal(presentAsyncQuestionReplies(repairedAsyncRows).answered.has("async-question"), true,
+  "the accepted reply must not leave the original async question awaiting an answer");
+assert.deepEqual(repairedAsyncRows.map(turn => turn.done), [true, false]);
+assert.deepEqual(mergeInitialHistory([{ ...canonicalReply, ts: 1000 }],
+  [asyncQuestion, asyncReply], refreshOptions).map(turn => turn.id),
+[asyncQuestion.id, asyncReply.id],
+"equal native task timestamps keep the observed order across a partial history page");
+const detailRestored = mergeAuthoritativeTurnDetail(repairedAsyncRows[1], asyncReply);
+assert.equal(detailRestored.ts, 2500, "old detail cannot restore the obsolete task stamp");
+assert.equal(mergeHistoryPageCopies([asyncReply, detailRestored])[1]?.ts, 2500,
+  "overlapping cached pages keep the newer user timestamp");
+
+const orderedText = (id: string, liveOrder: number) => ({
+  kind: "text" as const, message_id: id, channel: "commentary" as const,
+  text: `progress ${id}`, done: true, liveOrder,
+});
+const liveSequence = ["a", "b", "c", "d", "e"].map(orderedText);
+const extraTool = { kind: "tool" as const, message_id: "source-tool-parent",
+  tool_use_id: "source-tool", tool: "Read", input: {}, done: true };
+const sparseReply: Turn = { ...canonicalReply, blocks: [
+  { ...liveSequence[1], liveOrder: undefined, text: "canonical progress b" },
+  extraTool, { ...liveSequence[3], liveOrder: undefined },
+] };
+const interleaved = mergeInitialHistory([sparseReply], [{
+  ...asyncReply, blocks: liveSequence,
+}], refreshOptions)[0];
+assert.deepEqual(interleaved.blocks.map(block => block.kind === "text"
+  ? block.message_id : block.kind === "tool" ? block.tool_use_id : block.item_id),
+["a", "b", "source-tool", "c", "d", "e"],
+"a sparse source page weaves missing live work around shared native anchors");
+assert.equal((interleaved.blocks[1] as TextBlock).text, "canonical progress b",
+  "ordering keeps canonical payload authority");
+assert.equal(new Set(interleaved.blocks).size, 6);
+
 const history: Turn[] = ["old", "guided"].map((name, index) => ({
   id: `user-${name}`, forkPointId: task, prompt: `prompt-${name}`,
   done: true, ts: 1000 + index * 78,
@@ -143,6 +212,31 @@ try {
   const { initialState, createRuntime, reduce } =
     await harness.ssrLoadModule("/src/reducer.ts");
   const { ChatView } = await harness.ssrLoadModule("/src/components/ChatView.tsx");
+  {
+    let state = { ...initialState, focusedSid: "s",
+      sessions: [{ session_id: "s", engine: "codex", space: "code" }],
+      runtimes: { s: { ...createRuntime(), state: "running", syncReady: true,
+        historyRevision: "revision", historyGeneration: "generation",
+        turns: staleAsyncRows, liveOwner: { turnId: asyncReply.id, seq: 1 },
+      } } };
+    for (let build = 1; build <= 2; build += 1) {
+      state = reduce(state, { type: "event", event: {
+        v: 85, type: "history", sid: "s", session_id: "s", seq: 0, ts: 10,
+        revision: "revision", generation: "generation", build_seq: build,
+        live_seq: 10, authoritative: true, in_progress: true,
+        detail: "summary", events: [], turns: [sparseReply],
+        has_more: true, oldest_id: canonicalReply.id, newest_id: canonicalReply.id,
+      } });
+      const runtime = state.runtimes.s;
+      assert.deepEqual(runtime.turns.map((turn: Turn) => turn.id),
+        [asyncQuestion.id, asyncReply.id]);
+      assert.equal(runtime.liveOwner?.turnId, asyncReply.id);
+      assert.equal(runtime.state, "running");
+      assert.equal(presentAsyncQuestionReplies(runtime.turns).answered.has("async-question"), true);
+      state = reduce(state, { type: "focus_session", sid: "other" });
+      state = reduce(state, { type: "focus_session", sid: "s" });
+    }
+  }
   {
     let state = { ...initialState, focusedSid: "s", runtimes: { s: {
       ...createRuntime(), state: "running", syncReady: true,

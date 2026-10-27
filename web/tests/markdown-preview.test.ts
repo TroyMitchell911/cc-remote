@@ -51,8 +51,23 @@ assert.equal(presentAsyncQuestionReplies([nativeQuestion, nativeReply], nativeRe
 assert.equal(presentAsyncQuestionReplies([nativeQuestion,
   { ...nativeReply, clientMsgId: "pending-client" }], "pending-client").answered.size, 0,
   "a pending reply's native alias also waits for acceptance");
-assert.equal(presentAsyncQuestionReplies([nativeReply]).replies.size, 0, "never guess from a prefix without the native question");
-assert.equal(presentAsyncQuestionReplies([nativeReply, nativeQuestion]).replies.size, 0, "a future question cannot own this reply");
+const replyOnly = presentAsyncQuestionReplies([nativeReply]);
+assert.deepEqual(replyOnly.replies.get(nativeReply.id), presentation.replies.get(nativeReply.id),
+  "a page beginning with the reply already has its complete question/answer bubble");
+assert.equal(replyOnly.answered.size, 0, "formatting alone cannot invent a native question receipt");
+assert.equal(presentAsyncQuestionReplies([nativeReply, nativeQuestion]).answered.size, 0,
+  "a future question cannot own this reply");
+for (const turns of [
+  [nativeReply], // First page after refresh, before its question is loaded.
+  [nativeQuestion, nativeReply], // Load the preceding page.
+  JSON.parse(JSON.stringify([nativeReply])) as Turn[], // Restore a bounded cache.
+  [nativeReply, nativeQuestion], // A later unrelated question is not its owner.
+]) {
+  assert.deepEqual(presentAsyncQuestionReplies(turns).replies.get(nativeReply.id),
+    replyOnly.replies.get(nativeReply.id), "pagination and cache restoration never restyle the reply");
+}
+assert.equal(presentAsyncQuestionReplies([]).replies.size, 0,
+  "switching to another session does not retain the previous reply presentation");
 const repeatedQuestion = { ...nativeQuestion, id: "after-compaction" };
 for (const turns of [
   [nativeQuestion, repeatedQuestion, nativeReply],
@@ -66,15 +81,43 @@ for (const turns of [
 }
 const independentQuestion: Turn = { ...nativeQuestion, id: "independent-question",
   blocks: nativeQuestion.blocks.map(block => ({ ...block, message_id: "other-question-message" })) };
-assert.equal(presentAsyncQuestionReplies([nativeQuestion, independentQuestion, nativeReply]).replies.size, 0,
-  "distinct native questions with equal titles remain ambiguous");
+const ambiguous = presentAsyncQuestionReplies([nativeQuestion, independentQuestion, nativeReply]);
+assert.deepEqual(ambiguous.replies.get(nativeReply.id), replyOnly.replies.get(nativeReply.id));
+assert.equal(ambiguous.answered.size, 0, "distinct native questions with equal titles remain ambiguous");
 assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, error: "rejected" }]).answered.size, 0);
-assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, prompt: "补充回答：\n\n问题：其他问题\n回答：保留原文" }]).replies.size, 0);
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply,
+  prompt: "补充回答：\n\n问题：其他问题\n回答：保留原文" }]).answered.size, 0,
+"a formatted envelope cannot answer a different native question");
 const multiReply = { ...nativeReply, prompt: supplementalAnswerPrompt([
   { question: "在哪个设备？", answer: "Mac" }, { question: "用的什么手势？", answer: "三指拖拽" },
 ]) };
 assert.equal(presentAsyncQuestionReplies([nativeQuestion, multiReply]).replies.get(nativeReply.id)?.length, 2);
+assert.deepEqual(presentAsyncQuestionReplies([multiReply]).replies.get(nativeReply.id),
+  presentAsyncQuestionReplies([nativeQuestion, multiReply]).replies.get(nativeReply.id),
+  "all embedded questions and multiline answers survive without the earlier page");
 assert.equal(nativeReply.prompt, "补充回答：\n\n问题：用的什么手势？\n回答：三指拖拽\n第二行也要保留", "presentation never rewrites the wire payload");
+
+for (const prompt of [
+  "补充回答：\n\n只是普通的补充说明，不是问答格式",
+  "补充回答：\n\n问题：只有问题，没有回答",
+  "补充回答：\n\n问题：\n回答：没有问题正文",
+  "补充回答：\n\n问题：在哪个设备？\n回答：",
+  "补充回答：\n\n问题：在哪个设备？\n回答： Mac ",
+  "以下是格式示例：\n" + nativeReply.prompt,
+  "```\n" + nativeReply.prompt + "\n```",
+  nativeReply.prompt + "\n\n问题：未完成的下一组",
+  supplementalAnswerPrompt(Array.from({ length: 17 }, (_, i) => ({ question: `问题 ${i}`, answer: "答案" }))),
+]) {
+  const turn = { ...nativeReply, prompt };
+  for (const turns of [[turn], [nativeQuestion, turn]]) {
+    assert.equal(presentAsyncQuestionReplies(turns).replies.size, 0,
+      "incomplete, quoted, or noncanonical envelopes keep their unabridged plain text");
+  }
+  assert.equal(turn.prompt, prompt);
+}
+assert.equal(presentAsyncQuestionReplies([{ ...nativeReply,
+  detailReasons: ["prompt_truncated"] }]).replies.size, 0,
+"a truncated summary cannot masquerade as a complete answer envelope");
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
   kind: "local", value: "docs/img/a.png",

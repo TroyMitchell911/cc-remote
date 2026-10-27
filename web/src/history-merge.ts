@@ -610,6 +610,43 @@ function blockIdentity(block: Block): string {
       : `process:${block.item_id}`;
 }
 
+/** Weave two partial timelines around exact shared identities. Source-only
+ * entries keep their source order; observed-only entries stay before their
+ * next shared anchor instead of being appended after the entire summary. */
+function anchoredOrder<T>(
+  source: T[], observed: T[], identity: (item: T) => string,
+): T[] {
+  const sourceIds = new Set(source.map(identity));
+  const observedIds = observed.map(identity);
+  if (sourceIds.size !== source.length
+      || new Set(observedIds).size !== observed.length) return source;
+  const positions = new Map(observedIds.map((id, index) => [id, index]));
+  let previous = -1;
+  for (const item of source) {
+    const position = positions.get(identity(item));
+    if (position == null) continue;
+    // Conflicting timelines cannot establish a common order.
+    if (position <= previous) return source;
+    previous = position;
+  }
+  if (previous < 0) return source;
+  const ordered: T[] = [];
+  let cursor = 0;
+  for (const item of source) {
+    const position = positions.get(identity(item));
+    if (position != null) {
+      while (cursor < position) {
+        if (!sourceIds.has(observedIds[cursor])) ordered.push(observed[cursor]);
+        cursor += 1;
+      }
+      cursor = position + 1;
+    }
+    ordered.push(item);
+  }
+  ordered.push(...observed.slice(cursor).filter(item => !sourceIds.has(identity(item))));
+  return ordered;
+}
+
 function compactionTurnAliases(turn: Turn): Set<string> {
   return new Set(turn.blocks.flatMap((block) =>
     block.kind === "process"
@@ -1092,12 +1129,18 @@ function mergeTurn(
         && new Set(liveOrders).size === live.blocks.length
         && liveIds.size === live.blocks.length
         && new Set(historyIds).size === historyIds.length
-        && new Set(mergedIds).size === mergedIds.length
-        && historyIds.every((identity) => liveIds.has(identity))) {
+        && new Set(mergedIds).size === mergedIds.length) {
       const byId = new Map(blocks.map((block) => [blockIdentity(block), block]));
-      blocks.splice(0, blocks.length, ...[...live.blocks]
-        .sort((left, right) => left.liveOrder! - right.liveOrder!)
-        .flatMap((block) => byId.get(blockIdentity(block)) ?? []));
+      const observed = [...live.blocks]
+        .sort((left, right) => left.liveOrder! - right.liveOrder!);
+      const ordered = anchoredOrder(history.blocks, observed, blockIdentity);
+      // Compatibility matching may replace ids. Reorder only an exact union;
+      // never discard unmatched payload or infer anchors from matching text.
+      if (ordered.length === blocks.length
+          && ordered.every(block => byId.has(blockIdentity(block)))) {
+        blocks.splice(0, blocks.length,
+          ...ordered.map(block => byId.get(blockIdentity(block))!));
+      }
     }
   }
   return {
@@ -1251,6 +1294,7 @@ export function mergeHistoryPageCopies(
       progress: turn.progress,
       terminalSource: turn.terminalSource,
       doneTs: turn.done ? merged.doneTs : turn.doneTs,
+      ts: turn.ts ?? previous.ts,
     };
   });
   return result;
@@ -1315,6 +1359,7 @@ export function mergeAuthoritativeTurnDetail(
   return {
     ...merged,
     id: summary.id,
+    ts: summary.ts ?? detail.ts,
     done: summary.done,
     doneTs: summary.doneTs,
     durationMs: summary.durationMs,
@@ -1915,7 +1960,21 @@ export function mergeInitialHistory(
       : restoreAuthoritativeLifecycle(bound, merged[index], liveTurn);
   }
 
-  const rows = [...merged, ...unmatched].map((turn, order) => ({ turn, order }));
+  if (options.reconcileReplayOrphans) {
+    // Native history may refine a task-level second stamp into the actual
+    // user item's millisecond stamp. Keeping Math.min with an old cache stamp
+    // gives every steer its predecessor's time and can invert question/reply.
+    for (let index = 0; index < merged.length; index += 1) {
+      if (history[index].ts != null) merged[index].ts = history[index].ts;
+    }
+  }
+  const unmatchedById = new Map(unmatched.map(turn => [turn.id, turn]));
+  const observed = live.flatMap((turn, index) => matches[index] >= 0
+    ? [merged[matches[index]]] : unmatchedById.get(turn.id) ?? []);
+  const anchored = anchoredOrder(merged, observed, turn => turn.id);
+  const anchoredRows = new Set(anchored);
+  const rows = [...anchored, ...unmatched.filter(turn => !anchoredRows.has(turn))]
+    .map((turn, order) => ({ turn, order }));
   rows.sort((a, b) => {
     const aTime = chronologicalTurnTime(a.turn);
     const bTime = chronologicalTurnTime(b.turn);
