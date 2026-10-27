@@ -331,7 +331,7 @@ assert.deepEqual(
   "a running Codex summary subset preserves the complete live chronology",
 );
 
-const sourceSuperset = mergeInitialHistory(
+const sourceWithMissingLiveItems = mergeInitialHistory(
   [{
     ...interleavedSummaryTurn,
     blocks: [{ kind: "process", item_id: "source-only-process",
@@ -342,10 +342,10 @@ const sourceSuperset = mergeInitialHistory(
   { preserveLiveTailOpen: true, reconcileReplayOrphans: true },
 )[0];
 assert.deepEqual(
-  sourceSuperset.blocks.map(blockIdentity),
-  ["source-only-process", "ordered-comment-a", "ordered-comment-b",
-    "ordered-tool-a", "ordered-tool-b"],
-  "a History superset remains the chronology authority",
+  sourceWithMissingLiveItems.blocks.map(blockIdentity),
+  ["source-only-process", "ordered-comment-a", "ordered-tool-a",
+    "ordered-comment-b", "ordered-tool-b"],
+  "a source-only item does not move missing live tools after later commentary",
 );
 
 const ambiguousLiveOrder = mergeInitialHistory(
