@@ -120,6 +120,7 @@ interface Props {
   onRequestModels?: () => void;
   editPrompt: string | null;
   onEditConsumed: () => void;
+  onRewind?: () => void;
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onSteerQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onInterrupt: () => void;
@@ -593,7 +594,10 @@ export function Composer(p: Props) {
       }
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
-      case "rewind": flash("Claude Rewind 暂未开放"); break;
+      case "rewind":
+        if (p.onRewind) p.onRewind();
+        else flash("请先打开一个 Claude Code 会话");
+        break;
       case "review": {
         const trimmed = args.trim();
         if (!trimmed) {

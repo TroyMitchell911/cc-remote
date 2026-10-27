@@ -201,6 +201,8 @@ def parse_conversation_rewind_response(
         ) from None
 
     prefill = response.get("prefillText")
+    if target != requested_target:
+        raise ClaudeRewindError("malformed_response", operation="conversation")
     if prefill is not None and not isinstance(prefill, str):
         raise ClaudeRewindError(
             "malformed_response", operation="conversation"

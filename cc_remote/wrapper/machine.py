@@ -157,7 +157,7 @@ from cc_remote.protocol import (
     SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
     SessionFocus,
     SessionRekey, SessionForked, SessionMigrated, DirList,
-    WorkDashboard, WorkArtifacts, RollbackResult,
+    WorkDashboard, WorkArtifacts, RollbackResult, RewindPreview,
     ERR_BUSY, ERR_NOT_RUNNING, ERR_BAD_PROMPT, ERR_DRAIN_TIMEOUT,
     ERR_CC_CRASH, ERR_INTERNAL, ERR_INVALID_CWD, ERR_AUTH, ERR_PROTOCOL,
     ERR_FORK_RECONCILING, ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
@@ -2023,6 +2023,7 @@ class WrapperMachine:
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
+        "get_rewind_preview",
         "list_sessions", "get_history", "get_turn_detail", "get_agent_detail",
         "get_history_image", "read_dsh",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
@@ -2061,6 +2062,7 @@ class WrapperMachine:
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
+        "get_rewind_preview",
         "get_history", "get_turn_detail", "get_agent_detail",
         "get_history_image", "switch_session",
         "rename_session", "archive_session", "pin_session",
@@ -32775,7 +32777,9 @@ class WrapperMachine:
                 return error
         return ctx
 
-    async def _claude_code_context(self, cmd, action: str) -> SessionContext | Error:
+    async def _claude_code_context(
+        self, cmd, action: str, *, reload_native: bool = True,
+    ) -> SessionContext | Error:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         try:
             profile, native_sid = self._claude_target(sid)
@@ -32837,7 +32841,7 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
-        if ctx.needs_reload:
+        if ctx.needs_reload and reload_native:
             # The terminal may have appended and exited before this control
             # request arrived.  Rewind must never run against the resident
             # Claude child's stale in-memory conversation/checkpoint map.
@@ -32888,6 +32892,84 @@ class WrapperMachine:
                 await self.transport.send(error)
                 return error
         return ctx
+
+    async def _claude_rewind_selection(self, sid: str, cwd: str, target: str) -> dict:
+        """Resolve the exact visible native checkpoint, including old pages."""
+        profile, native_sid = self._claude_target(sid)
+
+        def read():
+            path = self._claude_transcript_path(profile, native_sid, directory=cwd)
+            if not path or os.path.getsize(path) > self.cfg.history_source_max_bytes:
+                raise ClaudeRewindError("target_not_found", operation="conversation")
+            snapshot = transcript_compact_snapshot(
+                native_sid, path=path, index_store=self._history_index,
+                snapshot_size=os.path.getsize(path))
+            if snapshot is None:
+                messages = self._claude_catalog_messages(profile, native_sid, directory=cwd)
+                timestamps = transcript_timestamps(native_sid, path=path)
+            else:
+                messages, timestamps, _ = snapshot
+            events = translate_history(messages, self.cfg.tool_result_max, timestamps=timestamps)
+            checkpoints = []
+            prompt = ""
+            selected_prompt = ""
+            for event in events:
+                if isinstance(event, UserMsg):
+                    prompt = event.prompt
+                if isinstance(event, TurnEnd) and event.checkpoint_id:
+                    if event.checkpoint_id not in checkpoints:
+                        checkpoints.append(event.checkpoint_id)
+                    if event.checkpoint_id == target:
+                        selected_prompt = prompt
+            if target not in checkpoints or len(checkpoints) - checkpoints.index(target) > 1000:
+                raise ClaudeRewindError("target_not_found", operation="conversation")
+            return {"latest_user_message_id": checkpoints[-1],
+                    "num_turns": len(checkpoints) - checkpoints.index(target),
+                    "prompt": selected_prompt}
+
+        return await asyncio.to_thread(read)
+
+    def _claude_rewind_busy(self, ctx: SessionContext) -> bool:
+        return bool(ctx.state != "idle" or ctx.btw
+                    or (ctx.turn_task and not ctx.turn_task.done())
+                    or ctx.queued_queries or ctx.queued_query_starting_msg_id
+                    or self._claude_has_background_work(ctx)
+                    or getattr(ctx.sdk, "autonomous_steer_pending", False))
+
+    async def _handle_get_rewind_preview(self, cmd):
+        result = RewindPreview(
+            request_id=cmd.cmd_id, session_id=cmd.session_id,
+            checkpoint_id=cmd.checkpoint_id, to=cmd.client_id)
+        ctx = await self._claude_code_context(cmd, "查看回退点", reload_native=False)
+        if isinstance(ctx, Error):
+            result.detail = ctx.message
+        else:
+            async with ctx.query_lock:
+                try:
+                    if self._claude_rewind_busy(ctx):
+                        raise ClaudeRewindError("turn_running", operation="conversation")
+                    selected = await self._claude_rewind_selection(
+                        cmd.session_id, ctx.cwd, cmd.checkpoint_id)
+                    if getattr(ctx.sdk, "is_claude_broker", False):
+                        raise ClaudeRewindError("capability_unavailable", operation="conversation")
+                    # Reconnect only when the observed transcript requires it.
+                    # An ordinary preview never interrupts a resident reader.
+                    if ctx.needs_reload:
+                        _, native_sid = self._claude_target(cmd.session_id)
+                        await ctx.sdk.prepare_conversation_rewind(resume_id=native_sid, cwd=ctx.cwd)
+                        ctx.needs_reload = False
+                    capability = await ctx.sdk.conversation_rewind_capability()
+                    if not capability.supported:
+                        raise ClaudeRewindError("capability_unavailable", operation="conversation")
+                    result = result.model_copy(update={**selected, "available": True,
+                        "files_available": await ctx.sdk.preview_file_rewind(cmd.checkpoint_id)})
+                except ClaudeRewindError as exc:
+                    result.detail = exc.user_message_zh
+                except Exception as exc:
+                    result.detail = "无法核对回退点，请稍后重试"
+                    log.warning("Claude rewind preview failed", error_type=type(exc).__name__)
+        await self.transport.send(result)
+        return result
 
     async def _claude_rewind_targets_after_stale(
         self,
@@ -33120,10 +33202,25 @@ class WrapperMachine:
         ctx = (
             await self._codex_code_context(cmd, "回滚")
             if cmd.engine == "codex"
-            else await self._claude_code_context(cmd, "回滚")
+            else await self._claude_code_context(cmd, "回退", reload_native=False)
         )
         if isinstance(ctx, Error):
             return ctx
+        async with ctx.query_lock:
+            if ctx.engine == "claude" and self._claude_rewind_busy(ctx):
+                error = Error(code=ERR_BUSY, message="会话有运行中或排队中的任务，请等待完成后回退",
+                              sid=cmd.session_id, to=cmd.client_id)
+                await self.transport.send(error)
+                return error
+            was_writing = ctx.claude_write_active
+            if ctx.engine == "claude":
+                ctx.claude_write_active = True
+            try:
+                return await self._rollback_session_locked(cmd, ctx)
+            finally:
+                ctx.claude_write_active = was_writing
+
+    async def _rollback_session_locked(self, cmd, ctx):
         sid = self._ctx_wire_sid(ctx) or cmd.session_id
         restore = getattr(cmd, "restore", "conversation")
         wants_files = restore in {"files", "both"}
@@ -33176,7 +33273,7 @@ class WrapperMachine:
             return error
 
         if durable["status"] == "complete":
-            result = RollbackResult(**durable["result"], to=client_id)
+            result = RollbackResult(**durable["result"], to=client_id, request_id=cmd_id)
             return await self._publish_rollback_outcome(
                 ctx,
                 result,
@@ -33200,6 +33297,7 @@ class WrapperMachine:
                         error_type=type(exc).__name__,
                     )
             result = RollbackResult(
+                request_id=cmd_id,
                 session_id=sid,
                 engine=ctx.engine,
                 restore=restore,
@@ -33228,6 +33326,26 @@ class WrapperMachine:
                 invalidate_conversation=wants_conversation,
                 invalidate_files=wants_files,
             )
+        if ctx.engine == "claude" and cmd.latest_user_message_id:
+            try:
+                selected = await self._claude_rewind_selection(sid, ctx.cwd, cmd.checkpoint_id)
+                if (selected["latest_user_message_id"] != cmd.latest_user_message_id
+                        or selected["num_turns"] != cmd.num_turns):
+                    raise ClaudeRewindError("state_changed", operation="conversation")
+                if await self._prime_claude_ownership(sid):
+                    raise ClaudeRewindError("state_changed", operation="conversation")
+            except ClaudeRewindError as exc:
+                result = RollbackResult(request_id=cmd_id, session_id=sid, engine="claude",
+                    restore=restore, conversation="failed" if wants_conversation else "skipped",
+                    files="failed" if wants_files else "skipped", detail=exc.user_message_zh,
+                    to=client_id)
+                # Persist a terminal refusal without crossing the native boundary.
+                claimed = await asyncio.to_thread(rollback_journal.mark_submitted, client_id, cmd_id)
+                if not claimed:
+                    return await self._rollback_session_locked(cmd, ctx)
+                await asyncio.to_thread(rollback_journal.complete, client_id, cmd_id, result)
+                await self._emit(ctx, result)
+                return result
         try:
             claimed = await asyncio.to_thread(
                 rollback_journal.mark_submitted, client_id, cmd_id
@@ -33257,6 +33375,7 @@ class WrapperMachine:
             if wants_conversation:
                 self._invalidate_session_history(ctx, sid)
             result = RollbackResult(
+                request_id=cmd_id,
                 session_id=sid,
                 engine=ctx.engine,
                 restore=restore,
@@ -33349,19 +33468,36 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
 
-        if ctx.engine == "claude" and wants_conversation:
+        if ctx.engine == "claude" and (wants_conversation or cmd.latest_user_message_id):
             try:
                 if getattr(ctx.sdk, "is_claude_broker", False):
                     raise ClaudeRewindError(
                         "capability_unavailable", operation="conversation")
                 prepare = getattr(ctx.sdk, "prepare_conversation_rewind", None)
                 if callable(prepare):
-                    await prepare(resume_id=sid, cwd=ctx.cwd)
+                    _, native_sid = self._claude_target(sid)
+                    await prepare(resume_id=native_sid, cwd=ctx.cwd)
+                    ctx.needs_reload = False
+                elif ctx.needs_reload:
+                    # Older embedded handles still expose the reconnect primitive.
+                    await ctx.sdk.force_reconnect(resume_id=self._claude_target(sid)[1],
+                        cwd=ctx.cwd, reason="prepare conversation rewind", preserve_model=True)
+                    ctx.needs_reload = False
+                if await self._prime_claude_ownership(sid) or ctx.needs_reload:
+                    raise ClaudeRewindError("state_changed", operation="conversation")
+                if cmd.latest_user_message_id:
+                    refreshed = await self._claude_rewind_selection(sid, ctx.cwd, cmd.checkpoint_id)
+                    if refreshed["latest_user_message_id"] != cmd.latest_user_message_id:
+                        raise ClaudeRewindError("state_changed", operation="conversation")
+                if wants_files and cmd.latest_user_message_id:
+                    if not await ctx.sdk.preview_file_rewind(cmd.checkpoint_id):
+                        raise ClaudeRewindError("file_rewind_failed", operation="files")
             except ClaudeRewindError as exc:
-                conversation = "failed"
+                conversation = "failed" if wants_conversation else "skipped"
+                files = "failed" if wants_files and not wants_conversation else "skipped"
                 conversation_blocked = True
                 detail_parts.append(
-                    f"对话历史恢复失败：{exc.user_message_zh}（{exc.code}）")
+                    f"回退检查失败：{exc.user_message_zh}（{exc.code}）")
                 log.warning(
                     "Claude conversation rollback preflight failed",
                     session_id=sid,
@@ -33369,7 +33505,8 @@ class WrapperMachine:
                     retryable=exc.retryable,
                 )
             except Exception as exc:
-                conversation = "failed"
+                conversation = "failed" if wants_conversation else "skipped"
+                files = "failed" if wants_files and not wants_conversation else "skipped"
                 conversation_blocked = True
                 detail_parts.append(
                     "对话回滚运行时准备失败，未修改对话或代码")
@@ -33434,11 +33571,13 @@ class WrapperMachine:
                     self._invalidate_claude_context_usage(ctx)
                     try:
                         result = await ctx.sdk.rewind_conversation(
-                            cmd.checkpoint_id, interrupt_if_running=False
+                            cmd.checkpoint_id, interrupt_if_running=False,
+                            **({"last_seen_user_message_uuid": cmd.latest_user_message_id}
+                               if cmd.latest_user_message_id else {}),
                         )
-                        claude_rewound_turns = 1
+                        claude_rewound_turns = cmd.num_turns if cmd.latest_user_message_id else 1
                     except ClaudeRewindError as exc:
-                        if exc.code != "stale_target":
+                        if exc.code != "stale_target" or cmd.latest_user_message_id:
                             raise
                         targets = await self._claude_rewind_targets_after_stale(
                             sid, ctx.cwd, cmd.checkpoint_id
@@ -33502,7 +33641,7 @@ class WrapperMachine:
                 # conversation+file restore, then reload the final transcript
                 # exactly once after both native mutations have returned.
                 await ctx.sdk.force_reconnect(
-                    resume_id=sid,
+                    resume_id=self._claude_target(sid)[1],
                     cwd=ctx.cwd,
                     reason="conversation rewind",
                 )
@@ -33575,6 +33714,7 @@ class WrapperMachine:
             else 0
         )
         result = RollbackResult(
+            request_id=cmd_id,
             session_id=sid,
             engine=ctx.engine,
             restore=restore,

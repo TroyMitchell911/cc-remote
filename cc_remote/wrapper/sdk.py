@@ -1388,6 +1388,20 @@ class SdkHandle:
             raise ClaudeRewindError(
                 "file_rewind_failed", operation="files") from None
 
+    async def preview_file_rewind(self, user_message_id: str) -> bool:
+        """Use the native non-mutating check; the Python SDK omits dry_run."""
+        target = validate_rewind_target(user_message_id, operation="files")
+        sender = self._conversation_rewind_sender()
+        if sender is None:
+            return False
+        try:
+            result = await sender({"subtype": "rewind_files",
+                                   "user_message_id": target, "dry_run": True},
+                                  timeout=10.0)
+        except Exception:
+            return False
+        return isinstance(result, dict) and result.get("canRewind") is True
+
     def _conversation_rewind_sender(self):
         client = self.client
         if client is None:
@@ -1477,6 +1491,7 @@ class SdkHandle:
         target_message_uuid: str,
         *,
         interrupt_if_running: bool = False,
+        last_seen_user_message_uuid: str | None = None,
     ) -> ClaudeConversationRewindResult:
         """Apply Claude Code's guarded native conversation-only rewind."""
         target = validate_rewind_target(
@@ -1497,6 +1512,9 @@ class SdkHandle:
                     "subtype": "rewind_conversation",
                     "target_message_uuid": target,
                     "interrupt_if_running": bool(interrupt_if_running),
+                    **({"last_seen_user_message_uuid": validate_rewind_target(
+                        last_seen_user_message_uuid, operation="conversation")}
+                       if last_seen_user_message_uuid else {}),
                 },
                 timeout=30.0,
             )

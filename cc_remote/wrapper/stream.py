@@ -45,6 +45,7 @@ from cc_remote.wrapper.claude_compaction import (
     compact_completion_events, compact_metadata, manual_compact_prompt,
 )
 from cc_remote.wrapper.claude_model_fallback import FALLBACK_TOOL, model_fallback_event
+from cc_remote.wrapper.claude_rewind_history import REWIND_ANCHOR, rewind_anchor_row
 from cc_remote.wrapper.turn_changes import native_claude_diff
 from cc_remote.wrapper.token_usage import UsageLedger, native_usage
 
@@ -2007,6 +2008,9 @@ def _transcript_graph_index(
                         row = json.loads(line)
                     except Exception:
                         continue
+                    if not isinstance(row, dict):
+                        continue
+                    row = rewind_anchor_row(row, offset)
                     if (row.get("type") == "queue-operation"
                             and row.get("operation") == "enqueue"):
                         content = row.get("content")
@@ -2094,7 +2098,7 @@ def _compact_chain_index(
         return None
 
     if not any(
-        rows[uid][0] == "system" and rows[uid][1] == "compact_boundary"
+        rows[uid][0] == "system" and rows[uid][1] in {"compact_boundary", REWIND_ANCHOR}
         for uid in chain_ids
     ):
         return None
@@ -2591,6 +2595,8 @@ def _load_compact_chain_messages(
                 metadata = rows.get(uid)
                 if metadata is None or not isinstance(metadata[5], int):
                     return None
+                if metadata[:2] == ("system", REWIND_ANCHOR):
+                    continue
                 source.seek(metadata[5])
                 record_limit = max(1024, int(max_record_bytes))
                 line = source.readline(record_limit + 1)
@@ -2725,7 +2731,7 @@ def transcript_compact_main_chain(
     ordered_ids, rows, queued = indexed
     loaded = _load_compact_chain_messages(
         session_id, source_path, ordered_ids, rows, queued)
-    if loaded is None or not loaded[0]:
+    if loaded is None:
         return None
     return loaded[0], loaded[1]
 
@@ -2759,7 +2765,7 @@ def transcript_compact_snapshot(
         session_id, source_path, ordered_ids, rows, queued,
         max_record_bytes=max_record_bytes,
     )
-    if loaded is None or not loaded[0]:
+    if loaded is None:
         return None
     return loaded
 
@@ -2802,6 +2808,8 @@ def transcript_compact_history_page(
         if bool(rows[uid][6])
     ]
     if not visible:
+        if before is None and any(rows[uid][:2] == ("system", REWIND_ANCHOR) for uid in ordered_ids):
+            return CompactTranscriptPage([], {}, {}, False, None)
         return None
     end = len(visible)
     if before is not None:

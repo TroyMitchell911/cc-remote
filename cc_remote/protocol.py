@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 84
+PROTOCOL_VERSION = 85
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -1473,6 +1473,26 @@ class DeleteSession(_Command):
     space: Space = "code"
 
 
+class GetRewindPreview(_Command):
+    """Check a Claude rewind target without changing files or conversation."""
+    type: Literal["get_rewind_preview"] = "get_rewind_preview"
+    session_id: WireId
+    checkpoint_id: WireId
+
+
+class RewindPreview(_Base):
+    type: Literal["rewind_preview"] = "rewind_preview"
+    request_id: Optional[WireId] = None
+    session_id: WireId
+    checkpoint_id: WireId
+    available: bool = False
+    files_available: bool = False
+    latest_user_message_id: Optional[WireId] = None
+    num_turns: int = Field(default=1, ge=1, le=1000)
+    prompt: str = Field(default="", max_length=2 * 1024 * 1024)
+    detail: Optional[str] = Field(default=None, max_length=4096)
+
+
 class RollbackSession(_Command):
     """Restore conversation state, files, or both for one Code session.
 
@@ -1488,6 +1508,7 @@ class RollbackSession(_Command):
     restore: RestoreMode = "conversation"
     num_turns: int = Field(default=1, ge=1, le=1000)
     checkpoint_id: Optional[WireId] = None
+    latest_user_message_id: Optional[WireId] = None
 
     @model_validator(mode="after")
     def target_matches_engine(self):
@@ -1501,6 +1522,7 @@ class RollbackSession(_Command):
 class RollbackResult(_Base):
     """Structured, non-atomic restore result for the confirmation UI."""
     type: Literal["rollback_result"] = "rollback_result"
+    request_id: Optional[WireId] = None
     session_id: WireId
     engine: Engine
     restore: RestoreMode
@@ -3203,6 +3225,7 @@ class CompletionState(_Base):
 
 
 AnyMessage = Union[
+    GetRewindPreview, RewindPreview,
     ReorderQueuedQueries,
     GetSessionArtifacts, GetSessionArtifactPreview, SessionArtifacts,
     ReadDsh, DshReadResult, ActDshSubagent, ActDshGoal, DownloadDsh, DshDownloadChunk,
@@ -3313,6 +3336,8 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "delete_session": DeleteSession,
     "rollback_session": RollbackSession,
     "rollback_result": RollbackResult,
+    "get_rewind_preview": GetRewindPreview,
+    "rewind_preview": RewindPreview,
     "compact_session": CompactSession,
     "start_review": StartReview,
     "get_work_dashboard": GetWorkDashboard,

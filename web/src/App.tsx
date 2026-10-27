@@ -230,6 +230,9 @@ import {
   summaryHistoryTurns,
 } from "./history-summary";
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
+import { useClaudeRewind } from "./use-claude-rewind";
+import { rewindChoices } from "./claude-rewind";
+const RollbackSheet = lazy(() => import("./components/RollbackSheet").then(m => ({ default: m.RollbackSheet })));
 import {
   acknowledgeCompletion,
   acknowledgeMatchingCompletion,
@@ -1277,6 +1280,19 @@ export default function App() {
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
   );
+  const rewindDisabledReason = state.connState !== "connected" || !state.wrapperOnline
+    ? "请等待连接恢复后回退"
+    : historyView.recovering || rt.loading || !rt.syncReady
+    ? "正在同步会话，请稍后回退"
+    : rt.state !== "idle" || rt.acceptancePending || rt.queue.length > 0
+      || rt.pendingSend || rt.backgroundProcesses.some(task => task.status === "running")
+    ? "会话有运行中或排队中的任务，请等待完成后回退"
+    : (rt.control ? sessionControlLocksInput(rt.control) : rt.external)
+    ? "请先退出正在控制此会话的本机终端"
+    : focusedSession?.tag === "archived" ? "请先取消归档后回退" : null;
+  const rewind = useClaudeRewind({ scope: focusedComposerDraftKey, sid: focusedSid,
+    disabledReason: rewindDisabledReason, ws: wsRef, drafts: composerDraftsRef.current,
+    onPrefill: setEditPrompt });
   const newChatDshPreset = dshPresetSelection?.scope === activeScopeKey
     ? dshPresetSelection.value : state.dshPresets?.find(preset => preset.is_default)?.id ?? null;
   const focusedSkillCatalogKey = skillCatalogKey(
@@ -2386,6 +2402,7 @@ export default function App() {
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
+          rewind.onEventRef.current(msg);
           if (turnFileRequestsRef.current.accept(msg)) return;
           if (goalApiRef.current?.accept(msg)) return;
           if (dshApi.accept(msg)) return;
@@ -3208,10 +3225,6 @@ export default function App() {
             // Close them instead of leaving a convincing but stale panel open.
             dispatch({ type: "clear_artifact" });
           }
-          if (msg.type === "rollback_result" && msg.prefill_text
-              && stateRef.current.focusedSid === msg.session_id) {
-            setEditPrompt(msg.prefill_text);
-          }
           if (msg.type === "btw_sync"
               && msg.revision >= stateRef.current.btwRevision) {
             const retained = new Set(msg.sessions.map((chat) => chat.btw_sid));
@@ -3998,6 +4011,7 @@ export default function App() {
         },
         onCommandCompleted: (commandId) => {
           if (!acceptsLifecycle()) return;
+          rewind.onCompletedRef.current(commandId);
           setPermissionProfileRequests((current) =>
             Object.values(current).includes(commandId)
               ? Object.fromEntries(Object.entries(current)
@@ -4083,6 +4097,8 @@ export default function App() {
     settleCancelledHistoryBrowse,
     settleTerminalHistoryRepair,
     startForkFocusLease,
+    rewind.onEventRef,
+    rewind.onCompletedRef,
   ]);
 
   // Land on the preferred/recent session only after an accepted list for the
@@ -6004,6 +6020,13 @@ export default function App() {
         onForkWorktree={openForkWorktree}
         onMigrate={openSessionMigration}
       /></Suspense>}</SidebarState>
+      {rewind.view && focusedEngine === "claude" && space === "code" && <Suspense fallback={null}>
+        <RollbackSheet key={`${focusedComposerDraftKey}:${rewind.view.target?.checkpointId ?? "picker"}`}
+          {...rewind.view} choices={rewindChoices(historyView.turns)} disabledReason={rewindDisabledReason}
+          onClose={rewind.close} onChoose={rewind.open} onConfirm={rewind.confirm}
+          onLoadMore={!rewind.view.target && historyView.hasMore && historyView.pagingReady
+            ? () => { loadOlderHistoryPage(); } : undefined} />
+      </Suspense>}
       {dirPickerOpen && <Suspense fallback={null}><DirPicker
         open={dirPickerOpen}
         path={state.dirPicker?.path ?? null}
@@ -6238,6 +6261,10 @@ export default function App() {
                 ? undefined : loadHistoryTurnDetail}
               onEdit={historyView.recovering
                 ? undefined : (prompt) => setEditPrompt(prompt)}
+              onRewind={focusedEngine === "claude" && space === "code" ? turn => {
+                if (turn.checkpointId) rewind.open({ checkpointId: turn.checkpointId,
+                  prompt: turn.prompt || "", ts: turn.ts });
+              } : undefined}
               asyncReplyMode={rt.state === "running" ? "steer"
                 : rt.state === "idle" ? "query" : undefined}
               pendingReplyId={rt.acceptancePending}
@@ -6400,6 +6427,7 @@ export default function App() {
           onDshCommand={(value, images, files) => focusedSid ? wsRef.current?.sendDshControl(focusedSid, "command", value, images, files) ?? null : null}
           draftKey={focusedComposerDraftKey}
           draftStore={composerDraftsRef.current}
+          onRewind={focusedEngine === "claude" && space === "code" ? () => rewind.open() : undefined}
           backgroundTasks={rt.backgroundProcesses.length > 0
             ? <Suspense fallback={null}>
                 <BackgroundTaskControl key={focusedComposerDraftKey}

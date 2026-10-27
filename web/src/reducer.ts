@@ -7067,6 +7067,7 @@ function reduceEvent(
     case "pong":
     case "command_ack":
     case "queued_query_detail":
+    case "rewind_preview":
     case "queued_query_updated":
     case "history_image":
     case "session_forked":

@@ -399,9 +399,28 @@ export interface RollbackSession extends Base {
   restore?: RestoreMode;
   num_turns?: number;
   checkpoint_id?: string | null;
+  latest_user_message_id?: string | null;
+}
+export interface GetRewindPreview extends Base {
+  type: "get_rewind_preview";
+  session_id: string;
+  checkpoint_id: string;
+}
+export interface RewindPreview extends Base {
+  type: "rewind_preview";
+  request_id?: string | null;
+  session_id: string;
+  checkpoint_id: string;
+  available: boolean;
+  files_available: boolean;
+  latest_user_message_id?: string | null;
+  num_turns: number;
+  prompt: string;
+  detail?: string | null;
 }
 export interface RollbackResult extends Base {
   type: "rollback_result";
+  request_id?: string | null;
   session_id: string;
   engine: Engine;
   restore: RestoreMode;
@@ -767,14 +786,14 @@ export interface CodexContext extends Base {
 export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | TurnFileChangesPage
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | BtwSync | BtwClosed | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | DshState | DshCommandResult | DshReadResult | DshDownloadChunk | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserSync | AskUserClosed | ClaudePlanState | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserSync | AskUserClosed | ClaudePlanState | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult | RewindPreview
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 84;
+export const PROTOCOL_VERSION = 85;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

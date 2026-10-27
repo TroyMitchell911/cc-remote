@@ -1253,7 +1253,7 @@ const rewindComposerSource = readFileSync(resolve(
   process.cwd(), "src/components/Composer.tsx"), "utf8");
 assert.equal(commandsFor("claude").some((command) => (
   "slash" in command && command.slash === "rewind"
-)), false, "Claude rewind must stay hidden from the command palette");
+)), true, "Claude rewind opens the local checkpoint picker");
 assert.equal(commandsFor("codex").some((command) => (
   "slash" in command && command.slash === "rollback"
 )), false, "Codex rollback must stay hidden from the command palette");
@@ -1312,12 +1312,12 @@ const codexGoalDescription = commandsFor("codex").flatMap((command) =>
   "slash" in command && command.slash === "goal" ? [command.ds] : [])[0] ?? "";
 assert.match(codexGoalDescription, /\/goal resume/,
   "the Codex command palette must advertise /goal resume");
-assert.doesNotMatch(historyAppSource, /openClaudeRewind|openLatestClaudeRewind/,
-  "Claude rewind must not have an App entry point while unsupported");
-assert.doesNotMatch(rewindChatViewSource, /onRewind|回到这里/,
-  "Claude messages must not expose a rewind action while unsupported");
-assert.match(rewindComposerSource, /case "rewind": flash\("Claude Rewind 暂未开放"\)/,
-  "a manually typed hidden rewind command must be blocked locally");
+assert.match(historyAppSource, /useClaudeRewind/,
+  "Claude rewind has a correlated local confirmation flow");
+assert.match(rewindChatViewSource, /t\.done && t\.checkpointId && onRewind/,
+  "Claude rewind requires a completed native checkpoint");
+assert.match(rewindComposerSource, /case "rewind":[\s\S]{0,100}p\.onRewind/,
+  "rewind is handled locally without a model prompt");
 assert.match(rewindComposerSource, /case "rollback": flash\("Codex Rollback 暂未开放"\)/,
   "a manually typed hidden Codex rollback command must be blocked locally");
 assert.match(historyAppSource, /replay_start[\s\S]*requestHistory/,

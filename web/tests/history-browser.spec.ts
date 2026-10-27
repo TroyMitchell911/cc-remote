@@ -3,6 +3,72 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pngChunk, staticPng } from "./fixtures/png";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol";
+
+test("Claude rewind keeps long prompts bounded and requires explicit capsule confirmation", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 375, height: 740 });
+  await page.goto("/tests/history-browser.html?rewind=1");
+  await page.getByRole("button", { name: "打开回退" }).click();
+  const dialog = page.getByRole("dialog", { name: "回退", exact: true });
+  await expect(dialog.getByRole("button", { name: "确认回退", exact: true })).toBeEnabled();
+  await expect(dialog.locator('[role="radio"]')).toHaveCount(3);
+  await expect(dialog.locator('[role="radio"] svg, [role="radio"] input')).toHaveCount(0);
+  await expect(dialog.getByRole("radio", { name: /^恢复对话和文件/ })).toHaveAttribute("aria-checked", "true");
+  const collapsed = await dialog.locator(".rewind-original").boundingBox();
+  await dialog.getByRole("button", { name: "展开原文" }).click();
+  expect((await dialog.locator(".rewind-original").boundingBox())!.height).toBeLessThanOrEqual(180);
+  expect(collapsed!.height).toBeLessThan(100);
+  await dialog.screenshot({ path: testInfo.outputPath("claude-rewind-mobile.png") });
+  for (const name of ["取消", "确认回退"]) {
+    const button = dialog.getByRole("button", { name, exact: true });
+    expect(await button.evaluate(node => getComputedStyle(node).borderRadius)).toBe("999px");
+    const box = (await button.boundingBox())!;
+    expect(box.y + box.height).toBeLessThan(740);
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(375);
+  }
+  await dialog.getByRole("radio", { name: /^仅恢复对话/ }).click();
+  await expect(page.getByTestId("sent")).toHaveText("0");
+  await dialog.getByRole("button", { name: "确认回退", exact: true }).click();
+  await expect(page.getByTestId("sent")).toHaveText("1");
+  await expect(dialog.getByRole("button", { name: "正在回退…" })).toBeDisabled();
+  // The mocked native receipt is delivered while the modal owns the screen.
+  await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
+  await expect(dialog).toContainText("对话：已恢复");
+  await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("原消息");
+  await page.getByRole("button", { name: "写入新草稿" }).evaluate(node => (node as HTMLButtonElement).click());
+  await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
+  await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("保留我的新草稿");
+});
+
+test("Claude rewind disables missing file checkpoints and keeps a newly typed draft", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?rewind=1&no-files=1");
+  await page.getByRole("button", { name: "打开回退" }).click();
+  const dialog = page.getByRole("dialog", { name: "回退", exact: true });
+  await expect(dialog.getByRole("radio", { name: /^仅恢复对话/ })).toBeEnabled();
+  await expect(dialog.getByRole("radio", { name: /^仅恢复文件/ })).toBeDisabled();
+  await expect(dialog.getByRole("radio", { name: /^恢复对话和文件/ })).toBeDisabled();
+  await dialog.getByRole("button", { name: "确认回退", exact: true }).click();
+  await page.getByRole("button", { name: "写入新草稿" }).evaluate(node => (node as HTMLButtonElement).click());
+  await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
+  await expect(dialog).toContainText("已保留输入框里的草稿");
+  await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("保留我的新草稿");
+});
+
+test("Claude rewind receipt stays with its original session after switching away", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?rewind=1");
+  await page.getByRole("button", { name: "打开回退" }).click();
+  const dialog = page.getByRole("dialog", { name: "回退", exact: true });
+  await expect(dialog.getByRole("button", { name: "确认回退", exact: true })).toBeEnabled();
+  await dialog.getByRole("button", { name: "确认回退", exact: true }).click();
+  await page.getByRole("button", { name: "切换会话" }).evaluate(node => (node as HTMLButtonElement).click());
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("button", { name: "写入新草稿" }).click();
+  await page.getByRole("button", { name: "返回回退结果" }).click();
+  await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("保留我的新草稿");
+  await page.getByRole("button", { name: "切换会话" }).click();
+  await expect(dialog).toContainText("对话：已恢复");
+  await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("原消息");
+});
 import {
   GITHUB_README_ATTACHMENT_URL, GITHUB_README_IMAGE_URL,
   MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README,
