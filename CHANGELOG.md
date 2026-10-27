@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.2
+
+Restore Claude file diffs after refreshing or reopening a session. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
+
+- Read native Edit/Write patches from the transcript envelope and preserve exact file paths.
+- Rebuild cached Claude history so existing sessions recover their saved diffs, while preserving native transcripts, binary assets and other engines' caches.
+- Keep missing, failed or discontinuous changes unavailable instead of inventing a cumulative diff.
+
+See the bilingual [release notes](docs/releases/v5.3.2.md).
+
 ## v5.3.1
 
 Keep Codex question/reply order and supplemental-answer bubbles stable across refresh, session switches and paged history. Upgrade Claude Agent SDK to 0.2.174; wire protocol v85 is unchanged.
