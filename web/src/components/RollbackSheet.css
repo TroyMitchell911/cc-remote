@@ -1,0 +1,28 @@
+.rewind-sheet { padding:0; overflow:hidden; }
+.rewind-body { overflow:auto; overscroll-behavior:contain; min-height:0; padding:18px 22px; overflow-wrap:anywhere; }
+.rewind-body h3 { margin:0 0 16px; font-size:18px; color:var(--text); }
+.rewind-prompt { padding:13px 15px; background:var(--surface); border:1px solid var(--border); border-radius:14px; margin-bottom:18px; }
+.rewind-prompt small { color:var(--faint); font-size:11px; }
+.rewind-original { white-space:pre-wrap; line-height:1.6; margin-top:6px; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }
+.rewind-original.expanded { display:block; max-height:180px; overflow:auto; overscroll-behavior:contain; }
+.rewind-prompt button { color:var(--accent-text,var(--accent)); font-size:12px; padding:6px 0 0; }
+.rewind-options, .rewind-choices { display:flex; flex-direction:column; gap:10px; }
+.rewind-options .qa-opt, .rewind-choices .qa-opt { display:flex; flex-direction:column; gap:5px; padding:13px 15px; border-radius:14px; text-align:left; }
+.rewind-options b { font-size:14px; font-weight:600; }
+.rewind-options small, .rewind-choices small { color:var(--dim); font-size:12px; line-height:1.5; }
+.rewind-options button:disabled { cursor:default; opacity:.45; }
+.rewind-choices .qa-opt span { display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; white-space:pre-wrap; }
+.rewind-help { color:var(--dim); font-size:12px; line-height:1.65; margin:14px 0 0; }
+.rewind-error { color:var(--accent-text,var(--accent)); font-size:13px; line-height:1.5; }
+.rewind-result { font-size:13px; margin-top:14px; line-height:1.5; }
+.rewind-result p { margin:4px 0; }
+.rewind-footer { flex:none; display:flex; justify-content:flex-end; gap:10px; padding:15px 22px 18px; border-top:1px solid var(--divider); }
+.rewind-footer button { min-height:44px; padding:10px 23px; border-radius:999px; font-weight:600; }
+.rewind-cancel { background:var(--raised); border:1px solid var(--border); color:var(--text); }
+.rewind-confirm { background:var(--accent); color:var(--on-accent,#fff); }
+.rewind-footer button:disabled { opacity:.45; cursor:default; }
+.rewind-more { padding:10px; color:var(--accent-text,var(--accent)); }
+@media (max-width:600px) {
+  .rewind-body { padding:16px; }
+  .rewind-footer { padding:13px 16px 16px; }
+}

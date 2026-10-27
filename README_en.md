@@ -4,7 +4,7 @@
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v5.2.2** · Wire protocol v84
+**Product version: v5.2.2** · Wire protocol v85
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Interface tour](#interface-tour) · [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -136,6 +136,7 @@ Type `/` in the composer to see commands available for the current engine.
 | `/open [path]` | Browse directories; also available from More → Session files |
 | `/preview <path>` | Open a file preview |
 | `/diff` | Inspect current project Git changes |
+| `/rewind` | Claude Code: choose an earlier message to restore conversation, files, or both |
 | `/context` | Inspect context usage; the small composer gauge opens it too |
 | `/autocompact` | Claude/Codex session context settings, with the semantics below |
 | `/status` | Codex thread, configuration, usage and account limits |
@@ -144,6 +145,15 @@ Type `/` in the composer to see commands available for the current engine.
 On desktop, **Enter sends and Shift+Enter inserts a newline** by default. Assistant
 question dialogs use the same keys; **Esc** dismisses the dialog while leaving
 the question unanswered. Confirming an IME composition does not submit it.
+
+Claude Code also offers **Rewind** beside historical user messages. Confirm a message
+to restore the state before it was sent; running and queued tasks must finish first.
+File restore covers only files recorded by Claude's native checkpoints and may
+overwrite later manual edits to those files. Without a checkpoint, only conversation
+restore is available. Conversation changes sync to other clients. The original prompt
+returns to the requesting composer's empty draft and is never sent automatically.
+Unsupported CLI versions or connections report that rewind is unavailable. See
+[Claude rewind](docs/claude-rewind.md) for implementation and validation details.
 
 Side conversations, file previews, diffs, session files, agent details and remote
 previews have a header button to expand into a centered view or dock on the right.

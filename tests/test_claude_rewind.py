@@ -71,6 +71,108 @@ def test_claude_file_rewind_uses_public_sdk_and_structured_errors():
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("mode", ["conversation", "files", "both"])
+@pytest.mark.parametrize("failure", [None, "stale", "missing_files", "file_failure"])
+def test_guarded_rewind_is_correlated_idempotent_and_reports_partial_success(mode, failure):
+    class Sdk:
+        def __init__(self):
+            self.calls = []
+
+        async def prepare_conversation_rewind(self, *, resume_id, cwd):
+            assert resume_id == SESSION_ID
+            self.calls.append("prepare")
+
+        async def preview_file_rewind(self, target):
+            assert target == TARGET_ID
+            self.calls.append("preview_files")
+            return failure != "missing_files"
+
+        async def rewind_conversation(self, target, *, interrupt_if_running, last_seen_user_message_uuid):
+            assert target == TARGET_ID and not interrupt_if_running
+            assert last_seen_user_message_uuid == LATEST_TARGET_ID
+            self.calls.append("conversation")
+            return SimpleNamespace(prefill_text="original prompt")
+
+        async def rewind_files(self, target):
+            assert target == TARGET_ID
+            self.calls.append("files")
+            if failure == "file_failure":
+                raise ClaudeRewindError("file_rewind_failed", operation="files")
+
+        async def force_reconnect(self, **_kwargs):
+            self.calls.append("reconnect")
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.sdk = Sdk()
+        machine.sessions[SESSION_ID] = ctx
+        async def context(*_args, **_kwargs):
+            return ctx
+        async def selected(*_args):
+            return {"latest_user_message_id": NEWER_TARGET_ID if failure == "stale" else LATEST_TARGET_ID,
+                    "num_turns": 3, "prompt": "original prompt"}
+        async def ownership(*_args):
+            return False
+        async def history(*_args, **_kwargs):
+            return History(session_id=SESSION_ID, revision="rewound", events=[], has_more=False)
+        machine._claude_code_context = context
+        machine._claude_rewind_selection = selected
+        machine._prime_claude_ownership = ownership
+        machine._build_history = history
+        cmd = RollbackSession(session_id=SESSION_ID, engine="claude", restore=mode,
+                              checkpoint_id=TARGET_ID, latest_user_message_id=LATEST_TARGET_ID,
+                              num_turns=3, cmd_id="guarded-rewind", client_id="client-a")
+        outcome = await machine._handle_rollback_session(cmd)
+        result = outcome if isinstance(outcome, RollbackResult) else next(
+            value for value in outcome if isinstance(value, RollbackResult))
+        assert result.request_id == cmd.cmd_id and result.to == "client-a"
+        calls = list(ctx.sdk.calls)
+        await machine._handle_rollback_session(cmd)
+        assert ctx.sdk.calls == calls  # a repeated receipt never calls Claude again
+        if failure == "stale":
+            assert calls == []
+            assert result.restored_turns == 0
+        elif failure == "missing_files" and mode != "conversation":
+            assert "conversation" not in calls and "files" not in calls
+        else:
+            if mode != "files":
+                assert result.conversation == "succeeded" and result.prefill_text == "original prompt"
+                assert "reconnect" in calls
+            else:
+                assert result.conversation == "skipped" and result.prefill_text is None
+            if mode != "conversation":
+                assert result.files == ("failed" if failure == "file_failure" else "succeeded")
+            if mode == "both":
+                assert calls.index("conversation") < calls.index("files")
+        assert not ctx.query_lock.locked() and not ctx.claude_write_active
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("busy", ["task", "queue", "followup", "turn"])
+def test_rewind_never_reconnects_background_or_queued_work(busy):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx(SESSION_ID, SESSION_ID)
+        ctx.sdk = SimpleNamespace()
+        async def context(*_args, **_kwargs):
+            return ctx
+        machine._claude_code_context = context
+        if busy == "task":
+            ctx.claude_active_tasks.add("child")
+        elif busy == "queue":
+            ctx.queued_query_starting_msg_id = "queued"
+        elif busy == "followup":
+            ctx.claude_background_followups["child"] = "notified"
+        else:
+            ctx.state = "running"
+        outcome = await machine._handle_rollback_session(RollbackSession(
+            session_id=SESSION_ID, engine="claude", checkpoint_id=TARGET_ID,
+            latest_user_message_id=LATEST_TARGET_ID, client_id="client-a", cmd_id="busy"))
+        assert isinstance(outcome, Error) and outcome.code == "busy"
+    asyncio.run(go())
+
+
 def test_claude_conversation_rewind_probes_then_normalizes_success():
     class Query:
         def __init__(self):
@@ -234,7 +336,7 @@ def test_broker_owned_combined_rewind_fails_before_mutating_files():
         ctx.sdk = BrokerSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         machine._claude_code_context = code_context
@@ -271,7 +373,7 @@ def test_conversation_rewind_surfaces_structured_native_failure():
         ctx.sdk = RejectedSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         machine._claude_code_context = code_context
@@ -317,7 +419,7 @@ def test_claude_combined_rewind_never_touches_files_after_stale_target():
         ctx.sdk = RejectedSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         machine._claude_code_context = code_context
@@ -409,7 +511,7 @@ def test_claude_stale_target_is_rewound_newest_to_selected_before_files():
         ctx.sdk = SequentialSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         async def rewind_targets(_sid, _cwd, _selected):
@@ -471,7 +573,7 @@ def test_claude_combined_rewind_orders_conversation_before_files():
         ctx.sdk = RewoundSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         machine._claude_code_context = code_context
@@ -543,7 +645,7 @@ def test_claude_rewind_remains_successful_when_only_reconnect_fails():
         ctx.sdk = RewoundSdk()
         machine.sessions[SESSION_ID] = ctx
 
-        async def code_context(_cmd, _action):
+        async def code_context(_cmd, _action, **_kwargs):
             return ctx
 
         async def history(_sid, **_kwargs):
@@ -639,7 +741,7 @@ def test_claude_rewind_reloads_stale_context_before_native_mutation():
             {
                 "resume_id": SESSION_ID,
                 "cwd": "/tmp/claude-stale-rewind",
-                "reason": "external transcript change before 回滚",
+                "reason": "prepare conversation rewind",
                 "preserve_model": True,
             },
         )
@@ -682,8 +784,10 @@ def test_claude_rewind_is_rejected_when_stale_context_reload_fails():
             client_id="client-1",
         ))
 
-        assert isinstance(outcome, Error)
-        assert outcome.code == "not_running"
+        result = outcome if isinstance(outcome, RollbackResult) else next(
+            item for item in outcome if isinstance(item, RollbackResult))
+        assert result.conversation == "failed"
+        assert "未修改" in result.detail
         assert ctx.sdk.rewind_calls == 0
         assert ctx.needs_reload is True
 

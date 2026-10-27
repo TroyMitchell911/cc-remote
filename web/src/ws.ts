@@ -1604,6 +1604,18 @@ export class RelayWs {
     return this.send(command);
   }
 
+  sendGetRewindPreview(sessionId: string, checkpointId: string): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "get_rewind_preview",
+      session_id: sessionId, checkpoint_id: checkpointId, ts: nowTs() });
+  }
+
+  sendClaudeRewind(sessionId: string, checkpointId: string, latestId: string,
+                   numTurns: number, restore: "conversation" | "files" | "both"): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "rollback_session",
+      engine: "claude", space: "code", session_id: sessionId, checkpoint_id: checkpointId,
+      latest_user_message_id: latestId, num_turns: numTurns, restore, ts: nowTs() });
+  }
+
   sendCompactSession(sessionId: string, engine: "claude" | "codex" | "dsh"): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,

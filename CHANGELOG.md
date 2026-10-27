@@ -2,6 +2,18 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+Add Claude Code rewind from historical user messages or `/rewind`, with explicit
+conversation, file, and combined restore choices. Wire protocol v85 requires a
+coordinated Relay, Wrapper and Web upgrade.
+
+- Bound long prompts and keep rounded confirmation buttons visible on phones.
+- Check native capability and file checkpoints, reject stale/busy confirmations,
+  preserve drafts, and report partial results without repeating a mutation.
+- Follow durable native rewind anchors across refresh and other clients,
+  including returning to an empty conversation before the first message.
+
 ## v5.2.2
 
 Fix Claude child-agent return links being attached to an earlier reply when several results arrive close together. Wire protocol v84 is unchanged. See the bilingual [release notes](docs/releases/v5.2.2.md).

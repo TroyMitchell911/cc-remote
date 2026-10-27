@@ -41,6 +41,7 @@ export const COMMANDS: Command[] = [
   { slash: "deep-research", name: "深度调研", ds: "多源检索 + 交叉验证 + 成文", ic: "research" },
   { slash: "init", name: "初始化 CLAUDE.md", ds: "生成代码库说明", ic: "init" },
   { g: "会话" },
+  { slash: "rewind", name: "回退", ds: "选择一条历史消息，恢复对话或文件", ic: "history" },
   { slash: "goal", name: "目标", ds: "/goal 查看 · /goal <目标> 设置 · /goal resume 恢复 Codex · /goal clear 清除", ic: "verify" },
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
@@ -337,8 +338,7 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // Slashes handled locally by the web client (never forwarded to cc as a prompt).
 // Everything else (code-review, verify, run, deep-research, …) is a cc skill and
 // is forwarded verbatim so cc's own slash-command layer runs it.
-// /rewind stays reserved locally while its UI is hidden so manually typing it
-// cannot fall through to Claude's interactive-only slash layer.
+// /rewind opens the local checkpoint picker, never a model prompt.
 const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
 export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "autocompact", "compact", "goal", "rewind", "btw", "diff", "preview", "open", ...EXTENSION_SLASHES]);
 

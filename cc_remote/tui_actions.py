@@ -19,6 +19,7 @@ ACTION_CLASSES = (
     p.ForkSessionWorktree,
     p.MigrateSession,
     p.RollbackSession,
+    p.GetRewindPreview,
     p.CompactSession,
     p.StartReview,
     p.Interrupt,

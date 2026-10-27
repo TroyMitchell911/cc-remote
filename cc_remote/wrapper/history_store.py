@@ -24,6 +24,7 @@ from threading import RLock
 from typing import Any, Callable
 
 from cc_remote.wrapper.codex_delegation import codex_message_target
+from cc_remote.wrapper.claude_rewind_history import rewind_anchor_row
 
 from cc_remote.attachments import (
     ALLOWED_IMAGE_TYPES,
@@ -84,7 +85,8 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v49 retains native child/task return identities for all engines.
 # v50 keeps return-link metadata out of process counts and timing.
 # v51 repairs Claude's failed-answer -> native background continuation scope.
-_SCHEMA_VERSION = 51
+# v52 honors native conversation rewind anchors, including an empty branch.
+_SCHEMA_VERSION = 52
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -1565,7 +1567,7 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50):
+            elif current in range(21, 52):
                 # The independent v22-v44 invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
@@ -1760,6 +1762,14 @@ class HistoryIndexStore:
                 # child detail and the raw Claude compact ancestry index.
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(f"DELETE FROM {table} WHERE engine IN ('claude', 'codex', 'dsh')")
+            if 0 < current < 52:
+                # Old graph indexes skipped last-prompt rewind anchors. Rebuild
+                # Claude narrative and ancestry even when source bytes have not
+                # changed; retain other engines, images and Agent detail assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+                for table in ("claude_compact_sources", "claude_compact_records", "claude_compact_queue"):
+                    connection.execute(f"DELETE FROM {table}")
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
@@ -1940,6 +1950,7 @@ class HistoryIndexStore:
                         scan_offset = source.tell()
                         if not isinstance(row, dict):
                             continue
+                        row = rewind_anchor_row(row, offset)
                         if (row.get("type") == "queue-operation"
                                 and row.get("operation") == "enqueue"):
                             content = row.get("content")

@@ -334,7 +334,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest, onPrefetchOlder,
-  onLoadDetail, onEdit, onReplyAsyncQuestion, asyncReplyMode, pendingReplyId, onOpenTurnDiff, onOpenArchivedDiff, onLoadFilePage, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onRewind, onReplyAsyncQuestion, asyncReplyMode, pendingReplyId, onOpenTurnDiff, onOpenArchivedDiff, onLoadFilePage, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
@@ -381,6 +381,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     autoLoad?: boolean,
   ) => boolean;
   onEdit?: (prompt: string) => void;
+  onRewind?: (turn: Turn) => void;
   onReplyAsyncQuestion?: (prompt: string) => Promise<QueryAcceptanceResult> | null;
   asyncReplyMode?: "query" | "steer";
   pendingReplyId?: string | null;
@@ -3220,6 +3221,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                   {t.ts && <span className="ubub-time">{formatTime(t.ts)}</span>}
                   {t.prompt && onEdit && <button className="ubub-act" onClick={() => onEdit(t.prompt!)} aria-label="编辑"><Icon name="edit" size={13} /></button>}
                   {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="copy" size={13} /></button>}
+                  {t.done && t.checkpointId && onRewind && <button className="ubub-act rewind-entry"
+                    onClick={() => onRewind(t)} aria-label="回退到这条消息之前"><Icon name="history" size={13} />回退</button>}
                 </div>
               </div>
             )}
