@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.1
+
+Keep Codex question/reply order and supplemental-answer bubbles stable across refresh, session switches and paged history. Upgrade Claude Agent SDK to 0.2.174; wire protocol v85 is unchanged.
+
+- Preserve corrected native timestamps and interleave partial history around shared message identities.
+- Render complete supplemental answers before their earlier question page loads, while keeping answered-state matching tied to the native question.
+- Align the account-isolated transport with the new SDK session-state handshake and retain explicit settings.
+
+See the bilingual [release notes](docs/releases/v5.3.1.md), including the independent Claude service upgrade boundary.
+
 ## v5.3.0
 
 Add Claude Code rewind from historical user messages or `/rewind`, with explicit
