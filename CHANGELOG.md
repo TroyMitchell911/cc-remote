@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG_zh.md)
 
-## Unreleased
+## v5.3.0
 
 Add Claude Code rewind from historical user messages or `/rewind`, with explicit
 conversation, file, and combined restore choices. Wire protocol v85 requires a
@@ -13,6 +13,8 @@ coordinated Relay, Wrapper and Web upgrade.
   preserve drafts, and report partial results without repeating a mutation.
 - Follow durable native rewind anchors across refresh and other clients,
   including returning to an empty conversation before the first message.
+
+See the bilingual [release notes](docs/releases/v5.3.0.md).
 
 ## v5.2.2
 
