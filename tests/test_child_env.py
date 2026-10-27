@@ -222,9 +222,17 @@ def test_native_claude_profile_symlink_uses_the_same_account_layout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state_env", [
+    {},
+    {"CLAUDE_CODE_SDK_READS_SESSION_STATE": "0"},
+    {"claude_code_sdk_reads_session_state": "0"},
+])
 async def test_account_isolated_transport_scrubs_only_its_child_environment(
-    monkeypatch,
+    monkeypatch, state_env,
 ):
+    for key in list(os.environ):
+        if key.upper() == "CLAUDE_CODE_SDK_READS_SESSION_STATE":
+            monkeypatch.delenv(key)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.invalid")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ambient-aws")
     monkeypatch.setenv("WRAPPER_TOKEN", "control-secret")
@@ -254,6 +262,7 @@ async def test_account_isolated_transport_scrubs_only_its_child_environment(
         env={
             "CLAUDE_CONFIG_DIR": "/profiles/company",
             "WRAPPER_TOKEN": "",
+            **state_env,
         },
     )
     transport = account_isolated_transport(options)
@@ -268,6 +277,10 @@ async def test_account_isolated_transport_scrubs_only_its_child_environment(
     assert child["CLAUDE_CONFIG_DIR"] == "/profiles/company"
     assert child["WRAPPER_TOKEN"] == ""
     assert child["CLAUDE_CODE_ENTRYPOINT"] == "sdk-py"
+    assert {
+        key: value for key, value in child.items()
+        if key.upper() == "CLAUDE_CODE_SDK_READS_SESSION_STATE"
+    } == (state_env or {"CLAUDE_CODE_SDK_READS_SESSION_STATE": "1"})
     assert "ANTHROPIC_BASE_URL" not in child
     assert "AWS_ACCESS_KEY_ID" not in child
     assert "CLAUDECODE" not in child
@@ -394,7 +407,7 @@ def test_claude_work_passes_complete_policy_path_without_sdk_replacement(
     command = transport._build_command()
     settings_index = command.index("--settings")
 
-    # SDK 0.2.157 returns inline JSON here whenever options.sandbox is set,
+    # SDK 0.2.174 returns inline JSON here whenever options.sandbox is set,
     # replacing the policy file's complete sandbox object. Work must pass the
     # wrapper-owned file path verbatim instead.
     assert command[settings_index + 1] == str(policy)
@@ -823,7 +836,7 @@ def test_claude_preflight_inspects_effective_bundled_runtime(monkeypatch):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.157",
+            sdk_version="0.2.174",
             cli_version="2.1.220",
             cli_source="bundled",
             cli_path="/sdk/_bundled/claude",
@@ -841,7 +854,7 @@ def test_claude_preflight_inspects_configured_runtime(monkeypatch, tmp_path):
         sdk_module,
         "inspect_claude_runtime",
         lambda configured: seen.append(configured) or SimpleNamespace(
-            sdk_version="0.2.157",
+            sdk_version="0.2.174",
             cli_version="2.1.220",
             cli_source="configured",
             cli_path=configured,
