@@ -17,6 +17,7 @@ export function RewindFixture() {
   const drafts = useRef(new ComposerDraftStore());
   const prompt = "请恢复到实现这一步之前，并检查计划中的变更。\n".repeat(120) + "x".repeat(3000);
   const noFiles = new URLSearchParams(location.search).has("no-files");
+  const partial = new URLSearchParams(location.search).has("partial");
   const ws = useRef({
     sendGetRewindPreview(sessionId: string, checkpointId: string) {
       const id = `preview-${++serial.current}`;
@@ -31,7 +32,7 @@ export function RewindFixture() {
       setSent(n => n + 1);
       receipt.current = { v: PROTOCOL_VERSION, ts: 2, type: "rollback_result", request_id: id,
         session_id: sessionId, engine: "claude", restore, conversation: restore === "files" ? "skipped" : "succeeded",
-        files: restore === "conversation" ? "skipped" : "succeeded", restored_turns: 3,
+        files: restore === "conversation" ? "skipped" : partial ? "failed" : "succeeded", restored_turns: 3,
         conflicts: [], prefill_text: "原消息" };
       return id;
     },

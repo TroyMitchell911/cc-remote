@@ -22,8 +22,19 @@ _META_USER_PREFIXES = (
     "<command-args>",
     "<local-command-stdout>",
     "<local-command-stderr>",
+    "<task-notification>",
 )
-_INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
+_INTERRUPTED_USER_TEXTS = {
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+}
+
+
+def _is_interrupt(content: object) -> bool:
+    if isinstance(content, list) and len(content) == 1:
+        block = content[0]
+        content = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+    return isinstance(content, str) and content.strip() in _INTERRUPTED_USER_TEXTS
 
 
 @dataclass(frozen=True)
@@ -43,32 +54,33 @@ def _wire_id(value: object) -> str | None:
 
 
 def _is_real_user_message(row: dict, message: dict) -> bool:
-    if row.get("isSidechain") is True or row.get("isMeta") is True:
+    origin = row.get("origin")
+    if (row.get("isSidechain") is True or row.get("isMeta") is True
+            or row.get("isCompactSummary") is True
+            or row.get("sourceToolAssistantUUID")
+            or origin == "task-notification"
+            or isinstance(origin, dict) and origin.get("kind") == "task-notification"):
         return False
     if message.get("role") != "user":
         return False
     content = message.get("content")
+    if _is_interrupt(content):
+        return False
     if isinstance(content, str):
         text = content.lstrip()
         return bool(text) and not text.startswith(_META_USER_PREFIXES)
     if not isinstance(content, list):
-        return False
-    if (
-        len(content) == 1
-        and isinstance(content[0], dict)
-        and content[0].get("type") == "text"
-        and isinstance(content[0].get("text"), str)
-        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
-    ):
-        # Lifecycle metadata from the preceding turn can be flushed after a
-        # replacement query has already frozen its transcript boundary.  It is
-        # SDK-authored but is never the new human prompt.
         return False
     # Tool results are represented as user-role rows but do not start a new
     # human turn.  A genuine multimodal prompt has text/image/document blocks.
     types = {
         item.get("type") for item in content if isinstance(item, dict)
     }
+    if types == {"text"}:
+        text = "".join(str(item.get("text", "")) for item in content
+                       if isinstance(item, dict)).lstrip()
+        if not text or text.startswith(_META_USER_PREFIXES):
+            return False
     return bool(types.intersection({"text", "image", "document"}))
 
 
@@ -100,11 +112,19 @@ def parse_claude_broker_lifecycle(
             continue
         if not isinstance(row, dict) or row.get("isSidechain") is True:
             continue
+        if (row.get("type") == "last-prompt" and row.get("rewound") is True
+                and row.get("explicit") is True):
+            ordered.append(("completed", "rewind"))
+            continue
         message = row.get("message")
         if not isinstance(message, dict):
             continue
         uid = _wire_id(row.get("uuid"))
         if uid is None:
+            continue
+        if row.get("type") == "user" and _is_interrupt(message.get("content")):
+            completed.append(uid)
+            ordered.append(("completed", uid))
             continue
         if row.get("type") == "user" and _is_real_user_message(row, message):
             started.append(uid)
@@ -112,7 +132,8 @@ def parse_claude_broker_lifecycle(
             continue
         if (row.get("type") == "assistant"
                 and message.get("role") == "assistant"
-                and message.get("stop_reason") == "end_turn"):
+                and (message.get("stop_reason") == "end_turn"
+                     or row.get("isApiErrorMessage") is True)):
             completed.append(uid)
             ordered.append(("completed", uid))
 
@@ -166,15 +187,18 @@ def first_claude_sdk_user_id(data: bytes) -> str | None:
 def claude_broker_tail_state(
     path: str,
     max_bytes: int = DEFAULT_TAIL_BYTES,
+    *, snapshot_size: int | None = None,
 ) -> tuple[bool, bytes]:
     """Return whether the latest top-level turn is active plus trailing bytes."""
     if not 1 <= max_bytes <= DEFAULT_TAIL_BYTES:
         raise ValueError("invalid Claude transcript tail limit")
     size = os.path.getsize(path)
+    if snapshot_size is not None:
+        size = min(size, max(0, snapshot_size))
     start = max(0, size - max_bytes)
     with open(path, "rb") as stream:
         stream.seek(start)
-        data = stream.read(max_bytes)
+        data = stream.read(size - start)
     if start:
         _discarded, separator, data = data.partition(b"\n")
         if not separator:

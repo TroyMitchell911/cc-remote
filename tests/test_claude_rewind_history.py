@@ -58,7 +58,7 @@ def test_native_rewind_anchor_survives_refresh_first_turn_and_new_branch(tmp_pat
     with source.open("a") as stream:
         stream.write(json.dumps({**rows[0], "uuid": fresh, "parentUuid": None,
                                  "message": {"role": "user", "content": "new branch"}}) + "\n")
-    assert read() is None  # the later native chain is now authoritative
+    assert [m.uuid for m in read()[0]] == [fresh]
 
 
 def test_invalid_or_non_rewind_metadata_cannot_hide_conversation(tmp_path):
@@ -67,6 +67,49 @@ def test_invalid_or_non_rewind_metadata_cannot_hide_conversation(tmp_path):
                 {"type": "last-prompt", "leafUuid": "missing", "explicit": True, "rewound": True},
                 {"type": "last-prompt", "explicit": True, "rewound": True}):
         assert rewind_anchor_row(row, 100) == row
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_rewind_cli_settings_and_next_prompt_never_restore_abandoned_branch(
+    tmp_path, indexed, empty,
+):
+    sid = str(uuid4())
+    ids = [str(uuid4()) for _ in range(7)]
+    source = tmp_path / f"{sid}.jsonl"
+    rows = [{"type": "user" if i % 2 == 0 else "assistant", "uuid": ids[i],
+             "parentUuid": ids[i - 1] if i else None,
+             "message": {"role": "user" if i % 2 == 0 else "assistant",
+                         "content": f"message {i}"}} for i in range(4)]
+    rows.append({"type": "last-prompt", "explicit": True, "rewound": True,
+                 "leafUuid": None if empty else ids[1]})
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    store = HistoryIndexStore(tmp_path / "index") if indexed else None
+
+    def prompts():
+        snapshot = transcript_compact_snapshot(sid, path=str(source), index_store=store)
+        assert snapshot is not None, "never fall back to the abandoned SDK leaf"
+        messages, stamps, internal = snapshot
+        return [e.prompt for e in translate_history(messages, 1000, stamps, internal)
+                if isinstance(e, UserMsg)]
+
+    expected = [] if empty else ["message 0"]
+    assert prompts() == expected
+    for index, command in ((4, "/model"), (5, "/effort")):
+        with source.open("a") as stream:
+            stream.write(json.dumps({
+                "type": "system", "subtype": "local_command", "uuid": ids[index],
+                "parentUuid": (None if empty else ids[1]) if index == 4 else ids[4],
+                "content": command,
+            }) + "\n")
+        assert prompts() == expected
+    with source.open("a") as stream:
+        stream.write(json.dumps({"type": "user", "uuid": ids[6], "parentUuid": ids[5],
+                                 "message": {"role": "user", "content": "tell me a story"}}) + "\n")
+    assert prompts() == [*expected, "tell me a story"]
+    page = transcript_compact_history_page(sid, path=str(source), index_store=store, limit=1)
+    assert page is not None and page.has_more is (not empty)
+    assert ids[2] in source.read_text()  # native abandoned records remain intact
 
 
 @pytest.mark.asyncio

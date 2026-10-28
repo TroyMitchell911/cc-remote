@@ -2235,6 +2235,14 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (Math.abs(event.deltaY) <= 0.5) return;
+    // A wheel gesture can select the browser's native scroll target while
+    // keyboard events still go to body. Establish the same explicit target,
+    // but never steal focus from the composer or another active control.
+    const ownerDocument = event.currentTarget.ownerDocument;
+    if (ownerDocument.activeElement === ownerDocument.body
+        || ownerDocument.activeElement === ownerDocument.documentElement) {
+      event.currentTarget.focus({ preventScroll: true });
+    }
     beginHistoryViewportLease();
     const direction: HistoryPageDirection =
       event.deltaY < 0 ? "older" : "newer";
@@ -2282,16 +2290,36 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.defaultPrevented) return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])')) return;
+    // Space activates controls inside the transcript; it only scrolls when
+    // focus belongs to the reading surface itself.
+    if (event.key === " " && target?.closest("button, a, summary, [role=button]")) return;
+    const towardHistory = ["ArrowUp", "PageUp", "Home"].includes(event.key)
+      || (event.key === " " && event.shiftKey);
+    const towardLatest = ["ArrowDown", "PageDown", "End", " "].includes(event.key);
+    if (!towardHistory && !towardLatest) return;
+    // As with wheel/touch, keep incoming rows pending until native scrolling
+    // settles. Otherwise End/ArrowDown can chase a bottom that moves each delta.
+    beginHistoryViewportLease();
     // Native keyboard scrolling can update scrollTop before React receives the
     // preceding scroll event (and browsers may coalesce that event with the
     // next key's movement). Use the physical position at this input boundary
     // as the baseline so End -> Home still registers as historyward movement.
     const el = scrollRef.current;
     if (el) lastScrollTopRef.current = el.scrollTop;
-    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+    if (towardHistory) {
       markUserScrollIntent("history");
-    } else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) {
+      pauseOutputFollow();
+    } else {
       markUserScrollIntent("latest");
+      if (event.key === "End" && target === el && !event.shiftKey && !browseMode) {
+        // End explicitly selects the live tail. Native smooth scrolling may
+        // retain an obsolete target if a queued delta commits in this frame.
+        event.preventDefault();
+        scrollToBottom();
+      }
     }
   };
 
@@ -2814,14 +2842,16 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
         </div>
       )}
       <div className="thread-frame">
-        <div className="thread" ref={scrollRef}
+        {/* Native keyboard scrolling must target this surface, not document.body. */}
+        <div className="thread" ref={scrollRef} tabIndex={0}
+        role="region" aria-label="对话记录"
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         data-text-selection-dragging={
           activeTextSelection?.dragging ? "true" : "false"
         }
         data-text-selection-retained={activeTextSelection ? "true" : "false"}
         onScroll={onScroll} onWheel={onWheel}
-        onKeyDownCapture={onKeyDown}
+        onKeyDown={onKeyDown}
         onPointerDown={onThreadPointerDown}
         onTouchStart={onTouchStart} onTouchMove={onTouchMove}
         onTouchEnd={clearTouch} onTouchCancel={clearTouch}>

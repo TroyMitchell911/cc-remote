@@ -10,11 +10,17 @@ export function EngineSelector({ engine, onChange }: {
 }) {
   const button = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<boolean | null>(null);
+  const altShortcuts = typeof navigator !== "undefined"
+    && navigator.platform.startsWith("Linux")
+    && !/Android|CrOS/.test(navigator.userAgent);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.keyCode === 229 || event.repeat
-          || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
+          || event.shiftKey
           || (event.key !== "1" && event.key !== "2" && event.key !== "3")) return;
+      if (altShortcuts
+          ? !event.altKey || event.ctrlKey || event.metaKey
+          : !(event.metaKey || event.ctrlKey) || event.altKey) return;
       // Harness navigation belongs to the app, even inside a modal or editor.
       // Capture before their key handlers; never submit or dismiss their work.
       event.preventDefault();
@@ -25,7 +31,7 @@ export function EngineSelector({ engine, onChange }: {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [engine, onChange]);
+  }, [engine, onChange, altShortcuts]);
   const close = (restoreFocus: boolean) => {
     setMenu(null);
     if (restoreFocus) button.current?.focus();
@@ -47,7 +53,7 @@ export function EngineSelector({ engine, onChange }: {
         {engine === "dsh" ? "DSH" : engine === "codex" ? "Codex" : "Claude"}</span>
     </button>
     {menu !== null && <Suspense fallback={null}><EngineMenu engine={engine} anchor={button}
-      keyboard={menu} onClose={close} onSelect={(next, keyboard) => {
+      keyboard={menu} altShortcuts={altShortcuts} onClose={close} onSelect={(next, keyboard) => {
         close(keyboard);
         if (next !== engine) onChange(next);
       }} /></Suspense>}

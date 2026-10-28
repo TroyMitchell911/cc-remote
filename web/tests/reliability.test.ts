@@ -11757,7 +11757,7 @@ try {
         historyGeneration: "settled-codex-g1",
         historyBuildSeq: 1,
         historyLiveSeq: 40,
-        lastLiveSeq: 40,
+        lastLiveSeq: 40, lastNarrativeSeq: 40,
         turns: [{
           id: settledBrowserId,
           clientMsgId: settledBrowserId,

@@ -12934,6 +12934,10 @@ class WrapperMachine:
         w["size"] = st.st_size
         w["file_id"] = (st.st_dev, st.st_ino)
         w["file_available"] = True
+        if w.get("engine") == "claude":
+            # Re-read lifecycle after an owned out-of-turn mutation (notably
+            # rewind). It may have advanced beyond the incremental cursor.
+            w.pop("claude_activity_initialized", None)
 
     def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
         """Start mirroring a session transcript when a client opens it.
@@ -14214,6 +14218,7 @@ class WrapperMachine:
         previous_holders = set(w.get("holders", ()))
         was_external = self._is_external(sid)
         was_file_available = w.get("file_available", True)
+        was_running = self._claude_external_running(w)
         ctx = self._ctx_by_sid(sid)
         external_growth = False
         growth_origin = "unknown"
@@ -14315,7 +14320,22 @@ class WrapperMachine:
         else:
             file_id = (file_stat.st_dev, file_stat.st_ino)
             size = file_stat.st_size
-            if file_id != w.get("file_id") or size < w["size"]:
+            replaced = file_id != w.get("file_id") or size < w["size"]
+            activity_reseed = (
+                not w.get("claude_activity_initialized")
+                or replaced or not was_file_available
+            )
+            if activity_reseed:
+                try:
+                    active, partial = await asyncio.to_thread(
+                        claude_broker_tail_state, w["path"],
+                        snapshot_size=size if replaced else int(w["size"]))
+                except OSError:
+                    active, partial = False, b""
+                w["claude_active"] = active
+                w["claude_partial"] = partial
+                w["claude_activity_initialized"] = True
+            if replaced:
                 w["file_id"] = file_id
                 w["size"] = size
                 external_growth = True
@@ -14333,6 +14353,11 @@ class WrapperMachine:
                     grew,
                 )
                 w["size"] = old_size + len(data)
+                lifecycle = parse_claude_broker_lifecycle(
+                    data, w.get("claude_partial", b""))
+                w["claude_partial"] = lifecycle.partial
+                for kind, _uid in lifecycle.ordered:
+                    w["claude_active"] = kind == "started"
                 owned_ids = w.setdefault("owned_message_ids", OrderedDict())
                 origin, new_owned_ids = classify_claude_growth(
                     data, owned_ids.keys())
@@ -14379,6 +14404,10 @@ class WrapperMachine:
                 ctx.claude_native_controls_dirty = True
 
         is_external = self._is_external(sid)
+        if ownership_scan_complete and not holders:
+            # A killed/exited CLI may leave no terminal row. Never animate it
+            # indefinitely or revive that turn when another CLI opens later.
+            w["claude_active"] = False
         if ctx is not None:
             await self._sync_external_control(ctx, w)
         mirror_changed = (
@@ -14386,6 +14415,7 @@ class WrapperMachine:
             or is_external != was_external
             or takeover_cleared
             or w["file_available"] != was_file_available
+            or self._claude_external_running(w) != was_running
         )
         # A brand-new managed Claude session starts fail-closed until its first
         # ownership scan completes. That control transition is real and is
@@ -14427,6 +14457,14 @@ class WrapperMachine:
                 pending=False,
                 message="终端进程已退出，会话已安全交给 Remote",
             ))
+
+    @staticmethod
+    def _claude_external_running(watch: dict) -> bool:
+        """Display-only activity; never grant write access or own a SDK turn."""
+        return bool(watch.get("engine") == "claude"
+                    and watch.get("holders")
+                    and watch.get("file_available", True)
+                    and watch.get("claude_active"))
 
     async def _poll_watches_once(self) -> None:
         paths = self._codex_watch_paths()
@@ -14616,6 +14654,7 @@ class WrapperMachine:
             (ctx is not None and ctx.state != "idle")
             or (isinstance(active_external_turns, dict)
                 and active_external_turns)
+            or self._claude_external_running(watch)
         )
         events: list = []
         mdl = None

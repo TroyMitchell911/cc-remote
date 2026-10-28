@@ -55,7 +55,11 @@ export function useClaudeRewind({ scope, sid, disabledReason, ws, drafts, onPref
       prefillSkipped = !applied;
       if (applied && current.current.scope === owner.scope) current.current.onPrefill(event.prefill_text);
     }
-    if (active?.scope === owner.scope) update({ ...active, pending: false, result: event, prefillSkipped });
+    if (active?.scope === owner.scope) {
+      const succeeded = (event.restore === "files" || event.conversation === "succeeded")
+        && (event.restore === "conversation" || event.files === "succeeded");
+      update(succeeded ? null : { ...active, pending: false, result: event, prefillSkipped });
+    }
   };
   const onCompletedRef = useRef((_: string) => {});
   onCompletedRef.current = (id) => {
