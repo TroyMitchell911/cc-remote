@@ -34,6 +34,8 @@ from claude_agent_sdk.types import (
 from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
+from cc_remote.claude_paths import claude_config_dir
+from cc_remote.wrapper.claude_settings import save_user_defaults
 from cc_remote.claude_permissions import CLAUDE_PERMISSION_MODES, native_permission_mode
 from cc_remote.claude_steering import (
     ClaudeSteerRejected, PendingSteers, background_end_ids, is_human_result, is_managed_input,
@@ -77,7 +79,7 @@ from cc_remote.wrapper.claude_goal import (
 log = logger("cc_remote.wrapper.sdk")
 
 CLAUDE_DEFAULT_MODEL = "claude-opus-5[1m]"
-CLAUDE_DEFAULT_EFFORT = "max"
+CLAUDE_DEFAULT_EFFORT = None
 CLAUDE_MAX_BUFFER_SIZE = 16 * 1024 * 1024
 _CLAUDE_1M_MODEL_PINS = {
     "opus": "opus[1m]",
@@ -250,9 +252,12 @@ class SdkHandle:
         # reasoning effort is a spawn-time flag (--effort), not a runtime setter.
         # `effort` is the desired level; `applied_effort` is what the live client
         # was spawned with — they differ after set_effort until the next reconnect.
-        # Default to "max" so new sessions get the strongest reasoning out of the
-        # box (matches the client's default chip); the user can lower it per session.
+        # Omission delegates to Claude's per-model user default on new sessions
+        # and resumes alike. A transcript's old effort is not a native override.
         self.effort: str | None = CLAUDE_DEFAULT_EFFORT
+        self.display_effort: str = "model-default"
+        self._native_effort_model: str | None = None
+        self._native_settings_supported: bool | None = None
         self.applied_effort: str | None = None
         # Automatic compaction is also a spawn-time CLI option. Keep desired and
         # applied values separate so a busy turn can drain to ResultMessage before
@@ -268,9 +273,13 @@ class SdkHandle:
         # this from the SDK control plane and preserve it across reconnects.
         self.model: str | None = None
         # Private BTW forks reserve and tombstone this identity before the CLI
-        # starts. An unqueried fork may reconnect from its parent using the same
-        # reservation; ordinary resumes must not pass --session-id again.
+        # starts. A replacement fork needs a fresh reservation, even before its
+        # first query: startup/shutdown may already have persisted the old id.
         self.fork_session_id: str | None = None
+        self.fork_query_started = False
+        self.private_reconnect_callback: (
+            Callable[[], Awaitable[tuple[str | None, bool]]] | None
+        ) = None
         # Desired and live Claude permission mode. Runtime changes update this
         # only after the CLI accepts them; every later reconnect passes the same
         # value back through ClaudeAgentOptions instead of silently reverting.
@@ -663,6 +672,10 @@ class SdkHandle:
             self.permission_mode = controls.get("permission_mode") or self.permission_mode
             metadata = description["metadata"]
             launch_effort = metadata.get("applied_effort")
+            # A service attachment does not cold-resume Claude. Keep its live
+            # override instead of causing an unrelated effort reconnect.
+            if self.effort is None:
+                self.effort = launch_effort
             launch_auto_compact = tuple(metadata["applied_auto_compact"])
             await self._enable_attached_thinking_summaries()
         if fork:
@@ -747,6 +760,8 @@ class SdkHandle:
         if resume_id and not fork:
             await self.refresh_goal(resume_id)
         self.applied_effort = launch_effort
+        self._native_settings_supported = None
+        await self._refresh_native_effort()
         self.applied_auto_compact_mode = launch_auto_compact[0]
         self.applied_auto_compact_threshold_tokens = (
             launch_auto_compact[1])
@@ -1210,6 +1225,8 @@ class SdkHandle:
                     self._managed_input_seen = False
                     self._steers.begin_turn()
                     try:
+                        if self.fork_session_id is not None:
+                            self.fork_query_started = True
                         await client.query(prompt)
                     except BaseException:
                         self._turn_active = False
@@ -1218,6 +1235,8 @@ class SdkHandle:
                 return
             # Compatibility for tests/custom clients that install a client without
             # going through connect(). Real SDK connections always use the sole pump.
+            if self.fork_session_id is not None:
+                self.fork_query_started = True
             await client.query(prompt)
 
     @property
@@ -1283,7 +1302,47 @@ class SdkHandle:
                 # the previous model only after Claude confirms the switch.
                 self.invalidate_context_usage_cache()
             self.model = model
+            await self._refresh_native_effort()
         log.info("model set", model=model)
+
+    async def _refresh_native_effort(self) -> None:
+        """Read the CLI's applied value without changing launch preferences.
+
+        get_settings also contains private configuration; retain only applied
+        effort, never the effective/sources objects. Older CLIs may reject this
+        optional read, in which case show model-default rather than stale data.
+        """
+        self.display_effort = "model-default"
+        self._native_effort_model = None
+        if self.client is None or self._native_settings_supported is False:
+            return
+        try:
+            result = await self.client._query._send_control_request(
+                {"subtype": "get_settings"}, timeout=5.0)
+            applied = result.get("applied", {}) if isinstance(result, dict) else {}
+            effort = applied.get("effort") if isinstance(applied, dict) else None
+            if isinstance(applied, dict):
+                self._native_effort_model = valid_claude_model(applied.get("model"))
+            if effort in {"low", "medium", "high", "xhigh", "max"}:
+                self.display_effort = effort
+            self._native_settings_supported = True
+        except Exception as exc:
+            self._native_settings_supported = False
+            log.debug("Claude applied effort unavailable", error_type=type(exc).__name__)
+
+    async def save_user_defaults(
+        self, *, model: str | None = None, effort: str | None = None,
+    ) -> None:
+        """Save an explicit user action, never an observed/restored value."""
+        if self.work_mode:
+            return
+        async with self._control_request_lock:
+            await asyncio.to_thread(
+                save_user_defaults,
+                self.claude_config_dir or claude_config_dir(),
+                model=model, effort=effort,
+                effort_model=self._native_effort_model,
+            )
 
     async def set_permission_mode(self, mode: str) -> None:
         """Switch the permission mode for the live cc subprocess (runtime, no reconnect)."""
@@ -2198,6 +2257,7 @@ class SdkHandle:
         self._background_callbacks_drained.set()
 
     async def disconnect(self) -> None:
+        closed = False
         try:
             if self.client is not None:
                 await self._stop_message_pump()
@@ -2208,8 +2268,12 @@ class SdkHandle:
                     self.service_metadata.pop("service_id", None)
                 if self.native_close_callback is not None:
                     self.native_close_callback()
+            closed = True
         finally:
-            self.client = None
+            # A private fork cannot replace its identity while its old writer
+            # may still be alive. Retain the client so a later close can retry.
+            if closed or self.private_reconnect_callback is None:
+                self.client = None
             self._conversation_rewind_capability = None
             callback = self.lifecycle_reset_callback
             if callback is not None:
@@ -2262,6 +2326,12 @@ class SdkHandle:
                 await self.disconnect()
             except Exception as e:
                 log.warning("disconnect during force-reconnect failed", error=str(e))
+                if self.private_reconnect_callback is not None:
+                    raise
+            if self.private_reconnect_callback is not None:
+                # Resolve after shutdown: it may have flushed the reserved
+                # transcript or delivered the fork's authoritative native id.
+                resume_id, fork = await self.private_reconnect_callback()
             if not preserve_model:
                 # An external terminal may have changed this session's model.
                 # Let resume recover it instead of forcing our stale cache back.

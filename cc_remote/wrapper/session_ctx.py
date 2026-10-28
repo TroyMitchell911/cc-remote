@@ -261,8 +261,8 @@ class SessionContext:
     # ephemeral fork); capture it here so close_btw can hard-delete it.
     btw_real_id: Optional[str] = None
     # Claude's native --session-id, durably hidden before fork startup. Keep it
-    # separate from btw_real_id: before the first turn no transcript exists to
-    # resume, so reconnect must still fork from the parent with this same id.
+    # separate from btw_real_id: a startup-only transcript is not proof of a
+    # resumable conversation. An unconfirmed replacement gets a fresh id.
     btw_reserved_id: Optional[str] = None
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None

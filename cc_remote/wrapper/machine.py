@@ -6513,6 +6513,9 @@ class WrapperMachine:
             lambda error: self._on_claude_message_pump_failure(ctx, error))
         sdk.lifecycle_reset_callback = (
             lambda: self._reset_claude_task_lifecycle(ctx))
+        if ctx.btw:
+            sdk.private_reconnect_callback = (
+                lambda: self._prepare_claude_btw_reconnect(ctx))
         from cc_remote.wrapper import claude_steer
 
         sdk.native_close_callback = lambda: claude_steer.cleanup(ctx)
@@ -7413,6 +7416,32 @@ class WrapperMachine:
         )
         return parent_id, True
 
+    async def _prepare_claude_btw_reconnect(
+        self, ctx: SessionContext,
+    ) -> tuple[Optional[str], bool]:
+        """Choose a private identity only after the previous CLI has closed."""
+        resume_id, fork = self._claude_reconnect_identity(ctx)
+        if not fork:
+            return resume_id, False
+        if ctx.sdk.fork_query_started:
+            # A write may have reached Claude before its init reached us. Do
+            # not discard that conversation by forking the parent again.
+            raise RuntimeError("private Claude query has no confirmed session identity")
+        previous_id = ctx.btw_reserved_id
+        reserved_id = str(uuid4())
+        profile = self._claude_profile_for_ctx(ctx)
+        # Persist the privacy boundary before changing the handle or launching
+        # a writer. Never infer resumability from a startup-only jsonl file.
+        self._remember_private_btw(
+            self._claude_wire_sid(profile, reserved_id), ctx.cwd)
+        ctx.btw_reserved_id = ctx.sdk.fork_session_id = reserved_id
+        if previous_id:
+            # A failed cleanup keeps its durable pending receipt for retry on
+            # startup. A late flush remains private even after successful cleanup.
+            await self._delete_private_btw(
+                previous_id, ctx.cwd, claude_profile_id=ctx.claude_profile_id)
+        return resume_id, True
+
     @staticmethod
     def _claude_cached_context_total(ctx: SessionContext) -> int | None:
         """Return a conservative trustworthy local total without an SDK RPC.
@@ -7937,6 +7966,28 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
 
+    async def _save_claude_user_defaults(
+        self, ctx: SessionContext, *, model: str | None = None,
+        effort: str | None = None,
+    ) -> None:
+        if (ctx.engine != "claude" or ctx.space != "code"
+                or getattr(ctx.sdk, "is_claude_broker", False)):
+            return
+        save = getattr(ctx.sdk, "save_user_defaults", None)
+        if not callable(save):
+            return
+        try:
+            await save(model=model, effort=effort)
+        except Exception as exc:
+            # Applying this session's choice succeeded. Report the distinct
+            # persistence failure without pretending the live change failed.
+            log.warning("Claude user default save failed", error_type=type(exc).__name__)
+            await self._emit(ctx, Notice(
+                notice_id="claude-user-default-save", severity="warning",
+                category="runtime", title="当前设置已应用，默认值未保存",
+                message="本会话会使用所选设置，但 Claude 默认值未能保存；新会话和终端恢复可能使用原设置。",
+            ))
+
     async def _load_claude_session_controls(
         self, session_id: str,
     ) -> ClaudeControls:
@@ -8100,11 +8151,11 @@ class WrapperMachine:
             if ctx.space == "code"
             else observed_model
         )
-        effort = controls.effort or previous_effort
-        if model:
-            ctx.sdk.model = model
-        if effort:
-            ctx.sdk.effort = effort
+        effort = None if adopt_native and ctx.space == "code" else previous_effort
+        ctx.sdk.model = model
+        ctx.sdk.effort = effort
+        if adopt_native and hasattr(ctx.sdk, "display_effort"):
+            ctx.sdk.display_effort = "model-default"
         return model, effort
 
     async def _reload_claude_after_takeover(
@@ -8156,7 +8207,7 @@ class WrapperMachine:
             # into Remote's model chip or its private session store.
             reported_model = None
         applied_model = reported_model or model
-        applied_effort = getattr(ctx.sdk, "effort", None) or effort
+        applied_effort = _session_effort(ctx) or effort
         if applied_model:
             ctx.sdk.model = applied_model
         if applied_model and applied_model != ctx.announced_model:
@@ -13396,7 +13447,9 @@ class WrapperMachine:
     async def _probe_claude_holders(
         self, paths: dict[str, str], cwds: dict[str, str],
     ):
-        profile_kwargs: dict[str, object] = {}
+        profile_kwargs: dict[str, object] = {
+            "default_config_dir": str(self._claude_legacy_config_dir),
+        }
         if self._claude_profiles_explicit:
             profile_kwargs = {
                 "config_dirs": {
@@ -20244,6 +20297,7 @@ class WrapperMachine:
                         if not recovered:
                             raise RuntimeError("Claude service recovery is not ready")
                     await ctx.sdk.set_model(requested_model)
+                    await self._save_claude_user_defaults(ctx, model=requested_model)
             else:
                 await ctx.sdk.set_model(requested_model)
             await self._refresh_pending_claude_work_baseline(ctx)
@@ -20265,6 +20319,14 @@ class WrapperMachine:
             ctx.announced_model = applied_model
             model_event = Model(model=applied_model)
             await self._emit(ctx, model_event)
+            current_effort = _session_effort(ctx)
+            if (getattr(ctx.sdk, "_native_settings_supported", False) is True
+                    and getattr(ctx.sdk, "effort", None) is None
+                    and current_effort and current_effort != ctx.announced_effort):
+                ctx.announced_effort = current_effort
+                effort_event = Effort(effort=current_effort)
+                await self._emit(ctx, effort_event)
+                return (model_event, effort_event)
             return (model_event,)
         except Exception as e:
             log.exception("set_model failed", error=str(e))
@@ -20513,9 +20575,13 @@ class WrapperMachine:
         else:
             # Agent SDK applies effort only after its next lazy reconnect.
             # Do not mark it applied here or _run_turn will skip that reconnect.
-            ctx.sdk.effort = cmd.effort
-            applied = cmd.effort
-            await self._persist_claude_session_controls(ctx)
+            async with ctx.query_lock:
+                if not self._is_resident_context(ctx):
+                    return await self._missing_session_error(cmd, "切换思考强度")
+                ctx.sdk.effort = cmd.effort
+                applied = cmd.effort
+                await self._save_claude_user_defaults(ctx, effort=applied)
+                await self._persist_claude_session_controls(ctx)
         ctx.announced_effort = applied
         event = Effort(effort=applied)
         await self._emit(ctx, event)
@@ -29047,6 +29113,13 @@ class WrapperMachine:
         # SessionFocus has created the temp-keyed client runtime; otherwise the
         # removed client-side pending-query effect would leave its chips stale.
         cached_responses = [snap, focus]
+        if ctx.engine == "claude" and ctx.space == "code":
+            # Creating a session with explicit picker choices follows native
+            # Enter-to-save semantics. Implicit/restored values never write.
+            selected_model = (
+                requested_model if requested_model == _session_model(ctx) else None)
+            await self._save_claude_user_defaults(
+                ctx, model=selected_model, effort=getattr(cmd, "effort", None))
         initial_model = _session_model(ctx)
         if initial_model:
             ctx.announced_model = initial_model
@@ -34326,10 +34399,10 @@ class WrapperMachine:
         saved = await self._load_claude_session_controls(sid)
         model = valid_claude_model(
             _session_model(ctx) if ctx is not None else None
-        ) or saved.model
+        )
         effort = (
             _session_effort(ctx) if ctx is not None else None
-        ) or saved.effort
+        )
         permission = valid_claude_permission(
             _session_permission_mode(ctx) if ctx is not None else None
         ) or saved.permission_mode
@@ -34366,7 +34439,7 @@ class WrapperMachine:
             )
         else:
             applied_mode, applied_threshold = auto_mode, auto_threshold
-        if (model is None or effort is None) and ctx is None:
+        if ctx is None:
             try:
                 profile, native_sid = self._claude_target(sid)
                 native = await asyncio.to_thread(
@@ -34377,8 +34450,9 @@ class WrapperMachine:
                     index_store=self._history_index,
                     config_dir=self._claude_config_root(profile),
                 )
-                model = model or native.model
-                effort = effort or native.effort
+                model = native.model
+                # A cold fork follows native resume: the account/model effort
+                # default applies, not an earlier Remote or transcript value.
             except Exception as exc:
                 log.warning(
                     "Claude fork model snapshot unavailable",
@@ -37016,44 +37090,33 @@ class WrapperMachine:
                 return None
 
         if (resume_id and engine == "claude" and broker_handle is None):
-            # Explicit command controls win. Otherwise restore only the private
-            # session override owned by Remote, never Claude's global settings.
-            # Work restores only autocompact; its model and permission policy
-            # remain owned by the isolated Work runtime.
+            # Cold resumes follow native model history and per-model defaults.
+            # Private Remote model/effort are display/reconnect caches, not an
+            # authority over changes made by an ordinary CLI since our last use.
             saved_controls = await self._load_claude_session_controls(
                 wire_resume_id)
             saved_claude_controls = saved_controls
             if space == "code":
-                model = model or saved_controls.model
                 if model is None:
-                    # Legacy/native sessions may predate Remote's private
-                    # control record. Resolve their last completed native model
-                    # before the child starts; history loading happens later and
-                    # updating only the model chip at that point leaves Claude
-                    # running on its implicit 200K alias.
                     try:
-                        transcript_controls = await asyncio.to_thread(
+                        native = await asyncio.to_thread(
                             last_completed_assistant_controls,
                             resume_id,
                             directory=target_cwd,
                             max_bytes=self.cfg.history_source_max_bytes,
                             index_store=self._history_index,
-                            config_dir=self._claude_config_root(
-                                claude_profile),
+                            config_dir=self._claude_config_root(claude_profile),
                         )
+                        model = native.model
                     except Exception as exc:
-                        # The native model is advisory when no private choice is
-                        # available. Preserve Claude's own resume behavior rather
-                        # than forcing the current global default onto this
-                        # conversation.
                         log.warning(
                             "Claude resume controls unavailable",
                             session_id=resume_id,
                             error_type=type(exc).__name__,
                         )
-                    else:
-                        model = transcript_controls.model
-                effort = effort or saved_controls.effort
+                # Omit effort unless this command explicitly selects it. Claude
+                # resolves the current model's user default, including menu-only
+                # /effort changes which never wrote an assistant transcript row.
                 permission_mode = (
                     permission_mode or saved_controls.permission_mode)
             if auto_compact_mode is None:
@@ -37350,9 +37413,9 @@ class WrapperMachine:
                         "codex_home": self._codex_home(codex_profile),
                     }),
                 )
-        if effort or (engine == "claude" and resume_id is None):
-            # A new Claude session with no override inherits native effort.
-            # SdkHandle's legacy resume fallback must not inject max here.
+        if effort or engine == "claude":
+            # Both new and resumed Claude sessions inherit native defaults
+            # unless this command supplied an explicit effort override.
             sdk.effort = effort
             sdk.applied_effort = effort
         work_context_baseline = (
@@ -37730,6 +37793,12 @@ class WrapperMachine:
             getattr(ctx.sdk, "client", None), "description", {}).get("attached"))
         if service_attached:
             model = getattr(ctx.sdk, "model", None)
+            if (effort is None and saved_claude_controls is not None
+                    and saved_claude_controls.effort is not None):
+                # This exact service worker still owns the conversation. A
+                # pending Remote choice survives controller replacement here;
+                # it must not become authority on a later true cold resume.
+                ctx.sdk.effort = saved_claude_controls.effort
         if model and engine != "codex" and not service_attached:
             try:
                 await ctx.sdk.set_model(model)
@@ -37763,9 +37832,7 @@ class WrapperMachine:
         # them (the client already reflects its own pick optimistically).
         if model:
             ctx.announced_model = model
-        initial_effort = (
-            _session_effort(ctx) if engine == "codex" else effort
-        )
+        initial_effort = _session_effort(ctx)
         if initial_effort:
             ctx.announced_effort = initial_effort
         # Resumed sessions know their native id. Fresh Claude sessions retain a

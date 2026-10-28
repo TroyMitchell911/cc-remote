@@ -215,7 +215,7 @@ def test_attached_summary_opt_in_keeps_running_turn_and_native_child(
                 assert calls == [({
                     "subtype": "set_max_thinking_tokens",
                     "thinking_display": "summarized",
-                }, 2.0)]
+                }, 2.0), ({"subtype": "get_settings"}, 5.0)]
                 assert worker.client is native
                 assert native.closed is False and native.interrupts == 0
                 assert native.prompts == ["hello"]

@@ -30,6 +30,8 @@ async def restarted_service(monkeypatch):
     controls = []
 
     async def control(client, request, timeout):
+        if request["subtype"] == "get_settings":
+            return {"applied": {"model": client.options.model, "effort": None}}
         controls.append(request)
         return dict(SUMMARY) if request["subtype"] == "get_context_usage" else {}
 

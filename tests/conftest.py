@@ -30,3 +30,24 @@ def _isolate_account_profile_environment(
     """
     for key in _ACCOUNT_PROFILE_ENV:
         monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_native_picker_writes(monkeypatch, tmp_path_factory):
+    """Legacy runtime mocks have no private account. Never write the real one.
+
+    Settings integration tests opt in by giving their handle a tmp_path config
+    root; those exercise the real writer, including errors and preservation.
+    """
+    from pathlib import Path
+    from cc_remote.wrapper import sdk
+    from cc_remote.wrapper.claude_settings import save_user_defaults
+
+    temporary = tmp_path_factory.getbasetemp().resolve()
+
+    def isolated_save(root, **choices):
+        if Path(root).resolve().is_relative_to(temporary):
+            return save_user_defaults(root, **choices)
+        return None
+
+    monkeypatch.setattr(sdk, "save_user_defaults", isolated_save)

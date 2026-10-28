@@ -314,9 +314,8 @@ export function Composer(p: Props) {
       : (!p.control && p.external) ? "外部 CLI"
       : null)
     : null;
-  // Claude's native surfaces do not expose their live model/effort/permission
-  // controls to the Agent SDK. Keep Remote's saved takeover preferences visible,
-  // but never present them as the active native runtime state.
+  // An unmanaged native CLI has no attached control connection. Its transcript
+  // and Remote's old choices cannot prove the current menu settings.
   const deferredClaudeControls = externalClaudeOwner !== null;
   const hasText = input.trim().length > 0 || pastes.length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
@@ -1085,22 +1084,17 @@ export function Composer(p: Props) {
             (p.engine === "codex" || p.engine === "dsh") && <> · <kbd>$</kbd> Skills</>
           }</span>
           <div className="hint-right" ref={ctxWrapRef}>
-            {deferredClaudeControls && (
+            {deferredClaudeControls ? (
               <span className="hint-control-scope"
-                title={`以下是 Remote 接管后的配置，不是${externalClaudeOwner}当前状态`}>
-                接管后
+                title={`${externalClaudeOwner}当前模型和强度未提供；接管后按 Claude 的会话记录和账号默认设置恢复`}>
+                CLI 配置未同步
               </span>
-            )}
-            <button className="hint-ctl" onClick={() => { p.onRequestModels?.(); setSheetKind("models"); }}
-              disabled={locked}
-              title={deferredClaudeControls
-                ? `Remote 接管后模型：${model?.name ?? "读取中"}；不是${externalClaudeOwner}当前模型`
-                : "选择模型"}>{model?.name ?? "模型读取中"}</button>
-            <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
-              disabled={locked}
-              title={deferredClaudeControls
-                ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
-                : "思考强度"}>{effortName ?? "强度读取中"}</button>
+            ) : <>
+              <button className="hint-ctl" onClick={() => { p.onRequestModels?.(); setSheetKind("models"); }}
+                disabled={locked} title="选择模型">{model?.name ?? "模型读取中"}</button>
+              <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
+                disabled={locked} title="思考强度">{effortName ?? "强度读取中"}</button>
+            </>}
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
