@@ -3048,6 +3048,7 @@ function HistoricalFilesFixture() {
 
 function TurnRegressionFixture() {
   const sid = "turn-regressions";
+  const [streaming, setStreaming] = useState(false);
   const [state, dispatch] = useReducer(reduce, {
     ...initialState, focusedSid: sid, runtimes: { [sid]: {
       ...createRuntime(), historyRevision: "stable", turns: [
@@ -3064,6 +3065,15 @@ function TurnRegressionFixture() {
       ] as Turn[],
     } },
   });
+  useEffect(() => {
+    if (!streaming) return;
+    let line = 0;
+    const timer = window.setInterval(() => dispatch({ type: "event", event: {
+      v: PROTOCOL_VERSION, ts: 4, type: "delta", sid, turn_id: "working", message_id: "live-answer",
+      text: `Live answer line ${++line}\n\n`, channel: "final",
+    } }), 100);
+    return () => window.clearInterval(timer);
+  }, [streaming]);
   const [opened, setOpened] = useState("");
   const runtime = state.runtimes[sid];
   return <main style={{ display: "flex", flexDirection: "column", height: "100dvh" }}>
@@ -3072,6 +3082,8 @@ function TurnRegressionFixture() {
       activeTurnId={runtime.acceptancePending ?? "working"}
       onOpenArchivedDiff={(turn, revision, path) => setOpened(`${turn}:${revision}:${path}`)} />
     <footer style={{ height: 60, flex: "none" }}>
+      <button data-testid="regression-live-toggle" aria-pressed={streaming}
+        onClick={() => setStreaming(value => !value)}>Stream continuously</button>
       <button data-testid="regression-send" onClick={() => dispatch({ type: "query_sent", sid,
         msg_id: "new-question", prompt: "sent without scrolling", ts: 3 })}>Send</button>
       <button data-testid="regression-stream" onClick={() => dispatch({ type: "event", event: {

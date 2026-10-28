@@ -17,6 +17,7 @@ from typing import Callable, Collection, Literal, Mapping
 from cc_remote.wrapper.codex_external import (
     HolderScan,
 )
+from cc_remote.wrapper.claude_registry import registered_pids, registered_session
 from cc_remote.wrapper.process_scan import (
     MAX_PROC_SCAN,
     ProcessIdentity,
@@ -25,6 +26,7 @@ from cc_remote.wrapper.process_scan import (
     _process_stat,
     darwin_process_snapshot,
     process_command_environment_value,
+    process_command,
     process_identity,
 )
 
@@ -68,7 +70,7 @@ def _profile_scoped_process(
     boundary.
     """
     if config_dirs is None:
-        return True, args, set(paths), None
+        return True, args, set(paths), default_config_dir
     complete, exact_args, configured = process_command_environment_value(
         identity, "CLAUDE_CONFIG_DIR", proc_root=proc_root)
     if not complete or exact_args is None:
@@ -352,6 +354,24 @@ def _darwin_claude_session_holders(
     snapshot, complete = darwin_process_snapshot()
     if not complete:
         return HolderScan(holders, False)
+    roots = set(config_dirs.values()) if config_dirs is not None else set()
+    if default_config_dir:
+        roots.add(default_config_dir)
+    hinted_pids, registry_complete = registered_pids(roots)
+    complete = complete and registry_complete
+    # A directly launched native binary can have a version-number kernel name
+    # (e.g. 2.1.311), so the generic name filter intentionally skips its argv.
+    # Registry PIDs supply bounded hints; exact argv/account/identity checks
+    # below still decide whether it is a genuine external Claude owner.
+    expanded = []
+    for identity, parent, tty, args in snapshot:
+        if not args and identity.pid in hinted_pids:
+            args = process_command(identity)
+            if args is None:
+                complete = False
+                continue
+        expanded.append((identity, parent, tty, args))
+    snapshot = expanded
     parent_by_pid = {info[0].pid: info[1] for info in snapshot}
     owned_roots = {info[0].pid for info in snapshot if info[0] in owner_identities}
     candidates = [
@@ -394,6 +414,17 @@ def _darwin_claude_session_holders(
             continue
         sid_by_arg = _scoped_sid_by_arg(
             account_sids, native_session_ids)
+        registered, native_sid = registered_session(identity, config_root)
+        if not registered:
+            complete = False
+            continue
+        if native_sid is not None:
+            # The CLI can /resume a different session without changing argv.
+            # A valid unwatched id also suppresses the startup/cwd fallback.
+            sid = sid_by_arg.get(native_sid.encode())
+            if sid is not None:
+                holders[sid].add(identity)
+            continue
         matched, has_explicit_session = _explicit_session_ids(
             args, sid_by_arg)
         continue_command = (
@@ -571,6 +602,16 @@ def claude_session_holders(
                 continue
             sid_by_arg = _scoped_sid_by_arg(
                 account_sids, native_session_ids)
+            registered, native_sid = registered_session(
+                identity, config_root, proc_root=proc_root)
+            if not registered:
+                complete = False
+                continue
+            if native_sid is not None:
+                sid = sid_by_arg.get(native_sid.encode())
+                if sid is not None:
+                    holders[sid].add(identity)
+                continue
             matched, has_explicit_session = _explicit_session_ids(
                 args, sid_by_arg)
             continue_command = (

@@ -629,6 +629,144 @@ try {
     v: 22, ts: 10, ...body,
   } as ServerEvent);
 
+  // A new Claude transcript can become discoverable before its temporary
+  // runtime captures the native session id. Focus may load that History first.
+  for (const bindingOrder of ["target-first", "source-first", "after-rekey"] as const) {
+    const source = "tmp-claude-query";
+    const target = "profile@claude-query";
+    const clientId = "browser-question";
+    const nativeId = "native-user-question";
+    const generation = "claude-rekey-generation";
+    const makeState = (historyOverrides: Partial<Turn> = {}) => ({
+      ...initialState,
+      focusedSid: target,
+      runtimes: {
+        [source]: {
+          ...createRuntime(), controlGeneration: generation, state: "running",
+          liveOwner: { turnId: clientId, seq: 1 },
+          turns: [{ id: clientId, clientMsgId: clientId, prompt: "same question",
+            ts: 1000, done: false, blocks: [] }],
+        },
+        [target]: {
+          ...createRuntime(), controlGeneration: generation,
+          historyGeneration: generation, historyRevision: "native-page",
+          historyNewestId: nativeId, historyHeadKnown: true,
+          turns: [{ id: nativeId, historyTurnId: nativeId, checkpointId: nativeId,
+            forkPointId: "native-assistant", prompt: "same question",
+            ts: 1000, done: true, durationMs: 19000, blocks: [{
+              kind: "tool", message_id: "tool-message", tool_use_id: "read-tool",
+              tool: "Read", input: {}, done: true,
+            }], ...historyOverrides }],
+        },
+      },
+    });
+    const rekey = (prepared: ReturnType<typeof makeState>, bind = true) => {
+      let state = prepared;
+      const apply = (body: Record<string, unknown>) => {
+        const previous = JSON.stringify(state);
+        const next = reduce(state, { type: "event", ownership: { engine: "claude" },
+          event: event(body) });
+        assert.equal(JSON.stringify(state), previous, "re-key/binding leaves prior state immutable");
+        state = next;
+      };
+      const binding = (sid: string) => ({ type: "turn_binding", sid,
+        msg_id: clientId, turn_id: nativeId, seq: 10 });
+      if (bind && bindingOrder !== "after-rekey") {
+        apply(binding(bindingOrder === "target-first" ? target : source));
+      }
+      apply({ type: "session_rekey", old_key: source, session_id: target,
+        sid: target, seq: 11 });
+      if (bind && bindingOrder === "after-rekey") apply(binding(target));
+      return { state, apply, current: () => state.runtimes[target] };
+    };
+    const prepared = makeState();
+    // A separate, identical earlier prompt must survive exact-identity repair.
+    prepared.runtimes[target].turns.unshift({
+      ...prepared.runtimes[target].turns[0], id: "earlier-user",
+      historyTurnId: "earlier-user", checkpointId: "earlier-user",
+      forkPointId: "earlier-assistant", blocks: [],
+    });
+    const run = rekey(prepared);
+    assert.equal(run.current().turns.length, 2,
+      `${bindingOrder}: the raced History row and optimistic prompt represent one question`);
+    const active = run.current().turns[1];
+    assert.equal(active.id, clientId);
+    assert.equal(active.historyTurnId, nativeId);
+    assert.equal(active.checkpointId, nativeId);
+    assert.equal(active.done, false, "a transcript EOF must not close the running query");
+    assert.equal(active.durationMs, undefined);
+    assert.equal(active.blocks.length, 1, "keep native tool detail during identity repair");
+    assert.equal(run.state.focusedSid, target);
+    assert.equal(run.state.runtimes[source], undefined);
+    run.apply({ type: "delta", sid: target, message_id: "reply", text: "answer", seq: 12 });
+    assert.equal(run.current().turns.length, 2);
+    assert.equal(run.current().turns[1].blocks.at(-1)?.text, "answer",
+      "streaming continues in the reconciled row");
+    run.apply({ type: "turn_end", sid: target, turn_id: "native-assistant",
+      checkpoint_id: nativeId, seq: 13,
+      result: { subtype: "success", duration_ms: 25000, is_error: false } });
+    assert.equal(run.current().turns[1].done, true);
+    assert.equal(run.current().turns[1].durationMs, 25000);
+    assert.equal(run.current().turns[1].forkPointId, "native-assistant");
+
+    assert.equal(rekey(makeState(), false).current().turns.length, 2,
+      "identical text and timestamps are not proof without TurnBinding");
+    assert.equal(rekey(makeState({ checkpointId: "different-user" })).current().turns.length, 2,
+      "a mismatched native checkpoint cannot prove a Claude identity alias");
+    const interrupted = rekey(makeState({ interrupted: true }));
+    assert.equal(interrupted.current().turns.length, 1);
+    assert.equal(interrupted.current().turns[0].done, true);
+    assert.equal(interrupted.current().turns[0].interrupted, true,
+      "a real native interruption remains terminal");
+    const staleGeneration = makeState();
+    staleGeneration.runtimes[target].controlGeneration = "old-wrapper";
+    staleGeneration.runtimes[target].historyGeneration = "old-wrapper";
+    assert.equal(rekey(staleGeneration).current().turns[0].historyTurnId, undefined,
+      "an old wrapper generation cannot contribute a native History row");
+  }
+
+  // A settings/plan update can overtake an asynchronous native-history read.
+  // It must neither retain the abandoned branch nor block external activity.
+  const rewindSid = "rewound-native-cli";
+  let rewindState = { ...initialState, focusedSid: rewindSid,
+    runtimes: { [rewindSid]: createRuntime() } };
+  const applyRewind = (body: Record<string, unknown>) => {
+    rewindState = reduce(rewindState, { type: "event", ownership: { engine: "claude" },
+      event: event({ sid: rewindSid, ...body }) });
+  };
+  const firstTurn = { id: "first", prompt: "hi", done: true, blocks: [] };
+  const abandonedTurn = { id: "abandoned", prompt: "second hi", done: true, blocks: [] };
+  const storyTurn = { id: "story", prompt: "tell me a story", done: true, blocks: [{
+    kind: "text", message_id: "story-text", text: "Once upon a time", done: true,
+  }] };
+  let rewindBuild = 0;
+  const rewindHistory = (turns: unknown[], liveSeq: number, running = false) => applyRewind({
+    type: "history", session_id: rewindSid, generation: "rewind-boot", revision: "rewound",
+    build_seq: ++rewindBuild, live_seq: liveSeq, authoritative: true, external: true,
+    in_progress: running, events: [], detail: "summary", turns, has_more: false,
+    newest_id: (turns.at(-1) as Turn | undefined)?.id,
+  });
+  rewindHistory([firstTurn, abandonedTurn], 100);
+  applyRewind({ type: "claude_plan_state", plan: null, seq: 101 });
+  rewindHistory([firstTurn, storyTurn], 100, true);
+  assert.deepEqual(rewindState.runtimes[rewindSid].turns.map((t: Turn) => t.id), ["first", "story"],
+    "a plan notification cannot preserve an abandoned completed question");
+  assert.equal(rewindState.runtimes[rewindSid].mirroredRunning, true);
+  assert.equal(rewindState.runtimes[rewindSid].state, "idle",
+    "external activity never gives the browser ownership of a terminal turn");
+  applyRewind({ type: "claude_plan_state", plan: null, seq: 102 });
+  rewindHistory([firstTurn, { ...storyTurn, interrupted: true }], 101);
+  assert.equal(rewindState.runtimes[rewindSid].mirroredRunning, false);
+  assert.equal(rewindState.runtimes[rewindSid].turns.at(-1)?.interrupted, true);
+  assert.equal(rewindState.runtimes[rewindSid].external, true,
+    "Ctrl+C stops the turn while the CLI retains ownership");
+  applyRewind({ type: "user_msg", msg_id: "new-live-question", prompt: "new work", seq: 103 });
+  applyRewind({ type: "turn_end", turn_id: "new-live-question", seq: 104,
+    result: { subtype: "success", duration_ms: 1, is_error: false } });
+  rewindHistory([firstTurn, storyTurn], 102);
+  assert.equal(rewindState.runtimes[rewindSid].turns.at(-1)?.id, "new-live-question",
+    "genuine content newer than History still retains its just-completed turn");
+
   const compactGapGeneration = "compact-gap-generation";
   const compactGapMessage = "compact-gap-browser-message";
   const compactGapNativeTurn = "compact-gap-native-turn";
@@ -1369,6 +1507,11 @@ try {
   "idle History repair retains the collapsed process payload");
   const { ChatView } = await reducerHarness.ssrLoadModule(
     "/src/components/ChatView.tsx");
+  const interruptedCliMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: rewindSid, engine: "claude", turns: [firstTurn, { ...storyTurn, interrupted: true }],
+  }));
+  assert.match(interruptedCliMarkup, /已打断/);
+  assert.match(interruptedCliMarkup, /Once upon a time/);
   // Goal can start its successor milliseconds after a terminal, without an
   // intervening idle state. Match the wrapper's ordered binding/state/anchor
   // contract; only the successor may own the running spark and process label.
@@ -1959,7 +2102,7 @@ try {
     runtimes: { [idleSid]: {
       ...createRuntime(), state: "running" as const,
       historyRevision: idleRevision, historyGeneration: idleGeneration,
-      lastLiveSeq: 41, liveDetailTurnIds: [summaryTurn.id],
+      lastLiveSeq: 41, lastNarrativeSeq: 41, liveDetailTurnIds: [summaryTurn.id],
       turns: [openObserved()],
     } },
   }, { type: "event", event: idleHistory });

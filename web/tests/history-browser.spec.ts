@@ -33,7 +33,7 @@ test("Claude rewind keeps long prompts bounded and requires explicit capsule con
   await expect(dialog.getByRole("button", { name: "正在回退…" })).toBeDisabled();
   // The mocked native receipt is delivered while the modal owns the screen.
   await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
-  await expect(dialog).toContainText("对话：已恢复");
+  await expect(dialog).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("原消息");
   await page.getByRole("button", { name: "写入新草稿" }).evaluate(node => (node as HTMLButtonElement).click());
   await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
@@ -50,7 +50,7 @@ test("Claude rewind disables missing file checkpoints and keeps a newly typed dr
   await dialog.getByRole("button", { name: "确认回退", exact: true }).click();
   await page.getByRole("button", { name: "写入新草稿" }).evaluate(node => (node as HTMLButtonElement).click());
   await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
-  await expect(dialog).toContainText("已保留输入框里的草稿");
+  await expect(dialog).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("保留我的新草稿");
 });
 
@@ -66,8 +66,26 @@ test("Claude rewind receipt stays with its original session after switching away
   await page.getByRole("button", { name: "返回回退结果" }).click();
   await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("保留我的新草稿");
   await page.getByRole("button", { name: "切换会话" }).click();
-  await expect(dialog).toContainText("对话：已恢复");
+  await expect(dialog).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("原消息");
+});
+test("Claude rewind keeps partial failures visible and closes successful files-only restore", async ({ page }) => {
+  for (const partial of [true, false]) {
+    await page.goto(`/tests/history-browser.html?rewind=1${partial ? "&partial=1" : ""}`);
+    await page.getByRole("button", { name: "打开回退" }).click();
+    const dialog = page.getByRole("dialog", { name: "回退", exact: true });
+    await expect(dialog.getByRole("button", { name: "确认回退", exact: true })).toBeEnabled();
+    if (!partial) await dialog.getByRole("radio", { name: /^仅恢复文件/ }).click();
+    await dialog.getByRole("button", { name: "确认回退", exact: true }).click();
+    await page.getByRole("button", { name: "返回回退结果" }).evaluate(node => (node as HTMLButtonElement).click());
+    if (partial) {
+      await expect(dialog).toContainText("文件：未恢复");
+      await expect(dialog.getByRole("button", { name: "关闭", exact: true })).toBeEnabled();
+    } else {
+      await expect(dialog).toHaveCount(0);
+      await expect(page.getByRole("textbox", { name: "草稿" })).toHaveValue("");
+    }
+  }
 });
 import {
   GITHUB_README_ATTACHMENT_URL, GITHUB_README_IMAGE_URL,
@@ -139,6 +157,66 @@ test("navigation reading isolates identical session ids on different devices", a
     node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
   await page.getByRole("button", { name: "Switch device" }).click();
   await expect.poll(() => navigationReadingAnchor(page)).toEqual(before);
+});
+
+test("turn regressions keyboard scrolling leaves the live tail and resumes at bottom", async ({ page, isMobile }) => {
+  test.skip(isMobile, "Physical desktop keyboard scrolling");
+  await page.goto("/tests/history-browser.html?turn-regressions=1");
+  const viewport = page.getByRole("region", { name: "对话记录", exact: true });
+  await expect(page.locator(".turn-working")).toBeVisible();
+  await page.getByTestId("regression-live-toggle").click();
+  await expect(viewport).toContainText("Live answer line 1");
+  // Clicking ordinary prose must establish keyboard ownership without a
+  // synthetic focus() or scrollTop write hiding the original regression.
+  await page.getByText("continue work", { exact: true }).click();
+  await expect(viewport).toBeFocused();
+  for (let repeat = 0; repeat < 16; repeat++) {
+    await page.keyboard.down("ArrowUp");
+    await page.waitForTimeout(40);
+  }
+  await page.keyboard.up("ArrowUp");
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await waitForScrollIdle(page);
+  expect(await viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeGreaterThan(200);
+  const readingTop = await viewport.evaluate(node => node.scrollTop);
+  await page.waitForTimeout(350); // new deltas must not pull the reader back
+  expect(Math.abs(await viewport.evaluate(node => node.scrollTop) - readingTop)).toBeLessThan(3);
+  await page.keyboard.press("End");
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await page.waitForTimeout(350);
+  expect(await viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await page.keyboard.press("Shift+Space");
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeGreaterThan(200);
+});
+
+test("turn regressions ArrowDown reaches bottom after a small wheel scroll", async ({ page, isMobile }) => {
+  test.skip(isMobile, "Physical desktop keyboard scrolling");
+  await page.goto("/tests/history-browser.html?turn-regressions=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator(".turn-working")).toBeVisible();
+  await viewport.hover();
+  await page.mouse.wheel(0, -40);
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await waitForScrollIdle(page);
+  // Deliver new output without moving keyboard focus to the fixture button.
+  await page.getByTestId("regression-live-toggle").evaluate(node => (node as HTMLButtonElement).click());
+  await expect(viewport).toContainText("Live answer line 1");
+  for (let repeat = 0; repeat < 12; repeat++) {
+    await page.keyboard.down("ArrowDown");
+    await page.waitForTimeout(40);
+  }
+  await page.keyboard.up("ArrowDown");
+  await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  // Wheel focus repair is limited to an unfocused document, never an active control.
+  const control = page.getByTestId("regression-live-toggle");
+  await control.focus();
+  await viewport.hover();
+  await page.mouse.wheel(0, -40);
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await expect(control).toBeFocused();
 });
 
 test("turn regressions manual small scroll back to bottom hides the return button", async ({ page }) => {

@@ -632,10 +632,10 @@ def test_reconnect_uses_immutable_spawn_snapshot_without_losing_newer_choice(
 
         replacement = BlockingDisconnect.created[-1]
         assert "autocompact" not in (replacement.options.extra_args or {})
-        assert replacement.options.effort == "max"
+        assert replacement.options.effort is None
         assert handle.applied_auto_compact_mode == "inherit"
         assert handle.applied_auto_compact_threshold_tokens is None
-        assert handle.applied_effort == "max"
+        assert handle.applied_effort is None
         assert handle.auto_compact_threshold_tokens == 300_000
         assert handle.effort == "high"
         await handle.disconnect()
@@ -1445,7 +1445,7 @@ def test_claude_code_resume_recovers_native_curated_model_before_history(
     asyncio.run(go())
 
 
-def test_claude_code_resume_migrates_saved_curated_model_to_native_1m_marker(
+def test_claude_code_resume_prefers_native_model_to_saved_remote_choice(
     monkeypatch,
     tmp_path,
 ):
@@ -1473,14 +1473,16 @@ def test_claude_code_resume_migrates_saved_curated_model_to_native_1m_marker(
             return ClaudeControls(model="claude-fable-5-1")
 
         machine._load_claude_session_controls = saved_controls
+        monkeypatch.setattr(machine_module, "last_completed_assistant_controls",
+                            lambda *_a, **_k: ClaudeControls(model="claude-sonnet-5"))
         ctx = await machine._spawn(
             resume_id=session_id, engine="claude", space="code")
 
         assert ctx is not None
         assert _FakeClaudeClient.created[-1].model_calls == [
-            "claude-fable-5-1[1m]",
+            "claude-sonnet-5",
         ]
-        assert ctx.sdk.model == "claude-fable-5-1[1m]"
+        assert ctx.sdk.model == "claude-sonnet-5"
         await ctx.sdk.disconnect()
 
     asyncio.run(go())
@@ -1581,7 +1583,7 @@ def test_claude_default_resolution_does_not_block_serial_commands():
     asyncio.run(go())
 
 
-def test_cold_claude_resume_restores_private_remote_controls(
+def test_cold_claude_resume_retains_permissions_but_inherits_native_model_effort(
     monkeypatch, tmp_path,
 ):
     session_id = "11111111-1111-4111-8111-111111111111"
@@ -1607,6 +1609,8 @@ def test_cold_claude_resume_restores_private_remote_controls(
             effort="high",
             permission_mode="plan",
         )
+        monkeypatch.setattr(machine_module, "last_completed_assistant_controls",
+                            lambda *_a, **_k: ClaudeControls(model="claude-sonnet-5", effort="low"))
         machine._watch_session = lambda _sid: None
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
@@ -1615,17 +1619,17 @@ def test_cold_claude_resume_restores_private_remote_controls(
             session_id, engine="claude", space="code")
 
         assert ctx is not None
-        assert ctx.sdk.model == "claude-opus-4-6[1m]"
-        assert ctx.sdk.effort == "high"
-        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.model == "claude-sonnet-5"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.applied_effort is None
         assert ctx.sdk.permission_mode == "plan"
         client = _FakeClaudeClient.created[-1]
         assert client.options.permission_mode == "plan"
-        assert client.options.effort == "high"
-        assert client.model_calls == ["claude-opus-4-6[1m]"]
+        assert client.options.effort is None
+        assert client.model_calls == ["claude-sonnet-5"]
         assert machine._claude_controls.get(session_id) == ClaudeControls(
-            model="claude-opus-4-6[1m]",
-            effort="high",
+            model="claude-sonnet-5",
+            effort=None,
             permission_mode="plan",
             applied_auto_compact_mode="inherit",
             applied_auto_compact_threshold_tokens=None,

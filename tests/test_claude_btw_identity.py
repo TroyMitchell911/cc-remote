@@ -75,8 +75,8 @@ def test_empty_btw_is_private_without_blocking_owner_or_other_client(setup):
             assert isinstance(listed, SessionList)
             assert listed.sessions == []
         assert all(event.type != "error" for event in transport.sent)
-        # Reserved is not yet resumable. A settings reconnect must repeat the
-        # fork with its original reserved UUID until a native init captures it.
+        # Reserved is not yet resumable. The pre-close lookup selects the
+        # parent; the private reconnect callback rotates the id after shutdown.
         assert machine._claude_reconnect_identity(fork) == (parent.session_id, True)
         assert fork.sdk._options(parent.session_id, fork=True).session_id == reserved
         await machine._capture_session_id(fork, reserved)

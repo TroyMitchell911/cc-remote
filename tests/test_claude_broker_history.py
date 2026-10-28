@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
     claude_broker_tail_state,
@@ -121,3 +123,30 @@ def test_native_control_envelopes_do_not_reopen_a_completed_turn(tmp_path):
     assert parsed.ordered == (("started", "prompt"), ("completed", "done"))
     active, partial = claude_broker_tail_state(str(path))
     assert active is False and partial == b""
+
+
+@pytest.mark.parametrize("marker", [
+    "[Request interrupted by user]", "[Request interrupted by user for tool use]",
+])
+@pytest.mark.parametrize("blocks", [False, True])
+def test_terminal_interrupt_is_a_stop_not_another_prompt(marker, blocks):
+    content = [{"type": "text", "text": marker}] if blocks else marker
+    parsed = parse_claude_broker_lifecycle(b"".join([
+        _row(type="user", uuid="start", message={"role": "user", "content": "work"}),
+        _row(type="user", uuid="stop", message={"role": "user", "content": content}),
+        _row(type="user", uuid="setting", message={"role": "user", "content": [
+            {"type": "text", "text": "<local-command-stdout>Set model</local-command-stdout>"}]}),
+    ]))
+    assert parsed.ordered == (("started", "start"), ("completed", "stop"))
+
+
+def test_rewind_and_api_failure_settle_native_activity():
+    parsed = parse_claude_broker_lifecycle(b"".join([
+        _row(type="user", uuid="a", message={"role": "user", "content": "work"}),
+        _row(type="assistant", uuid="error", isApiErrorMessage=True,
+             message={"role": "assistant", "content": "API Error"}),
+        _row(type="user", uuid="b", message={"role": "user", "content": "again"}),
+        _row(type="last-prompt", explicit=True, rewound=True, leafUuid=None),
+    ]))
+    assert parsed.ordered == (("started", "a"), ("completed", "error"),
+                              ("started", "b"), ("completed", "rewind"))

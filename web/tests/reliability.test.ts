@@ -11757,7 +11757,7 @@ try {
         historyGeneration: "settled-codex-g1",
         historyBuildSeq: 1,
         historyLiveSeq: 40,
-        lastLiveSeq: 40,
+        lastLiveSeq: 40, lastNarrativeSeq: 40,
         turns: [{
           id: settledBrowserId,
           clientMsgId: settledBrowserId,
@@ -18525,20 +18525,18 @@ assert.doesNotMatch(contextPopoverSource, /正在读取真实上下文/,
   "background context refreshes must not flash a loading notice");
 assert.match(composerSource, /ref=\{workSettingsRef\}/);
 assert.match(composerSource, /document\.addEventListener\("pointerdown", onPointerDown\)/);
-assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "选择模型"/,
-  "external read-only sessions must disable model changes");
-assert.match(composerSource, /disabled=\{locked\}[\s\S]*?: "思考强度"/,
-  "external read-only sessions must disable effort changes");
+assert.match(composerSource, /disabled=\{locked\} title="选择模型"/,
+  "read-only sessions must disable model changes");
+assert.match(composerSource, /disabled=\{locked\} title="思考强度"/,
+  "read-only sessions must disable effort changes");
 assert.match(composerSource, /const deferredClaudeControls = externalClaudeOwner !== null/,
-  "native Claude ownership must distinguish saved takeover preferences from live controls");
-assert.match(composerSource, />\s*接管后\s*<\/span>/,
-  "saved Claude model and effort must be labelled as post-takeover controls");
+  "unmanaged native Claude controls must not expose saved values as current");
+assert.match(composerSource, /deferredClaudeControls \? \([\s\S]*?CLI 配置未同步[\s\S]*?\) : <>/,
+  "unknown native controls replace the pickers with one compact label");
 assert.match(composerSource, /当前权限模式未公开/,
   "native Claude ownership must not present Remote's saved permission as live state");
-assert.match(composerSource, /不是\$\{externalClaudeOwner\}当前模型/,
-  "native Claude ownership must not present Remote's saved model as live state");
-assert.match(composerSource, /不是\$\{externalClaudeOwner\}当前强度/,
-  "native Claude ownership must not present Remote's saved effort as live state");
+assert.match(composerSource, /当前模型和强度未提供/,
+  "native Claude ownership must explain unavailable controls");
 assert.doesNotMatch(composerSource, /终端占用/,
   "shared control must never be presented as exclusive terminal occupancy");
 assert.match(composerSource, /presentLegacyExternalControl/);

@@ -297,9 +297,11 @@ export interface SessionRuntime {
   // This is deliberately distinct from IndexedDB hydration: an authoritative
   // first page must still be able to replace stale cached rows.
   hasLoadedOlderHistory: boolean;
-  // Greatest downstream sequence that confirmed a turn on this connection.
-  // A History captured before it may merge rows but cannot delete the live tail.
+  // Greatest downstream sequence, including control and auxiliary projections.
   lastLiveSeq: number;
+  // Only actual turn content can protect rows from an older History page.
+  // Plan/settings notifications must not preserve an abandoned rewind branch.
+  lastNarrativeSeq: number;
   // Greatest direct lifecycle state sequence. A positive running bit captured
   // by older History may recover from unrelated live settings races, but must
   // never overwrite a newer explicit idle state.
@@ -505,7 +507,7 @@ export function createRuntime(): SessionRuntime {
     historyFence: null, liveOwner: null, pendingLiveBinding: null,
     pendingTerminalFences: null,
     legacyLiveFallbackBlocked: false,
-    lastLiveSeq: 0, lastLifecycleSeq: 0,
+    lastLiveSeq: 0, lastNarrativeSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
     liveDetailTurnIds: [],
@@ -818,6 +820,49 @@ function turnsShareIdentityAlias(
   const firstAliases = new Set(turnIdentityAliases(first));
   return turnIdentityAliases(second).some((alias) =>
     firstAliases.has(alias));
+}
+
+function reconcileBoundClaudeHistoryTurn(
+  runtime: SessionRuntime, turns: Turn[],
+): Turn[] {
+  const binding = runtime.pendingLiveBinding;
+  if (!binding || binding.generation !== runtimeOrderingGeneration(runtime)) {
+    return turns;
+  }
+  const owners = turns.filter(turn => turnHasIdentityAlias(turn, binding.msgId));
+  // Claude binds the browser message to the native user/checkpoint UUID.
+  // Codex task ids may cover several steer rows, so they cannot prove this
+  // merge. Neither matching prompts nor a shared assistant/fork id is enough.
+  const nativeRows = turns.filter(turn => turn.checkpointId === binding.turnId
+    && turnHasIdentityAlias(turn, binding.turnId));
+  if (owners.length !== 1 || nativeRows.length !== 1) return turns;
+  const owner = owners[0];
+  const native = nativeRows[0];
+  if (owner === native || owner.liveTaskId
+      || (owner.checkpointId && owner.checkpointId !== binding.turnId)
+      || (owner.historyTurnId && owner.historyTurnId !== binding.turnId)
+      || (native.clientMsgId && native.clientMsgId !== binding.msgId)) return turns;
+  const currentOwner = runtime.liveOwner && turns.find(turn =>
+    turnHasIdentityAlias(turn, runtime.liveOwner!.turnId));
+  if (currentOwner && currentOwner !== owner
+      && runtime.liveOwner!.seq > binding.seq) return turns;
+  const merged = mergeInitialHistory(
+    [{ ...native, clientMsgId: binding.msgId }], [owner], {
+      preserveLiveTailOpen: !owner.done && runtime.state !== "idle",
+    },
+  )[0];
+  // Keep the running stream on the browser row until its real Result supplies
+  // the assistant UUID. The native user id remains the detail/checkpoint key.
+  if (!merged.done) {
+    merged.forkPointId = binding.turnId;
+    merged.durationMs = owner.durationMs;
+  }
+  const ownerIndex = turns.indexOf(owner);
+  const nativeIndex = turns.indexOf(native);
+  const result = [...turns];
+  result.splice(Math.max(ownerIndex, nativeIndex), 1);
+  result.splice(Math.min(ownerIndex, nativeIndex), 1, merged);
+  return result;
 }
 
 function reconcileBoundCompactionOrphan(
@@ -2115,6 +2160,7 @@ function markTurnAsLive(
   }
   if (eventSeq != null) {
     runtime.lastLiveSeq = Math.max(runtime.lastLiveSeq, eventSeq);
+    runtime.lastNarrativeSeq = Math.max(runtime.lastNarrativeSeq, eventSeq);
   }
   if (runtime.hydratedCacheTurnIds.length > 0) {
     runtime.hydratedCacheTurnIds = runtime.hydratedCacheTurnIds.filter(
@@ -2228,7 +2274,9 @@ function reconcileAuthoritativeBackgroundProcessLevel(
 function markTurnDetailAsLive(
   runtime: SessionRuntime, turnId: string, liveEvent: boolean,
 ): void {
-  if (!liveEvent || runtime.liveDetailTurnIds.includes(turnId)) return;
+  if (!liveEvent) return;
+  runtime.lastNarrativeSeq = Math.max(runtime.lastNarrativeSeq, runtime.lastLiveSeq);
+  if (runtime.liveDetailTurnIds.includes(turnId)) return;
   runtime.liveDetailTurnIds = [
     ...runtime.liveDetailTurnIds,
     turnId,
@@ -3791,6 +3839,8 @@ function reduceEvent(
               ? false : mergedHistoryRuntime.historyHeadKnown,
             lastLiveSeq: Math.max(
               source.lastLiveSeq, mergeTarget.lastLiveSeq),
+            lastNarrativeSeq: Math.max(
+              source.lastNarrativeSeq, mergeTarget.lastNarrativeSeq),
             lastLifecycleSeq: Math.max(
               source.lastLifecycleSeq, mergeTarget.lastLifecycleSeq),
             hydratedCacheTurnIds: Array.from(new Set([
@@ -3826,7 +3876,11 @@ function reduceEvent(
           };
           switchControlGeneration(mergedRuntime, mergedControlGeneration);
           if (mergedControl) applySessionControl(mergedRuntime, mergedControl);
-          replaceWithBoundedTurns(mergedRuntime, mergedTurns);
+          // TurnBinding can arrive on either sid before re-key. Reconcile it
+          // after combining the two projections, even when no new History or
+          // binding frame follows the rename.
+          replaceWithBoundedTurns(mergedRuntime,
+            reconcileBoundClaudeHistoryTurn(mergedRuntime, mergedTurns));
           reconcileAuthoritativeBackgroundProcessLevel(mergedRuntime);
           // switchControlGeneration intentionally clears cross-generation
           // sequence evidence. Restore only the owner already filtered to the
@@ -4423,17 +4477,20 @@ function reduceEvent(
       }
       const racedLiveEvent = e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const racedNarrativeEvent = e.live_seq != null
+        && base.lastNarrativeSeq > e.live_seq;
+      const racedTurnEvent = racedNarrativeEvent || (e.live_seq != null
+        && base.lastLifecycleSeq > e.live_seq);
       const runningGeneration = preControlBase.controlGeneration
         ?? preControlBase.historyGeneration;
       const currentRunningHistory = e.in_progress === true
         && e.live_seq != null
-        && base.lastLiveSeq <= e.live_seq
-        && base.lastLifecycleSeq <= e.live_seq
+        && !racedTurnEvent
         && (runningGeneration == null || e.generation === runningGeneration);
-      const preserveProjectionOpenPlans = racedLiveEvent
+      const preserveProjectionOpenPlans = racedTurnEvent
         || e.in_progress === true
         || (e.in_progress == null && base.state !== "idle");
-      const settledHistory = !racedLiveEvent
+      const settledHistory = !racedTurnEvent
         && e.in_progress === false;
       const isCodexHistory = ownership?.engine === "codex"
         || state.sessions.some((session) =>
@@ -4503,10 +4560,10 @@ function reduceEvent(
           // explicit older pages. This is essential when compact makes the
           // current turn itself larger than the backend byte window.
           ? base.turns
-          : racedLiveEvent
-          // This History started before a live event already painted by the
-          // browser. Keep every non-cache local row (including a just-completed
-          // TurnEnd); the stale frame may add history but cannot delete it.
+          : racedNarrativeEvent
+          // Preserve content painted after this History started (including a
+          // just-completed TurnEnd). Unrelated plan/settings events do not
+          // justify retaining rows absent from the authoritative transcript.
           ? base.turns.filter((turn) => !cached.has(turn.id))
           : base.historyInvalidated
           // Replay gaps begin at an arbitrary ring position and can therefore
@@ -4906,7 +4963,8 @@ function reduceEvent(
                   && e.external !== true && !base.external
                 ? "idle"
                 : base.state,
-            mirroredRunning: acceptsControlState && !racedLiveEvent
+            mirroredRunning: acceptsControlState && !racedTurnEvent
+              && (!racedLiveEvent || e.external === base.external)
               ? e.external === true && e.in_progress === true
               : base.mirroredRunning,
             historyInvalidated: acceptsControlState
@@ -5977,6 +6035,7 @@ function reduceEvent(
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
+            rt.lastNarrativeSeq = 0;
             rt.lastLifecycleSeq = 0;
           }
           rt.loading = true;
@@ -6866,6 +6925,7 @@ function reduceEvent(
           rt.pendingLiveBinding = binding;
         }
         if (bindingCanSupersedeOwner) {
+          turns = reconcileBoundClaudeHistoryTurn(rt, turns);
           bindAuthoritativeActiveHistoryHead(
             rt, turns, e.msg_id, e.turn_id, seq);
         }
@@ -6886,6 +6946,7 @@ function reduceEvent(
             && !turnHasBoundEngineId(owner);
           const authoritativeCandidates = turns.filter((turn, index) =>
             index !== ownerIndex
+            && (!turn.checkpointId || turn.checkpointId === e.turn_id)
             && (turn.forkPointId === e.turn_id || turn.id === e.turn_id));
           if (!owner.forkPointId || owner.forkPointId === e.turn_id
               || owner.liveTaskId === e.turn_id) {

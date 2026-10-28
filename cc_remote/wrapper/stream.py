@@ -77,7 +77,10 @@ _CLAUDE_IMAGE_READ_SUFFIXES = frozenset({
     ".png", ".jpg", ".jpeg", ".webp",
 })
 _SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
-_INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
+_INTERRUPTED_USER_TEXTS = {
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+}
 _SYNTHETIC_API_ERROR_PREFIX = "API Error:"
 _CLAUDE_AGENT_TASK_TYPES = frozenset({
     # Current Claude Code / Agent SDK task types.
@@ -1919,9 +1922,11 @@ def _compact_visible_user(row: dict[str, Any]) -> bool:
     if role != "user":
         return False
     content = message.get("content")
+    if _is_interrupted_user_content(content):
+        return False
     if isinstance(content, str):
         return bool(content.strip()) and not _is_meta_user_text(content)
-    if not isinstance(content, list) or _is_interrupted_user_content(content):
+    if not isinstance(content, list):
         return False
     return any(
         isinstance(block, dict) and (
@@ -2097,9 +2102,13 @@ def _compact_chain_index(
     if chain_ids is None:
         return None
 
-    if not any(
-        rows[uid][0] == "system" and rows[uid][1] in {"compact_boundary", REWIND_ANCHOR}
-        for uid in chain_ids
+    # Native children reference the rewind's target, not our synthetic index
+    # anchor. Keep using the active ancestry after /model or /effort appends;
+    # the SDK catalog may otherwise select the abandoned latest assistant.
+    has_rewind = any(row[:2] == ("system", REWIND_ANCHOR)
+                     for row in rows.values())
+    if not has_rewind and not any(
+        rows[uid][:2] == ("system", "compact_boundary") for uid in chain_ids
     ):
         return None
     # Claude persists the completed boundary before replaying the command that
@@ -3257,6 +3266,17 @@ def translate_history(
                     if stamp is not None:
                         last_ts = max(last_ts or stamp, stamp)
                     close_turn("steered", False)
+            if _is_interrupted_user_content(content):
+                misplaced_alias = client_message_ids.get(message_uid)
+                pending_interrupted_alias = (
+                    (message_index + 1, misplaced_alias)
+                    if misplaced_alias is not None else None
+                )
+                marker_ts = _ts(source_uid)
+                if marker_ts is not None:
+                    last_ts = marker_ts
+                close_turn("interrupted", False)
+                continue
             compact_prompt = manual_compact_prompt(content)
             if compact_prompt is not None:
                 content = compact_prompt
@@ -3308,17 +3328,6 @@ def translate_history(
                     and _is_meta_user_text(block["text"])
                     for block in content
                 ):
-                    continue
-                if _is_interrupted_user_content(content):
-                    misplaced_alias = client_message_ids.get(message_uid)
-                    pending_interrupted_alias = (
-                        (message_index + 1, misplaced_alias)
-                        if misplaced_alias is not None else None
-                    )
-                    marker_ts = _ts(source_uid)
-                    if marker_ts is not None:
-                        last_ts = marker_ts
-                    close_turn("interrupted", False)
                     continue
                 # collect any uploaded images up front so they attach to this turn's
                 # UserMsg (replay on reload — the transcript stores the base64).
@@ -3956,6 +3965,8 @@ def _is_interrupted_user_content(content: Any) -> bool:
     This row is lifecycle metadata for the preceding prompt, not a second
     human-authored message. Claude currently persists it as one text block.
     """
+    if isinstance(content, str):
+        return content.strip() in _INTERRUPTED_USER_TEXTS
     if not isinstance(content, list) or len(content) != 1:
         return False
     block = content[0]
@@ -3970,7 +3981,7 @@ def _is_interrupted_user_content(content: Any) -> bool:
     return (
         block_type == "text"
         and isinstance(text, str)
-        and text.strip() == _INTERRUPTED_USER_TEXT
+        and text.strip() in _INTERRUPTED_USER_TEXTS
     )
 
 

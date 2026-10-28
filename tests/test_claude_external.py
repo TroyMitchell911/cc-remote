@@ -1576,6 +1576,7 @@ def test_claude_takeover_adopts_only_completed_native_controls(
         async def force_reconnect(self, **kwargs):
             await super().force_reconnect(**kwargs)
             self.model = "glm-5.2"
+            self.display_effort = "model-default"
 
     async def go():
         machine, transport = _mk_machine()
@@ -1614,12 +1615,12 @@ def test_claude_takeover_adopts_only_completed_native_controls(
 
         assert result is None
         assert ctx.sdk.model == "claude-opus-4-6[1m]"
-        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.effort is None
         assert ctx.sdk.reconnect_args[-1]["preserve_model"] is True
         assert ctx.needs_reload is False
         assert machine._claude_controls.get(session_id) == ClaudeControls(
             model="claude-opus-4-6[1m]",
-            effort="high",
+            effort=None,
             permission_mode="bypassPermissions",
             auto_compact_mode="custom",
             auto_compact_threshold_tokens=500_000,
@@ -1630,7 +1631,7 @@ def test_claude_takeover_adopts_only_completed_native_controls(
                    and event.model == "claude-opus-4-6[1m]"
                    for event in transport.sent)
         assert any(getattr(event, "type", None) == "effort"
-                   and event.effort == "high" for event in transport.sent)
+                   and event.effort == "model-default" for event in transport.sent)
 
     asyncio.run(go())
 
@@ -1906,7 +1907,7 @@ def test_short_external_append_is_reloaded_before_claude_query(
             "preserve_model": True,
         }]
         assert sdk.model == "claude-fable-5-1[1m]"
-        assert sdk.effort == "high"
+        assert sdk.effort is None
         assert sdk.queries == 1
         assert ctx.state == "idle"
         assert ctx.needs_reload is False
