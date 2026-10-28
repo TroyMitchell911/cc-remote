@@ -822,6 +822,49 @@ function turnsShareIdentityAlias(
     firstAliases.has(alias));
 }
 
+function reconcileBoundClaudeHistoryTurn(
+  runtime: SessionRuntime, turns: Turn[],
+): Turn[] {
+  const binding = runtime.pendingLiveBinding;
+  if (!binding || binding.generation !== runtimeOrderingGeneration(runtime)) {
+    return turns;
+  }
+  const owners = turns.filter(turn => turnHasIdentityAlias(turn, binding.msgId));
+  // Claude binds the browser message to the native user/checkpoint UUID.
+  // Codex task ids may cover several steer rows, so they cannot prove this
+  // merge. Neither matching prompts nor a shared assistant/fork id is enough.
+  const nativeRows = turns.filter(turn => turn.checkpointId === binding.turnId
+    && turnHasIdentityAlias(turn, binding.turnId));
+  if (owners.length !== 1 || nativeRows.length !== 1) return turns;
+  const owner = owners[0];
+  const native = nativeRows[0];
+  if (owner === native || owner.liveTaskId
+      || (owner.checkpointId && owner.checkpointId !== binding.turnId)
+      || (owner.historyTurnId && owner.historyTurnId !== binding.turnId)
+      || (native.clientMsgId && native.clientMsgId !== binding.msgId)) return turns;
+  const currentOwner = runtime.liveOwner && turns.find(turn =>
+    turnHasIdentityAlias(turn, runtime.liveOwner!.turnId));
+  if (currentOwner && currentOwner !== owner
+      && runtime.liveOwner!.seq > binding.seq) return turns;
+  const merged = mergeInitialHistory(
+    [{ ...native, clientMsgId: binding.msgId }], [owner], {
+      preserveLiveTailOpen: !owner.done && runtime.state !== "idle",
+    },
+  )[0];
+  // Keep the running stream on the browser row until its real Result supplies
+  // the assistant UUID. The native user id remains the detail/checkpoint key.
+  if (!merged.done) {
+    merged.forkPointId = binding.turnId;
+    merged.durationMs = owner.durationMs;
+  }
+  const ownerIndex = turns.indexOf(owner);
+  const nativeIndex = turns.indexOf(native);
+  const result = [...turns];
+  result.splice(Math.max(ownerIndex, nativeIndex), 1);
+  result.splice(Math.min(ownerIndex, nativeIndex), 1, merged);
+  return result;
+}
+
 function reconcileBoundCompactionOrphan(
   runtime: SessionRuntime,
   turns: Turn[],
@@ -3833,7 +3876,11 @@ function reduceEvent(
           };
           switchControlGeneration(mergedRuntime, mergedControlGeneration);
           if (mergedControl) applySessionControl(mergedRuntime, mergedControl);
-          replaceWithBoundedTurns(mergedRuntime, mergedTurns);
+          // TurnBinding can arrive on either sid before re-key. Reconcile it
+          // after combining the two projections, even when no new History or
+          // binding frame follows the rename.
+          replaceWithBoundedTurns(mergedRuntime,
+            reconcileBoundClaudeHistoryTurn(mergedRuntime, mergedTurns));
           reconcileAuthoritativeBackgroundProcessLevel(mergedRuntime);
           // switchControlGeneration intentionally clears cross-generation
           // sequence evidence. Restore only the owner already filtered to the
@@ -6878,6 +6925,7 @@ function reduceEvent(
           rt.pendingLiveBinding = binding;
         }
         if (bindingCanSupersedeOwner) {
+          turns = reconcileBoundClaudeHistoryTurn(rt, turns);
           bindAuthoritativeActiveHistoryHead(
             rt, turns, e.msg_id, e.turn_id, seq);
         }
@@ -6898,6 +6946,7 @@ function reduceEvent(
             && !turnHasBoundEngineId(owner);
           const authoritativeCandidates = turns.filter((turn, index) =>
             index !== ownerIndex
+            && (!turn.checkpointId || turn.checkpointId === e.turn_id)
             && (turn.forkPointId === e.turn_id || turn.id === e.turn_id));
           if (!owner.forkPointId || owner.forkPointId === e.turn_id
               || owner.liveTaskId === e.turn_id) {
