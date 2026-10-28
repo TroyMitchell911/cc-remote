@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.3
+
+Align Claude native controls, ownership and terminal activity; fix side-chat reconnects, rewind history and duplicate prompts after switching engines. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
+
+- Close successful rewind dialogs and preserve the active history branch across subsequent CLI use.
+- Let keyboard navigation leave streaming output and resume following at the bottom.
+- Change Linux desktop engine shortcuts to Alt+1/2/3.
+
+See the bilingual [release notes](docs/releases/v5.3.3.md).
+
 ## v5.3.2
 
 Restore Claude file diffs after refreshing or reopening a session. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
