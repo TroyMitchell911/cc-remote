@@ -421,6 +421,114 @@ def codex_session_confirmed_missing(
     return codex_session_presence(session_id, codex_home=home) is False
 
 
+def codex_missing_sidebar_sessions(
+    session_ids: Iterable[str],
+    *,
+    unloaded_ids: Iterable[str] = (),
+    codex_home: str | os.PathLike[str] | None = None,
+) -> set[str]:
+    """Confirm deleted cold sidebar entries without changing native state.
+
+    Readable catalog absence plus a complete scan of both rollout roots proves
+    deletion. A stale catalog row is also eligible only when the fresh official
+    list says ``notLoaded`` and its exact, profile-local rollout path is gone.
+    Missing databases, permissions, symlinks and scan limits preserve rows.
+    This is a batch sidebar check, never a live-handle retirement predicate.
+    """
+    ids = set()
+    for sid in session_ids:
+        if isinstance(sid, str) and _SAFE_SESSION_ID.fullmatch(sid):
+            ids.add(sid)
+        if len(ids) >= 8192:
+            break
+    if not ids:
+        return set()
+    unloaded = set(unloaded_ids) & ids
+    home = _codex_home(codex_home)
+    roots = _session_roots(home)
+
+    def path_missing(path: object) -> bool:
+        if (not isinstance(path, str) or not os.path.isabs(path)
+                or len(os.fsencode(path)) > 16 * 1024):
+            return False
+        absolute = os.path.abspath(path)
+        # Do not follow an index copied from another account, or a symlink
+        # through which a missing file could really belong to another root.
+        if absolute != os.path.realpath(path):
+            return False
+        if not any(absolute.startswith(root + os.sep) for root in roots):
+            return False
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass
+        return False
+
+    def candidates() -> dict[str, str | None]:
+        db_path = _state_db_path(home)
+        if db_path is None:
+            return {}
+        try:
+            uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as db:
+                db.execute("BEGIN")
+                columns = {row[1] for row in db.execute('PRAGMA table_info("threads")')}
+                if "id" not in columns:
+                    return {}
+                rollout_column = '"rollout_path"' if "rollout_path" in columns else "NULL"
+                found = {}
+                ordered = sorted(ids)
+                for start in range(0, len(ordered), 400):
+                    batch = ordered[start:start + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    found.update(db.execute(
+                        f'SELECT "id", {rollout_column} FROM threads '
+                        f'WHERE "id" IN ({placeholders})', batch,
+                    ))
+        except (OSError, sqlite3.Error):
+            return {}
+        return {
+            sid: found.get(sid) for sid in ids
+            if sid not in found or (sid in unloaded and path_missing(found[sid]))
+        }
+
+    before = candidates()
+    if not before:
+        return set()
+    remaining = set(before)
+    scanned = 0
+
+    def failed_scan(error: OSError) -> None:
+        raise error
+
+    try:
+        for root in roots:
+            try:
+                mode = os.lstat(root).st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                return set()
+            for directory, dirs, files in os.walk(root, onerror=failed_scan):
+                scanned += 1 + len(dirs) + len(files)
+                if scanned > 100_000:
+                    return set()
+                if any(os.path.islink(os.path.join(directory, name)) for name in dirs):
+                    return set()
+                for name in files:
+                    if name.endswith(".jsonl"):
+                        remaining.difference_update(sid for sid in tuple(remaining)
+                                                    if sid in name)
+                if not remaining:
+                    return set()
+    except OSError:
+        return set()
+    after = candidates()
+    return {sid for sid in remaining if sid in after and before[sid] == after[sid]}
+
+
 def codex_thread_archive_states(
     session_ids: Iterable[str],
     *,

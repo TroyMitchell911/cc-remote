@@ -353,6 +353,7 @@ from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_exact_catalog_rows, codex_session_cwd,
     codex_rollout_path, codex_model, codex_effort, codex_session_settings,
     codex_session_presence, codex_session_confirmed_missing,
+    codex_missing_sidebar_sessions,
     codex_current_provider,
     codex_thread_archive_states, codex_thread_catalog_row,
     codex_thread_parent_maps, codex_thread_rollout_record,
@@ -27533,6 +27534,8 @@ class WrapperMachine:
             # built. Never let the old rows replace the optimistic temp row.
             return await self._refresh_codex_session_catalog()
         cached = self._codex_session_list_cache
+        unloaded_sids = {row["session_id"] for row in raw
+                         if row.get("status") == "notLoaded"}
         failed_profile_ids = {profile_id for profile_id, _ in profile_errors}
         if failed_profile_ids and cached is not None:
             # A profile catalog is a rebuildable projection, not an
@@ -27578,11 +27581,91 @@ class WrapperMachine:
         # native catalog or fork overlay. Filter again at the generation edge
         # before any row enters the reusable cache.
         raw = self._filter_private_codex_btw_rows(raw)
+        raw = await self._prune_missing_codex_sidebar_rows(
+            raw, cached[1] if cached is not None else [],
+            epoch=epoch, unloaded_sids=unloaded_sids,
+            unavailable_profiles=frozenset(failed_profile_ids),
+        )
+        if epoch != self._codex_session_list_epoch:
+            return await self._refresh_codex_session_catalog()
+        raw = self._filter_private_codex_btw_rows(raw)
         self._codex_session_profile_errors = profile_errors
         self._codex_session_list_cache = (
             time.monotonic(), raw, profile_errors,
         )
         return raw
+
+    async def _prune_missing_codex_sidebar_rows(
+        self, raw: list[dict], previous: list[dict], *, epoch: int,
+        unloaded_sids: set[str],
+        unavailable_profiles: frozenset[str] = frozenset(),
+    ) -> list[dict]:
+        """Forget confirmed deleted cold rows and pins, preserving live work."""
+        pins = (self._session_pins.ids("codex")
+                if self._session_pins is not None else frozenset())
+        candidates = set(pins)
+        candidates.update(row["session_id"] for row in [*previous, *raw]
+                          if isinstance(row.get("session_id"), str))
+        if not candidates:
+            return raw
+        fresh_status = {row["session_id"]: row.get("status") for row in raw}
+        work = await asyncio.to_thread(
+            self._work.for_engine("codex").records_by_profile_session)
+
+        def protected(sid: str, profile: CodexProfile, native_sid: str) -> bool:
+            return (
+                profile.id in unavailable_profiles
+                or self._ctx_by_sid(sid) is not None
+                or self._is_external(sid)
+                or self._codex_sidebar_watch_state(self._watch.get(sid)) == "running"
+                or (profile.id, native_sid) in work
+                or (profile.id, native_sid) in self._codex_thread_started_hints
+                or fresh_status.get(sid) in {"active", "idle", "systemError"}
+                # A native list row with unknown/loaded status, or a freshly
+                # verified fork overlay, is positive evidence of existence.
+                # Do not overrule it with a lagging SQLite/filesystem view.
+                or (sid in fresh_status and sid not in unloaded_sids)
+            )
+
+        by_profile: dict[str, dict[str, str]] = {}
+        for sid in sorted(candidates):
+            try:
+                profile, native_sid = self._codex_target(sid)
+            except ValueError:
+                continue
+            if not protected(sid, profile, native_sid):
+                by_profile.setdefault(profile.id, {})[native_sid] = sid
+        removed = set()
+        for profile in self._codex_profiles:
+            ids = by_profile.get(profile.id, {})
+            if not ids:
+                continue
+            missing = await asyncio.to_thread(
+                codex_missing_sidebar_sessions, ids,
+                unloaded_ids=[native_sid for native_sid, sid in ids.items()
+                              if sid in unloaded_sids],
+                codex_home=self._codex_home(profile),
+            )
+            if epoch != self._codex_session_list_epoch:
+                return raw
+            for native_sid in missing:
+                sid = ids[native_sid]
+                if protected(sid, profile, native_sid):
+                    continue
+                if sid in pins:
+                    try:
+                        await asyncio.to_thread(
+                            self._session_pins.set_pinned, "codex", sid, False)
+                    except SessionPinStoreError:
+                        log.warning("missing Codex sidebar pin cleanup failed",
+                                    session_id=sid)
+                if (epoch != self._codex_session_list_epoch
+                        or protected(sid, profile, native_sid)):
+                    continue
+                removed.add(sid)
+        if removed:
+            log.info("removed missing Codex sidebar entries", count=len(removed))
+        return [row for row in raw if row["session_id"] not in removed]
 
     def _overlay_completed_codex_forks(
         self, raw: list[dict],
@@ -29973,16 +30056,79 @@ class WrapperMachine:
 
     async def _handle_pin_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        is_codex = await self._is_codex_session(sid)
-        engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
-        if requested_engine is not None and requested_engine != engine:
+        requested_space = getattr(cmd, "space", "code")
+
+        async def reject(code: str, message: str, reason: str) -> Error:
+            log.warning(
+                "session pin rejected", session_id=sid,
+                requested_engine=requested_engine, space=requested_space,
+                pinned=bool(cmd.pinned), reason=reason,
+                cmd_id=getattr(cmd, "cmd_id", None),
+            )
             error = Error(
-                code=ERR_AUTH, message="会话不属于请求的引擎",
+                code=code, message=message,
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None))
             await self._emit_to_sid(sid, error)
             return error
+
+        ctx = self._ctx_by_sid(sid)
+        unpin_engine = requested_engine if not cmd.pinned else None
+        if not cmd.pinned and ctx is None and unpin_engine is None:
+            # Legacy commands omit the engine. An existing pin is sufficient
+            # identity for removing that preference, even after native deletion.
+            owners = [engine for engine in ("claude", "codex")
+                      if self._session_pins is not None
+                      and sid in self._session_pins.ids(engine)]
+            if len(owners) == 1:
+                unpin_engine = owners[0]
+            elif len(owners) > 1:
+                return await reject(
+                    ERR_AUTH, "请指定要取消置顶的会话引擎", "ambiguous_pin_engine")
+        metadata_only = ctx is None and unpin_engine is not None
+        if metadata_only:
+            try:
+                (self._codex_target if unpin_engine == "codex"
+                 else self._claude_target)(sid)
+            except ValueError:
+                return await reject(
+                    ERR_AUTH, "账号或会话标识无效", "invalid_unpin_route")
+            is_codex = unpin_engine == "codex"
+        else:
+            is_codex = await self._is_codex_session(sid)
+        if (not metadata_only and not is_codex and ctx is None
+                and requested_engine in {None, "codex"}):
+            # Pinning is wrapper metadata: a cold thread need not have a
+            # readable rollout. Verify its exact account catalog without
+            # resuming it or broadening guards for destructive operations.
+            try:
+                profile, native_sid = self._codex_target(sid)
+            except ValueError:
+                if requested_engine == "codex":
+                    return await reject(
+                        ERR_AUTH, "Codex 账号或会话标识无效", "invalid_codex_route")
+            else:
+                presence = await asyncio.to_thread(
+                    codex_session_presence, native_sid,
+                    codex_home=str(profile.home),
+                )
+                if presence is True:
+                    is_codex = True
+                elif requested_engine == "codex":
+                    # An unreadable/missing catalog is unknown, not evidence
+                    # that a Codex request belongs to Claude.
+                    return await reject(
+                        ERR_BUSY if presence is None else ERR_NOT_RUNNING,
+                        "暂时无法确认 Codex 会话，请稍后重试。"
+                        if presence is None else "Codex 会话不存在",
+                        "codex_catalog_unavailable" if presence is None
+                        else "codex_session_missing",
+                    )
+        engine = "codex" if is_codex else "claude"
+        if requested_engine is not None and requested_engine != engine:
+            return await reject(
+                ERR_AUTH, "会话不属于请求的引擎", "engine_mismatch")
         try:
             native_sid, work_profile_id = self._work_session_identity(engine, sid)
         except ValueError:
@@ -29995,15 +30141,10 @@ class WrapperMachine:
             codex_profile_id=(
                 work_profile_id if engine == "codex" else None),
         )
-        requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
-            error = Error(
-                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间",
-                request_id=getattr(cmd, "cmd_id", None),
-                to=getattr(cmd, "client_id", None))
-            await self._emit_to_sid(sid, error)
-            return error
-        if (work_record is None and self._ctx_by_sid(sid) is None
+            return await reject(
+                ERR_AUTH, "会话不属于请求的 Work/Code 空间", "space_mismatch")
+        if (cmd.pinned and work_record is None and self._ctx_by_sid(sid) is None
                 and not is_codex):
             try:
                 claude_profile, claude_native_sid = self._claude_target(sid)
@@ -30048,6 +30189,13 @@ class WrapperMachine:
             listing = await (self._list_codex_sessions(cmd) if is_codex
                              else self._handle_list_sessions(cmd))
             return error, listing
+        if is_codex and not cmd.pinned and self._codex_session_list_cache is not None:
+            # Keep outage fallback rows, but reconcile them even when the
+            # one-second cache is fresh: the user may be unpinning a deleted row.
+            cached = self._codex_session_list_cache
+            self._codex_session_list_cache = (
+                0.0, cached[1], cached[2] if len(cached) > 2 else (),
+            )
         return await (self._list_codex_sessions(cmd) if is_codex
                       else self._handle_list_sessions(cmd))
 

@@ -2483,6 +2483,96 @@ def recover_claude_delayed_retry_tail(
     return output
 
 
+def _recover_pending_meta_tail(
+    session_id, messages, path, chain, rows, queued, *, max_record_bytes,
+):
+    """Repair the SDK catalog selecting an old tool branch behind an isMeta leaf.
+
+    A fresh image prompt ends in an internal user row until Claude responds.
+    SDK 0.2.174 excludes that leaf instead of walking to its visible parent,
+    and can return a much older parallel tool branch as the whole conversation.
+    Only that exact, complete native ancestry may replace this projection.
+    """
+    if not chain or rows[chain[-1]][0] != "user":
+        return None
+    visible_ids = {getattr(message, "uuid", None) for message in messages}
+    try:
+        with open(path, "rb") as source:
+            tail = _indexed_transcript_row(
+                source, chain[-1], rows[chain[-1]], max_record_bytes=max_record_bytes)
+            if (not tail or tail.get("isMeta") is not True
+                    or tail.get("teamName") or tail.get("isSidechain") is True):
+                return None
+            last_human = next((uid for uid in reversed(chain) if rows[uid][6]), None)
+            if last_human is None or last_human in visible_ids:
+                return None
+            loaded = _load_compact_chain_messages(
+                session_id, path, chain, rows, queued, max_record_bytes=max_record_bytes)
+            if loaded is None:
+                return None
+            # Retain parallel tool receipts whose calls are on this ancestry.
+            # A sibling result's parent can be any split block of the same API
+            # assistant message; human/retry/sidechain siblings are never added.
+            call_groups: dict[str, set[str]] = {}
+            owners: dict[str, str] = {}
+            for message in loaded[0]:
+                if message.type != "assistant":
+                    continue
+                msg = message.message
+                mid = msg.get("id") or message.uuid
+                owners[message.uuid] = mid
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                call_groups.setdefault(mid, set()).update(
+                    block["id"] for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                    and isinstance(block.get("id"), str))
+            selected = set(chain)
+            for uid, metadata in rows.items():
+                if (uid in selected or metadata[0] != "assistant" or metadata[4] is True
+                        or metadata[5] > rows[chain[-1]][5]):
+                    continue
+                row = _indexed_transcript_row(
+                    source, uid, metadata, max_record_bytes=max_record_bytes)
+                if not row or row.get("teamName"):
+                    continue
+                msg = row.get("message") or {}
+                mid = msg.get("id")
+                content = msg.get("content")
+                if mid not in call_groups or not isinstance(content, list):
+                    continue
+                owners[uid] = mid
+                selected.add(uid)
+                call_groups[mid].update(
+                    block["id"] for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                    and isinstance(block.get("id"), str))
+            for uid, metadata in rows.items():
+                if (uid in selected or metadata[0] != "user" or metadata[4] is True
+                        or metadata[2] not in owners or metadata[6]
+                        or metadata[5] > rows[chain[-1]][5]):
+                    continue
+                row = _indexed_transcript_row(
+                    source, uid, metadata, max_record_bytes=max_record_bytes)
+                if not row or row.get("isMeta") or row.get("teamName"):
+                    continue
+                content = (row.get("message") or {}).get("content")
+                owned = call_groups.get(owners[metadata[2]], set())
+                if isinstance(content, list) and content and all(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") in owned for block in content
+                ):
+                    selected.add(uid)
+            if len(selected) == len(chain):
+                return loaded
+            ordered = sorted(selected, key=lambda uid: rows[uid][5])
+            return _load_compact_chain_messages(
+                session_id, path, ordered, rows, queued, max_record_bytes=max_record_bytes)
+    except OSError:
+        return None
+
+
 def recover_claude_native_metadata(
     session_id: str,
     messages: list,
@@ -2509,10 +2599,21 @@ def recover_claude_native_metadata(
         max_record_bytes=max_record_bytes)
     if graph is None:
         return messages
-    leaf, rows, _ = graph
+    leaf, rows, queued = graph
     chain = _ordered_graph_chain(leaf, rows)
     if chain is None:
         return messages
+    # Whole SDK catalogs may have selected an abandoned branch while a new
+    # image/meta input awaits its first assistant record. Bounded raw pages
+    # already follow the correct chain and must never expand beyond their page.
+    if include_queued_prompts:
+        recovered = _recover_pending_meta_tail(
+            session_id, messages, path, chain, rows, queued,
+            max_record_bytes=max_record_bytes)
+        if recovered is not None:
+            messages, recovered_timestamps, recovered_internal = recovered
+            timestamps.update(recovered_timestamps)
+            internal_events.update(recovered_internal)
     visible = {getattr(message, "uuid", None) for message in messages}
     by_id = {getattr(message, "uuid", None): message for message in messages}
     insertions: dict[str, list[SimpleNamespace]] = {}
