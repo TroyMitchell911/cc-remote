@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.4
+
+Restore compressed Codex sessions and agent details, stabilize history merging and scrolling, and simplify chat controls and the mobile session list. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
+
+- Preserve compressed histories, pins, native activity and subagent results without blocking the control loop.
+- Prevent history-cache lock contention and keep the reading position when a response finishes.
+- Add compact/comfortable session layouts and compact header feedback; refine mobile long-press menus.
+- Remove the steer/queue switch; desktop Tab queues the current input while a turn is running.
+
+See the bilingual [release notes](docs/releases/v5.3.4.md).
+
 ## v5.3.3
 
 Align Claude native controls, ownership and terminal activity; fix side-chat reconnects, rewind history and duplicate prompts after switching engines. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
