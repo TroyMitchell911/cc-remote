@@ -1326,7 +1326,7 @@ function HistoryConversationBrowserFixture() {
         && !mermaidHistory && !math && !streamingMath && !timeline && !deepBrowse
         && !delayedHistoryAvailability && !historicalPlan,
       pagesLoaded: 0,
-      hasNewer: deepBrowse,
+      hasNewer: deepBrowse && !params.has("exhausted-browse"),
       newerPagesLoaded: 0,
       windowEpoch: 0,
     },

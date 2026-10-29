@@ -390,7 +390,7 @@ assert.deepEqual(controller.reset({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: true, nearBottom: true });
+}), { followOutput: true, nearBottom: true, atBottom: true });
 
 // An upward wheel/touch intent pauses even while still geometrically near the
 // bottom. A layout update must not silently turn following back on.
@@ -398,12 +398,12 @@ assert.deepEqual(controller.pause({
   scrollHeight: 1_000,
   scrollTop: 350,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: false });
 assert.deepEqual(controller.observeLayout({
   scrollHeight: 1_200,
   scrollTop: 350,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: false });
+}), { followOutput: false, nearBottom: false, atBottom: false });
 
 // Scrolling close is not enough; reaching the real bottom is the deliberate
 // gesture that resumes live output following.
@@ -411,12 +411,12 @@ assert.deepEqual(controller.observeScroll({
   scrollHeight: 1_200,
   scrollTop: 580,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: false });
 assert.deepEqual(controller.observeScroll({
   scrollHeight: 1_200,
   scrollTop: 598,
   clientHeight: 600,
-}), { followOutput: true, nearBottom: true });
+}), { followOutput: true, nearBottom: true, atBottom: true });
 
 const browseController = new ScrollFollowController();
 browseController.pause({
@@ -428,7 +428,7 @@ assert.deepEqual(browseController.observeScroll({
   scrollHeight: 1_200,
   scrollTop: 600,
   clientHeight: 600,
-}, false), { followOutput: false, nearBottom: true },
+}, false), { followOutput: false, nearBottom: true, atBottom: true },
 "reaching a browse window's bottom must not silently resume live following");
 
 // Moving toward history pauses immediately even if the new position remains
@@ -437,7 +437,7 @@ assert.deepEqual(controller.observeScroll({
   scrollHeight: 1_200,
   scrollTop: 570,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: false });
 
 // Hiding an in-flow bottom control can shrink scrollHeight and make the
 // browser clamp scrollTop by the same amount. The viewport is still at the
@@ -453,12 +453,12 @@ assert.deepEqual(layoutClampController.observeScroll({
   scrollHeight: 1_040,
   scrollTop: 440,
   clientHeight: 600,
-}), { followOutput: true, nearBottom: true });
+}), { followOutput: true, nearBottom: true, atBottom: true });
 assert.deepEqual(layoutClampController.observeScroll({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: true, nearBottom: true });
+}), { followOutput: true, nearBottom: true, atBottom: true });
 
 // A process card can collapse while the user is reading history. Reaching the
 // bottom because the layout shrank is not a deliberate downward gesture, no
@@ -473,12 +473,12 @@ assert.deepEqual(shrinkLayoutFirst.observeLayout({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: true });
 assert.deepEqual(shrinkLayoutFirst.observeScroll({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: true });
 
 const shrinkScrollFirst = new ScrollFollowController();
 shrinkScrollFirst.pause({
@@ -490,12 +490,12 @@ assert.deepEqual(shrinkScrollFirst.observeScroll({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: true });
 assert.deepEqual(shrinkScrollFirst.observeLayout({
   scrollHeight: 1_000,
   scrollTop: 400,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: true });
 
 // History anchoring writes scrollTop programmatically and must preserve the
 // paused intent. A session reset intentionally restores following.
@@ -503,12 +503,12 @@ assert.deepEqual(controller.recordProgrammaticScroll({
   scrollHeight: 1_500,
   scrollTop: 870,
   clientHeight: 600,
-}), { followOutput: false, nearBottom: true });
+}), { followOutput: false, nearBottom: true, atBottom: false });
 assert.deepEqual(controller.reset({
   scrollHeight: 2_000,
   scrollTop: 1_400,
   clientHeight: 600,
-}), { followOutput: true, nearBottom: true });
+}), { followOutput: true, nearBottom: true, atBottom: true });
 
 const queuedFrames = new Map<number, () => void>();
 const cancelledFrames: number[] = [];

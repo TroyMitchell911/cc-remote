@@ -615,6 +615,43 @@ try {
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const boardUrl = "http://127.0.0.1:38127/";
+  for (const done of [false, true]) {
+    for (const punctuation of ["，", "。", "；", "）"]) {
+      const markup = renderToStaticMarkup(createElement(MessageBlock, {
+        text: `开发板地址是 **${boardUrl}**${punctuation}用浏览器打开。`, done,
+      }));
+      assert.match(markup, /<strong><a href="http:\/\/127\.0\.0\.1:38127\/"[^>]*>http:\/\/127\.0\.0\.1:38127\/<\/a><\/strong>/,
+        "a Chinese punctuation suffix cannot swallow the closing bold marker into the address");
+      assert.ok(markup.includes(`</strong>${punctuation}用浏览器打开。`));
+      assert.doesNotMatch(markup, /\*\*/);
+    }
+  }
+  const linkedInstructions = renderToStaticMarkup(createElement(MessageBlock, {
+    text: `**${boardUrl}**，用 **浏览器** 打开。\n\n备用 **https://example.test/docs/?a=1&b=2**。`,
+    done: true,
+  }));
+  assert.match(linkedInstructions, /<strong>浏览器<\/strong>/);
+  assert.match(linkedInstructions, /href="https:\/\/example\.test\/docs\/\?a=1&amp;b=2"/);
+  assert.doesNotMatch(linkedInstructions, /\*\*/);
+  const urlExamples = renderToStaticMarkup(createElement(MessageBlock, {
+    text: `\`**${boardUrl}**，示例\`\n\n\`\`\`text\n**${boardUrl}**，示例\n\`\`\`\n\n正文 **${boardUrl}**，打开。`,
+    done: true,
+  }));
+  assert.equal(urlExamples.split(`<strong><a href="${boardUrl}"`).length - 1, 1);
+  assert.equal(urlExamples.split(`**${boardUrl}**，示例`).length - 1, 2,
+    "repairing one prose link must leave inline and fenced examples literal");
+  const explicitUrl = `${boardUrl}**，资源`;
+  for (const text of [`[地址](${explicitUrl})`, `<${explicitUrl}>`]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, { text, done: true }));
+    assert.ok(markup.includes(`href="${encodeURI(explicitUrl)}"`),
+      "explicit Markdown and angle-autolink destinations are never rewritten");
+  }
+  const escapedUrl = renderToStaticMarkup(createElement(MessageBlock, {
+    text: `\\**${boardUrl}**，原文`, done: true,
+  }));
+  assert.doesNotMatch(escapedUrl, /<strong>/,
+    "escaped emphasis is not permission to reinterpret a literal URL");
   const { preloadMarkdownExtras } = await harness.ssrLoadModule(
     "/src/use-markdown-extras.ts");
   const replyAnalysis = "先核对 **职责边界**，再查看 [说明][guide]。\n\n"

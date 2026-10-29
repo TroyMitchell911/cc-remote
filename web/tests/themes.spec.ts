@@ -14,6 +14,80 @@ async function choosePalette(page: Page, name: string) {
 }
 const background = (page: Page) => page.locator(".pane").evaluate(node => getComputedStyle(node).backgroundColor);
 
+test("session layout compact hides repeated paths in every engine including single-account DSH", async ({ page }) => {
+  for (const engine of ["codex", "claude", "dsh"]) {
+    await page.goto(`/tests/theme-preview.html?engine=${engine}`);
+    // Each navigation retains this engine's own appearance settings.
+    await expect(page.locator(".sessions")).toHaveAttribute("data-layout", "compact");
+    await expect(page.locator(".scard-location, .scard-prev")).toHaveCount(0);
+    if (engine === "dsh") await expect(page.locator(".scard-profile-dot")).toHaveCount(0);
+    await openPicker(page);
+    await picker(page).getByRole("button", { name: "舒展", exact: true }).click();
+    await expect(page.locator(".scard-location")).toHaveCount(engine === "dsh" ? 5 : 3);
+    await picker(page).getByRole("button", { name: "完成", exact: true }).click();
+  }
+});
+
+test("session layout changes live and persists per engine across themes, reloads and tabs", async ({ page }) => {
+  await page.goto(url);
+  const sidebar = page.locator(".sessions");
+  const card = sidebar.locator(".scard").first();
+  await expect(sidebar).toHaveAttribute("data-layout", "compact");
+  await expect(sidebar.locator(".scard-profile-dot")).toHaveCount(5);
+  const compactHeight = await card.evaluate(node => node.getBoundingClientRect().height);
+  await page.locator(".inrow textarea").fill("保留排布切换前的草稿");
+  await openPicker(page);
+  await expect(picker(page).getByRole("button", { name: "紧凑", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await picker(page).getByRole("button", { name: "舒展", exact: true }).click();
+  await expect(sidebar).toHaveAttribute("data-layout", "comfortable");
+  await expect(sidebar.locator(".scard-profile-ribbon")).toHaveCount(5);
+  await expect(sidebar.locator(".scard-profile-dot")).toHaveCount(0);
+  await expect(sidebar.locator(".scard-location")).toHaveCount(3);
+  expect(await card.evaluate(node => node.getBoundingClientRect().height)).toBeGreaterThan(compactHeight);
+  await expect(sidebar.locator('[aria-current="true"] .scard-title')).toHaveText("cc-remote");
+  await expect(sidebar.locator(".pill.idle")).toHaveCount(0);
+  await expect(page.locator(".inrow textarea")).toHaveValue("保留排布切换前的草稿");
+  await picker(page).getByRole("button", { name: "深色", exact: true }).click();
+  await picker(page).getByRole("button", { name: "恢复默认", exact: true }).click();
+  await expect(sidebar).toHaveAttribute("data-layout", "comfortable");
+  await page.reload();
+  await expect(sidebar).toHaveAttribute("data-layout", "comfortable");
+  await page.getByRole("button", { name: "切换新会话引擎" }).click();
+  await page.getByRole("menuitemradio", { name: "Claude" }).click();
+  await expect(sidebar).toHaveAttribute("data-layout", "compact");
+  await page.getByRole("button", { name: "切换新会话引擎" }).click();
+  await page.getByRole("menuitemradio", { name: "Codex" }).click();
+  await expect(sidebar).toHaveAttribute("data-layout", "comfortable");
+  const other = await page.context().newPage();
+  await other.goto(url);
+  await openPicker(other);
+  await other.getByRole("button", { name: "紧凑", exact: true }).click();
+  await expect(sidebar).toHaveAttribute("data-layout", "compact");
+  await expect(sidebar.locator(".scard-location")).toHaveCount(0);
+  await other.close();
+});
+
+test("session layout picker fits narrow screens and keeps both choices reachable", async ({ page }, info) => {
+  await page.goto(url);
+  for (const width of [320, 390, 1440]) {
+    await page.setViewportSize({ width, height: width < 980 ? 740 : 1080 });
+    await openPicker(page);
+    for (const label of ["舒展", "紧凑"]) {
+      const option = picker(page).getByRole("button", { name: label, exact: true });
+      await option.click();
+      await expect(option).toHaveAttribute("aria-pressed", "true");
+      const geometry = await picker(page).evaluate(node => ({
+        fits: node.getBoundingClientRect().left >= 0 && node.getBoundingClientRect().right <= innerWidth,
+        overflow: node.scrollWidth > node.clientWidth,
+        clippedOptions: [...node.querySelectorAll(".appearance-layout-option")].some(option => option.scrollWidth > option.clientWidth),
+      }));
+      expect(geometry).toEqual({ fits: true, overflow: false, clippedOptions: false });
+    }
+    await picker(page).screenshot({ path: info.outputPath(`session-layout-${width}.png`), animations: "disabled" });
+    await picker(page).getByRole("button", { name: "完成", exact: true }).click();
+  }
+});
+
 test("preset content keeps emphasis, highlighted code and links distinct in both engines", async ({ page }, info) => {
   test.setTimeout(120_000);
   await page.route("**/api/link-preview**", route => route.fulfill({ status: 404, body: "{}" }));
@@ -369,6 +443,10 @@ test("appearance font menu supports keyboard selection, dismissal and themed sam
   await font.click();
   await page.keyboard.press("Tab");
   await expect(menu).toHaveCount(0);
+  await expect(picker(page).getByRole("button", { name: "舒展", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(picker(page).getByRole("button", { name: "紧凑", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
   await expect(picker(page).getByRole("button", { name: "恢复默认", exact: true })).toBeFocused();
   await font.click();
   await picker(page).locator(".theme-picker-intro").click();

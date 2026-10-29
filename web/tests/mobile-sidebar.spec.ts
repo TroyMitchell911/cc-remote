@@ -784,6 +784,118 @@ test("mobile sidebar menu and exposed chat strip work, while drag does not selec
   await expect(page.locator(".shell")).toHaveAttribute("data-selected", "sidebar-1");
 });
 
+test("mobile sidebar long press enlarges the card and keeps the menu still during streaming", async ({ page }) => {
+  for (const layout of ["compact", "comfortable"]) {
+    await page.goto(`/tests/history-browser.html?mobile-sidebar=1&layout=${layout}`);
+    await page.getByTestId("sidebar-toggle").click();
+    await settled(page, true);
+    await page.mouse.move(380, 800);
+    const visibleActions = () => page.locator(".scard-actions").evaluateAll(nodes => nodes.filter(node =>
+      getComputedStyle(node).opacity === "1" && getComputedStyle(node).pointerEvents !== "none").length);
+    await expect.poll(visibleActions).toBe(1);
+    const card = page.locator(".scard").nth(1);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect.poll(() => card.evaluate(node => getComputedStyle(node).transform)).toBe("none");
+      // Sample the entire opening, including the first cold open. A cached
+      // screenshot misses delayed chunk loading and intermediate anchor jumps.
+      const samples = await card.evaluate(async node => {
+        const before = node.getBoundingClientRect();
+        const event = new Event("touchstart", { bubbles: true });
+        Object.defineProperty(event, "touches", { value: [{ clientX: before.x + 12, clientY: before.y + 12 }] });
+        const start = performance.now();
+        let liftFrame = -1, menuFrame = -1, frame = 0;
+        const positions: { left: number; top: number; width: number; height: number }[] = [];
+        const cardWidths: number[] = [];
+        const nextTop = node.nextElementSibling!.getBoundingClientRect().top;
+        node.dispatchEvent(event);
+        while (performance.now() - start < 1000) {
+          await new Promise(requestAnimationFrame);
+          window.dispatchEvent(new Event("sidebar-fixture-stream"));
+          if (node.classList.contains("lifting") && liftFrame < 0) liftFrame = frame;
+          cardWidths.push(node.getBoundingClientRect().width);
+          const menu = document.querySelector<HTMLElement>(".card-menu");
+          if (menu && getComputedStyle(menu).visibility === "visible") {
+            if (menuFrame < 0) menuFrame = frame;
+            const box = menu.getBoundingClientRect();
+            positions.push({ left: box.left, top: box.top, width: box.width, height: box.height });
+          }
+          frame++;
+        }
+        return { liftFrame, menuFrame, positions, cardWidths, originalWidth: before.width,
+          finalWidth: node.getBoundingClientRect().width,
+          nextShift: node.nextElementSibling!.getBoundingClientRect().top - nextTop };
+      });
+      expect(samples.liftFrame).toBeGreaterThanOrEqual(0);
+      expect(samples.menuFrame).toBe(samples.liftFrame);
+      expect(samples.positions.length).toBeGreaterThan(5);
+      for (const key of ["left", "top", "width", "height"] as const) {
+        const values = samples.positions.map(position => position[key]);
+        expect(Math.max(...values) - Math.min(...values)).toBeLessThan(.5);
+      }
+      expect(samples.finalWidth / samples.originalWidth).toBeCloseTo(1.08, 2);
+      expect(samples.cardWidths.some(width => width > samples.originalWidth + .5
+        && width < samples.finalWidth - .5)).toBe(true);
+      expect(Math.abs(samples.nextShift)).toBeLessThan(.5);
+      await card.dispatchEvent("touchend");
+      await card.dispatchEvent("click", { bubbles: true, cancelable: true, detail: 1 });
+      await expect(page.locator(".card-menu")).toBeVisible();
+      await expect(page.locator(".shell")).toHaveAttribute("data-selected", "sidebar-0");
+      await page.locator(".search").click();
+      await expect(page.locator(".card-menu")).toHaveCount(0);
+      await expect(card).not.toHaveClass(/lifting/);
+    }
+    await page.locator(".scard.active").getByRole("button", { name: "更多操作" }).click();
+    await expect(page.locator(".card-menu")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await page.locator(".search input").focus();
+    await expect.poll(visibleActions).toBe(1);
+  }
+});
+
+for (const layout of ["compact", "comfortable"]) {
+  test(`mobile sidebar ${layout} outside tap dismisses only the session menu`, async ({ page }) => {
+    await page.goto(`/tests/history-browser.html?mobile-sidebar=1&layout=${layout}`);
+    await page.getByTestId("sidebar-toggle").click();
+    await settled(page, true);
+    for (const entry of ["long-press", "dots"]) {
+      for (const outside of ["chat", "brand", "other-card", "footer"]) {
+        const card = page.locator(".scard.active");
+        if (entry === "long-press") {
+          await touch(page, "touchstart", 160, 250, 1000, ".scard.active");
+          await expect(card).toHaveClass(/lifting/);
+          await touch(page, "touchend", 160, 250, 1600, ".scard.active");
+          await card.dispatchEvent("click", { bubbles: true, cancelable: true, detail: 1 });
+        } else {
+          const button = (await card.getByRole("button", { name: "更多操作" }).boundingBox())!;
+          await page.mouse.click(button.x + button.width / 2, button.y + button.height / 2);
+        }
+        const menu = page.locator(".card-menu");
+        await expect(menu).toBeVisible();
+        // Menu actions remain usable and must not be swallowed by outside dismissal.
+        await menu.getByRole("button", { name: /复制 session ID|已复制/ }).click();
+        await expect(menu.getByRole("button", { name: "已复制", exact: true })).toBeVisible();
+        const target = outside === "chat" ? page.locator(".scrim-side")
+          : outside === "brand" ? page.locator(".brand")
+          : outside === "footer" ? page.locator(".newbtn") : page.locator(".scard").nth(2);
+        // The long-press veil may cover a card; hit-test the real coordinates.
+        const box = (await target.boundingBox())!;
+        const x = outside === "chat" ? 375 : box.x + box.width / 2;
+        await page.mouse.click(x, outside === "chat" ? 400 : box.y + box.height / 2);
+        await expect(menu).toHaveCount(0);
+        await expect(page.locator(".scard.lifting")).toHaveCount(0);
+        await settled(page, true);
+        await expect(page.locator(".shell")).toHaveAttribute("data-selected", "sidebar-0");
+        if (outside === "chat") {
+          await page.mouse.click(375, 400);
+          await settled(page, false);
+          await page.getByTestId("sidebar-toggle").click();
+          await settled(page, true);
+        }
+      }
+    }
+  });
+}
+
 test("mobile sidebar canceled touches and native scrolling cannot leave a pending long press", async ({ page }) => {
   await page.getByTestId("sidebar-toggle").click();
   await settled(page, true);

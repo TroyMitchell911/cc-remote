@@ -1366,7 +1366,7 @@ assert.match(historyAppSource,
   /historyViewRevision=\{historyView\.viewRevision\}/,
   "an atomic recovery replacement must retain the prior virtual-scroll scope");
 assert.match(historyAppSource,
-  /replaying=\{rt\.replaying \|\| historyView\.recovering\}/,
+  /phase=\{headerConnectionPhase\(state\.connState, state\.wrapperOnline,\s*rt\.replaying \|\| historyView\.recovering/,
   "the retained projection must remain visibly marked as synchronizing");
 assert.match(historyAppSource,
   /onEdit=\{historyView\.recovering\s*\? undefined/,
@@ -1571,23 +1571,6 @@ assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
 assert.doesNotMatch(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*\bwidth/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
-assert.doesNotMatch(layoutCss, /\.scard\.has-profile-ribbon\s*\{[^}]*padding-top/,
-  "profile stamps must not add a second row to every session card");
-assert.doesNotMatch(layoutCss,
-  /\.scard\.has-profile-ribbon \.scard-top\s*\{[^}]*padding-left/s,
-  "profile keycaps must not push session titles into a second column");
-assert.match(layoutCss,
-  /\.scard\.has-profile-ribbon\s*\{[^}]*border-color\s*:\s*color-mix\([^}]*background\s*:\s*color-mix\(/s,
-  "every profile keycap needs a quiet card edge to hang from");
-assert.match(layoutCss,
-  /:root\[data-engine="codex"\]\[data-theme="dark"\] \.scard\.has-profile-ribbon\s*\{[^}]*background\s*:\s*color-mix\([^}]*border-color\s*:\s*var\(--border-strong\)/s,
-  "dark profile cards need an opaque edge that survives the dark sidebar");
-assert.match(layoutCss,
-  /\.scard-profile-ribbon\s*\{[^}]*top\s*:\s*-6px[^}]*height\s*:\s*16px[^}]*max-width\s*:\s*64px[^}]*font-family\s*:\s*var\(--mono\)[^}]*font-size\s*:\s*8\.5px/s,
-  "profile keycaps must hang compactly from the card edge");
-assert.match(layoutCss,
-    /\.work-profile-owner\s*\{[^}]*max-width\s*:\s*72px[^}]*height\s*:\s*19px[^}]*font\s*:\s*var\(--font-weight-650\) 9px\/1 var\(--mono\)/s,
-  "a multi-account Work owner stays compact in the shared header");
 assert.match(layoutCss,
   /@media \(max-width:980px\)\{\s*\.artifact-panel\{[^}]*top:calc\(var\(--app-offset-top,0px\) \+ 10px\)[^}]*bottom:auto[^}]*height:calc\(var\(--app-height,100dvh\) - 20px\)[^}]*max-height:none/s,
   "mobile artifact previews must fill the visual viewport instead of shrink-wrapping iframe or Markdown content");
@@ -11030,9 +11013,9 @@ try {
     },
   ));
   assert.match(profileSidebarMarkup,
-    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+    /class="scard-profile-dot tone-0"[^>]*aria-label="Codex 账号：default · Main"/);
   assert.match(profileSidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+    /class="scard-profile-dot tone-1"[^>]*aria-label="Codex 账号：nyx · Stack"/);
   assert.match(profileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const workProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11060,9 +11043,9 @@ try {
   ));
   assert.match(workProfileSidebarMarkup, /aria-label="筛选 Codex 账号"/);
   assert.match(workProfileSidebarMarkup,
-    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+    /class="scard-profile-dot tone-0"[^>]*aria-label="Codex 账号：default · Main"/);
   assert.match(workProfileSidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+    /class="scard-profile-dot tone-1"[^>]*aria-label="Codex 账号：nyx · Stack"/);
   assert.match(workProfileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const singleProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11076,7 +11059,7 @@ try {
       }],
     },
   ));
-  assert.doesNotMatch(singleProfileSidebarMarkup, /profile-ribbon|profile-filter/,
+  assert.doesNotMatch(singleProfileSidebarMarkup, /scard-profile-dot|profile-filter/,
     "single-account sidebar output remains free of profile-only DOM");
   const singleProfileWorkSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11094,7 +11077,7 @@ try {
   ));
   assert.doesNotMatch(
     singleProfileWorkSidebarMarkup,
-    /profile-ribbon|profile-filter/,
+    /scard-profile-dot|profile-filter/,
     "single-account Work keeps its historical sidebar DOM",
   );
   const btwDraftStore = new ComposerDraftStore();
@@ -18442,12 +18425,6 @@ assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 assert.match(appSource,
   /focusedSession\?\.native_session_id[\s\S]{0,180}nativeProfileSessionId\(rt\.ccSessionId\)/,
   "the Work header must not expose a profile-namespaced routing id");
-assert.match(appSource,
-  /<span className=\{`work-profile-owner tone-\$\{focusedWorkProfile\.tone\}`\}/,
-  "multi-account Work must expose its immutable owner in the header");
-assert.doesNotMatch(appSource,
-  /<button className=\{`work-profile-owner/,
-  "an existing Work owner is informational and must not become switchable");
 assert.match(appSource,
   /workDashboardMachineId === machineId[\s\S]{0,180}workDashboards\[engine\]/,
   "Work dashboard data must not cross a device boundary");

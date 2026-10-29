@@ -54,6 +54,8 @@ const BackgroundTaskControl = lazy(() => import("./components/BackgroundTaskCont
 import type { QueuedQueryEditor } from "./components/QueuedQueryDialog";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
+import { HeaderFeedback } from "./components/HeaderFeedback";
+import { headerBannerKind, headerConnectionPhase, isHeaderNotice } from "./header-feedback";
 import { presentCommandProblem } from "./problem-presentation";
 const LoginForm = lazy(() => import("./components/LoginForm").then(m => ({ default: m.LoginForm })));
 import {
@@ -73,9 +75,7 @@ import { deviceVersionNotice } from "./device-version";
 import { EngineSelector } from "./components/EngineSelector";
 import {
   claudeProfileIdForSession,
-  claudeProfilePresentation,
   codexProfileIdForSession,
-  codexProfilePresentation,
 } from "./codex-profile-presentation";
 import type { GoalApi } from "./goal-api";
 import { parseGoalCommand } from "./goal-command";
@@ -1216,20 +1216,6 @@ export default function App() {
     : null;
   const focusedAccountProfileId = focusedEngine === "codex"
     ? focusedCodexProfileId : focusedClaudeProfileId;
-  const focusedWorkProfile = space === "work" && !state.newChat
-    && focusedAccountProfileId
-    ? (focusedEngine === "codex"
-      ? codexProfilePresentation(
-        state.codexProfiles,
-        state.defaultCodexProfileId,
-        focusedAccountProfileId,
-      )
-      : claudeProfilePresentation(
-        state.claudeProfiles,
-        state.defaultClaudeProfileId,
-        focusedAccountProfileId,
-      ))
-    : null;
   const focusedNativeSessionId = focusedSession?.native_session_id
     ?? (rt.ccSessionId
       ? nativeProfileSessionId(rt.ccSessionId)
@@ -5938,6 +5924,7 @@ export default function App() {
     <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !panelExpanded && !(visibleRightPanel === "btw" && btwExpanded) ? "panel-open" : ""}>
       <SidebarState controller={sidebar}>{sidebarOpen => <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
+        sessionLayout={appearance.sessionLayout}
         onOpenChange={setSidebarOpen}
         engine={engine}
         space={space}
@@ -6066,17 +6053,18 @@ export default function App() {
                 title={focusedDshPresetName} aria-label={`当前会话模式：${focusedDshPresetName}`}>
                 {focusedDshPresetName}
               </span>}
-              {focusedWorkProfile && (
-                <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
-                  title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
-                  aria-label={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}>
-                  <i className="profile-tone" />
-                  {focusedWorkProfile.name}
-                </span>
-              )}
             </div>
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
           </div>
+          <HeaderFeedback deviceScope={machineId} sessionScope={`${activeScopeKey}:${focusedSid ?? "new"}`}
+            phase={headerConnectionPhase(state.connState, state.wrapperOnline,
+              rt.replaying || historyView.recovering, state.banner, state.wrapperConnection)}
+            banner={state.banner} bannerRevision={state.bannerRevision}
+            notices={rt.notices.filter(isHeaderNotice)}
+            onDismissBanner={(banner, revision) => dispatch({ type: "dismiss_banner", banner, revision })}
+            onDismissNotice={(noticeId) => {
+              if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
+            }} />
           <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
             <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat
@@ -6120,15 +6108,15 @@ export default function App() {
           <span className="notice-icon" aria-hidden="true"><Icon name="info" size={16} /></span>
           <span className="notice-copy">{versionNotice}</span>
         </div>}
-        <ReconnectBanner banner={state.banner}
-          replaying={rt.replaying || historyView.recovering}
+        <ReconnectBanner banner={headerBannerKind(state.banner) ? undefined : state.banner}
+          replaying={false}
           truncated={rt.truncated}
           busy={state.connState !== "connected" || !state.wrapperOnline
             || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
         {focusedEngine === "dsh" && <Suspense fallback={null}><DshConnectionNotice
           key={`${activeScopeKey}:${focusedSid}`} error={dshConnectionError} /></Suspense>}
-        <NoticeStack notices={rt.notices}
+        <NoticeStack notices={rt.notices.filter(notice => !isHeaderNotice(notice))}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
           }} />

@@ -84,6 +84,7 @@ export function ThemePreview() {
     codex_profile_id: index === 1 ? "nyx" : "default", claude_profile_id: index === 1 ? "nyx" : "default" })) as SessionInfo[];
   return <div className={`shell${sidebarOpen ? " sidebar-open" : ""}`}>
     <SessionsSidebar open={sidebarOpen} engine={engine} space={space} profileScopeKey={`preview:${engine}`}
+      sessionLayout={appearance.sessionLayout}
       machineId="theme-preview" codexProfiles={profiles} claudeProfiles={profiles}
       defaultCodexProfileId="default" defaultClaudeProfileId="default"
       sessions={sessions} activeSessionId={active} onSpaceChange={setSpace} onSelect={setActive}

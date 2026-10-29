@@ -7,6 +7,7 @@ export interface ScrollMetrics {
 export interface ScrollFollowSnapshot {
   followOutput: boolean;
   nearBottom: boolean;
+  atBottom: boolean;
 }
 
 export interface BottomMeasurement {
@@ -273,6 +274,7 @@ export class ScrollFollowController {
   private current: ScrollFollowSnapshot = {
     followOutput: true,
     nearBottom: true,
+    atBottom: true,
   };
 
   private lastScrollTop = 0;
@@ -287,27 +289,30 @@ export class ScrollFollowController {
 
   reset(metrics: ScrollMetrics): ScrollFollowSnapshot {
     this.lastScrollTop = metrics.scrollTop;
+    const { nearBottom, atBottom } = measureBottom(metrics);
     this.current = {
       followOutput: true,
-      nearBottom: measureBottom(metrics).nearBottom,
+      nearBottom, atBottom,
     };
     return this.snapshot();
   }
 
   pause(metrics: ScrollMetrics): ScrollFollowSnapshot {
     this.lastScrollTop = metrics.scrollTop;
+    const { nearBottom, atBottom } = measureBottom(metrics);
     this.current = {
       followOutput: false,
-      nearBottom: measureBottom(metrics).nearBottom,
+      nearBottom, atBottom,
     };
     return this.snapshot();
   }
 
   resume(metrics: ScrollMetrics): ScrollFollowSnapshot {
     this.lastScrollTop = metrics.scrollTop;
+    const { nearBottom, atBottom } = measureBottom(metrics);
     this.current = {
       followOutput: true,
-      nearBottom: measureBottom(metrics).nearBottom,
+      nearBottom, atBottom,
     };
     return this.snapshot();
   }
@@ -315,18 +320,20 @@ export class ScrollFollowController {
   /** Record a DOM scrollTop write without treating its later scroll event as intent. */
   recordProgrammaticScroll(metrics: ScrollMetrics): ScrollFollowSnapshot {
     this.lastScrollTop = metrics.scrollTop;
+    const { nearBottom, atBottom } = measureBottom(metrics);
     this.current = {
       ...this.current,
-      nearBottom: measureBottom(metrics).nearBottom,
+      nearBottom, atBottom,
     };
     return this.snapshot();
   }
 
   /** Content resized. Update geometry, but never infer user intent from layout. */
   observeLayout(metrics: ScrollMetrics): ScrollFollowSnapshot {
+    const { nearBottom, atBottom } = measureBottom(metrics);
     this.current = {
       ...this.current,
-      nearBottom: measureBottom(metrics).nearBottom,
+      nearBottom, atBottom,
     };
     return this.snapshot();
   }
@@ -353,7 +360,9 @@ export class ScrollFollowController {
     }
 
     this.lastScrollTop = metrics.scrollTop;
-    this.current = { followOutput, nearBottom: measurement.nearBottom };
+    this.current = {
+      followOutput, nearBottom: measurement.nearBottom, atBottom: measurement.atBottom,
+    };
     return this.snapshot();
   }
 }

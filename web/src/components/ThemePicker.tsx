@@ -7,6 +7,7 @@ import { CenteredSheet } from "./CenteredSheet";
 import { AppearanceColor } from "./AppearanceColor";
 import { AppearanceFont } from "./AppearanceFont";
 import { AppearancePalette } from "./AppearancePalette";
+import { AppearanceSessionLayout } from "./AppearanceSessionLayout";
 import "./ThemePicker.css";
 
 export default function ThemePicker({ engine, appearance, onClose, returnFocusRef }: {
@@ -15,12 +16,12 @@ export default function ThemePicker({ engine, appearance, onClose, returnFocusRe
   onClose: () => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
-  const { choice, mode, look, colors, selectTheme, updateLook, replaceLook } = appearance;
+  const { choice, mode, look, colors, sessionLayout, selectTheme, updateLook, replaceLook, selectSessionLayout } = appearance;
   const custom = isCustomPalette(engine, mode, look);
   const baseColors = appearanceColors(engine, mode, { preset: look.preset });
   const lowContrast = colorContrast(colors.background, colors.foreground) < 4.5;
   const modeLabel = mode === "light" ? "浅色" : "深色";
-  return <CenteredSheet open label="外观" onClose={onClose} maxWidth={engine === "dsh" ? 520 : 620} maxHeight={740} minimumHeight={engine === "dsh" ? 700 : 600}
+  return <CenteredSheet open label="外观" onClose={onClose} maxWidth={engine === "dsh" ? 520 : 620} maxHeight={940} minimumHeight={engine === "dsh" ? 700 : 600}
     className={`theme-picker${engine === "dsh" ? " theme-picker-dsh" : ""}`} returnFocusRef={returnFocusRef}>
     <div className="theme-picker-intro">
       <span><EngineIcon engine={engine} size={17} />{({ claude: "Claude", codex: "Codex", dsh: "DSH" })[engine]}</span>
@@ -55,6 +56,7 @@ export default function ThemePicker({ engine, appearance, onClose, returnFocusRe
       </div>
       <p className="appearance-help">{custom ? "手动调色后，自动标记为自定义。" : "点击色块选色，也可输入 HEX 色值。调整即时预览。"}</p>
       {lowContrast && <p className="appearance-contrast" role="status">文字与背景较接近，建议拉开明暗差距，便于阅读。</p>}
+      <AppearanceSessionLayout value={sessionLayout} onChange={selectSessionLayout} />
     </div>
     <footer className="theme-picker-footer">
       <button type="button" className="appearance-reset" onClick={() => replaceLook({})}

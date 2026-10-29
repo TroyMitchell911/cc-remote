@@ -263,7 +263,7 @@ test(`DSH sidebar uses session cards and directory subtitles (${theme})`, async 
   const cards = page.locator(".sessions .scard");
   await expect(cards).toHaveCount(2);
   await expect(cards.locator(".scard-location")).toHaveText(["dsh-test", "dsh-test"]);
-  await expect(cards.locator(".scard-profile-ribbon")).toHaveCount(0);
+  await expect(cards.locator(".scard-profile-dot")).toHaveCount(0);
   const sizes = await cards.evaluateAll(nodes => nodes.map(node => {
     const style = getComputedStyle(node);
     return { height: node.getBoundingClientRect().height, border: style.borderTopColor,

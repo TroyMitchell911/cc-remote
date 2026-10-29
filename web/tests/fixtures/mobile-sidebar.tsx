@@ -18,6 +18,7 @@ const stress = new URLSearchParams(location.search).has("sidebar-load");
 const delayedCommit = new URLSearchParams(location.search).has("sidebar-delayed-commit");
 const showCode = new URLSearchParams(location.search).has("sidebar-code");
 const showOverlays = new URLSearchParams(location.search).has("sidebar-overlays");
+const sessionLayout = new URLSearchParams(location.search).get("layout") === "comfortable" ? "comfortable" : "compact";
 const markdown = Array.from({ length: 12 }, (_, index) =>
   `### 检查项 ${index + 1}\n\n正文 **强调** 和 [链接](https://example.com) 保持正常。\n\n`
   + "| 模块 | 状态 |\n| --- | --- |\n| `wrapper` | 正常 |\n| `relay` | 正常 |\n\n"
@@ -80,6 +81,7 @@ function SidebarScene() {
   return <SidebarShell controller={sidebar} className={revision % 2 ? "fixture-streaming" : ""}
     data-revision={revision} data-selected={selected}>
     <SidebarState controller={sidebar}>{open => <SessionsSidebar open={open} onOpenChange={changeOpen} onClose={() => setOpen(false)}
+      sessionLayout={sessionLayout}
       engine="codex" space="code" profileScopeKey="sidebar-fixture" sessions={sessions}
       activeSessionId={selected} onSelect={id => { setSelected(id); setOpen(false); }}
       onNew={noop} onNewInDir={noop} onSpaceChange={noop} onRename={noop} onArchive={noop}
