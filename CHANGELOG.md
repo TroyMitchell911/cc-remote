@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.5
+
+Enable pinch zoom in centered and docked image file previews on trackpads and touchscreens. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
+
+- Pan enlarged images and keep zoom when switching between centered and docked views.
+- Avoid applying overlapping Safari gesture events twice; reset the view when opening another image.
+
+See the bilingual [release notes](docs/releases/v5.3.5.md).
+
 ## v5.3.4
 
 Restore compressed Codex sessions and agent details, stabilize history merging and scrolling, and simplify chat controls and the mobile session list. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
