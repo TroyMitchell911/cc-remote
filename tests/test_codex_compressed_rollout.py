@@ -14,14 +14,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cc_remote.protocol import History
+from cc_remote.protocol import History, SessionActivity
 from cc_remote.wrapper import codex_sessions, rollout_io
 from cc_remote.wrapper.codex_stream import codex_translate_history, codex_history_window_info
+from cc_remote.wrapper.codex_external import HolderScan
 from cc_remote.wrapper.history_store import HistorySourceFingerprint, history_source_extends
 from cc_remote.wrapper.machine import WrapperMachine
 from tests.test_codex_detail_pages import _long_rollout
 from tests.test_codex_sidebar_missing import _catalog, _row
-from tests.test_codex_profiles import _machine
+from tests.test_codex_profiles import _context, _machine
+from tests.test_codex_external import _event
+from tests.test_codex_shared_machine import _SharedSdk
 
 
 @pytest.fixture(autouse=True)
@@ -246,6 +249,171 @@ async def test_cold_history_and_resume_follow_native_source_without_background_d
     await machine._poll_codex_watch(sid, watch, set(), time.time())
     assert watch["path"] == str(path)
     assert watch["file_id"] == (path.stat().st_dev, path.stat().st_ino)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["decompress", "rotate", "truncate"])
+@pytest.mark.parametrize("partial_terminal", [False, True])
+async def test_native_resume_reseeds_private_app_activity(
+    tmp_path, monkeypatch, transition, partial_terminal,
+):
+    from cc_remote.wrapper.process_scan import ProcessIdentity
+
+    machine, transport = _machine(tmp_path)
+    path, packed = _rollout(tmp_path / "primary", "thread")
+    original = rollout_io.zstd.decompress(packed.read_bytes())
+    if transition != "decompress":
+        path.write_bytes(original + b" " * 4096 + b"\n")
+    _catalog(tmp_path / "primary", [("thread", str(path))])
+    sid = "primary@thread"
+    ctx = _context(sid, "thread", "primary")
+    ctx.sdk = _SharedSdk()
+    machine.sessions[sid] = ctx
+    monkeypatch.setattr(machine, "_push_mirrored_history", AsyncMock())
+    await machine._watch_session(sid)
+    watch = machine._watch[sid]
+
+    # Native App restores JSONL and starts work before the next watch poll.
+    terminal = _event("task_complete", "app-turn")
+    prefix = terminal[:len(terminal) // 2] if partial_terminal else b""
+    restored = original + _event("task_started", "app-turn") + prefix
+    if transition == "rotate":
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(restored)
+        replacement.replace(path)
+    else:
+        path.write_bytes(restored)
+    private = ProcessIdentity(109, 1009)
+    await machine._poll_codex_watch(
+        sid, watch, set(), 1000.0, writers={private}, private_holders={private})
+
+    assert watch["path"] == str(path)
+    assert watch["active_external_turns"] == {"app-turn": 1000.0}
+    assert watch["desktop_active"] is True
+    assert watch["external"] is True
+    assert watch["partial"] == prefix
+    assert ctx.control_mode == "desktop" and ctx.write_state == "read_only"
+    assert any(isinstance(event, SessionActivity) and event.state == "running"
+               for event in transport.sent)
+
+    # A confirmed App turn survives a later scan between its short-lived opens.
+    holders, writers, private_holders = machine._codex_holder_sets(
+        watch, HolderScan({sid: set()}, True), sid)
+    await machine._poll_codex_watch(
+        sid, watch, holders, 1000.5, writers=writers, private_holders=private_holders)
+    assert watch["external"] is True
+
+    with path.open("ab") as stream:
+        stream.write(terminal[len(prefix):])
+    await machine._poll_codex_watch(
+        sid, watch, set(), 1001.0, writers={private}, private_holders={private})
+    assert watch["active_external_turns"] == {}
+    assert watch["external"] is False and ctx.write_state == "writable"
+    assert any(isinstance(event, SessionActivity) and event.state == "idle"
+               for event in transport.sent)
+    await asyncio.gather(*machine._codex_terminal_persist_tasks)
+
+
+@pytest.mark.asyncio
+async def test_restored_orphan_requires_new_source_owner_confirmation(tmp_path, monkeypatch):
+    machine, transport = _machine(tmp_path)
+    path, packed = _rollout(tmp_path / "primary", "thread")
+    original = rollout_io.zstd.decompress(packed.read_bytes())
+    _catalog(tmp_path / "primary", [("thread", str(path))])
+    sid = "primary@thread"
+    monkeypatch.setattr(machine, "_push_mirrored_history", AsyncMock())
+    await machine._watch_session(sid)
+    watch = machine._watch[sid]
+    path.write_bytes(original + _event("task_started", "orphan"))
+    await machine._poll_codex_watch(sid, watch, set(), 1000.0)
+    assert watch["seeded_external_turns"] == {"orphan"}
+    holders, writers, private = machine._codex_holder_sets(
+        watch, HolderScan({sid: set()}, True), sid)
+    await machine._poll_codex_watch(
+        sid, watch, holders, 1001.0, writers=writers, private_holders=private)
+    assert watch["active_external_turns"] == {}
+    assert watch["external"] is False
+    assert [event.state for event in transport.sent if isinstance(event, SessionActivity)] == [
+        "running", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", [
+    "remote_owned", "remote_pending", "shared_cli", "completed", "interrupted",
+])
+async def test_restored_lifecycle_keeps_turn_attribution(tmp_path, monkeypatch, state):
+    from cc_remote.wrapper.process_scan import ProcessIdentity
+
+    machine, _transport = _machine(tmp_path)
+    path, packed = _rollout(tmp_path / "primary", "thread")
+    original = rollout_io.zstd.decompress(packed.read_bytes())
+    _catalog(tmp_path / "primary", [("thread", str(path))])
+    sid = "primary@thread"
+    ctx = _context(sid, "thread", "primary")
+    ctx.sdk = _SharedSdk()
+    machine.sessions[sid] = ctx
+    monkeypatch.setattr(machine, "_push_mirrored_history", AsyncMock())
+    await machine._watch_session(sid)
+    watch = machine._watch[sid]
+    if state == "remote_owned":
+        ctx.sdk.remember_owned_turn_id("new-turn")
+    elif state == "remote_pending":
+        ctx.sdk.turn_start_pending = True
+        ctx.sdk.turn_active = True
+    terminal = {
+        "completed": _event("task_complete", "new-turn"),
+        "interrupted": _event("turn_aborted", "new-turn"),
+    }.get(state, b"")
+    # The last lifecycle wins; an earlier crashed start must not be resurrected.
+    path.write_bytes(original + _event("task_started", "old-orphan")
+                     + _event("task_started", "new-turn") + terminal)
+    holder = ProcessIdentity(109, 1009)
+    interactive = {holder} if state == "shared_cli" else set()
+    private = set() if state in {"shared_cli", "remote_pending"} else {holder}
+    await machine._poll_codex_watch(
+        sid, watch, interactive, 1000.0,
+        writers=interactive | private, private_holders=private)
+    assert watch["external"] is False and watch["desktop_active"] is False
+    assert ctx.write_state == "writable"
+    assert set(watch["active_external_turns"]) == (
+        {"new-turn"} if state == "shared_cli" else set())
+    if state == "remote_pending":
+        assert set(watch["pending_wrapper_turns"]) == {"new-turn"}
+        ctx.sdk.remember_owned_turn_id("new-turn")
+        ctx.sdk.turn_start_pending = False
+        await machine._poll_codex_watch(sid, watch, set(), 1001.0)
+        assert watch["pending_wrapper_turns"] == {}
+        assert watch["external"] is False
+    elif terminal:
+        if state == "interrupted":
+            assert set(watch["terminal_candidates"]) == {"new-turn"}
+            await machine._poll_codex_watch(
+                sid, watch, set(), 1001.0 + machine.CODEX_TERMINAL_CANDIDATE_GRACE,
+                writers=private, private_holders=private)
+        fences = machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid))
+        assert [(f.turn_id, f.status) for f in fences] == [("new-turn", state)]
+    await asyncio.gather(*machine._codex_terminal_persist_tasks)
+
+
+def test_watch_tail_does_not_consume_past_its_snapshot_size(tmp_path, monkeypatch):
+    from cc_remote.wrapper import machine as machine_module
+
+    path = tmp_path / "rollout.jsonl"
+    start = _event("task_started", "turn")
+    path.write_bytes(start)
+    fstat = machine_module.rollout_fstat
+
+    def append_after_stat(stream):
+        st = fstat(stream)
+        with path.open("ab") as writer:
+            writer.write(_event("task_complete", "turn"))
+        return st
+
+    monkeypatch.setattr(machine_module, "rollout_fstat", append_after_stat)
+    st, (active, partial, _marker, terminal) = WrapperMachine._read_codex_watch_snapshot(str(path))
+    assert st.st_size == len(start)
+    assert active == {"turn"} and partial == b"" and terminal is None
 
 
 @pytest.mark.asyncio

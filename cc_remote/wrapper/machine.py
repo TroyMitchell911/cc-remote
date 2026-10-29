@@ -413,7 +413,7 @@ from cc_remote.wrapper.claude_external import (
 )
 from cc_remote.wrapper.codex_external import (
     codex_active_goal_turn,
-    CodexTuiLogTracker, HolderScan, RolloutTerminalMarker,
+    CodexTuiLogTracker, HolderScan, RolloutTerminalMarker, TurnMarkers,
     codex_app_server_client_socket,
     parse_turn_markers,
     writable_rollout_holders,
@@ -13700,7 +13700,7 @@ class WrapperMachine:
     def _codex_tail_snapshot_from_stream(cls, stream, size: int):
         start = max(0, size - cls.CODEX_TAIL_READ_MAX)
         stream.seek(start)
-        data = stream.read(cls.CODEX_TAIL_READ_MAX)
+        data = stream.read(size - start)
         if start:
             _, separator, data = data.partition(b"\n")
             if not separator:
@@ -13889,7 +13889,8 @@ class WrapperMachine:
         # transcript mutation while _sync_external_control still fails closed.
         w["scan_complete"] = ownership_scan_complete
         was_external = bool(w.get("external"))
-        was_sidebar_running = bool(w.get("active_external_turns"))
+        was_sidebar_running = bool(w.get(
+            "sidebar_running", w.get("active_external_turns")))
         was_desktop_active = bool(w.get("desktop_active"))
         w["holders"] = holders
         w["writers"] = writers
@@ -13898,17 +13899,31 @@ class WrapperMachine:
         takeover_cleared = False
         takeover_clear_message: Optional[str] = None
         data = b""
+        markers: TurnMarkers | None = None
+        replacement_tail = None
         visible_user_growth = False
         try:
             # Native resume can replace a compressed cold source with live
             # JSONL. Follow the native representation, never the decoded cache.
-            if is_compressed_rollout(w["path"]) or not os.path.exists(w["path"]):
+            path = w["path"]
+            if is_compressed_rollout(path) or not os.path.exists(path):
                 current_path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
                 if current_path:
-                    w["path"] = current_path
-            st = await asyncio.to_thread(rollout_stat, w["path"])
+                    path = current_path
+            st = await asyncio.to_thread(rollout_stat, path)
+            replaced = (
+                path != w["path"]
+                or (st.st_dev, st.st_ino) != w.get("file_id")
+                or st.st_size < w["size"]
+            )
+            if replaced:
+                # Read size and lifecycle from the same open source. Only the
+                # bounded tail is needed; never replay the replacement as growth.
+                st, replacement_tail = await asyncio.to_thread(
+                    self._read_codex_watch_snapshot, path)
         except OSError:
             return
+        w["path"] = path
 
         ctx = self._ctx_by_sid(sid)
         shared_affinity = bool(
@@ -13951,18 +13966,28 @@ class WrapperMachine:
                     session_id=sid, new_holders=len(new_writers))
 
         file_id = (st.st_dev, st.st_ino)
-        if file_id != w.get("file_id") or st.st_size < w["size"]:
+        if replaced:
             # Codex is append-only. Rotation/truncation is itself an external
             # mutation unless caused by a process we already classify as external;
-            # in either case the resident context must reload. Re-baseline at EOF
-            # to avoid replaying a potentially huge replacement as fresh turns.
+            # in either case the resident context must reload. Re-baseline at EOF,
+            # retaining its latest lifecycle and partial record for the next poll.
             w["file_id"] = file_id
             w["size"] = st.st_size
             w["partial"] = b""
             w["active_external_turns"].clear()
+            w.setdefault("seeded_external_turns", set()).clear()
+            w["preserve_seeded_without_holder"] = False
             w.setdefault("observed_external_turns", set()).clear()
             w["pending_wrapper_turns"].clear()
             w.setdefault("terminal_candidates", OrderedDict()).clear()
+            tail_active, tail_partial, last_marker, terminal = replacement_tail
+            markers = TurnMarkers(
+                started=frozenset(tail_active),
+                finished=frozenset({terminal.turn_id}) if terminal else frozenset(),
+                partial=tail_partial,
+                ordered=(last_marker,) if last_marker else (),
+                terminals=(terminal,) if terminal else (),
+            )
             if w.get("takeover_pending"):
                 takeover_cleared = True
                 takeover_clear_message = "会话文件已变化，本次自动接管已取消，请重新点击接管"
@@ -14026,8 +14051,9 @@ class WrapperMachine:
                 external_growth = True
 
         if data:
-            w["last_growth_at"] = now
             markers = parse_turn_markers(data, w.get("partial", b""))
+        if markers is not None:
+            w["last_growth_at"] = now
             w["partial"] = markers.partial
             visible_user_growth = markers.has_visible_user_message
             source_identity = self._codex_watch_source_identity(w)
@@ -14108,7 +14134,12 @@ class WrapperMachine:
                     # governed by the active marker below.
                     self._revoke_codex_takeover(w, holders, writers)
                     self._remember_watch_turn(active, turn_id, now)
-                    observed.add(turn_id)
+                    if replaced and not (holders or writers or private_holders):
+                        # Without a live writer yet, the next scan must confirm
+                        # this cold tail against the replacement's inode.
+                        w["seeded_external_turns"].add(turn_id)
+                    else:
+                        observed.add(turn_id)
                     while len(observed) > self.CODEX_TURN_TRACK_MAX:
                         observed.pop()
                     external_growth = True
@@ -14224,6 +14255,9 @@ class WrapperMachine:
             await self._sync_external_control(ctx, w)
 
         sidebar_running = bool(w.get("active_external_turns"))
+        # Holder reconciliation can clear a cold seed before this poll starts.
+        # Compare with the last published state so that still emits an idle edge.
+        w["sidebar_running"] = sidebar_running
         if sidebar_running != was_sidebar_running:
             await self.transport.send(SessionActivity(
                 engine="codex",
