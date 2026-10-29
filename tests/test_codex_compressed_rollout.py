@@ -16,6 +16,7 @@ import pytest
 
 from cc_remote.protocol import History, SessionActivity
 from cc_remote.wrapper import codex_sessions, rollout_io
+from cc_remote.wrapper.codex_agents import load_detail
 from cc_remote.wrapper.codex_stream import codex_translate_history, codex_history_window_info
 from cc_remote.wrapper.codex_external import HolderScan
 from cc_remote.wrapper.history_store import HistorySourceFingerprint, history_source_extends
@@ -25,6 +26,7 @@ from tests.test_codex_sidebar_missing import _catalog, _row
 from tests.test_codex_profiles import _context, _machine
 from tests.test_codex_external import _event
 from tests.test_codex_shared_machine import _SharedSdk
+from tests.test_codex_agents import activity, answer, rollout as agent_rollout, task
 
 
 @pytest.fixture(autouse=True)
@@ -148,6 +150,60 @@ def test_legacy_message_and_cursor_ids_survive_compression(tmp_path):
     assert first and [e.model_dump() for e in first] == [e.model_dump() for e in second]
     args = dict(before=None, limit=1, max_bytes=1024 * 1024)
     assert codex_history_window_info(str(path), **args) == codex_history_window_info(str(packed), **args)
+
+
+@pytest.mark.parametrize("compressed_sources", [("parent",), ("child",), ("parent", "child")])
+@pytest.mark.parametrize("native_boundary", [False, True])
+def test_compressed_agent_details_match_plain_history(tmp_path, compressed_sources, native_boundary):
+    paths = {"parent": agent_rollout(tmp_path, "parent", rows=[
+        task("parent-turn"), activity("child"),
+        ("event_msg", {"type": "item_completed", "item": {
+            "type": "CollabAgentToolCall", "id": "wait-child", "tool": "wait",
+            "receiver_thread_ids": ["child"], "status": "completed"}}),
+    ])}
+    boundary = [("event_msg", {"type": "thread_settings_applied", "thread_id": "child"})]
+    paths["child"] = agent_rollout(tmp_path, "child", "parent", rows=[
+        task("parent-turn"), answer("INHERITED_PARENT"),
+        *(boundary if native_boundary else []), task("child-turn"),
+        ("event_msg", {"type": "user_message", "message": "PRIVATE_DELEGATION"}),
+        ("response_item", {"type": "function_call", "name": "exec_command", "call_id": "tool",
+                           "arguments": '{"cmd":"pwd"}'}),
+        ("response_item", {"type": "function_call_output", "call_id": "tool", "output": "/project"}),
+        answer("子代理完成核对"), ("event_msg", {"type": "task_complete", "turn_id": "child-turn"}),
+    ], archived=True)
+    expected = load_detail(tmp_path, "parent", "codex-agent:child", 8000)
+    assert expected[1] == "succeeded"
+    text = json.dumps(expected[0], ensure_ascii=False)
+    assert "子代理完成核对" in text and "tool_use" in text and "tool_result" in text
+    assert "INHERITED_PARENT" not in text and "PRIVATE_DELEGATION" not in text
+    for sid in compressed_sources:
+        packed = _compress(paths[sid])
+        paths[sid].unlink()
+        paths[sid] = packed
+    original = {path: path.read_bytes() for path in paths.values()}
+    for run_id in ("codex-agent:child", "activity", "wait-child"):
+        actual = load_detail(tmp_path, "parent", run_id, 8000)
+        assert actual[:3] == expected[:3]
+    assert all(path.read_bytes() == data for path, data in original.items())
+    assert all(not Path(str(paths[sid]).removesuffix(".zst")).exists()
+               for sid in compressed_sources)
+
+
+@pytest.mark.parametrize("limit", ["_MAX_BYTES", "_MAX_RECORD"])
+def test_compressed_agent_detail_limits_use_decoded_bytes(tmp_path, monkeypatch, limit):
+    from cc_remote.wrapper import codex_agents
+
+    agent_rollout(tmp_path, "parent")
+    child = agent_rollout(tmp_path, "child", "parent", rows=[
+        task("child-turn"), answer("x" * 8192),
+        ("event_msg", {"type": "task_complete", "turn_id": "child-turn"}),
+    ])
+    packed = _compress(child)
+    child.unlink()
+    assert packed.stat().st_size < 1024
+    monkeypatch.setattr(codex_agents, limit, 1024)
+    with pytest.raises(ValueError, match="记录过大"):
+        load_detail(tmp_path, "parent", "codex-agent:child", 8000)
 
 
 def test_cache_identity_invalidation_and_independent_readers(tmp_path, monkeypatch):
