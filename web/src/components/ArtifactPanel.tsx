@@ -31,6 +31,7 @@ import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { PanelResizer } from "./PanelResizer";
 import { PdfArtifactPreview } from "./PdfArtifactPreview";
 import { AudioArtifactPreview } from "./AudioArtifactPreview";
+import { ZoomableImage } from "./ZoomableImage";
 import { previewImageDimension, rehypePreviewHtml } from "../markdown-preview-html";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
@@ -202,9 +203,9 @@ function ImageArtifactPreview({ data, mediaType, title }: {
     ? "图片无法解码或格式不受支持" : null;
   if (resolvedError || decodeError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError || decodeError}</div>;
   if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
-  return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title}
+  return <ZoomableImage src={resolvedUrl} alt={title}
     onLoad={() => setFailedUrl(current => current === resolvedUrl ? null : current)}
-    onError={() => setFailedUrl(resolvedUrl)} /></div>;
+    onError={() => setFailedUrl(resolvedUrl)} />;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
