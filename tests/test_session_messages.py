@@ -1,4 +1,5 @@
 """Unified MCP transport, routing and replay. No live engines or model calls."""
+from unittest.mock import AsyncMock
 import asyncio
 import json
 import os
@@ -839,7 +840,7 @@ async def test_optional_tool_refresh_does_not_block_ordinary_chat_with_backgroun
     async def no_owner(*_): return False
     monkeypatch.setattr(machine, '_adopt_claude_broker_handle', noop)
     monkeypatch.setattr(machine, '_prime_claude_ownership', no_owner)
-    monkeypatch.setattr(machine, '_watch_session', lambda *_: None)
+    monkeypatch.setattr(machine, '_watch_session', AsyncMock(side_effect=lambda *_: None))
     monkeypatch.setattr(machine, '_prepare_claude_context_before_query', noop)
     launched = []
     async def run(*args, **_): launched.append(args[1])
@@ -871,7 +872,7 @@ async def test_message_delivery_refreshes_independent_route_with_ask_disabled(mo
     async def no_owner(*_): return False
     monkeypatch.setattr(machine, '_adopt_claude_broker_handle', noop)
     monkeypatch.setattr(machine, '_prime_claude_ownership', no_owner)
-    monkeypatch.setattr(machine, '_watch_session', lambda *_: None)
+    monkeypatch.setattr(machine, '_watch_session', AsyncMock(side_effect=lambda *_: None))
     monkeypatch.setattr(machine, '_prepare_claude_context_before_query', noop)
     launched = []
     async def run(*args, **_): launched.append(args[1])
@@ -904,7 +905,7 @@ async def test_ordinary_chat_recovers_pending_refresh_after_messaging_opt_out(mo
     async def no_owner(*_): return False
     monkeypatch.setattr(machine, '_adopt_claude_broker_handle', noop)
     monkeypatch.setattr(machine, '_prime_claude_ownership', no_owner)
-    monkeypatch.setattr(machine, '_watch_session', lambda *_: None)
+    monkeypatch.setattr(machine, '_watch_session', AsyncMock(side_effect=lambda *_: None))
     monkeypatch.setattr(machine, '_prepare_claude_context_before_query', noop)
     launched = []
     async def run(*args, **_): launched.append(args[1])

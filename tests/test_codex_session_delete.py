@@ -1747,7 +1747,7 @@ def test_cold_multi_profile_delete_excludes_its_control_proxy(
                 "_prime_codex_ownership",
                 WrapperMachine._prime_codex_ownership.__get__(machine),
             )
-            machine._watch_session("primary@codex-thread")
+            await machine._watch_session("primary@codex-thread")
         proxy = ProcessIdentity(4242, 42)
 
         def identity(pid, *, parent_pid=None):

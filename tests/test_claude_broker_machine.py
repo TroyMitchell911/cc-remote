@@ -1,5 +1,6 @@
 """Focused wrapper integration tests for broker-owned official Claude TUIs."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -551,7 +552,7 @@ def test_external_claude_cli_blocks_controls_without_fake_state(
             return True
 
         monkeypatch.setattr(machine, "_adopt_claude_broker_handle", no_broker)
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
         monkeypatch.setattr(machine, "_prime_claude_ownership", external_owner)
 
         results = [
@@ -627,7 +628,7 @@ def test_spawn_uses_live_broker_cwd_without_transcript_metadata(
         monkeypatch.setattr(
             machine_module, "get_session_info", transcript_lookup_must_not_run)
         monkeypatch.setattr(machine_module, "save_session_id", lambda *_args: None)
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
         monkeypatch.setattr(machine, "_load_history", no_history)
 
         ctx = await machine._spawn(
@@ -1341,7 +1342,7 @@ def test_query_refuses_while_terminal_is_composing(monkeypatch, tmp_path):
         machine, transport = _mk_machine()
         ctx = _broker_ctx(tmp_path, input_busy=True)
         machine.sessions[SESSION_ID] = ctx
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         result = await machine._handle_query(Query(
             sid=SESSION_ID, prompt="remote prompt", msg_id="msg-1"))
@@ -1388,7 +1389,7 @@ def test_exited_broker_is_rejected_before_state_claim_or_user_echo(
         ctx.engine = "claude"
         ctx.sdk = sdk
         machine.sessions[SESSION_ID] = ctx
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         result = await machine._handle_query(Query(
             sid=SESSION_ID, prompt="must not send", msg_id="msg-exited"))
@@ -1408,7 +1409,7 @@ def test_query_selects_broker_runner_instead_of_sdk_runner(
         machine, _ = _mk_machine()
         ctx = _broker_ctx(tmp_path)
         machine.sessions[SESSION_ID] = ctx
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
         calls = []
 
         async def broker_runner(target, prompt, images, files):
@@ -1450,7 +1451,7 @@ def test_managed_broker_turn_finishes_on_engine_transcript_boundary(
 
         monkeypatch.setattr(
             machine_module, "transcript_path", lambda _sid: str(transcript))
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def mirror(sid):
             mirrors.append(sid)
@@ -1494,7 +1495,7 @@ def test_broker_attachment_paths_are_submitted_but_not_echoed(
         machine.sessions[SESSION_ID] = ctx
         monkeypatch.setattr(
             machine_module, "transcript_path", lambda _sid: str(transcript))
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
         monkeypatch.setattr(
             machine,
             "_stash_files",
@@ -1570,7 +1571,7 @@ def test_submit_input_busy_race_does_not_publish_unsent_user_message(
         machine.sessions[SESSION_ID] = ctx
         monkeypatch.setattr(
             machine_module, "transcript_path", lambda _sid: str(transcript))
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def mirror(_sid):
             return None
@@ -1604,7 +1605,7 @@ def test_managed_broker_interrupt_uses_ctrl_c_and_unlocks_after_drain(
         machine.sessions[SESSION_ID] = ctx
         monkeypatch.setattr(
             machine_module, "transcript_path", lambda _sid: str(transcript))
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def mirror(_sid):
             return None
@@ -1654,7 +1655,7 @@ def test_interrupt_terminal_boundary_stays_interrupted_not_success(
         machine.sessions[SESSION_ID] = ctx
         monkeypatch.setattr(
             machine_module, "transcript_path", lambda _sid: str(transcript))
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def mirror(_sid):
             return None

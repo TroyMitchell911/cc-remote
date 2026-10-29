@@ -1,4 +1,5 @@
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 from pathlib import Path
@@ -799,7 +800,7 @@ def test_codex_session_list_overlays_durable_migrated_cwd(
         machine._codex_controls.set_cwd_override(
             "thread-1", str(migrated))
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         event = await machine._send_codex_session_list(_command(str(migrated)), [{
             "session_id": "thread-1",
@@ -829,7 +830,7 @@ def test_codex_session_list_discards_a_missing_cwd_override(
         machine._codex_controls.set_cwd_override(
             "thread-1", str(missing))
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         event = await machine._send_codex_session_list(
             SimpleNamespace(space="code", client_id="client-1"),
@@ -934,7 +935,7 @@ def test_restart_clears_missing_override_before_runtime_and_sidebar_resume(
             lambda *_args: {},
         )
         monkeypatch.setattr(
-            machine, "_watch_session", lambda _sid: None)
+            machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
         monkeypatch.setattr(
             machine,
             "_prime_codex_ownership",
@@ -946,7 +947,7 @@ def test_restart_clears_missing_override_before_runtime_and_sidebar_resume(
             lambda *_args: asyncio.sleep(0),
         )
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         ctx = await machine._spawn(
             resume_id=thread_id,

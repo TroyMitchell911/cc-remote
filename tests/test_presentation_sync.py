@@ -1,5 +1,6 @@
 """Cross-client completion and Goal presentation regressions."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -286,7 +287,7 @@ def test_cold_session_catalog_carries_durable_completion_receipts(monkeypatch):
         machine._session_presentation.mark_completion(
             "codex", "cold-unread", "turn-2")
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None)
         )
 
         event = await machine._send_codex_session_list(
@@ -352,7 +353,7 @@ def test_codex_catalog_claims_only_unambiguous_v1_receipt(
             ).endswith("secondary-home"),
         )
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         event = await machine._send_codex_session_list(
             SimpleNamespace(
@@ -410,7 +411,7 @@ def test_codex_catalog_keeps_v1_receipt_quarantined_when_claude_is_unknown(
             ).endswith("secondary-home"),
         )
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         event = await machine._send_codex_session_list(
             SimpleNamespace(
@@ -466,7 +467,7 @@ def test_codex_catalog_keeps_v1_receipt_quarantined_for_duplicate_profiles(
         )
         profiles = list(machine._codex_profiles)
         monkeypatch.setattr(
-            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+            machine, "_prime_codex_sidebar_watches", AsyncMock(side_effect=lambda _raw: None))
 
         await machine._send_codex_session_list(
             SimpleNamespace(

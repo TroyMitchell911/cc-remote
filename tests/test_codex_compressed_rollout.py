@@ -1,17 +1,20 @@
 """Native compressed histories remain visible and use decoded byte offsets."""
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from unittest.mock import AsyncMock
 
 import pytest
 
+from cc_remote.protocol import History
 from cc_remote.wrapper import codex_sessions, rollout_io
 from cc_remote.wrapper.codex_stream import codex_translate_history, codex_history_window_info
 from cc_remote.wrapper.history_store import HistorySourceFingerprint, history_source_extends
@@ -226,9 +229,9 @@ async def test_cold_history_and_resume_follow_native_source_without_background_d
     packed.write_bytes(rollout_io.zstd.compress(raw))
     _catalog(tmp_path / "primary", [("thread", str(path))])
     sid = "primary@thread"
-    machine._watch_session(sid, sidebar=True)
+    await machine._watch_session(sid, sidebar=True)
     assert sid not in machine._watch and not rollout_io._cache
-    machine._watch_session(sid)
+    await machine._watch_session(sid)
     watch = machine._watch[sid]
     assert watch["path"] == str(packed) and watch["size"] == len(raw)
     page = await machine._build_history(sid, limit=4, detail="summary")
@@ -243,6 +246,101 @@ async def test_cold_history_and_resume_follow_native_source_without_background_d
     await machine._poll_codex_watch(sid, watch, set(), time.time())
     assert watch["path"] == str(path)
     assert watch["file_id"] == (path.stat().st_dev, path.stat().st_ino)
+
+
+@pytest.mark.asyncio
+async def test_cold_history_decode_keeps_control_loop_responsive(tmp_path, monkeypatch):
+    machine, _transport = _machine(tmp_path)
+    path, packed = _rollout(tmp_path / "primary", "thread")
+    _catalog(tmp_path / "primary", [("thread", str(path))])
+    sid = "primary@thread"
+    loop_thread = threading.get_ident()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    decode = rollout_io._decoded_path
+    calls = []
+
+    def paused_decode(native):
+        assert threading.get_ident() != loop_thread, "cold decode blocked the control loop"
+        calls.append(native)
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(5), "control loop did not release the decoder"
+        return decode(native)
+
+    monkeypatch.setattr(rollout_io, "_decoded_path", paused_decode)
+    # Isolate registration, before the history adapter does its own worker reads.
+    monkeypatch.setattr(machine, "_read_requested_history", AsyncMock(
+        return_value=History(session_id=sid, revision="test")))
+    task = asyncio.create_task(machine._build_requested_history(
+        sid, before=None, limit=4, cwd=None, detail="summary"))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        # The event loop handles an unrelated callback while decoding is paused.
+        responsive = asyncio.Event()
+        loop.call_soon(responsive.set)
+        await asyncio.wait_for(responsive.wait(), 1)
+        assert sid not in machine._watch and not task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 5)
+    assert calls == [str(packed.resolve())]
+    assert machine._watch[sid]["size"] == len(rollout_io.zstd.decompress(packed.read_bytes()))
+
+
+@pytest.mark.asyncio
+async def test_parallel_cold_watch_reads_do_not_replace_registered_state(tmp_path, monkeypatch):
+    machine, _transport = _machine(tmp_path)
+    path, packed = _rollout(tmp_path / "primary", "thread")
+    _catalog(tmp_path / "primary", [("thread", str(path))])
+    sid = "primary@thread"
+    other = _compress(tmp_path / "eviction.jsonl", b"other\n")
+    monkeypatch.setattr(rollout_io, "_CACHE_ENTRIES", 1)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    ready = [asyncio.Event(), asyncio.Event()]
+    release = [threading.Event(), threading.Event()]
+    read_snapshot = machine._read_codex_watch_snapshot
+    count = 0
+    count_lock = threading.Lock()
+
+    def paused_snapshot(source):
+        nonlocal count
+        assert threading.get_ident() != loop_thread
+        with count_lock:
+            index = count
+            count += 1
+        result = read_snapshot(source)
+        # Registering must use this snapshot even after the decoded view is
+        # evicted; prewarming followed by synchronous stat/tail reads is unsafe.
+        with rollout_io.rollout_open(other):
+            pass
+        loop.call_soon_threadsafe(ready[index].set)
+        assert release[index].wait(5)
+        return result
+
+    monkeypatch.setattr(machine, "_read_codex_watch_snapshot", paused_snapshot)
+    first = asyncio.create_task(machine._watch_session(sid))
+    tasks = [first]
+    try:
+        await asyncio.wait_for(ready[0].wait(), 2)
+        second = asyncio.create_task(machine._watch_session(sid))
+        tasks.append(second)
+        await asyncio.wait_for(ready[1].wait(), 2)
+        assert str(packed.resolve()) not in rollout_io._cache
+        release[1].set()
+        await asyncio.wait_for(second, 2)
+        watch = machine._watch[sid]
+        watch["active_external_turns"]["new-live-turn"] = time.time()
+        release[0].set()
+        await asyncio.wait_for(first, 2)
+        assert machine._watch[sid] is watch
+        assert "new-live-turn" in watch["active_external_turns"]
+        assert str(packed.resolve()) not in rollout_io._cache
+    finally:
+        for event in release:
+            event.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
 
 
 def test_source_replaced_during_decode_is_rejected(tmp_path, monkeypatch):

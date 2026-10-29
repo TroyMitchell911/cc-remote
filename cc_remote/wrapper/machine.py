@@ -359,7 +359,7 @@ from cc_remote.wrapper.codex_sessions import (
     codex_thread_parent_maps, codex_thread_rollout_record,
 )
 from cc_remote.wrapper.rollout_io import (
-    is_compressed_rollout, rollout_open, rollout_size, rollout_stat,
+    is_compressed_rollout, rollout_fstat, rollout_open, rollout_stat,
 )
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
@@ -8627,7 +8627,7 @@ class WrapperMachine:
                 watch["broker_partial"] = partial
 
         if ctx.session_id not in self._watch:
-            self._watch_session(ctx.session_id)
+            await self._watch_session(ctx.session_id)
         watch = self._watch.get(ctx.session_id)
         if (watch is not None and watch.get("broker_active")
                 and ctx.turn_task is None and ctx.state == "idle"):
@@ -12943,7 +12943,7 @@ class WrapperMachine:
             # rewind). It may have advanced beyond the incremental cursor.
             w.pop("claude_activity_initialized", None)
 
-    def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
+    async def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
         """Start mirroring a session transcript when a client opens it.
 
         Claude combines stable CLI process identity with unattributed file growth.
@@ -13007,8 +13007,26 @@ class WrapperMachine:
         # Native resume creates a plain JSONL, eligible on the next refresh.
         if sidebar and engine == "codex" and is_compressed_rollout(path):
             return
+        tail_snapshot = None
         try:
-            st = rollout_stat(path)
+            if engine == "codex" and is_compressed_rollout(path):
+                # A cold read may decode gigabytes or wait for another decoder's
+                # cache lock. Prepare both the stat and tail in the worker, so
+                # cache eviction cannot trigger a second decode on this loop.
+                st, tail_snapshot = await asyncio.to_thread(
+                    self._read_codex_watch_snapshot, path)
+                if self._ctx_by_sid(sid) is not ctx or sid in self._watch:
+                    # A concurrent request may have registered or attached this
+                    # session while the worker read. Never replace its live state.
+                    await self._watch_session(sid, sidebar=sidebar)
+                    return
+                current = os.stat(path)
+                if (current.st_dev, current.st_ino, current.st_mtime_ns,
+                        current.st_ctime_ns) != (
+                        st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns):
+                    return
+            else:
+                st = os.stat(path)
         except OSError:
             return
         if len(self._watch) >= self.WATCH_MAX:
@@ -13044,7 +13062,8 @@ class WrapperMachine:
                 tail_partial,
                 _tail_marker,
                 tail_terminal,
-            ) = self._codex_tail_snapshot(path, st.st_size)
+            ) = (tail_snapshot if tail_snapshot is not None
+                 else self._codex_tail_snapshot(path, st.st_size))
             active_turns = {
                 turn_id: time.time()
                 for turn_id in tail_active
@@ -13142,7 +13161,7 @@ class WrapperMachine:
             self._codex_sidebar_watches.move_to_end(sid)
         log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
 
-    def _prime_codex_sidebar_watches(self, rows: list[dict]) -> None:
+    async def _prime_codex_sidebar_watches(self, rows: list[dict]) -> None:
         """Watch the newest cold Codex threads for native App lifecycle.
 
         A private Codex App app-server reports such threads as ``notLoaded`` to
@@ -13189,7 +13208,7 @@ class WrapperMachine:
             self._codex_sidebar_watches.pop(sid, None)
             self._watch.pop(sid, None)
         for sid in candidates:
-            self._watch_session(sid, sidebar=True)
+            await self._watch_session(sid, sidebar=True)
 
     @staticmethod
     def _codex_sidebar_watch_state(watch: Optional[dict]) -> Optional[State]:
@@ -13653,6 +13672,13 @@ class WrapperMachine:
             return self._is_external(sid)
 
     @classmethod
+    def _read_codex_watch_snapshot(cls, path: str):
+        """Read one consistent, seekable source without mutating loop state."""
+        with rollout_open(path, "rb") as stream:
+            st = rollout_fstat(stream)
+            return st, cls._codex_tail_snapshot_from_stream(stream, st.st_size)
+
+    @classmethod
     def _codex_tail_snapshot(
         cls, path: str, size: int,
     ) -> tuple[
@@ -13663,14 +13689,18 @@ class WrapperMachine:
     ]:
         """Return the latest bounded lifecycle state and exact last marker."""
         try:
-            if is_compressed_rollout(path):
-                size = rollout_size(path)
-            start = max(0, size - cls.CODEX_TAIL_READ_MAX)
             with rollout_open(path, "rb") as stream:
-                stream.seek(start)
-                data = stream.read(cls.CODEX_TAIL_READ_MAX)
+                if is_compressed_rollout(path):
+                    size = rollout_fstat(stream).st_size
+                return cls._codex_tail_snapshot_from_stream(stream, size)
         except OSError:
             return set(), b"", None, None
+
+    @classmethod
+    def _codex_tail_snapshot_from_stream(cls, stream, size: int):
+        start = max(0, size - cls.CODEX_TAIL_READ_MAX)
+        stream.seek(start)
+        data = stream.read(cls.CODEX_TAIL_READ_MAX)
         if start:
             _, separator, data = data.partition(b"\n")
             if not separator:
@@ -14548,7 +14578,7 @@ class WrapperMachine:
                     if (getattr(ctx.sdk, "is_claude_broker", False)
                             and ctx.session_id
                             and ctx.session_id not in self._watch):
-                        self._watch_session(ctx.session_id)
+                        await self._watch_session(ctx.session_id)
                 await self._poll_watches_once()
                 await self._refresh_timed_tasks()
                 await self._refresh_codex_background_processes()
@@ -16768,7 +16798,7 @@ class WrapperMachine:
         started = time.perf_counter()
         cache_hit = False
         try:
-            self._watch_session(sid)
+            await self._watch_session(sid)
             ctx = self._ctx_by_sid(sid)
             watch = self._watch.get(sid) or {}
             codex = bool((ctx is not None and ctx.engine == "codex") or watch.get("engine") == "codex")
@@ -16873,7 +16903,7 @@ class WrapperMachine:
         _background: bool = False,
     ) -> History:
         """Build one requester-neutral page shared by concurrent clients."""
-        self._watch_session(sid)
+        await self._watch_session(sid)
         # Content and ownership are independent projections.  A bounded ps/lsof
         # scan can take seconds on macOS and must not hold the conversation
         # first paint. The watch loop and switch/query safety paths refresh
@@ -17489,7 +17519,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新展开该轮")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         is_codex = bool(
@@ -18007,7 +18037,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新打开协作代理")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         if ctx is not None and ctx.space != "code":
@@ -18278,7 +18308,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新加载图片")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         is_codex = bool(
@@ -18617,7 +18647,7 @@ class WrapperMachine:
                 message="Claude 已通过 broker 双向连接，无需结束终端或迁移会话",
             ))
             return None
-        self._watch_session(resolved_sid)
+        await self._watch_session(resolved_sid)
         w = self._watch.get(resolved_sid)
         if w is None:
             error = Error(code=ERR_INTERNAL, message="无法读取该会话的终端状态")
@@ -18902,7 +18932,7 @@ class WrapperMachine:
                 return await self._reject_query(ctx, cmd, error)
         route_sid = self._ctx_wire_sid(ctx)
         if route_sid:
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             external = (
                 await self._prime_codex_ownership(route_sid)
                 if ctx.engine == "codex"
@@ -20223,7 +20253,7 @@ class WrapperMachine:
         route_sid = self._ctx_wire_sid(ctx)
         if not route_sid:
             return None
-        self._watch_session(route_sid)
+        await self._watch_session(route_sid)
         external = (
             await self._prime_codex_ownership(route_sid)
             if ctx.engine == "codex"
@@ -21926,7 +21956,7 @@ class WrapperMachine:
 
         route_sid = self._ctx_wire_sid(ctx)
         if route_sid:
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             external = await self._prime_claude_ownership(route_sid)
             if expected_sdk is not None and ctx.sdk is not expected_sdk:
                 return "changed"
@@ -28441,7 +28471,7 @@ class WrapperMachine:
             # connecting. Do not let that newly private row start a sidebar
             # watch before the final pre-serialization guard below.
             raw = self._filter_private_codex_btw_rows(raw)
-            self._prime_codex_sidebar_watches(raw)
+            await self._prime_codex_sidebar_watches(raw)
             resident_state = {
                 c.key: c.state for c in self.sessions.values()
                 if c.key and c.session_id and c.engine == "codex"
@@ -29057,7 +29087,7 @@ class WrapperMachine:
             # The real id becomes visible before the first turn necessarily ends.
             # Start ownership monitoring at capture so a terminal resume during
             # that first response cannot wait until the next Remote query.
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             await self._persist_claude_session_controls(ctx)
             await self._flush_claude_client_message_ids(ctx)
         log.info(
@@ -30743,7 +30773,7 @@ class WrapperMachine:
 
     async def _codex_delete_external_owner(self, sid: str) -> bool:
         """Close the ownership interval before deleting one Code thread."""
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid)
         if watch is None or watch.get("engine") != "codex":
             log.warning(
@@ -38058,7 +38088,7 @@ class WrapperMachine:
                 self.sessions[key] = ctx
         if resume_id:
             route_sid = key if engine in {"claude", "codex"} else resume_id
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             if engine == "codex":
                 await self._recover_codex_owned_turn(ctx, route_sid)
                 await self._prime_codex_ownership(route_sid)
@@ -39088,7 +39118,7 @@ class WrapperMachine:
                                 # official TUI. Bound live refreshes while still
                                 # guaranteeing a final authoritative mirror.
                                 if now - last_mirror_at >= 0.1:
-                                    self._watch_session(ctx.session_id)
+                                    await self._watch_session(ctx.session_id)
                                     await self._push_mirrored_history(ctx.session_id)
                                     last_mirror_at = now
                                 if terminal_id is not None:

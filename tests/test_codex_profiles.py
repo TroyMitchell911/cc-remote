@@ -1,3 +1,4 @@
+from unittest.mock import AsyncMock
 import asyncio
 import hashlib
 import json
@@ -686,8 +687,8 @@ def test_profile_rollouts_and_watches_remain_in_their_own_home(
             "type": "session_meta", "payload": {"id": "same-native-id"},
         }) + "\n", encoding="utf-8")
 
-    machine._watch_session("primary@same-native-id")
-    machine._watch_session("stack@same-native-id")
+    asyncio.run(machine._watch_session("primary@same-native-id"))
+    asyncio.run(machine._watch_session("stack@same-native-id"))
 
     assert machine._watch["primary@same-native-id"]["path"] == str(
         primary_rollout)
@@ -1362,7 +1363,7 @@ def test_cold_profile_does_not_preserve_sibling_stale_holder(
         lambda sid: paths.get(sid),
     )
     for sid in paths:
-        machine._watch_session(sid)
+        asyncio.run(machine._watch_session(sid))
 
     stale_holder = ProcessIdentity(320, 14)
     primary_watch = machine._watch["primary@primary-native"]
@@ -1989,7 +1990,7 @@ def test_sidebar_watch_budget_is_fair_across_profiles(
     monkeypatch.setattr(
         machine,
         "_watch_session",
-        lambda sid, sidebar=False: watched.append((sid, sidebar)),
+        AsyncMock(side_effect=lambda sid, sidebar=False: watched.append((sid, sidebar))),
     )
     rows = [
         {
@@ -2002,7 +2003,7 @@ def test_sidebar_watch_budget_is_fair_across_profiles(
         "codex_profile_id": "stack",
     }]
 
-    machine._prime_codex_sidebar_watches(rows)
+    asyncio.run(machine._prime_codex_sidebar_watches(rows))
 
     assert watched == [
         ("primary@native-0", True),

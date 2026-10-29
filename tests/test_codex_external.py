@@ -1,5 +1,6 @@
 """Zero-token tests for Codex external-terminal ownership detection."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import ctypes
@@ -1565,7 +1566,7 @@ def test_query_is_rejected_before_state_claim_when_codex_is_external(monkeypatch
         ctx.engine = "codex"
         ctx.sdk = _CodexSdk()
         machine.sessions["sid"] = ctx
-        monkeypatch.setattr(machine, "_watch_session", lambda sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda sid: None))
 
         async def occupied(sid):
             return True
@@ -2123,7 +2124,7 @@ def test_cold_codex_history_registers_codex_watcher(tmp_path, monkeypatch):
         machine_module, "codex_rollout_path",
         lambda sid: str(path) if sid == "cold-codex" else None)
     monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
-    machine._watch_session("cold-codex")
+    asyncio.run(machine._watch_session("cold-codex"))
     assert machine._watch["cold-codex"]["engine"] == "codex"
     assert machine._watch["cold-codex"]["path"] == str(path)
 
@@ -2139,7 +2140,7 @@ def test_cold_codex_watcher_seeds_unfinished_external_turn(tmp_path, monkeypatch
         machine_module, "codex_rollout_path",
         lambda sid: str(path) if sid == "cold-active" else None)
     monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
-    machine._watch_session("cold-active")
+    asyncio.run(machine._watch_session("cold-active"))
     watch = machine._watch["cold-active"]
     assert set(watch["active_external_turns"]) == {"still-running"}
     assert watch["external"] is True
@@ -2160,7 +2161,7 @@ def test_cold_codex_watcher_seeds_latest_completed_terminal_fence(
     )
     monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
 
-    machine._watch_session("cold-completed-session")
+    asyncio.run(machine._watch_session("cold-completed-session"))
 
     fences = machine._codex_terminal_ledger.snapshot(
         "cold-completed-session",
@@ -2195,7 +2196,7 @@ def test_sidebar_watch_preserves_private_app_seed_without_stable_writer(
             lambda sid: str(path) if sid == "private-app" else None)
         monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
 
-        machine._watch_session("private-app", sidebar=True)
+        await machine._watch_session("private-app", sidebar=True)
         watch = machine._watch["private-app"]
         scan = HolderScan({"private-app": set()}, True)
         holders, writers, private_holders = machine._codex_holder_sets(
@@ -2220,7 +2221,7 @@ def test_sidebar_watch_emits_running_and_idle_lifecycle(tmp_path, monkeypatch):
             machine_module, "codex_rollout_path",
             lambda sid: str(path) if sid == "private-app" else None)
         monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
-        machine._watch_session("private-app", sidebar=True)
+        await machine._watch_session("private-app", sidebar=True)
         watch = machine._watch["private-app"]
         machine._push_mirrored_history = lambda sid: _record_async([], sid)
 
@@ -2407,7 +2408,7 @@ def test_cold_orphan_seed_unlocks_on_first_complete_empty_holder_scan(
             machine_module, "codex_rollout_path",
             lambda sid: str(path) if sid == "cold-orphan" else None)
         monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
-        machine._watch_session("cold-orphan")
+        await machine._watch_session("cold-orphan")
         watch = machine._watch["cold-orphan"]
         assert watch["external"] is True
 
@@ -2459,7 +2460,7 @@ def test_codex_tail_seed_preserves_partial_record_for_next_poll(
             machine_module, "codex_rollout_path",
             lambda sid: str(path) if sid == "cold-partial" else None)
         monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
-        machine._watch_session("cold-partial")
+        await machine._watch_session("cold-partial")
         watch = machine._watch["cold-partial"]
         assert watch["partial"] == complete[:split]
         with path.open("ab") as stream:

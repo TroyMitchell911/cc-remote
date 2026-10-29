@@ -1,5 +1,6 @@
 """Zero-token regressions for Codex approvals and cross-engine controls."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -3524,7 +3525,7 @@ def test_codex_resume_preserves_native_model_and_restores_nullable_effort(
             return effort
 
         monkeypatch.setattr(machine_module, "clamp_effort", unchanged_effort)
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_codex_ownership = (
             lambda _sid: asyncio.sleep(0, result=False))
         machine._load_history = lambda *_args: asyncio.sleep(0)
@@ -8490,7 +8491,7 @@ def test_codex_resume_restores_migrated_cwd_and_discards_unavailable_profile(
                 "permission_profile": ":removed-profile",
             },
         )
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_codex_ownership = (
             lambda _sid: asyncio.sleep(0, result=False))
         machine._load_history = lambda *_args: asyncio.sleep(0)

@@ -1,5 +1,6 @@
 """Zero-token tests for atomic new-session first queries."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 
@@ -356,7 +357,7 @@ def test_spawn_bootstrap_disconnects_failed_resume_before_fresh_retry(
             lambda _sid: type("Info", (), {"cwd": str(tmp_path)})(),
         )
         monkeypatch.setattr(machine_module, "save_session_id", lambda *_args: None)
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
