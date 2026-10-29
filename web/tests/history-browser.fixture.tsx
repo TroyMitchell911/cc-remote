@@ -1,4 +1,5 @@
 import { MobileSidebarFixture } from "./fixtures/mobile-sidebar";
+import { RightPanelPresentation } from "../src/right-panel-presentation";
 import { ImageGalleryFixture } from "./fixtures/image-gallery";
 import {
   useCallback,
@@ -2876,6 +2877,9 @@ function ArtifactPreviewFixture({ kind }: {
     | "markdown-svg" | "markdown-source" | "markdown-html" | "markdown-github-html";
 }) {
   const [openedFile, setOpenedFile] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const [replacement, setReplacement] = useState(false);
+  const gestureFixture = new URLSearchParams(location.search).has("image-gestures");
   const svgData = (window as unknown as { svgFixture?: string }).svgFixture
     || window.btoa(UNSAFE_SVG);
   const htmlReadme = kind === "markdown-github-html"
@@ -2938,7 +2942,7 @@ function ArtifactPreviewFixture({ kind }: {
       sid: "artifact-preview-session",
       requestId: "artifact-preview-request",
       kind: "image" as const,
-      data: svgData,
+      data: replacement ? window.btoa('<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1200"><rect width="900" height="1200" fill="green"/></svg>') : svgData,
       mediaType: "image/svg+xml",
       size: UNSAFE_SVG.length,
       mtimeNs: "1",
@@ -2990,12 +2994,17 @@ function ArtifactPreviewFixture({ kind }: {
         },
       },
     };
-  return <main style={{ height: "100dvh" }}>
+  return <main style={{ height: "100dvh", ...(gestureFixture ? { width: "min(440px,100vw)" } : {}) }}>
     <output hidden data-testid="artifact-opened-file">{openedFile}</output>
+    {gestureFixture && <button onClick={() => setReplacement(value => !value)}>换一张图片</button>}
+    <RightPanelPresentation.Provider value={{ expanded, covered: false, layer: 0, chat: false,
+      onExpand: () => setExpanded(true), onDock: () => setExpanded(false),
+      onDismiss: () => setExpanded(false), onOpenChat: () => {} }}>
     <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
       theme={kind === "html" ? "dark" : "light"}
       onOpenFile={(path, line) => setOpenedFile(`${path}:${line || ""}`)}
       onTab={() => {}} onClose={() => {}} />
+    </RightPanelPresentation.Provider>
   </main>;
 }
 

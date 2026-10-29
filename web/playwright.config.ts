@@ -25,7 +25,7 @@ const WEBKIT_GENERAL_EXCLUSIONS = [
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: ["history-browser.spec.ts", "background-tasks.spec.ts", "composer-queue.spec.ts", "themes.spec.ts", "mobile-sidebar.spec.ts", "header-feedback.spec.ts"],
+  testMatch: ["history-browser.spec.ts", "image-preview.spec.ts", "background-tasks.spec.ts", "composer-queue.spec.ts", "themes.spec.ts", "mobile-sidebar.spec.ts", "header-feedback.spec.ts"],
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 2 : 0,
@@ -40,6 +40,11 @@ export default defineConfig({
     reuseExistingServer: false,
   },
   projects: [
+    {
+      name: "firefox-image-preview",
+      testMatch: "image-preview.spec.ts",
+      use: { ...devices["Desktop Firefox"], viewport: { width: 900, height: 720 } },
+    },
     {
       name: "chromium",
       use: {
