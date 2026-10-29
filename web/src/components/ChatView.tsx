@@ -876,7 +876,16 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     }
     // Preserve native motion that has not reached onScroll yet. Explicit
     // history/selection transactions instead own their exact viewport offset.
-    const nativeMotion = delta == null ? 0 : el.scrollTop - lastScrollTopRef.current;
+    const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    // Collapsing a tall process can make the old scrollTop exceed the new
+    // range. Browsers clamp it before observers run. That lost distance is
+    // layout movement, not a user scroll; applying the content delta to the
+    // already-clamped position would move the reading paragraph twice.
+    const clampedDistance = delta != null && delta < 0 && el.scrollTop >= maxScrollTop - 0.5
+      ? Math.max(0, lastScrollTopRef.current - maxScrollTop) : 0;
+    const nativeMotion = delta == null ? 0
+      : el.scrollTop + clampedDistance - lastScrollTopRef.current;
+    if (delta != null) delta += clampedDistance;
     if (delta == null) {
       if (!boundary || boundary.scope !== activeScrollScopeRef.current
           || userScrollIntentRef.current || touchYRef.current !== null
@@ -1007,9 +1016,16 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   const syncScrollState = useCallback((next: ScrollFollowSnapshot) => {
     setScrollState((previous) =>
       previous.followOutput === next.followOutput && previous.nearBottom === next.nearBottom
+        && previous.atBottom === next.atBottom
         ? previous
         : next);
   }, []);
+
+  const observeScrollLayout = useCallback(() => {
+    const el = scrollRef.current;
+    const controller = controllerRef.current;
+    if (el && controller) syncScrollState(controller.observeLayout(readScrollMetrics(el)));
+  }, [syncScrollState]);
 
   const applyScrollCommand = useCallback((command: ScrollCommand | null) => {
     if (!command) return;
@@ -1051,10 +1067,11 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       // outside the virtual list. ResizeObserver runs before paint, so retain
       // the live-tail intent here instead of exposing one wrong-height frame.
       maintainFollowedLiveTail();
+      observeScrollLayout();
     });
     observer.observe(el);
     return () => observer.disconnect();
-  }, [maintainFollowedLiveTail, scrollScope]);
+  }, [maintainFollowedLiveTail, observeScrollLayout, scrollScope]);
 
   useLayoutEffect(() => {
     const content = contentSizerRef.current;
@@ -1066,6 +1083,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       // intermediate jump.
       restoreRetainedMeasurementBoundary();
       if (hasOpenTailRef.current) maintainFollowedLiveTail();
+      observeScrollLayout();
     };
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
@@ -1111,7 +1129,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       mutationObserver?.disconnect();
     };
   }, [
-    hasOpenTail, maintainFollowedLiveTail,
+    hasOpenTail, maintainFollowedLiveTail, observeScrollLayout,
     restoreRetainedMeasurementBoundary, scrollScope, virtualizer,
   ]);
 
@@ -1923,6 +1941,20 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     userScrollIntentRef.current = false;
     userScrollDirectionRef.current = null;
     flushHistoryViewportLease();
+    const controller = controllerRef.current;
+    const el = scrollRef.current;
+    const explicitlyReachedBottom = reachedLatestIntentionally
+      && !scrollCoordinatorRef.current.isInteractionLocked()
+      && !textSelectionRef.current?.dragging && el != null
+      && measureBottom(readScrollMetrics(el)).atBottom;
+    // A downward gesture at a clamped browse edge emits no native scroll.
+    // Remember the same explicit intent as onScroll, including while the last
+    // cached-newer page/anchor is settling. Layout alone never leaves browse.
+    if (explicitlyReachedBottom && browseMode) {
+      manualLatestIntentRef.current = scrollScope;
+      if (!hasNewer && !historyRequestRef.current
+          && !historyAnchorRef.current.current() && leaveHistoryBrowse()) return;
+    }
     // A page transaction owns an older exact row until its keyed correction
     // settles. Capturing the temporarily shifted DOM here would replace that
     // authority with the very jump we are trying to undo. Explicit movement
@@ -1934,15 +1966,11 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       }
       return;
     }
-    const controller = controllerRef.current;
-    const el = scrollRef.current;
     // At the physical edge, a final downward gesture may produce no scroll
     // event (clamping, coalescing, or short content). Settle that explicit
     // intent here; layout alone must never resume a paused history reader.
-    if (reachedLatestIntentionally && !browseMode && !historyRequestRef.current
-        && !scrollCoordinatorRef.current.isInteractionLocked()
-        && !textSelectionRef.current?.dragging && el && controller
-        && measureBottom(readScrollMetrics(el)).atBottom) {
+    if (explicitlyReachedBottom && !browseMode && !historyRequestRef.current
+        && el && controller) {
       syncScrollState(controller.resume(readScrollMetrics(el)));
       setMeasurementBoundary(null);
     }
@@ -3361,7 +3389,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
           }} />
         </div>
         </div>
-        {(!scrollState.followOutput || !scrollState.nearBottom) && (
+        {(browseMode || (!scrollState.atBottom
+          && (!scrollState.followOutput || !scrollState.nearBottom))) && (
           <div className="scroll-bottom-wrap">
             <button className="scroll-bottom-btn" onClick={returnToLatest}
               aria-label={browseMode ? "回到最新" : "滚动到底部"}

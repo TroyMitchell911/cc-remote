@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-import os
 import threading
 from typing import Callable
 from uuid import uuid4
 
+from cc_remote.wrapper.rollout_io import rollout_open, rollout_size
 from cc_remote.protocol import TurnBinding, UserMsg
 from cc_remote.wrapper.codex_stream import (
     _history_boundary_records,
@@ -103,12 +103,12 @@ class CodexDetailPages:
                     or self._cursor(key, position) != before):
                 raise CodexDetailCursorExpired("Codex detail cursor scope changed")
         else:
-            if os.path.getsize(path) <= window_bytes:
+            if rollout_size(path) <= window_bytes:
                 return None
             source = HistorySourceFingerprint.capture(path)
             end = source.size
             # Never freeze a half-written JSONL record into an immutable page.
-            with open(path, "rb") as stream:
+            with rollout_open(path, "rb") as stream:
                 stream.seek(end - 1)
                 if stream.read(1) != b"\n":
                     end = _previous_jsonl_record_offset(path, end)

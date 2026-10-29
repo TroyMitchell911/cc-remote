@@ -2,14 +2,21 @@ import { readThemePreferences, themePalette, type PaletteId, type ThemeEngine, t
 
 export type AppearanceMode = "system" | ThemeMode;
 export type AppearanceFont = "system" | "sans" | "serif";
+export type SessionLayout = "comfortable" | "compact";
 export interface AppearanceColors { accent: string; background: string; foreground: string }
 export interface AppearanceLook extends Partial<AppearanceColors> {
   preset?: PaletteId;
   font?: AppearanceFont;
 }
-export interface EngineAppearance { mode: AppearanceMode; light: AppearanceLook; dark: AppearanceLook }
+export interface EngineAppearance {
+  mode: AppearanceMode;
+  light: AppearanceLook;
+  dark: AppearanceLook;
+  sessionLayout?: SessionLayout;
+}
 export type AppearancePreferences = Partial<Record<ThemeEngine, EngineAppearance>>;
 export type AppearanceChange = { mode: AppearanceMode }
+  | { sessionLayout: SessionLayout }
   | { target: ThemeMode; patch: AppearanceLook }
   | { target: ThemeMode; replace: AppearanceLook };
 export const APPEARANCE_STORAGE_KEY = "cc_remote_appearance_v2";
@@ -79,6 +86,9 @@ export function readAppearancePreferences(storage?: Pick<Storage, "getItem">): A
     next[engine] = validMode(raw.mode)
       ? { mode: raw.mode, light: sanitizeLook(raw.light, "light"), dark: sanitizeLook(raw.dark, "dark") }
       : fallback;
+    if (raw.sessionLayout === "comfortable" || raw.sessionLayout === "compact") {
+      next[engine].sessionLayout = raw.sessionLayout;
+    }
   }
   return next;
 }
@@ -92,6 +102,7 @@ export function saveAppearanceChange(storage: Pick<Storage, "getItem" | "setItem
   const apply = (source: AppearancePreferences): AppearancePreferences => {
     const previous = source[engine] ?? { mode: "system", light: {}, dark: {} };
     const edited: EngineAppearance = "mode" in change ? { ...previous, mode: change.mode }
+      : "sessionLayout" in change ? { ...previous, sessionLayout: change.sessionLayout }
       : { ...previous, [change.target]: sanitizeLook("replace" in change ? change.replace
         : { ...previous[change.target], ...change.patch }, change.target) };
     return { ...source, [engine]: edited };

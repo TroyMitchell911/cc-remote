@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cc_remote.wrapper.rollout_io import zstd
 from cc_remote.wrapper.codex_detail_pages import CodexDetailPages, CodexDetailCursorExpired
 from cc_remote.wrapper.machine import _turn_detail_page
 from tests.test_multisession import _mk_ctx, _mk_machine
@@ -63,9 +64,15 @@ def _read(pager, path, before=None, **overrides):
 
 
 @pytest.mark.parametrize("newer", [False, True])
-def test_long_turn_pages_recover_every_public_message_and_navigate_back(tmp_path, newer):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_long_turn_pages_recover_every_public_message_and_navigate_back(tmp_path, newer, compressed):
     path = tmp_path / "rollout.jsonl"
     _long_rollout(path, newer=newer)
+    if compressed:
+        encoded = zstd.compress(path.read_bytes())
+        path.unlink()
+        path = path.with_suffix(".jsonl.zst")
+        path.write_bytes(encoded)
     pager = CodexDetailPages()
     page = _read(pager, path)
     ids = []

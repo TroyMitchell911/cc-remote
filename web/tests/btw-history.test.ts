@@ -23,7 +23,7 @@ try {
   const panel = () => renderToStaticMarkup(createElement(BtwPanel, {
     sid, rt: state.runtimes[sid], engine: "claude", chats: [],
     active: "btw", hasArtifact: false, catalog: {}, draftKey: sid,
-    draftStore: new ComposerDraftStore(), sendMode: "steer",
+    draftStore: new ComposerDraftStore(),
     unconfirmedQueued: [], unconfirmedReplaceable: [],
     queueCapacity: {}, replaceQueueCapacity: {},
   }));

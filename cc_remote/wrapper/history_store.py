@@ -23,6 +23,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open
 from cc_remote.wrapper.codex_delegation import codex_message_target
 from cc_remote.wrapper.claude_rewind_history import rewind_anchor_row
 
@@ -88,7 +89,8 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v52 honors native conversation rewind anchors, including an empty branch.
 # v53 recovers native Claude Edit/Write diffs from the transcript envelope.
 # v54 preserves the active rewind branch after native settings and new prompts.
-_SCHEMA_VERSION = 54
+# v55 rebuilds Claude catalogs truncated behind pending image metadata leaves.
+_SCHEMA_VERSION = 55
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -206,8 +208,8 @@ class HistorySourceFingerprint:
     @classmethod
     def capture(cls, path: str | os.PathLike[str]) -> "HistorySourceFingerprint":
         resolved = os.path.realpath(os.fspath(path))
-        with open(resolved, "rb") as source:
-            stat = os.fstat(source.fileno())
+        with rollout_open(resolved, "rb") as source:
+            stat = rollout_fstat(source)
             head = source.read(_FINGERPRINT_SAMPLE_BYTES)
             tail = head
             digest = hashlib.sha256()
@@ -280,8 +282,8 @@ def history_source_extends(
         return False
     sample_size = min(previous.size, _FINGERPRINT_SAMPLE_BYTES)
     try:
-        with open(current.path, "rb") as source:
-            stat = os.fstat(source.fileno())
+        with rollout_open(current.path, "rb") as source:
+            stat = rollout_fstat(source)
             if (
                 int(stat.st_dev) != current.device
                 or int(stat.st_ino) != current.inode
@@ -1318,6 +1320,10 @@ def materialize_history_turns(
     return tuple(turns)
 
 
+class _CompactIndexChanged(Exception):
+    """A concurrent scan committed a different source prefix."""
+
+
 class HistoryIndexStore:
     """Small SQLite LRU for source-bound materialized conversation pages.
 
@@ -1343,7 +1349,7 @@ class HistoryIndexStore:
         self._ensure_schema()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             os.chmod(self.path.parent, 0o700)
@@ -1355,6 +1361,8 @@ class HistoryIndexStore:
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA journal_mode=WAL")
             with connection:
+                if write:
+                    connection.execute("BEGIN IMMEDIATE")
                 yield connection
         finally:
             connection.close()
@@ -1390,7 +1398,7 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current in range(10, 54):
+            if current in range(10, 55):
                 # Source bytes are unchanged. Rebuild only derived Claude
                 # narrative; retain native indexes, binary assets and engines.
                 for table in ("history_pages", "history_turn_details"):
@@ -1569,8 +1577,8 @@ class HistoryIndexStore:
                 for table in ("history_pages", "history_turn_details"):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
-            elif current in range(21, 54):
-                # The independent v22-v44 invalidations above suffice.
+            elif current in range(21, 55):
+                # The independent projection invalidations above suffice.
                 pass
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
@@ -1813,11 +1821,20 @@ class HistoryIndexStore:
                     index.leaf, dict(index.rows), index.queued_notifications,
                     index.indexed_size,
                 )
-        index = self._read_claude_compact_index(
-            source_path, snapshot_size=snapshot_size,
-            max_record_bytes=max_record_bytes, max_entries=max_entries,
-            visible_user=visible_user,
-        )
+        for _ in range(3):
+            try:
+                index = self._read_claude_compact_index(
+                    source_path, snapshot_size=snapshot_size,
+                    max_record_bytes=max_record_bytes, max_entries=max_entries,
+                    visible_user=visible_user,
+                )
+                break
+            except _CompactIndexChanged:
+                # Reuse the winning prefix, still restricted to this reader's
+                # requested snapshot. A cache race is not a missing history.
+                continue
+        else:
+            return None
         if index is None:
             return None
         try:
@@ -1885,23 +1902,124 @@ class HistoryIndexStore:
                     "SELECT * FROM claude_compact_sources WHERE source_path=?",
                     (resolved,),
                 ).fetchone()
-                rebuild = state is None
+            rebuild = state is None
+            indexed_size = 0
+            record_count = 0
+            if state is not None:
+                indexed_size = int(state["indexed_size"])
+                record_count = int(state["record_count"])
+                rebuild = (
+                    int(state["source_device"]) != device
+                    or int(state["source_inode"]) != inode
+                    or int(stat.st_size) < indexed_size
+                )
+                if not rebuild:
+                    head, tail = _prefix_samples(source, indexed_size)
+                    rebuild = (
+                        head != state["source_head_sha256"]
+                        or tail != state["source_tail_sha256"]
+                    )
+            if rebuild:
                 indexed_size = 0
                 record_count = 0
-                if state is not None:
-                    indexed_size = int(state["indexed_size"])
-                    record_count = int(state["record_count"])
-                    rebuild = (
-                        int(state["source_device"]) != device
-                        or int(state["source_inode"]) != inode
-                        or int(stat.st_size) < indexed_size
-                    )
-                    if not rebuild:
-                        head, tail = _prefix_samples(source, indexed_size)
-                        rebuild = (
-                            head != state["source_head_sha256"]
-                            or tail != state["source_tail_sha256"]
-                        )
+
+            # Parsing a cold/replaced transcript can take seconds. Keep file
+            # I/O and JSON decoding outside the database writer transaction.
+            sampled_size = max(target_size, indexed_size)
+            scan_samples = _prefix_samples(source, sampled_size)
+            new_records: list[tuple[object, ...]] = []
+            new_queue: list[tuple[object, ...]] = []
+            scan_offset = indexed_size
+            scan_needed = target_size > indexed_size
+            scan_complete = not scan_needed
+            if scan_needed:
+                source.seek(indexed_size)
+                while source.tell() < target_size:
+                    offset = source.tell()
+                    remaining = target_size - offset
+                    line = source.readline(min(remaining, bounded_record + 1))
+                    if not line:
+                        break
+                    if not line.endswith(b"\n") and len(line) > bounded_record:
+                        # Do not index past an unknown ancestry record. A
+                        # raised configured record cap can safely retry from
+                        # this exact byte on the next request.
+                        scan_offset = offset
+                        break
+                    if not line.endswith(b"\n"):
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            # Snapshot captured a writer's partial final row.
+                            scan_offset = offset
+                            break
+                    else:
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            scan_offset = source.tell()
+                            continue
+                    scan_offset = source.tell()
+                    if not isinstance(row, dict):
+                        continue
+                    row = rewind_anchor_row(row, offset)
+                    if (row.get("type") == "queue-operation"
+                            and row.get("operation") == "enqueue"):
+                        content = row.get("content")
+                        if (isinstance(content, str) and content.lstrip().startswith(
+                                "<task-notification>")):
+                            new_queue.append((
+                                resolved, device, inode, len(content),
+                                hashlib.sha256(content.encode(
+                                    "utf-8", "surrogatepass")).hexdigest(),
+                            ))
+                    uid = row.get("uuid")
+                    if not (isinstance(uid, str)
+                            and _SAFE_COMPACT_ID.fullmatch(uid)):
+                        continue
+                    def text_field(name: str) -> str | None:
+                        value = row.get(name)
+                        return value if isinstance(value, str) else None
+                    visible = visible_user(row)
+                    # Accepted attachment edges use a different UUID from
+                    # the native user echo. Index that public cursor without
+                    # retaining/re-reading potentially large prompt bodies.
+                    public_uid = (visible if isinstance(visible, str)
+                                  else uid if visible else None)
+                    new_records.append((
+                        resolved, device, inode, uid,
+                        text_field("type"), text_field("subtype"),
+                        text_field("parentUuid"),
+                        text_field("logicalParentUuid"),
+                        (1 if row.get("isSidechain") is True else 0
+                         if row.get("isSidechain") is False else None),
+                        offset, len(line), int(bool(visible)), public_uid,
+                    ))
+                scan_complete = scan_offset >= target_size
+            indexed_size = max(indexed_size, scan_offset)
+            if _prefix_samples(source, sampled_size) != scan_samples:
+                return None
+            try:
+                current_stat = os.stat(resolved)
+            except OSError:
+                return None
+            if (current_stat.st_dev != device or current_stat.st_ino != inode
+                    or current_stat.st_size < sampled_size):
+                return None
+            head, tail = _prefix_samples(source, indexed_size)
+            with self._connect(write=True) as connection:
+                current = connection.execute(
+                    "SELECT * FROM claude_compact_sources WHERE source_path=?",
+                    (resolved,),
+                ).fetchone()
+                # Another reader may have committed a newer prefix while this
+                # scan was outside SQLite. Never overwrite its graph/offsets.
+                if ((current is None) != (state is None)
+                        or (current is not None and state is not None and any(
+                            current[key] != state[key]
+                            for key in state.keys() if key != "updated_at"
+                        ))):
+                    raise _CompactIndexChanged
                 if rebuild:
                     connection.execute(
                         "DELETE FROM claude_compact_records WHERE source_path=?",
@@ -1915,111 +2033,41 @@ class HistoryIndexStore:
                         "DELETE FROM claude_compact_sources WHERE source_path=?",
                         (resolved,),
                     )
-                    indexed_size = 0
-                    record_count = 0
-
-                new_records: list[tuple[object, ...]] = []
-                new_queue: list[tuple[object, ...]] = []
-                scan_offset = indexed_size
-                scan_complete = target_size <= indexed_size
-                if target_size > indexed_size:
-                    source.seek(indexed_size)
-                    while source.tell() < target_size:
-                        offset = source.tell()
-                        remaining = target_size - offset
-                        line = source.readline(min(remaining, bounded_record + 1))
-                        if not line:
-                            break
-                        if not line.endswith(b"\n") and len(line) > bounded_record:
-                            # Do not index past an unknown ancestry record. A
-                            # raised configured record cap can safely retry from
-                            # this exact byte on the next request.
-                            scan_offset = offset
-                            break
-                        if not line.endswith(b"\n"):
-                            try:
-                                row = json.loads(line)
-                            except Exception:
-                                # Snapshot captured a writer's partial final row.
-                                scan_offset = offset
-                                break
-                        else:
-                            try:
-                                row = json.loads(line)
-                            except Exception:
-                                scan_offset = source.tell()
-                                continue
-                        scan_offset = source.tell()
-                        if not isinstance(row, dict):
-                            continue
-                        row = rewind_anchor_row(row, offset)
-                        if (row.get("type") == "queue-operation"
-                                and row.get("operation") == "enqueue"):
-                            content = row.get("content")
-                            if (isinstance(content, str) and content.lstrip().startswith(
-                                    "<task-notification>")):
-                                new_queue.append((
-                                    resolved, device, inode, len(content),
-                                    hashlib.sha256(content.encode(
-                                        "utf-8", "surrogatepass")).hexdigest(),
-                                ))
-                        uid = row.get("uuid")
-                        if not (isinstance(uid, str)
-                                and _SAFE_COMPACT_ID.fullmatch(uid)):
-                            continue
-                        def text_field(name: str) -> str | None:
-                            value = row.get(name)
-                            return value if isinstance(value, str) else None
-                        visible = visible_user(row)
-                        # Accepted attachment edges use a different UUID from
-                        # the native user echo. Index that public cursor without
-                        # retaining/re-reading potentially large prompt bodies.
-                        public_uid = (visible if isinstance(visible, str)
-                                      else uid if visible else None)
-                        new_records.append((
-                            resolved, device, inode, uid,
-                            text_field("type"), text_field("subtype"),
-                            text_field("parentUuid"),
-                            text_field("logicalParentUuid"),
-                            (1 if row.get("isSidechain") is True else 0
-                             if row.get("isSidechain") is False else None),
-                            offset, len(line), int(bool(visible)), public_uid,
-                        ))
-                    scan_complete = scan_offset >= target_size
-                    if new_records:
-                        connection.executemany(
-                            """
-                            INSERT INTO claude_compact_records (
-                                source_path, source_device, source_inode, uuid,
-                                row_type, subtype, parent_uuid,
-                                logical_parent_uuid, is_sidechain,
-                                source_offset, record_bytes, visible_user, public_user_id
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT (
-                                source_path, source_device, source_inode, uuid
-                            ) DO UPDATE SET
-                                row_type=excluded.row_type,
-                                subtype=excluded.subtype,
-                                parent_uuid=excluded.parent_uuid,
-                                logical_parent_uuid=excluded.logical_parent_uuid,
-                                is_sidechain=excluded.is_sidechain,
-                                source_offset=excluded.source_offset,
-                                record_bytes=excluded.record_bytes,
-                                visible_user=excluded.visible_user,
-                                public_user_id=excluded.public_user_id
-                            """,
-                            new_records,
-                        )
-                    if new_queue:
-                        connection.executemany(
-                            """
-                            INSERT OR IGNORE INTO claude_compact_queue (
-                                source_path, source_device, source_inode,
-                                content_length, content_sha256
-                            ) VALUES (?, ?, ?, ?, ?)
-                            """,
-                            new_queue,
-                        )
+                if new_records:
+                    connection.executemany(
+                        """
+                        INSERT INTO claude_compact_records (
+                            source_path, source_device, source_inode, uuid,
+                            row_type, subtype, parent_uuid,
+                            logical_parent_uuid, is_sidechain,
+                            source_offset, record_bytes, visible_user, public_user_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (
+                            source_path, source_device, source_inode, uuid
+                        ) DO UPDATE SET
+                            row_type=excluded.row_type,
+                            subtype=excluded.subtype,
+                            parent_uuid=excluded.parent_uuid,
+                            logical_parent_uuid=excluded.logical_parent_uuid,
+                            is_sidechain=excluded.is_sidechain,
+                            source_offset=excluded.source_offset,
+                            record_bytes=excluded.record_bytes,
+                            visible_user=excluded.visible_user,
+                            public_user_id=excluded.public_user_id
+                        """,
+                        new_records,
+                    )
+                if new_queue:
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO claude_compact_queue (
+                            source_path, source_device, source_inode,
+                            content_length, content_sha256
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        new_queue,
+                    )
+                if scan_needed:
                     record_count = int(connection.execute(
                         """
                         SELECT COUNT(*) FROM claude_compact_records
@@ -2044,8 +2092,6 @@ class HistoryIndexStore:
                             (resolved,),
                         )
                         return None
-                indexed_size = max(indexed_size, scan_offset)
-                head, tail = _prefix_samples(source, indexed_size)
                 now = time.time()
                 connection.execute(
                     """
@@ -2249,8 +2295,8 @@ class HistoryIndexStore:
             return None
         old_size = int(row["source_size"])
         try:
-            with open(source.path, "rb") as current:
-                stat = os.fstat(current.fileno())
+            with rollout_open(source.path, "rb") as current:
+                stat = rollout_fstat(current)
                 if (int(stat.st_dev) != source.device
                         or int(stat.st_ino) != source.inode
                         or int(stat.st_size) < source.size):
@@ -2295,6 +2341,9 @@ class HistoryIndexStore:
         payload = json.dumps(
             page.as_payload(), ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
+        details = self._prepare_turn_details(
+            detail_events if detail_events is not None else page.events,
+        )
         now = time.time()
         with self._connect() as connection:
             self._put_turn_details(
@@ -2302,9 +2351,8 @@ class HistoryIndexStore:
                 session_id,
                 engine,
                 source,
-                detail_events if detail_events is not None else page.events,
+                details,
                 now,
-                max_bytes=self.max_bytes,
             )
             self._prune_details(connection)
             if len(payload) > self.max_bytes:
@@ -2349,18 +2397,12 @@ class HistoryIndexStore:
             self._prune(connection)
         return True
 
-    @staticmethod
-    def _put_turn_details(
-        connection: sqlite3.Connection,
-        session_id: str,
-        engine: str,
-        source: HistorySourceFingerprint,
+    def _prepare_turn_details(
+        self,
         events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
-        now: float,
-        *,
-        max_bytes: int | None = None,
-    ) -> None:
-        """Write source-complete detail independently from the wire-safe page."""
+    ) -> list[tuple[str, bytes]]:
+        """Encode source-complete detail before taking the writer lock."""
+        prepared: list[tuple[str, bytes]] = []
         for group in group_history_events(events):
             turn_id = _turn_id(group)
             if turn_id is None:
@@ -2368,8 +2410,22 @@ class HistoryIndexStore:
             detail_payload = json.dumps(
                 group, ensure_ascii=False, separators=(",", ":"),
             ).encode("utf-8")
-            if max_bytes is not None and len(detail_payload) > max_bytes:
+            if len(detail_payload) > self.max_bytes:
                 continue
+            prepared.append((turn_id, detail_payload))
+        return prepared
+
+    @staticmethod
+    def _put_turn_details(
+        connection: sqlite3.Connection,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        details: list[tuple[str, bytes]],
+        now: float,
+    ) -> None:
+        """Write prepared detail independently from the wire-safe page."""
+        for turn_id, detail_payload in details:
             connection.execute(
                 """
                 INSERT INTO history_turn_details (
@@ -2402,6 +2458,7 @@ class HistoryIndexStore:
         per-turn expansion rows, however, are derived from the coherent source
         snapshot before any transport-only compaction.
         """
+        details = self._prepare_turn_details(events)
         now = time.time()
         with self._connect() as connection:
             self._put_turn_details(
@@ -2409,9 +2466,8 @@ class HistoryIndexStore:
                 session_id,
                 engine,
                 source,
-                events,
+                details,
                 now,
-                max_bytes=self.max_bytes,
             )
             self._prune_details(connection)
 

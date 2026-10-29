@@ -2,7 +2,7 @@ import type { Notice } from "./protocol";
 
 const OFFICIAL_NOTICE_PREFIX = "codex-notice-";
 
-function cleanProductText(value: string): string {
+export function cleanProductText(value: string): string {
   return value
     .replace(/\bcc[_ -]?crash\b/gi, "运行问题")
     .replace(/\b(?:crash|warning|error|exception|traceback)\b/gi, "问题")

@@ -164,9 +164,9 @@ try {
   }));
   assert.match(sidebarMarkup, /aria-label="筛选 Claude 账号"/);
   assert.match(sidebarMarkup,
-    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+    /class="scard-profile-dot tone-0"[^>]*aria-label="Claude 账号：default · Personal"/);
   assert.match(sidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+    /class="scard-profile-dot tone-1"[^>]*aria-label="Claude 账号：nyx · Company"/);
   assert.match(sidebarMarkup, /Claude 账号：nyx · Company/);
 
   const ownership = {

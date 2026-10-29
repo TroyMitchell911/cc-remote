@@ -6,7 +6,7 @@ const WEBKIT_VIEWER_TESTS = /remote Viewer/;
 const WEBKIT_LIVE_INTERACTION_TESTS =
   /async question|side chat scope|right panel layout|live append follows|scrolling a live-dirty history window|returning to a background-grown live turn|iOS pointercancel releases process interactions|switching sessions clears retained desktop text selection|nested process disclosures|stationary press opens|dragging a process header|dragging nested process|multi-line IME growth|long paste|composer bounded attachment selection|oversized edited paste|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =
-  /generated image|image gallery|external preview|Codex visualize output|Codex file citations|local Markdown file link|mounted message image|two visible images|HTML preview|artifact-(?:audio|svg|markdown-svg|pdf|gif|invalid-gif)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|Markdown disclosures|Markdown breaks|real wide Robot|pending composer image|profile keycaps|profile session card (?:edges|manual unread)/;
+  /generated image|image gallery|external preview|Codex visualize output|Codex file citations|local Markdown file link|mounted message image|two visible images|HTML preview|artifact-(?:audio|svg|markdown-svg|pdf|gif|invalid-gif)|mobile Markdown source editor|dark desktop code block|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|Markdown disclosures|Markdown breaks|real wide Robot|pending composer image|profile dots|profile session card (?:only highlights|manual unread)/;
 const WEBKIT_GOAL_PLAN_TESTS = /[Pp]lan|[Gg]oal/;
 const TURN_REGRESSION_TESTS = /turn regressions|provider capacity/;
 const WEBKIT_SELECTION_TESTS =
@@ -25,7 +25,7 @@ const WEBKIT_GENERAL_EXCLUSIONS = [
 
 export default defineConfig({
   testDir: "./tests",
-  testMatch: ["history-browser.spec.ts", "background-tasks.spec.ts", "themes.spec.ts", "mobile-sidebar.spec.ts"],
+  testMatch: ["history-browser.spec.ts", "background-tasks.spec.ts", "composer-queue.spec.ts", "themes.spec.ts", "mobile-sidebar.spec.ts", "header-feedback.spec.ts"],
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 2 : 0,

@@ -29,6 +29,7 @@ import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
 import { ImeSubmitGuard } from "../ime-submit";
 import {
   classifyBusySubmit,
+  shouldQueueOnTab,
   isComposerBusy,
   isInterruptSettling,
   isSettlingStopDisabled,
@@ -96,7 +97,6 @@ interface Props {
   draftKey: string;
   draftStore: ComposerDraftStore;
   questionDrafts?: Map<string, QuestionDraft>;
-  sendMode: SendMode;
   unconfirmedQueued: PendingQuery[];
   unconfirmedReplaceable: PendingQuery[];
   queueCapacity: QueueCapacity;
@@ -109,7 +109,6 @@ interface Props {
   onSteer: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
   onReplyAsyncQuestion?: (prompt: string) => Promise<QueryAcceptanceResult> | null;
   onInterrupt: () => void;
-  onSetSendMode: (mode: SendMode) => void;
   onEnqueue: (query: PendingQuery) => boolean;
   onSetPending: (query: PendingQuery) => boolean;
   onRemoveQueued: (query: PendingQuery) => void;
@@ -351,10 +350,16 @@ export function BtwPanel(p: Props) {
     if (taRef.current) grow(taRef.current);
   }, [input, p.draftKey, lockReason, expanded]);
 
-  const submit = (value = taRef.current?.value ?? input) => {
+  const submit = (value = taRef.current?.value ?? input, mode: SendMode = "steer") => {
     if (awaitingFirstChat || !p.sid || inputLockedRef.current) return;
     if (importingRef.current) { flash("请等待附件导入完成"); return; }
     const command = parseSlash(value.trim());
+    if (mode === "queue" && command
+        && (["open", "autocompact"].includes(command.slash)
+          || (command.slash === "fast" && p.engine === "codex"))) {
+      flash("此命令请按 Enter 执行");
+      return;
+    }
     if (command?.slash === "fast" && p.engine === "codex") {
       if (p.onSetServiceTier("toggle")) {
         setInput("");
@@ -410,7 +415,7 @@ export function BtwPanel(p: Props) {
     };
     if (runtimeBusy) {
       const action = classifyBusySubmit(
-        submitState, p.sendMode,
+        submitState, mode,
         p.engine,
         prompt.length > 0 || hasAttachments);
       if (action === "noop") return;
@@ -421,9 +426,9 @@ export function BtwPanel(p: Props) {
         }
         return;
       }
-      const unconfirmed = p.sendMode === "queue"
+      const unconfirmed = mode === "queue"
         ? p.unconfirmedQueued : p.unconfirmedReplaceable;
-      const capacity = p.sendMode === "queue"
+      const capacity = mode === "queue"
         ? p.queueCapacity : p.replaceQueueCapacity;
       if (!canEnqueueQuery(unconfirmed, query, capacity)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
@@ -468,9 +473,7 @@ export function BtwPanel(p: Props) {
   const effortName = effortNameForDisplay(p.rt?.effort);
   const stopping = runtimeBusy && !hasContent;
   const interruptSettling = isInterruptSettling(submitState);
-  const sendIcon = !runtimeBusy ? "send"
-    : stopping ? "stop" : p.sendMode === "steer"
-      ? "send" : "queue";
+  const sendIcon = stopping ? "stop" : "send";
   const sendClass = "btw-send"
     + (stopping ? " interrupt" : "");
   const sendDisabled = attachmentsLocked || importing
@@ -645,20 +648,6 @@ export function BtwPanel(p: Props) {
               }))} />
           </div>
         )}
-        {runtimeBusy && !inputLocked && (
-          <div className="btw-runbar">
-            <div className="seg">
-              <button className={p.sendMode === "steer" ? "on" : ""}
-                onClick={() => p.onSetSendMode("steer")}>
-                <Icon name="send" size={14} />引导
-              </button>
-              <button className={p.sendMode === "queue" ? "on" : ""}
-                onClick={() => p.onSetSendMode("queue")}>
-                <Icon name="queue" size={14} />排队
-              </button>
-            </div>
-          </div>
-        )}
         <div className="btw-input-card">
           <div className="btw-input">
             <AttachmentPicker key={p.draftKey} onPick={onPickFiles}
@@ -670,7 +659,7 @@ export function BtwPanel(p: Props) {
               value={input}
               placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
                 : runtimeBusy
-                  ? "输入以引导当前任务，或选择排队…"
+                  ? "补充当前任务…"
                   : "问点什么")}
               rows={1}
               disabled={inputLocked || awaitingFirstChat || !p.sid}
@@ -685,6 +674,13 @@ export function BtwPanel(p: Props) {
               }}
               onPaste={onPaste}
               onKeyDown={(event) => {
+                if (imeSubmitRef.current.isComposingInput(event.nativeEvent)) return;
+                if (shouldQueueOnTab(event, submitState,
+                    !!event.currentTarget.value.trim() || hasAttachments || pastes.length > 0)) {
+                  event.preventDefault();
+                  submit(event.currentTarget.value, "queue");
+                  return;
+                }
                 if (!imeSubmitRef.current.shouldSubmitKey({
                   key: event.key,
                   shiftKey: event.shiftKey,
@@ -710,7 +706,7 @@ export function BtwPanel(p: Props) {
           </div>
         </div>
         <div className="btw-controls">
-          <span>BTW 设置</span>
+          <span>BTW 设置{submitState === "running" && <span className="btw-queue-hint"> · Tab 排队</span>}</span>
           <button className="hint-ctl" onClick={() => { p.onRequestModels?.(); setSheetKind("models"); }}
             disabled={inputLocked || busy || !p.sid}>{model?.name
               ?? (p.sid && p.rt ? "选择模型" : "模型读取中")}</button>

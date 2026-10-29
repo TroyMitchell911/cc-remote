@@ -118,8 +118,7 @@ export function BackgroundTasksFixture() {
       backgroundTasks={runtime.backgroundProcesses.length > 0
         ? <BackgroundTaskControl key={sid} processes={runtime.backgroundProcesses}
             onOpenAgent={id => setOpened(id)} /> : null}
-      connState="connected" wrapperOnline sendMode={runtime.sendMode}
-      setSendMode={mode => dispatch({ type: "set_send_mode", sid, mode })}
+      connState="connected" wrapperOnline
       queue={[]} pendingSend={null} failedDeferred={[]}
       unconfirmedQueued={[]} unconfirmedReplaceable={[]}
       queueCapacity={{}} replaceQueueCapacity={{}}

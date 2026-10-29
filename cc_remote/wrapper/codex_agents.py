@@ -8,6 +8,7 @@ import re
 from cc_remote.wrapper.codex_sessions import codex_rollout_path, _read_meta
 from cc_remote.wrapper.codex_stream import codex_translate_history, _live_id
 from cc_remote.wrapper.history_store import HistorySourceFingerprint
+from cc_remote.wrapper.rollout_io import rollout_open
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
 _MAX_BYTES = 64 * 1024 * 1024
@@ -39,7 +40,7 @@ def _parent(meta):
 
 def _records(path):
     # Never allocate an unbounded transcript or record for a detail request.
-    with open(path, "rb") as stream:
+    with rollout_open(path, "rb") as stream:
         while True:
             offset = stream.tell()
             if offset > _MAX_BYTES:

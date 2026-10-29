@@ -73,6 +73,7 @@ const migrated = readAppearancePreferences(storage);
 assert.deepEqual(migrated.claude, { mode: "light", light: { preset: "rose" }, dark: {} });
 assert.deepEqual(migrated.codex, { mode: "dark", light: {}, dark: {} });
 assert.deepEqual(migrated.dsh, { mode: "dark", light: {}, dark: { preset: "heritage" } });
+assert.equal(migrated.codex?.sessionLayout, undefined, "legacy preferences leave the current compact layout as default");
 assert.equal(values.has(APPEARANCE_STORAGE_KEY), false, "reading legacy preferences does not write storage");
 let current = saveAppearanceChange(storage, migrated, "codex", { target: "light", patch: { accent: "#123456" } });
 const stale = current;
@@ -89,10 +90,19 @@ assert.equal(current.codex?.mode, "system", "reset does not change mode selectio
 assert.equal(current.codex?.dark.accent, "#FEDCBA");
 assert.equal(current.claude?.light.preset, "rose");
 assert.equal(values.get(THEME_STORAGE_KEY), JSON.stringify({ claude: "rose", codex: "dark", dsh: "heritage" }));
+const beforeLayout = current;
+current = saveAppearanceChange(storage, current, "codex", { sessionLayout: "comfortable" });
+saveAppearanceChange(storage, beforeLayout, "claude", { sessionLayout: "compact" });
+current = saveAppearanceChange(storage, beforeLayout, "codex", { target: "dark", replace: {} });
+assert.equal(current.codex?.sessionLayout, "comfortable", "a stale color reset must preserve the latest layout");
+assert.equal(current.claude?.sessionLayout, "compact", "layout changes preserve other engines");
+current = saveAppearanceChange(storage, current, "codex", { mode: "light" });
+assert.equal(readAppearancePreferences(storage).codex?.sessionLayout, "comfortable", "layout survives mode changes and reloads");
+assert.deepEqual(current.claude?.light, beforeLayout.claude?.light, "layout changes preserve existing colors and fonts");
 values.set(APPEARANCE_STORAGE_KEY, JSON.stringify({ codex: { mode: "light", light: {
   accent: "red; background: url(https://example.com)", background: "#abc", foreground: "#12345G",
   preset: "__proto__", font: "constructor", evil: "ignored",
-}, dark: { preset: "rose" } } }));
+}, dark: { preset: "rose" }, sessionLayout: "invalid" } }));
 assert.deepEqual(readAppearancePreferences(storage).codex, { mode: "light", light: { background: "#AABBCC" }, dark: {} });
 values.set(APPEARANCE_STORAGE_KEY, "{");
 assert.deepEqual(readAppearancePreferences(storage), migrated);
@@ -104,6 +114,10 @@ const readOnly = { getItem: storage.getItem, setItem: () => { throw new Error("q
 values.set(APPEARANCE_STORAGE_KEY, JSON.stringify(migrated));
 let inMemory = saveAppearanceChange(readOnly, migrated, "codex", { target: "light", patch: { accent: "#111111" } });
 inMemory = saveAppearanceChange(readOnly, inMemory, "codex", { target: "light", patch: { background: "#EFEFEF" } });
+assert.deepEqual(inMemory.codex?.light, { accent: "#111111", background: "#EFEFEF" });
+inMemory = saveAppearanceChange(readOnly, inMemory, "codex", { sessionLayout: "comfortable" });
+inMemory = saveAppearanceChange(readOnly, inMemory, "codex", { target: "dark", patch: { font: "serif" } });
+assert.equal(inMemory.codex?.sessionLayout, "comfortable", "blocked storage still retains layout while editing colors");
 assert.deepEqual(inMemory.codex?.light, { accent: "#111111", background: "#EFEFEF" });
 assert.equal(readAppearancePreferences(blocked).codex?.mode, "system");
 for (const engine of ["claude", "codex", "dsh"] as const) {

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator } from "@playwright/test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pngChunk, staticPng } from "./fixtures/png";
@@ -170,6 +170,12 @@ test("turn regressions keyboard scrolling leaves the live tail and resumes at bo
   // synthetic focus() or scrollTop write hiding the original regression.
   await page.getByText("continue work", { exact: true }).click();
   await expect(viewport).toBeFocused();
+  // A non-text input-source key can switch the browser to keyboard focus
+  // styling after a prose click. The reading surface must not gain a full
+  // accent frame (only its bottom edge is visible in the app layout).
+  await page.keyboard.press("CapsLock");
+  await expect.poll(() => viewport.evaluate(node => node.matches(":focus-visible"))).toBe(true);
+  await expect(viewport).toHaveCSS("outline-style", "none");
   for (let repeat = 0; repeat < 16; repeat++) {
     await page.keyboard.down("ArrowUp");
     await page.waitForTimeout(40);
@@ -189,6 +195,106 @@ test("turn regressions keyboard scrolling leaves the live tail and resumes at bo
   await page.keyboard.press("Shift+Space");
   await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
   await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeGreaterThan(200);
+  // Suppressing the reading-surface frame must leave real controls visible
+  // to keyboard users.
+  const control = page.getByTestId("regression-live-toggle");
+  await control.focus();
+  await expect(control).toHaveCSS("outline-style", "solid");
+  await expect(control).toHaveCSS("outline-width", "2px");
+});
+
+for (const visible of ["thinking and answer", "only answer", "process header and answer"]) {
+  test(`turn regressions completion preserves the reading paragraph with ${visible} visible`, async ({ page, isMobile }, testInfo) => {
+    await page.goto(`/tests/history-browser.html?completion-reading=1${visible === "process header and answer" ? "&short-process=1" : ""}`);
+    const viewport = page.locator(".thread");
+    const paragraph = page.getByText("Answer paragraph 0. This is the explanation the user is reading.", { exact: true });
+    await expect(page.locator(".process-reasoning-body")).toBeVisible();
+    await waitForScrollIdle(page);
+    const offset = () => paragraph.evaluate(node => node.getBoundingClientRect().top
+      - node.closest(".thread")!.getBoundingClientRect().top);
+    const targetOffset = visible === "only answer" ? 0 : 180;
+    if (isMobile) {
+      await dispatchTouchPhase(page, "touchstart", 160);
+      await dispatchTouchPhase(page, "touchmove", 220);
+      await viewport.evaluate((node, delta) => { node.scrollTop += delta; }, await offset() - targetOffset);
+      await dispatchTouchPhase(page, "touchend", 220);
+    } else {
+      await viewport.hover();
+      await page.mouse.wheel(0, await offset() - targetOffset);
+    }
+    await waitForScrollIdle(page);
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    const before = await offset();
+    expect(Math.abs(before - targetOffset)).toBeLessThan(3);
+    // Incoming events must not transfer focus or manufacture a user gesture.
+    await page.getByTestId("append-answer").evaluate(node => (node as HTMLButtonElement).click());
+    await expect.poll(offset).toBeCloseTo(before, 0);
+    const frames = await paragraph.evaluate(node => new Promise<number[]>((resolve) => {
+      const viewport = node.closest(".thread")!;
+      const samples: number[] = [];
+      const sample = () => {
+        samples.push(node.getBoundingClientRect().top - viewport.getBoundingClientRect().top);
+        if (samples.length === 45) resolve(samples);
+        // Measure after each paint opportunity, including the collapse frame,
+        // so a jump to bottom followed by a correction cannot pass this test.
+        else requestAnimationFrame(() => setTimeout(sample, 0));
+      };
+      document.querySelector<HTMLButtonElement>('[data-testid="complete-answer"]')!.click();
+      requestAnimationFrame(() => setTimeout(sample, 0));
+    }));
+    await expect(page.locator(".process-reasoning-body")).toHaveCount(0);
+    await waitForScrollIdle(page);
+    const after = await offset();
+    const distance = await viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop);
+    await testInfo.attach("reading-position", { body: JSON.stringify({ before, after, distance, frames }), contentType: "application/json" });
+    expect(Math.max(...frames.map(value => Math.abs(value - before)))).toBeLessThan(3);
+    expect(Math.abs(after - before)).toBeLessThan(3);
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    // The retained paragraph is not a permanent scroll lock.
+    if (!isMobile) {
+      await viewport.hover();
+      await page.mouse.wheel(0, 100);
+      await waitForScrollIdle(page);
+      expect(await offset()).toBeLessThan(after - 80);
+    }
+    await page.locator(".scroll-bottom-btn").click();
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+    await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  });
+}
+
+test("turn regressions completion keeps a followed answer at the bottom", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?completion-reading=1");
+  const viewport = page.locator(".thread");
+  const distance = () => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop);
+  await expect.poll(distance).toBeLessThan(3);
+  await page.getByTestId("append-answer").evaluate(node => (node as HTMLButtonElement).click());
+  await expect.poll(distance).toBeLessThan(3);
+  await page.getByTestId("complete-answer").evaluate(node => (node as HTMLButtonElement).click());
+  await expect(page.locator(".process-reasoning-body")).toHaveCount(0);
+  await waitForScrollIdle(page);
+  expect(await distance()).toBeLessThan(3);
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+});
+
+test("turn regressions manual keyboard collapse retains the process header", async ({ page, isMobile }) => {
+  test.skip(isMobile, "Physical desktop keyboard activation");
+  await page.goto("/tests/history-browser.html?completion-reading=1&short-process=1");
+  const viewport = page.locator(".thread");
+  const header = page.locator(".turn-process-head");
+  await waitForScrollIdle(page);
+  const offset = () => header.evaluate(node => node.getBoundingClientRect().top
+    - node.closest(".thread")!.getBoundingClientRect().top);
+  await viewport.hover();
+  await page.mouse.wheel(0, await offset());
+  await waitForScrollIdle(page);
+  const before = await offset();
+  expect(Math.abs(before)).toBeLessThan(3);
+  await header.press("Enter");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await waitForScrollIdle(page);
+  expect(Math.abs(await offset() - before)).toBeLessThan(3);
+  await expect(page.locator("[data-process-auto-collapsed]")).toHaveCount(0);
 });
 
 test("turn regressions ArrowDown reaches bottom after a small wheel scroll", async ({ page, isMobile }) => {
@@ -217,6 +323,36 @@ test("turn regressions ArrowDown reaches bottom after a small wheel scroll", asy
   await page.mouse.wheel(0, -40);
   await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
   await expect(control).toBeFocused();
+});
+
+test("turn regressions a resized viewport at bottom hides the return button without resuming output", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?turn-regressions=1");
+  const viewport = page.locator(".thread");
+  await expect(page.locator(".turn-working")).toBeVisible();
+  await viewport.evaluate(node => {
+    node.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -40 }));
+    node.scrollTop -= 40;
+    node.dispatchEvent(new Event("scroll"));
+  });
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await waitForScrollIdle(page);
+  const size = page.viewportSize()!;
+  await page.setViewportSize({ ...size, height: size.height + 180 });
+  await expect.poll(() => viewport.evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+
+  // Geometry alone must not turn following back on. New output should expose
+  // the button again, without pulling the reader away from this position.
+  await page.getByTestId("regression-live-toggle").evaluate(node => (node as HTMLButtonElement).click());
+  await expect.poll(() => viewport.evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeGreaterThan(80);
+  await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+  await page.locator(".scroll-bottom-btn").click();
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  await page.waitForTimeout(350);
+  expect(await viewport.evaluate(node =>
+    node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
 });
 
 test("turn regressions manual small scroll back to bottom hides the return button", async ({ page }) => {
@@ -248,7 +384,7 @@ test("turn regressions manual small scroll back to bottom hides the return butto
       node.scrollTop = node.scrollHeight;
       node.dispatchEvent(new Event("scroll"));
     });
-    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
     if (gesture === "wheel") await viewport.dispatchEvent("wheel", { deltaY: 30 });
     else await dispatchTouchGesture(page, -30);
     await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
@@ -1069,7 +1205,7 @@ for (const running of [false, true]) {
     )).toBe(true);
     if (running) {
       relay.emit({ type: "state", sid: "layout-parent", state: "running" });
-      await expect(input).toHaveAttribute("placeholder", /引导/);
+      await expect(input).toHaveAttribute("placeholder", /补充当前任务/);
     }
     const prompt = "/Users/Tester/workspace/unitree-go2这里有双目的，看看我们的大脑是否能接入？";
     await input.fill(prompt);
@@ -1094,7 +1230,7 @@ for (const side of [false, true]) {
     const surface = page.locator(side ? ".btw-panel" : ".composer");
     const input = surface.locator("textarea");
     await expect(input).toBeVisible();
-    await expect(surface.getByRole("button", { name: "引导", exact: true })).toBeVisible();
+    await expect(surface.getByRole("button", { name: "引导", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "打断并发送", exact: true })).toHaveCount(0);
     relay.emit({ type: "user_msg", sid, msg_id: "claude-root", prompt: "检查输入" });
     relay.emit({ type: "state", sid, state: "running", msg_id: "claude-root" });
@@ -1129,9 +1265,8 @@ for (const side of [false, true]) {
       await expect(page.locator(`.turn[data-turn-id="${String(command.msg_id)}"]`))
         .not.toContainText("原任务输出");
     }
-    await surface.getByRole("button", { name: "排队", exact: true }).click();
     await input.fill("完成后再检查磁盘");
-    await input.press("Enter");
+    await input.press("Tab");
     await expect.poll(() => relay.commands.filter(c => c.type === "query"
       && c.delivery === "queue" && c.sid === sid).length).toBe(1);
     expect(relay.commands.filter(c => c.type === "interrupt")).toHaveLength(0);
@@ -1949,12 +2084,10 @@ for (const [engine, delivery] of [
     await page.goto("/");
     const panel = page.locator(".btw-panel");
     await expect(panel.getByRole("textbox")).toBeEnabled();
-    await expect(panel.locator(".btw-runbar")).toBeVisible();
+    await expect(panel.locator(".btw-runbar")).toHaveCount(0);
     if (delivery === "query") {
       relay.emit({ type: "state", sid: "btw-layout-child", state: "idle" });
       await expect(panel.locator(".btw-runbar")).toHaveCount(0);
-    } else if (delivery === "queue") {
-      await panel.getByRole("button", { name: "排队", exact: true }).click();
     }
     await panel.getByRole("button", { name: "添加附件", exact: true }).click();
     const chooser = page.getByRole("dialog", { name: "添加附件", exact: true });
@@ -1977,8 +2110,9 @@ for (const [engine, delivery] of [
     expect(attachment!.y + attachment!.height).toBeLessThan(card!.y);
     await expect(panel.locator(".btw-input-card .attach")).toHaveCount(0);
     await expect(page.locator(".composer .attach-file, .composer .attach-image-preview")).toHaveCount(0);
-    // An attachment-only click sends payload; it must never stop the active turn.
-    await panel.getByRole("button", { name: "发送", exact: true }).click();
+    // An attachment-only click/Tab sends the payload, never an interrupt.
+    if (delivery === "queue") await panel.getByRole("textbox").press("Tab");
+    else await panel.getByRole("button", { name: "发送", exact: true }).click();
     await expect.poll(() => relay.commands.filter(c => c.type === "query" || c.type === "steer").length).toBe(1);
     const sent = relay.commands.find(c => c.type === "query" || c.type === "steer")!;
     expect(sent.sid).toBe("btw-layout-child");
@@ -11709,6 +11843,35 @@ test("live append follows at the bottom but not while reading history", async ({
   await assertCodexBurstNeverPaintsAboveTail(page, testInfo.project.name);
 });
 
+for (const input of ["wheel", "touch", "keyboard"]) {
+  test(`downward input at an already clamped history edge restores the active tail (${input})`, async ({ page }, testInfo) => {
+    await page.goto("/tests/history-browser.html?deep-browse=1&dirty-live-browse=1&exhausted-browse=1");
+    await page.getByTestId("append-turn").click();
+    const thread = page.locator(".thread");
+    // A resize or a settled page can leave the native viewport already at the
+    // edge, without a user-driven scroll event. Merely being here must retain
+    // the historical page until the reader explicitly continues downward.
+    await thread.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await waitForScrollIdle(page);
+    await expect(page.getByRole("button", { name: "回到最新", exact: true })).toBeVisible();
+    await expect(page.locator('[data-turn-id="live-streaming"]')).toHaveCount(0);
+    if (input === "touch") await dispatchTouchGesture(page, -60);
+    else if (input === "keyboard") {
+      await thread.focus();
+      await page.keyboard.press("ArrowDown");
+    } else if (isMobileWebKitProject(testInfo.project.name)) {
+      // Playwright cannot send native mouse-wheel input to iOS WebKit. Exercise
+      // the clamped wheel event itself; native desktop wheel is covered below.
+      await thread.dispatchEvent("wheel", { deltaY: 200 });
+    } else {
+      await thread.hover();
+      await page.mouse.wheel(0, 200);
+    }
+    await expect(page.locator('[data-turn-id="live-streaming"] .turn-working')).toBeVisible();
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+  });
+}
+
 test("scrolling a live-dirty history window to its latest edge restores the active tail", async ({
   page,
 }, testInfo) => {
@@ -13603,11 +13766,11 @@ test("Work multi-account controls filter labels and seed a new immutable owner",
   await expect(page.getByRole("group", {
     name: "筛选 Codex 账号",
   })).toBeVisible();
-  await expect(page.locator(".scard-profile-ribbon")).toHaveCount(2);
+  await expect(page.locator(".scard-profile-dot")).toHaveCount(2);
 
   await page.getByRole("button", { name: "nyx · Stack" }).click();
   await expect(page.locator(".scard")).toHaveCount(1);
-  await expect(page.locator(".scard-profile-ribbon")).toHaveText("nyx");
+  await expect(page.locator(".scard-profile-dot")).toHaveAttribute("aria-label", "Codex 账号：nyx · Stack");
   await page.getByRole("button", { name: "新工作" }).click();
   await expect(page.getByTestId("new-work-profile")).toHaveText("stack");
 
@@ -13623,64 +13786,31 @@ test("Work multi-account controls filter labels and seed a new immutable owner",
   await expect(page.locator(".scard")).toHaveCount(2);
 });
 
-test("profile keycaps hang from session cards without shifting titles", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 720, height: 900 });
-  await page.goto("/tests/history-browser.html?profile-sidebar=1");
-
-  const activeCard = page.locator(".scard.active");
-  await expect(activeCard).toBeVisible();
-  const geometry = await activeCard.evaluate((card) => {
-    const keycap = card.querySelector<HTMLElement>(".scard-profile-ribbon");
-    const title = card.querySelector<HTMLElement>(".scard-title");
-    const preview = card.querySelector<HTMLElement>(".scard-prev");
-    if (!keycap || !title || !preview) {
-      throw new Error("profile sidebar fixture is incomplete");
-    }
-    const cardRect = card.getBoundingClientRect();
-    const keycapRect = keycap.getBoundingClientRect();
-    const titleRect = title.getBoundingClientRect();
-    const previewRect = preview.getBoundingClientRect();
-    return {
-      cardLeft: cardRect.left,
-      cardTop: cardRect.top,
-      keycapTop: keycapRect.top,
-      keycapBottom: keycapRect.bottom,
-      keycapWidth: keycapRect.width,
-      titleLeft: titleRect.left,
-      titleTop: titleRect.top,
-      previewLeft: previewRect.left,
-      position: getComputedStyle(keycap).position,
-    };
+test("profile dots stay outside session highlights without shifting titles", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/tests/history-browser.html?profile-sidebar=1&theme=dark");
+  const active = page.locator(".scard.active");
+  await expect(active).toBeVisible();
+  const geometry = await active.evaluate(card => {
+    const dot = card.querySelector<HTMLElement>(".scard-profile-dot")!;
+    const title = card.querySelector<HTMLElement>(".scard-title")!;
+    const sidebar = card.closest(".sessions")!;
+    const row = card.getBoundingClientRect();
+    const dotRect = dot.getBoundingClientRect();
+    const label = title.getBoundingClientRect();
+    return { dotRight: dotRect.right, dotLeft: dotRect.left, dotWidth: dotRect.width,
+      rowLeft: row.left, sidebarLeft: sidebar.getBoundingClientRect().left,
+      titleInset: label.left - row.left, dotCenter: (dotRect.top + dotRect.bottom) / 2,
+      titleCenter: (label.top + label.bottom) / 2 };
   });
-
-  expect(geometry.position).toBe("absolute");
-  expect(geometry.keycapTop).toBeLessThan(geometry.cardTop);
-  expect(geometry.keycapBottom).toBeGreaterThan(geometry.cardTop);
-  expect(geometry.keycapBottom).toBeLessThanOrEqual(geometry.titleTop);
-  expect(geometry.keycapWidth).toBeLessThanOrEqual(64);
-  expect(geometry.titleLeft - geometry.cardLeft).toBeLessThanOrEqual(18);
-  expect(Math.abs(geometry.titleLeft - geometry.previewLeft)).toBeLessThanOrEqual(1);
-
-  const ordinaryCard = page.locator(".scard").filter({
-    hasText: "cc-remote 派生",
-  });
-  const ordinaryGeometry = await ordinaryCard.evaluate((card) => {
-    const title = card.querySelector<HTMLElement>(".scard-title");
-    if (!title) throw new Error("ordinary profile title missing");
-    const style = getComputedStyle(card);
-    return {
-      titleInset:
-        title.getBoundingClientRect().left - card.getBoundingClientRect().left,
-      borderColor: style.borderTopColor,
-      backgroundColor: style.backgroundColor,
-    };
-  });
-  expect(ordinaryGeometry.titleInset).toBeLessThanOrEqual(18);
-  expect(ordinaryGeometry.borderColor).not.toBe("transparent");
-  expect(ordinaryGeometry.borderColor).not.toBe("rgba(0, 0, 0, 0)");
-  expect(ordinaryGeometry.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(geometry.dotRight).toBeLessThan(geometry.rowLeft);
+  expect(geometry.dotLeft).toBeGreaterThan(geometry.sidebarLeft);
+  expect(geometry.dotWidth).toBeLessThanOrEqual(7);
+  expect(geometry.titleInset).toBeLessThanOrEqual(12);
+  expect(Math.abs(geometry.dotCenter - geometry.titleCenter)).toBeLessThanOrEqual(1);
+  await expect(active.locator(".scard-prev")).toHaveCount(0);
+  await active.getByRole("button", { name: "更多操作" }).click();
+  await expect(page.getByRole("group", { name: "会话操作" })).toContainText("Codex 账号：nyx · Stack");
 });
 
 test("profile session card manual unread survives refresh until explicit opening", async ({ page }) => {
@@ -13777,61 +13907,13 @@ test("profile session card manual unread still synchronizes across tabs", async 
   }
 });
 
-test("profile session card edges remain visible in dark theme", async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 720, height: 900 });
+test("profile session card only highlights the selected row in dark theme", async ({ page }) => {
   await page.goto("/tests/history-browser.html?profile-sidebar=1&theme=dark");
-  await page.waitForFunction(() =>
-    document.documentElement.dataset.theme === "dark"
-  );
-  await page.waitForTimeout(200);
-
-  const appearance = await page.locator(".scard").evaluateAll((cards) => {
-    const sample = (color: string) => {
-      const canvas = document.createElement("canvas");
-      canvas.width = 1;
-      canvas.height = 1;
-      const context = canvas.getContext("2d");
-      if (!context) throw new Error("canvas context unavailable");
-      context.clearRect(0, 0, 1, 1);
-      context.fillStyle = color;
-      context.fillRect(0, 0, 1, 1);
-      return Array.from(context.getImageData(0, 0, 1, 1).data);
-    };
-    const channelDelta = (left: number[], right: number[]) =>
-      Math.max(...left.slice(0, 3).map((value, index) =>
-        Math.abs(value - right[index])
-      ));
-    const sidebar = sample(getComputedStyle(document.documentElement)
-      .getPropertyValue("--sidebar"));
-    return cards.map((card) => {
-      const style = getComputedStyle(card);
-      const border = sample(style.borderTopColor);
-      const background = sample(style.backgroundColor);
-      return {
-        active: card.classList.contains("active"),
-        borderAlpha: border[3],
-        borderCardDelta: channelDelta(border, background),
-        borderSidebarDelta: channelDelta(border, sidebar),
-        background: style.backgroundColor,
-        boxShadow: style.boxShadow,
-      };
-    });
-  });
-
-  expect(appearance).toHaveLength(2);
-  for (const card of appearance) {
-    expect(card.borderAlpha).toBe(255);
-    expect(card.borderCardDelta).toBeGreaterThanOrEqual(20);
-    expect(card.borderSidebarDelta).toBeGreaterThanOrEqual(20);
-  }
-  expect(appearance.some((card) => card.active)).toBe(true);
-  expect(appearance.some((card) => !card.active)).toBe(true);
-  const active = appearance.find((card) => card.active)!;
-  const inactive = appearance.find((card) => !card.active)!;
-  expect(active.background).not.toBe(inactive.background);
-  expect(active.boxShadow).not.toBe("none");
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  const inactive = page.locator(".scard:not(.active)");
+  await expect(inactive).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(inactive).toHaveCSS("border-top-color", "rgba(0, 0, 0, 0)");
+  await expect(page.locator(".scard.active")).not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
 });
 
 for (const engine of ["codex", "claude"] as const) {
@@ -14004,6 +14086,23 @@ test("Goal editor restores after a late keyboard viewport correction without ano
   })).toBe(true);
 });
 
+async function openSessionActions(card: Locator) {
+  const trigger = card.getByRole("button", { name: "更多操作" });
+  if (await card.evaluate(node => matchMedia("(hover: none)").matches && !node.classList.contains("active"))) {
+    await card.evaluate(node => {
+      const box = node.getBoundingClientRect();
+      const event = new Event("touchstart", { bubbles: true });
+      Object.defineProperty(event, "touches", { value: [{ clientX: box.x + 10, clientY: box.y + 10 }] });
+      node.dispatchEvent(event);
+    });
+    await expect(card).toHaveClass(/lifting/);
+    await card.dispatchEvent("touchend");
+  } else {
+    await card.hover();
+    await trigger.click();
+  }
+}
+
 for (const viewport of [{ width: 390, height: 560 }, { width: 1280, height: 500 }]) {
   test(`timed task popover stays above the footer at ${viewport.width}px without making the session busy`, async ({ page }, testInfo) => {
     await page.setViewportSize(viewport);
@@ -14028,7 +14127,7 @@ for (const viewport of [{ width: 390, height: 560 }, { width: 1280, height: 500 
     await page.screenshot({ path: testInfo.outputPath("timed-task-popover.png") });
     await page.keyboard.press("Escape");
     await expect(panel).toHaveCount(0);
-    await card.getByRole("button", { name: "更多操作" }).click();
+    await openSessionActions(card);
     await expect(panel).toHaveCount(0);
     await expect(page.locator(".card-menu")).toHaveAttribute("data-placement", "above");
   });
@@ -14068,8 +14167,7 @@ for (const viewport of [{ width: 390, height: 560 }, { width: 1280, height: 500 
   test(`session action menu opens upward above the footer at ${viewport.width}px`, async ({ page }, testInfo) => {
     await page.setViewportSize(viewport);
     await page.goto("/tests/history-browser.html?profile-sidebar=code&theme=dark");
-    const trigger = page.locator(".scard").last().getByRole("button", { name: "更多操作" });
-    await trigger.click();
+    await openSessionActions(page.locator(".scard").last());
     const menu = page.locator(".card-menu");
     await expect(menu).toHaveAttribute("data-placement", "above");
     const geometry = await menu.evaluate(element => {
@@ -14156,7 +14254,7 @@ test("session action menu long press stays above the footer and dismisses outsid
   await menu.getByRole("button", { name: "标记为未读" }).click();
   await expect(menu).toHaveCount(0);
   await expect(card.locator(".pill.completed")).toHaveText("未读");
-  await card.getByRole("button", { name: "更多操作" }).click();
+  await openSessionActions(card);
   await page.getByRole("button", { name: "新会话", exact: true }).click();
   await expect(menu).toHaveCount(0);
 });

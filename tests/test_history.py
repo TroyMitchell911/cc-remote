@@ -5,6 +5,7 @@ cc/model — these exercise the wrapper handlers directly with a stub transport.
 Run: ./.venv/bin/python -m pytest tests/test_history.py -q
 """
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import base64
@@ -3177,7 +3178,7 @@ def test_large_head_process_metadata_reads_only_appends(monkeypatch, tmp_path):
             reads.append(len(data))
             return data
 
-    monkeypatch.setattr(codex_stream_module, "open", lambda *args, **kwargs:
+    monkeypatch.setattr(codex_stream_module, "rollout_open", lambda *args, **kwargs:
                         CountedFile(original_open(*args, **kwargs)), raising=False)
 
     async def run():
@@ -4457,8 +4458,8 @@ def test_distinct_history_commands_share_one_page_build_and_route_per_client():
 def test_history_content_does_not_wait_for_external_ownership_scan():
     async def go():
         machine, _ = _mk_machine()
-        machine._watch_session = lambda sid: machine._watch.setdefault(
-            sid, {"engine": "codex"})
+        machine._watch_session = AsyncMock(side_effect=lambda sid: machine._watch.setdefault(
+            sid, {"engine": "codex"}))
         prime_called = False
 
         async def blocked_prime(_sid):
@@ -5151,7 +5152,7 @@ def test_claude_tool_image_rehydrates_from_transcript_after_asset_eviction(
     async def go():
         machine, _transport = _mk_machine()
         machine._history_index = HistoryIndexStore(tmp_path / "state-claude-image")
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._claude_transcript_path_for_wire = (
             lambda _sid: str(transcript)
         )

@@ -166,7 +166,7 @@ def test_official_history_request_preserves_timed_message_receipts(tmp_path, mon
     machine._timed_tasks = store
     machine._ctx_by_sid = lambda sid: None
     machine._codex_target = lambda sid: (SimpleNamespace(home=home), sid)
-    machine._watch_session = lambda sid: None
+    machine._watch_session = AsyncMock(side_effect=lambda sid: None)
     machine._watch = {sid: {"engine": "codex"}}
     machine._history_revision = lambda sid: "r"
     machine._history_continuity_revisions = {}

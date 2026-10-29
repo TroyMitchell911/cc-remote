@@ -57,18 +57,16 @@ test("background tasks keep the composer compact and open readable details", asy
   await expect(dialog(page)).toHaveCount(0);
   const before = await page.locator(".thread-shell").boundingBox();
   const chipBox = (await chip.boundingBox())!;
-  const modeBox = (await page.locator(".runbar .seg").boundingBox())!;
-  expect(Math.abs(chipBox.y + chipBox.height / 2 - modeBox.y - modeBox.height / 2)).toBeLessThan(2);
-  expect(chipBox.x + chipBox.width).toBeLessThan(modeBox.x);
+  await expect(page.locator(".runbar .seg")).toHaveCount(0);
   expect(chipBox.height).toBeLessThanOrEqual(40);
   await chip.click();
   const panel = dialog(page);
   await expect(panel).toBeVisible();
+  await expect(panel.locator(".background-task-header")).toHaveCount(0);
+  await expect(panel.getByRole("button", { name: "关闭后台任务" })).toHaveCount(0);
   await expect(panel.getByText("检查构建进度和板载温度", { exact: true })).toBeVisible();
   await expect(panel.getByText(/运行中 · 2分/)).toBeVisible();
   if ((page.viewportSize()?.width ?? 0) <= 600) {
-    await page.keyboard.press("Tab");
-    await expect(panel.getByRole("button", { name: "关闭后台任务" })).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(panel.locator("summary")).toBeFocused();
     await page.keyboard.press("Tab");
@@ -147,7 +145,14 @@ test("background tasks preserve draft input and reset open state on session chan
   const input = page.locator(".inrow textarea");
   await input.fill("继续检查这次构建");
   await trigger(page).click();
-  await dialog(page).getByRole("button", { name: "关闭后台任务", exact: true }).click();
+  await page.keyboard.press("Escape");
+  await expect(dialog(page)).toHaveCount(0);
+  await expect(trigger(page)).toBeFocused();
+  await expect(input).toHaveValue("继续检查这次构建");
+  await trigger(page).click();
+  await expect(dialog(page)).toBeVisible();
+  await page.mouse.click(3, 3);
+  await expect(dialog(page)).toHaveCount(0);
   await expect(input).toHaveValue("继续检查这次构建");
   await trigger(page).click();
   await page.getByRole("button", { name: "切换会话", exact: true }).evaluate(button => (button as HTMLButtonElement).click());

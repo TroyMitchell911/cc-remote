@@ -102,18 +102,8 @@ function TaskPopover({ anchor, id, preview, onClose, ...props }: Props & {
     data-placement={placement} style={style}
     role={preview ? "tooltip" : "dialog"} aria-label={preview ? undefined : "后台任务"}
     aria-modal={preview ? undefined : false}>
-    {!preview && <TaskHeader count={props.processes.length} onClose={() => onClose(true)} />}
     <TaskList {...props} preview={preview} />
   </section>, document.body);
-}
-
-function TaskHeader({ count, onClose }: { count: number; onClose: () => void }) {
-  return <header className="background-task-header">
-    <strong>后台任务</strong><span>{count}</span>
-    <button type="button" aria-label="关闭后台任务" onClick={onClose}>
-      <Icon name="close" size={17} />
-    </button>
-  </header>;
 }
 
 function ActiveBackgroundTasks(props: Props) {
@@ -164,7 +154,6 @@ function ActiveBackgroundTasks(props: Props) {
           className="background-task-sheet" maxWidth={400} maxHeight={480}
           returnFocusRef={anchor} onClose={() => close()}>
           <div id={id} className="background-task-sheet-content">
-            <TaskHeader count={props.processes.length} onClose={() => close()} />
             <TaskList {...details} />
           </div>
         </CenteredSheet>

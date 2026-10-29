@@ -353,9 +353,13 @@ from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_exact_catalog_rows, codex_session_cwd,
     codex_rollout_path, codex_model, codex_effort, codex_session_settings,
     codex_session_presence, codex_session_confirmed_missing,
+    codex_missing_sidebar_sessions,
     codex_current_provider,
     codex_thread_archive_states, codex_thread_catalog_row,
     codex_thread_parent_maps, codex_thread_rollout_record,
+)
+from cc_remote.wrapper.rollout_io import (
+    is_compressed_rollout, rollout_fstat, rollout_open, rollout_stat,
 )
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
@@ -409,7 +413,7 @@ from cc_remote.wrapper.claude_external import (
 )
 from cc_remote.wrapper.codex_external import (
     codex_active_goal_turn,
-    CodexTuiLogTracker, HolderScan, RolloutTerminalMarker,
+    CodexTuiLogTracker, HolderScan, RolloutTerminalMarker, TurnMarkers,
     codex_app_server_client_socket,
     parse_turn_markers,
     writable_rollout_holders,
@@ -8623,7 +8627,7 @@ class WrapperMachine:
                 watch["broker_partial"] = partial
 
         if ctx.session_id not in self._watch:
-            self._watch_session(ctx.session_id)
+            await self._watch_session(ctx.session_id)
         watch = self._watch.get(ctx.session_id)
         if (watch is not None and watch.get("broker_active")
                 and ctx.turn_task is None and ctx.state == "idle"):
@@ -12927,7 +12931,7 @@ class WrapperMachine:
         if not w:
             return
         try:
-            st = os.stat(w["path"])
+            st = rollout_stat(w["path"])
         except OSError:
             w["file_available"] = False
             return
@@ -12939,7 +12943,7 @@ class WrapperMachine:
             # rewind). It may have advanced beyond the incremental cursor.
             w.pop("claude_activity_initialized", None)
 
-    def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
+    async def _watch_session(self, sid: str, *, sidebar: bool = False) -> None:
         """Start mirroring a session transcript when a client opens it.
 
         Claude combines stable CLI process identity with unattributed file growth.
@@ -12998,8 +13002,31 @@ class WrapperMachine:
                 path = self._claude_transcript_path(profile, native_sid)
         if not path:
             return
+        # Compressed rollouts are cold native history. Sidebar rotation must
+        # not materialize every old conversation just to watch for live growth.
+        # Native resume creates a plain JSONL, eligible on the next refresh.
+        if sidebar and engine == "codex" and is_compressed_rollout(path):
+            return
+        tail_snapshot = None
         try:
-            st = os.stat(path)
+            if engine == "codex" and is_compressed_rollout(path):
+                # A cold read may decode gigabytes or wait for another decoder's
+                # cache lock. Prepare both the stat and tail in the worker, so
+                # cache eviction cannot trigger a second decode on this loop.
+                st, tail_snapshot = await asyncio.to_thread(
+                    self._read_codex_watch_snapshot, path)
+                if self._ctx_by_sid(sid) is not ctx or sid in self._watch:
+                    # A concurrent request may have registered or attached this
+                    # session while the worker read. Never replace its live state.
+                    await self._watch_session(sid, sidebar=sidebar)
+                    return
+                current = os.stat(path)
+                if (current.st_dev, current.st_ino, current.st_mtime_ns,
+                        current.st_ctime_ns) != (
+                        st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns):
+                    return
+            else:
+                st = os.stat(path)
         except OSError:
             return
         if len(self._watch) >= self.WATCH_MAX:
@@ -13035,7 +13062,8 @@ class WrapperMachine:
                 tail_partial,
                 _tail_marker,
                 tail_terminal,
-            ) = self._codex_tail_snapshot(path, st.st_size)
+            ) = (tail_snapshot if tail_snapshot is not None
+                 else self._codex_tail_snapshot(path, st.st_size))
             active_turns = {
                 turn_id: time.time()
                 for turn_id in tail_active
@@ -13133,7 +13161,7 @@ class WrapperMachine:
             self._codex_sidebar_watches.move_to_end(sid)
         log.info("watching transcript", session_id=sid, engine=engine, size=st.st_size)
 
-    def _prime_codex_sidebar_watches(self, rows: list[dict]) -> None:
+    async def _prime_codex_sidebar_watches(self, rows: list[dict]) -> None:
         """Watch the newest cold Codex threads for native App lifecycle.
 
         A private Codex App app-server reports such threads as ``notLoaded`` to
@@ -13180,7 +13208,7 @@ class WrapperMachine:
             self._codex_sidebar_watches.pop(sid, None)
             self._watch.pop(sid, None)
         for sid in candidates:
-            self._watch_session(sid, sidebar=True)
+            await self._watch_session(sid, sidebar=True)
 
     @staticmethod
     def _codex_sidebar_watch_state(watch: Optional[dict]) -> Optional[State]:
@@ -13644,6 +13672,13 @@ class WrapperMachine:
             return self._is_external(sid)
 
     @classmethod
+    def _read_codex_watch_snapshot(cls, path: str):
+        """Read one consistent, seekable source without mutating loop state."""
+        with rollout_open(path, "rb") as stream:
+            st = rollout_fstat(stream)
+            return st, cls._codex_tail_snapshot_from_stream(stream, st.st_size)
+
+    @classmethod
     def _codex_tail_snapshot(
         cls, path: str, size: int,
     ) -> tuple[
@@ -13654,12 +13689,18 @@ class WrapperMachine:
     ]:
         """Return the latest bounded lifecycle state and exact last marker."""
         try:
-            start = max(0, size - cls.CODEX_TAIL_READ_MAX)
-            with open(path, "rb") as stream:
-                stream.seek(start)
-                data = stream.read(cls.CODEX_TAIL_READ_MAX)
+            with rollout_open(path, "rb") as stream:
+                if is_compressed_rollout(path):
+                    size = rollout_fstat(stream).st_size
+                return cls._codex_tail_snapshot_from_stream(stream, size)
         except OSError:
             return set(), b"", None, None
+
+    @classmethod
+    def _codex_tail_snapshot_from_stream(cls, stream, size: int):
+        start = max(0, size - cls.CODEX_TAIL_READ_MAX)
+        stream.seek(start)
+        data = stream.read(size - start)
         if start:
             _, separator, data = data.partition(b"\n")
             if not separator:
@@ -13691,7 +13732,7 @@ class WrapperMachine:
 
     @classmethod
     def _read_watch_growth(cls, path: str, offset: int, available: int) -> bytes:
-        with open(path, "rb") as stream:
+        with rollout_open(path, "rb") as stream:
             stream.seek(offset)
             return stream.read(min(max(0, available), cls.WATCH_READ_MAX))
 
@@ -13848,7 +13889,8 @@ class WrapperMachine:
         # transcript mutation while _sync_external_control still fails closed.
         w["scan_complete"] = ownership_scan_complete
         was_external = bool(w.get("external"))
-        was_sidebar_running = bool(w.get("active_external_turns"))
+        was_sidebar_running = bool(w.get(
+            "sidebar_running", w.get("active_external_turns")))
         was_desktop_active = bool(w.get("desktop_active"))
         w["holders"] = holders
         w["writers"] = writers
@@ -13857,11 +13899,31 @@ class WrapperMachine:
         takeover_cleared = False
         takeover_clear_message: Optional[str] = None
         data = b""
+        markers: TurnMarkers | None = None
+        replacement_tail = None
         visible_user_growth = False
         try:
-            st = await asyncio.to_thread(os.stat, w["path"])
+            # Native resume can replace a compressed cold source with live
+            # JSONL. Follow the native representation, never the decoded cache.
+            path = w["path"]
+            if is_compressed_rollout(path) or not os.path.exists(path):
+                current_path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
+                if current_path:
+                    path = current_path
+            st = await asyncio.to_thread(rollout_stat, path)
+            replaced = (
+                path != w["path"]
+                or (st.st_dev, st.st_ino) != w.get("file_id")
+                or st.st_size < w["size"]
+            )
+            if replaced:
+                # Read size and lifecycle from the same open source. Only the
+                # bounded tail is needed; never replay the replacement as growth.
+                st, replacement_tail = await asyncio.to_thread(
+                    self._read_codex_watch_snapshot, path)
         except OSError:
             return
+        w["path"] = path
 
         ctx = self._ctx_by_sid(sid)
         shared_affinity = bool(
@@ -13904,18 +13966,28 @@ class WrapperMachine:
                     session_id=sid, new_holders=len(new_writers))
 
         file_id = (st.st_dev, st.st_ino)
-        if file_id != w.get("file_id") or st.st_size < w["size"]:
+        if replaced:
             # Codex is append-only. Rotation/truncation is itself an external
             # mutation unless caused by a process we already classify as external;
-            # in either case the resident context must reload. Re-baseline at EOF
-            # to avoid replaying a potentially huge replacement as fresh turns.
+            # in either case the resident context must reload. Re-baseline at EOF,
+            # retaining its latest lifecycle and partial record for the next poll.
             w["file_id"] = file_id
             w["size"] = st.st_size
             w["partial"] = b""
             w["active_external_turns"].clear()
+            w.setdefault("seeded_external_turns", set()).clear()
+            w["preserve_seeded_without_holder"] = False
             w.setdefault("observed_external_turns", set()).clear()
             w["pending_wrapper_turns"].clear()
             w.setdefault("terminal_candidates", OrderedDict()).clear()
+            tail_active, tail_partial, last_marker, terminal = replacement_tail
+            markers = TurnMarkers(
+                started=frozenset(tail_active),
+                finished=frozenset({terminal.turn_id}) if terminal else frozenset(),
+                partial=tail_partial,
+                ordered=(last_marker,) if last_marker else (),
+                terminals=(terminal,) if terminal else (),
+            )
             if w.get("takeover_pending"):
                 takeover_cleared = True
                 takeover_clear_message = "会话文件已变化，本次自动接管已取消，请重新点击接管"
@@ -13979,8 +14051,9 @@ class WrapperMachine:
                 external_growth = True
 
         if data:
-            w["last_growth_at"] = now
             markers = parse_turn_markers(data, w.get("partial", b""))
+        if markers is not None:
+            w["last_growth_at"] = now
             w["partial"] = markers.partial
             visible_user_growth = markers.has_visible_user_message
             source_identity = self._codex_watch_source_identity(w)
@@ -14061,7 +14134,12 @@ class WrapperMachine:
                     # governed by the active marker below.
                     self._revoke_codex_takeover(w, holders, writers)
                     self._remember_watch_turn(active, turn_id, now)
-                    observed.add(turn_id)
+                    if replaced and not (holders or writers or private_holders):
+                        # Without a live writer yet, the next scan must confirm
+                        # this cold tail against the replacement's inode.
+                        w["seeded_external_turns"].add(turn_id)
+                    else:
+                        observed.add(turn_id)
                     while len(observed) > self.CODEX_TURN_TRACK_MAX:
                         observed.pop()
                     external_growth = True
@@ -14177,6 +14255,9 @@ class WrapperMachine:
             await self._sync_external_control(ctx, w)
 
         sidebar_running = bool(w.get("active_external_turns"))
+        # Holder reconciliation can clear a cold seed before this poll starts.
+        # Compare with the last published state so that still emits an idle edge.
+        w["sidebar_running"] = sidebar_running
         if sidebar_running != was_sidebar_running:
             await self.transport.send(SessionActivity(
                 engine="codex",
@@ -14531,7 +14612,7 @@ class WrapperMachine:
                     if (getattr(ctx.sdk, "is_claude_broker", False)
                             and ctx.session_id
                             and ctx.session_id not in self._watch):
-                        self._watch_session(ctx.session_id)
+                        await self._watch_session(ctx.session_id)
                 await self._poll_watches_once()
                 await self._refresh_timed_tasks()
                 await self._refresh_codex_background_processes()
@@ -16751,7 +16832,7 @@ class WrapperMachine:
         started = time.perf_counter()
         cache_hit = False
         try:
-            self._watch_session(sid)
+            await self._watch_session(sid)
             ctx = self._ctx_by_sid(sid)
             watch = self._watch.get(sid) or {}
             codex = bool((ctx is not None and ctx.engine == "codex") or watch.get("engine") == "codex")
@@ -16856,7 +16937,7 @@ class WrapperMachine:
         _background: bool = False,
     ) -> History:
         """Build one requester-neutral page shared by concurrent clients."""
-        self._watch_session(sid)
+        await self._watch_session(sid)
         # Content and ownership are independent projections.  A bounded ps/lsof
         # scan can take seconds on macOS and must not hold the conversation
         # first paint. The watch loop and switch/query safety paths refresh
@@ -17472,7 +17553,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新展开该轮")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         is_codex = bool(
@@ -17990,7 +18071,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新打开协作代理")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         if ctx is not None and ctx.space != "code":
@@ -18261,7 +18342,7 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新加载图片")
 
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
         is_codex = bool(
@@ -18600,7 +18681,7 @@ class WrapperMachine:
                 message="Claude 已通过 broker 双向连接，无需结束终端或迁移会话",
             ))
             return None
-        self._watch_session(resolved_sid)
+        await self._watch_session(resolved_sid)
         w = self._watch.get(resolved_sid)
         if w is None:
             error = Error(code=ERR_INTERNAL, message="无法读取该会话的终端状态")
@@ -18885,7 +18966,7 @@ class WrapperMachine:
                 return await self._reject_query(ctx, cmd, error)
         route_sid = self._ctx_wire_sid(ctx)
         if route_sid:
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             external = (
                 await self._prime_codex_ownership(route_sid)
                 if ctx.engine == "codex"
@@ -20206,7 +20287,7 @@ class WrapperMachine:
         route_sid = self._ctx_wire_sid(ctx)
         if not route_sid:
             return None
-        self._watch_session(route_sid)
+        await self._watch_session(route_sid)
         external = (
             await self._prime_codex_ownership(route_sid)
             if ctx.engine == "codex"
@@ -21909,7 +21990,7 @@ class WrapperMachine:
 
         route_sid = self._ctx_wire_sid(ctx)
         if route_sid:
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             external = await self._prime_claude_ownership(route_sid)
             if expected_sdk is not None and ctx.sdk is not expected_sdk:
                 return "changed"
@@ -27533,6 +27614,8 @@ class WrapperMachine:
             # built. Never let the old rows replace the optimistic temp row.
             return await self._refresh_codex_session_catalog()
         cached = self._codex_session_list_cache
+        unloaded_sids = {row["session_id"] for row in raw
+                         if row.get("status") == "notLoaded"}
         failed_profile_ids = {profile_id for profile_id, _ in profile_errors}
         if failed_profile_ids and cached is not None:
             # A profile catalog is a rebuildable projection, not an
@@ -27578,11 +27661,91 @@ class WrapperMachine:
         # native catalog or fork overlay. Filter again at the generation edge
         # before any row enters the reusable cache.
         raw = self._filter_private_codex_btw_rows(raw)
+        raw = await self._prune_missing_codex_sidebar_rows(
+            raw, cached[1] if cached is not None else [],
+            epoch=epoch, unloaded_sids=unloaded_sids,
+            unavailable_profiles=frozenset(failed_profile_ids),
+        )
+        if epoch != self._codex_session_list_epoch:
+            return await self._refresh_codex_session_catalog()
+        raw = self._filter_private_codex_btw_rows(raw)
         self._codex_session_profile_errors = profile_errors
         self._codex_session_list_cache = (
             time.monotonic(), raw, profile_errors,
         )
         return raw
+
+    async def _prune_missing_codex_sidebar_rows(
+        self, raw: list[dict], previous: list[dict], *, epoch: int,
+        unloaded_sids: set[str],
+        unavailable_profiles: frozenset[str] = frozenset(),
+    ) -> list[dict]:
+        """Forget confirmed deleted cold rows and pins, preserving live work."""
+        pins = (self._session_pins.ids("codex")
+                if self._session_pins is not None else frozenset())
+        candidates = set(pins)
+        candidates.update(row["session_id"] for row in [*previous, *raw]
+                          if isinstance(row.get("session_id"), str))
+        if not candidates:
+            return raw
+        fresh_status = {row["session_id"]: row.get("status") for row in raw}
+        work = await asyncio.to_thread(
+            self._work.for_engine("codex").records_by_profile_session)
+
+        def protected(sid: str, profile: CodexProfile, native_sid: str) -> bool:
+            return (
+                profile.id in unavailable_profiles
+                or self._ctx_by_sid(sid) is not None
+                or self._is_external(sid)
+                or self._codex_sidebar_watch_state(self._watch.get(sid)) == "running"
+                or (profile.id, native_sid) in work
+                or (profile.id, native_sid) in self._codex_thread_started_hints
+                or fresh_status.get(sid) in {"active", "idle", "systemError"}
+                # A native list row with unknown/loaded status, or a freshly
+                # verified fork overlay, is positive evidence of existence.
+                # Do not overrule it with a lagging SQLite/filesystem view.
+                or (sid in fresh_status and sid not in unloaded_sids)
+            )
+
+        by_profile: dict[str, dict[str, str]] = {}
+        for sid in sorted(candidates):
+            try:
+                profile, native_sid = self._codex_target(sid)
+            except ValueError:
+                continue
+            if not protected(sid, profile, native_sid):
+                by_profile.setdefault(profile.id, {})[native_sid] = sid
+        removed = set()
+        for profile in self._codex_profiles:
+            ids = by_profile.get(profile.id, {})
+            if not ids:
+                continue
+            missing = await asyncio.to_thread(
+                codex_missing_sidebar_sessions, ids,
+                unloaded_ids=[native_sid for native_sid, sid in ids.items()
+                              if sid in unloaded_sids],
+                codex_home=self._codex_home(profile),
+            )
+            if epoch != self._codex_session_list_epoch:
+                return raw
+            for native_sid in missing:
+                sid = ids[native_sid]
+                if protected(sid, profile, native_sid):
+                    continue
+                if sid in pins:
+                    try:
+                        await asyncio.to_thread(
+                            self._session_pins.set_pinned, "codex", sid, False)
+                    except SessionPinStoreError:
+                        log.warning("missing Codex sidebar pin cleanup failed",
+                                    session_id=sid)
+                if (epoch != self._codex_session_list_epoch
+                        or protected(sid, profile, native_sid)):
+                    continue
+                removed.add(sid)
+        if removed:
+            log.info("removed missing Codex sidebar entries", count=len(removed))
+        return [row for row in raw if row["session_id"] not in removed]
 
     def _overlay_completed_codex_forks(
         self, raw: list[dict],
@@ -28342,7 +28505,7 @@ class WrapperMachine:
             # connecting. Do not let that newly private row start a sidebar
             # watch before the final pre-serialization guard below.
             raw = self._filter_private_codex_btw_rows(raw)
-            self._prime_codex_sidebar_watches(raw)
+            await self._prime_codex_sidebar_watches(raw)
             resident_state = {
                 c.key: c.state for c in self.sessions.values()
                 if c.key and c.session_id and c.engine == "codex"
@@ -28958,7 +29121,7 @@ class WrapperMachine:
             # The real id becomes visible before the first turn necessarily ends.
             # Start ownership monitoring at capture so a terminal resume during
             # that first response cannot wait until the next Remote query.
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             await self._persist_claude_session_controls(ctx)
             await self._flush_claude_client_message_ids(ctx)
         log.info(
@@ -29973,16 +30136,79 @@ class WrapperMachine:
 
     async def _handle_pin_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
-        is_codex = await self._is_codex_session(sid)
-        engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
-        if requested_engine is not None and requested_engine != engine:
+        requested_space = getattr(cmd, "space", "code")
+
+        async def reject(code: str, message: str, reason: str) -> Error:
+            log.warning(
+                "session pin rejected", session_id=sid,
+                requested_engine=requested_engine, space=requested_space,
+                pinned=bool(cmd.pinned), reason=reason,
+                cmd_id=getattr(cmd, "cmd_id", None),
+            )
             error = Error(
-                code=ERR_AUTH, message="会话不属于请求的引擎",
+                code=code, message=message,
                 request_id=getattr(cmd, "cmd_id", None),
                 to=getattr(cmd, "client_id", None))
             await self._emit_to_sid(sid, error)
             return error
+
+        ctx = self._ctx_by_sid(sid)
+        unpin_engine = requested_engine if not cmd.pinned else None
+        if not cmd.pinned and ctx is None and unpin_engine is None:
+            # Legacy commands omit the engine. An existing pin is sufficient
+            # identity for removing that preference, even after native deletion.
+            owners = [engine for engine in ("claude", "codex")
+                      if self._session_pins is not None
+                      and sid in self._session_pins.ids(engine)]
+            if len(owners) == 1:
+                unpin_engine = owners[0]
+            elif len(owners) > 1:
+                return await reject(
+                    ERR_AUTH, "请指定要取消置顶的会话引擎", "ambiguous_pin_engine")
+        metadata_only = ctx is None and unpin_engine is not None
+        if metadata_only:
+            try:
+                (self._codex_target if unpin_engine == "codex"
+                 else self._claude_target)(sid)
+            except ValueError:
+                return await reject(
+                    ERR_AUTH, "账号或会话标识无效", "invalid_unpin_route")
+            is_codex = unpin_engine == "codex"
+        else:
+            is_codex = await self._is_codex_session(sid)
+        if (not metadata_only and not is_codex and ctx is None
+                and requested_engine in {None, "codex"}):
+            # Pinning is wrapper metadata: a cold thread need not have a
+            # readable rollout. Verify its exact account catalog without
+            # resuming it or broadening guards for destructive operations.
+            try:
+                profile, native_sid = self._codex_target(sid)
+            except ValueError:
+                if requested_engine == "codex":
+                    return await reject(
+                        ERR_AUTH, "Codex 账号或会话标识无效", "invalid_codex_route")
+            else:
+                presence = await asyncio.to_thread(
+                    codex_session_presence, native_sid,
+                    codex_home=str(profile.home),
+                )
+                if presence is True:
+                    is_codex = True
+                elif requested_engine == "codex":
+                    # An unreadable/missing catalog is unknown, not evidence
+                    # that a Codex request belongs to Claude.
+                    return await reject(
+                        ERR_BUSY if presence is None else ERR_NOT_RUNNING,
+                        "暂时无法确认 Codex 会话，请稍后重试。"
+                        if presence is None else "Codex 会话不存在",
+                        "codex_catalog_unavailable" if presence is None
+                        else "codex_session_missing",
+                    )
+        engine = "codex" if is_codex else "claude"
+        if requested_engine is not None and requested_engine != engine:
+            return await reject(
+                ERR_AUTH, "会话不属于请求的引擎", "engine_mismatch")
         try:
             native_sid, work_profile_id = self._work_session_identity(engine, sid)
         except ValueError:
@@ -29995,15 +30221,10 @@ class WrapperMachine:
             codex_profile_id=(
                 work_profile_id if engine == "codex" else None),
         )
-        requested_space = getattr(cmd, "space", "code")
         if (work_record is not None) != (requested_space == "work"):
-            error = Error(
-                code=ERR_AUTH, message="会话不属于请求的 Work/Code 空间",
-                request_id=getattr(cmd, "cmd_id", None),
-                to=getattr(cmd, "client_id", None))
-            await self._emit_to_sid(sid, error)
-            return error
-        if (work_record is None and self._ctx_by_sid(sid) is None
+            return await reject(
+                ERR_AUTH, "会话不属于请求的 Work/Code 空间", "space_mismatch")
+        if (cmd.pinned and work_record is None and self._ctx_by_sid(sid) is None
                 and not is_codex):
             try:
                 claude_profile, claude_native_sid = self._claude_target(sid)
@@ -30048,6 +30269,13 @@ class WrapperMachine:
             listing = await (self._list_codex_sessions(cmd) if is_codex
                              else self._handle_list_sessions(cmd))
             return error, listing
+        if is_codex and not cmd.pinned and self._codex_session_list_cache is not None:
+            # Keep outage fallback rows, but reconcile them even when the
+            # one-second cache is fresh: the user may be unpinning a deleted row.
+            cached = self._codex_session_list_cache
+            self._codex_session_list_cache = (
+                0.0, cached[1], cached[2] if len(cached) > 2 else (),
+            )
         return await (self._list_codex_sessions(cmd) if is_codex
                       else self._handle_list_sessions(cmd))
 
@@ -30579,7 +30807,7 @@ class WrapperMachine:
 
     async def _codex_delete_external_owner(self, sid: str) -> bool:
         """Close the ownership interval before deleting one Code thread."""
-        self._watch_session(sid)
+        await self._watch_session(sid)
         watch = self._watch.get(sid)
         if watch is None or watch.get("engine") != "codex":
             log.warning(
@@ -37894,7 +38122,7 @@ class WrapperMachine:
                 self.sessions[key] = ctx
         if resume_id:
             route_sid = key if engine in {"claude", "codex"} else resume_id
-            self._watch_session(route_sid)
+            await self._watch_session(route_sid)
             if engine == "codex":
                 await self._recover_codex_owned_turn(ctx, route_sid)
                 await self._prime_codex_ownership(route_sid)
@@ -38924,7 +39152,7 @@ class WrapperMachine:
                                 # official TUI. Bound live refreshes while still
                                 # guaranteeing a final authoritative mirror.
                                 if now - last_mirror_at >= 0.1:
-                                    self._watch_session(ctx.session_id)
+                                    await self._watch_session(ctx.session_id)
                                     await self._push_mirrored_history(ctx.session_id)
                                     last_mirror_at = now
                                 if terminal_id is not None:

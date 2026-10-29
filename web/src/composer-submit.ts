@@ -2,6 +2,25 @@ import type { State } from "./protocol";
 
 export type SendMode = "steer" | "queue";
 
+/** Only a plain Tab with a draft in a running task can enqueue. Callers give
+ * completion menus and IME composition priority over this shortcut. */
+export function shouldQueueOnTab(
+  event: {
+    key: string;
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+    repeat: boolean;
+  },
+  state: State,
+  hasPayload: boolean,
+): boolean {
+  return event.key === "Tab" && !event.shiftKey && !event.ctrlKey
+    && !event.altKey && !event.metaKey && !event.repeat
+    && state === "running" && hasPayload;
+}
+
 export type BusySubmitAction =
   | "steer"
   | "replace"

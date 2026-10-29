@@ -1959,7 +1959,7 @@ def test_codex_settings_tail_stops_at_captured_source_size(
     rollout.write_text(first + appended)
     monkeypatch.setattr(
         codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
-    monkeypatch.setattr(codex_sessions_module.os.path, "getsize", lambda _p: len(first))
+    monkeypatch.setattr(codex_sessions_module, "rollout_size", lambda _p: len(first))
 
     assert codex_session_settings("session-1", max_bytes=len(first)) == {
         "model": "gpt-snapshot",

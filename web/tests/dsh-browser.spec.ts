@@ -263,7 +263,7 @@ test(`DSH sidebar uses session cards and directory subtitles (${theme})`, async 
   const cards = page.locator(".sessions .scard");
   await expect(cards).toHaveCount(2);
   await expect(cards.locator(".scard-location")).toHaveText(["dsh-test", "dsh-test"]);
-  await expect(cards.locator(".scard-profile-ribbon")).toHaveCount(0);
+  await expect(cards.locator(".scard-profile-dot")).toHaveCount(0);
   const sizes = await cards.evaluateAll(nodes => nodes.map(node => {
     const style = getComputedStyle(node);
     return { height: node.getBoundingClientRect().height, border: style.borderTopColor,
@@ -735,6 +735,19 @@ test("DSH references insert the native quoted file and session syntax", async ({
   await expect(input).toHaveValue("关联 @[相关会话](dsh-session:native-session) ");
   await input.press("Enter");
   await expect.poll(() => relay.commands.filter(c => c.type === "query" && c.prompt === "关联 @[相关会话](dsh-session:native-session)").length).toBe(1);
+});
+
+test("DSH Tab completes a file reference before queueing a running task", async ({ page }) => {
+  const relay = await openDsh(page, { features: true, running: true });
+  const input = page.locator(".composer textarea");
+  await input.fill("检查 @report");
+  await expect(page.getByRole("option", { name: "文件 report notes.md" })).toBeVisible();
+  await input.press("Tab");
+  await expect(input).toHaveValue('检查 @"report notes.md" ');
+  expect(relay.commands.some(c => c.type === "query" || c.type === "steer")).toBe(false);
+  await input.press("Tab");
+  await expect.poll(() => relay.commands.filter(c => c.type === "query"
+    && c.delivery === "queue" && c.prompt === '检查 @"report notes.md"').length).toBe(1);
 });
 
 test("DSH subagent controls, jobs, diagnostics and complete export share a compact panel", async ({ page }, info) => {

@@ -16,10 +16,31 @@ export function SessionCardMenu({ anchor, onClose, children }: {
     const scroll = trigger?.closest<HTMLElement>(".s-scroll");
     const footer = sidebar?.querySelector<HTMLElement>(".s-foot");
     if (!trigger || !menu || !sidebar || !scroll || !footer) return;
+    const card = trigger.closest<HTMLElement>(".scard");
     const viewport = window.visualViewport;
     const position = () => {
-      const button = trigger.getBoundingClientRect();
       const list = scroll.getBoundingClientRect();
+      // The card scales visually during a hold. Anchor to its layout coordinates
+      // so resize/scroll callbacks never sample an intermediate animation frame.
+      // The scroller's rect still follows the drawer and visual viewport.
+      const reference = card?.classList.contains("lifting") ? card : trigger;
+      let leftOffset = 0, topOffset = 0;
+      let parent: HTMLElement | null = reference;
+      while (parent && parent !== scroll) {
+        leftOffset += parent.offsetLeft;
+        topOffset += parent.offsetTop;
+        parent = parent.offsetParent as HTMLElement | null;
+        if (parent) {
+          leftOffset += parent.clientLeft;
+          topOffset += parent.clientTop;
+        }
+      }
+      if (parent !== scroll) { onClose(); return; }
+      const button = {
+        top: list.top + topOffset - scroll.scrollTop,
+        bottom: list.top + topOffset - scroll.scrollTop + reference.offsetHeight,
+        right: list.left + leftOffset - scroll.scrollLeft + reference.offsetWidth,
+      };
       if (!trigger.isConnected || button.bottom <= list.top || button.top >= list.bottom) {
         onClose();
         return;
@@ -60,21 +81,37 @@ export function SessionCardMenu({ anchor, onClose, children }: {
     if (document.activeElement === trigger && trigger.matches(":focus-visible")) {
       menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus({ preventScroll: true });
     }
-    const observer = new ResizeObserver(position);
-    for (const element of [menu, trigger, sidebar, scroll, footer]) observer.observe(element);
-    window.addEventListener("resize", position);
-    window.addEventListener("scroll", position, true);
-    viewport?.addEventListener("resize", position);
-    viewport?.addEventListener("scroll", position);
-    sidebar.addEventListener("transitionend", position);
+    let frame = 0;
+    const schedulePosition = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; position(); });
+    };
+    const sidebarTransition = (event: TransitionEvent) => {
+      // A child's hover/highlight transition must not move the menu again.
+      if (event.target === sidebar && event.propertyName === "transform") schedulePosition();
+    };
+    const onScroll = (event: Event) => {
+      if (event.target instanceof Node && menu.contains(event.target)) return;
+      schedulePosition();
+    };
+    const observer = new ResizeObserver(schedulePosition);
+    for (const element of [menu, trigger, card, sidebar, scroll, footer]) {
+      if (element) observer.observe(element);
+    }
+    window.addEventListener("resize", schedulePosition);
+    window.addEventListener("scroll", onScroll, true);
+    viewport?.addEventListener("resize", schedulePosition);
+    viewport?.addEventListener("scroll", schedulePosition);
+    sidebar.addEventListener("transitionend", sidebarTransition);
     document.addEventListener("keydown", escape, true);
     return () => {
       observer.disconnect();
-      window.removeEventListener("resize", position);
-      window.removeEventListener("scroll", position, true);
-      viewport?.removeEventListener("resize", position);
-      viewport?.removeEventListener("scroll", position);
-      sidebar.removeEventListener("transitionend", position);
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", schedulePosition);
+      window.removeEventListener("scroll", onScroll, true);
+      viewport?.removeEventListener("resize", schedulePosition);
+      viewport?.removeEventListener("scroll", schedulePosition);
+      sidebar.removeEventListener("transitionend", sidebarTransition);
       document.removeEventListener("keydown", escape, true);
     };
   }, [anchor, onClose]);

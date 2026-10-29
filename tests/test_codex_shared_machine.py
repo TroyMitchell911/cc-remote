@@ -1,5 +1,6 @@
 """Zero-token regressions for shared Codex daemon ownership semantics."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -1890,7 +1891,7 @@ def test_private_app_idle_client_does_not_block_remote_query(
         watch = _watch(path)
         watch.update({"external": False, "private_app_loaded": True})
         machine._watch[ctx.session_id] = watch
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def refresh_idle_app(_sid: str) -> bool:
             return False
@@ -2054,7 +2055,7 @@ def test_shared_code_query_refreshes_activity_without_locking_cli(
             "writers": {ProcessIdentity(111, 1101)},
         })
         machine._watch["sid"] = watch
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         activity_probes: list[str] = []
 
@@ -2106,7 +2107,7 @@ def test_interrupted_shared_query_reconnects_and_refreshes_activity(
             "writers": {ProcessIdentity(111, 1101)},
         })
         machine._watch["sid"] = watch
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         activity_probes: list[str] = []
 
@@ -2156,7 +2157,7 @@ def test_intentional_restart_reconnects_live_proxy_before_query(monkeypatch):
             epoch="2" * 32,
             phase="ready",
         )
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def no_external(_sid):
             return False
@@ -2195,7 +2196,7 @@ def test_same_restart_epoch_does_not_reconnect_live_proxy(monkeypatch):
             epoch="3" * 32,
             phase="ready",
         )
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def no_external(_sid):
             return False
@@ -2268,7 +2269,7 @@ def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
             updated_at=1.0,
             deadline_at=2.0,
         )
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def restart_state(*, wait, interrupt_event):
             assert wait is True
@@ -3086,7 +3087,7 @@ def test_query_waits_for_restart_ready_before_reconnecting(monkeypatch):
             epoch="7" * 32,
             phase="restarting",
         )
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def no_external(_sid):
             return False
@@ -3533,7 +3534,7 @@ def test_shared_takeover_is_an_idempotent_noop(monkeypatch, tmp_path):
         def legacy_watch_must_not_run(_sid: str) -> None:
             raise AssertionError("shared takeover entered legacy watcher")
 
-        monkeypatch.setattr(machine, "_watch_session", legacy_watch_must_not_run)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=legacy_watch_must_not_run))
 
         result = await machine._handle_takeover(Takeover(
             sid="sid", cmd_id="stale-shared-takeover"
@@ -3627,7 +3628,7 @@ def test_stdio_work_keeps_legacy_terminal_mutex_and_read_only_state(
         assert ctx.terminal_attached is True
         assert ctx.control_can_takeover is True
 
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def occupied(_sid: str) -> bool:
             return True

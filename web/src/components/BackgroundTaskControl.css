@@ -26,18 +26,8 @@
 .background-task-popover.place-below { transform:translate(-50%,0); }
 .background-task-popover.preview { pointer-events:none; }
 @keyframes background-task-appear { from { opacity:0; } to { opacity:1; } }
-.background-task-header { display:flex; align-items:center; gap:8px; flex:none; padding:12px 14px 6px; }
-.background-task-header > strong { font-size:14px; font-weight:var(--font-weight-650); }
-.background-task-header > span {
-  padding:2px 7px; border-radius:999px; background:var(--raised); color:var(--dim); font-size:11px;
-}
-.background-task-header > button {
-  display:grid; place-items:center; margin-left:auto; width:30px; height:30px;
-  border-radius:50%; color:var(--dim);
-}
-.background-task-header > button:hover { color:var(--text); background:var(--raised); }
 .background-task-list {
-  display:flex; flex-direction:column; gap:8px; min-height:0; margin:0; padding:8px 12px 12px;
+  display:flex; flex-direction:column; gap:8px; min-height:0; margin:0; padding:12px;
   list-style:none; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin;
 }
 .background-task-list > li {
@@ -56,9 +46,7 @@
 }
 .background-task-more { color:var(--dim); font-size:11px; }
 .background-task-sheet-content { display:flex; flex-direction:column; min-height:0; max-height:inherit; }
-.background-task-sheet .background-task-header { padding:14px 16px 6px; }
-.background-task-sheet .background-task-header > button { width:36px; height:36px; }
-.background-task-sheet .background-task-list { padding:8px 14px 16px; }
+.background-task-sheet .background-task-list { padding:14px; }
 @media (max-width:600px) {
   .background-task-trigger { min-height:36px; padding:7px 9px; gap:6px; }
 }

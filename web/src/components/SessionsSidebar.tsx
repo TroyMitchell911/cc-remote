@@ -1,6 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type TouchEvent } from "react";
 import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
+import type { SessionLayout } from "../appearance";
 import type { DshRead } from "../dsh-api";
 const DshSearch = lazy(() => import("./DshSearch"));
 import { Icon, EngineIcon } from "../icons";
@@ -23,7 +24,8 @@ import { newWorkProfileForSidebarFilter } from "../work-profile-selection";
 import { manualUnreadKey } from "../manual-unread";
 import { useManualUnread } from "../use-manual-unread";
 import { useMobileSidebar } from "../use-mobile-sidebar";
-const SessionCardMenu = lazy(() => import("./SessionCardMenu").then(module => ({ default: module.SessionCardMenu })));
+import { SessionPathTitle } from "./SessionPathTitle";
+import { SessionCardMenu } from "./SessionCardMenu";
 const TimedTaskIndicator = lazy(() => import("./TimedTaskIndicator").then(module => ({ default: module.TimedTaskIndicator })));
 
 interface Props {
@@ -32,6 +34,7 @@ interface Props {
   open: boolean;
   engine: Engine;
   space: Space;
+  sessionLayout?: SessionLayout;
   profileScopeKey: string;
   machineId?: string;
   claudeProfiles?: ClaudeProfileInfo[];
@@ -80,13 +83,14 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
   return { key: "older", label: "更早" };
 }
 
-export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
+export function SessionsSidebar({ open, engine, space, sessionLayout = "compact", readDsh, onDshSearch,
   profileScopeKey, machineId, claudeProfiles = [], defaultClaudeProfileId,
   codexProfiles = [], defaultCodexProfileId,
   onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose, onOpenChange,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
   const sidebarRef = useMobileSidebar(open, onOpenChange);
+  const comfortable = sessionLayout === "comfortable";
   const manualUnread = useManualUnread();
   const [q, setQ] = useState("");
   const [menuCardId, setMenuCardId] = useState<string | null>(null);
@@ -101,6 +105,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
   const [expandedDirectories, setExpandedDirectories] = useState<Record<string, boolean>>({});
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
+  const longPressSession = useRef<string | null>(null);
   const cancelPress = useCallback(() => {
     if (pressTimer.current !== null) window.clearTimeout(pressTimer.current);
     pressTimer.current = null;
@@ -199,7 +204,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
     onDelete(s.session_id);
     setMenuCardId(null); setLifting(false);
   };
-  const closeMenu = () => { setMenuCardId(null); setLifting(false); };
+  const closeMenu = useCallback(() => { setMenuCardId(null); setLifting(false); }, []);
 
   // reset menu/lift state when the sidebar closes (so it doesn't linger into the next open)
   useEffect(() => {
@@ -224,19 +229,24 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
     showProfileManagement,
   ]);
 
-  // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
-  // the side scrim, and the rest of the page (not just .s-scroll). The long-press lift
-  // is dismissed via .s-lift-scrim instead, so we only handle the non-lifting popover here.
+  // Dismiss the topmost surface before an outside click can select a session,
+  // activate a header/footer action, or close the mobile drawer underneath it.
   useEffect(() => {
-    if (menuCardId === null || lifting) return;
+    if (menuCardId === null) return;
     const onDocClick = (e: MouseEvent) => {
       const t = e.target as Element | null;
       if (t && (t.closest?.(".card-menu") || t.closest?.(".scard-act"))) return;  // click inside menu / on ⋯
-      setMenuCardId(null);
+      // Let the card consume the compatibility click from releasing the hold.
+      // A fresh touch clears this marker before its subsequent click.
+      if (longPressSession.current === menuCardId && e.detail !== 0
+          && t?.closest?.(".scard.lifting")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenu();
     };
-    document.addEventListener("click", onDocClick);
-    return () => document.removeEventListener("click", onDocClick);
-  }, [menuCardId, lifting]);
+    document.addEventListener("click", onDocClick, true);
+    return () => document.removeEventListener("click", onDocClick, true);
+  }, [menuCardId, closeMenu]);
 
   // long-press (500ms hold, no >10px move) => lift the card + dim the rest + show actions.
   // Browser scroll/zoom ownership can cancel a touch before a >10px move
@@ -244,10 +254,13 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
   // a timer left behind must not lift a card halfway through a native fling.
   const onCardTouchStart = (s: SessionInfo, e: TouchEvent) => {
     cancelPress();
+    longPressSession.current = null;
     if (e.touches.length !== 1) return;
+    if ((e.target as Element).closest("button, input")) return;
     pressStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
     pressTimer.current = window.setTimeout(() => {
       cancelPress();
+      longPressSession.current = s.session_id;
       setMenuCardId(s.session_id);
       setLifting(true);
       if (navigator.vibrate) navigator.vibrate(15);
@@ -261,7 +274,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
     if (dx > 10 || dy > 10) cancelPress();
   };
 
-  const renderCard = (s: SessionInfo, showLocation = false) => {
+  const renderCard = (s: SessionInfo) => {
     const isActive = s.session_id === activeSessionId;
     const isArchived = s.tag === "archived";
     const isMenu = menuCardId === s.session_id;
@@ -302,7 +315,15 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
         </div>
       );
     }
-    const onTitleClick = () => {
+    const onTitleClick = (event: ReactMouseEvent) => {
+      // Ignore the compatibility click from releasing this long press. A fresh
+      // touch resets the marker, so the next tap can dismiss/select normally.
+      if (longPressSession.current === s.session_id && event.detail !== 0) {
+        longPressSession.current = null;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       if (lifting) { closeMenu(); return; }
       if (onSelect(s.session_id) !== false && machineId) {
         manualUnread.update({ machineId, engine: s.engine ?? engine, space: s.space ?? space }, s.session_id, false);
@@ -326,10 +347,12 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
     const archiveBlocked = !isArchived && (engine === "codex" || engine === "dsh")
       && isSessionArchiveBlockedByState(st);
     const profilePresentation = profilePresentationFor(s);
+    const title = s.summary || (s.first_prompt || "").slice(0, 40) || s.session_id.slice(0, 8);
     return (
       <div
         key={s.session_id}
-        className={"scard" + (profilePresentation ? " has-profile-ribbon" : "") + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
+        aria-current={isActive ? "true" : undefined}
+        className={"scard" + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
         onTouchStart={(e) => onCardTouchStart(s, e)}
         onTouchMove={onCardTouchMove}
         onTouchEnd={cancelPress}
@@ -339,18 +362,16 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
       >
         {profilePresentation && (
           <span
-            className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
+            className={`${comfortable ? "scard-profile-ribbon" : "scard-profile-dot"} tone-${profilePresentation.tone}`}
+            role="img"
             title={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
             aria-label={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
-          >
-            {profilePresentation.name}
-          </span>
+          >{comfortable ? profilePresentation.name : null}</span>
         )}
         <div className={"scard-top" + (sessionBusy && visibleCompletion === "btw" ? " has-btw-completion" : "")}>
-          <span className="scard-title">
-            {s.summary || (s.first_prompt || "").slice(0, 40) || s.session_id.slice(0, 8)}
-          </span>
-          {isActive && <span className="pill idle"><span className="sd" />当前</span>}
+          {open && space === "code" && !isMenu && s.cwd
+            ? <SessionPathTitle key={`${profileScopeKey}:${s.cwd}`} path={s.cwd}>{title}</SessionPathTitle>
+            : <span className="scard-title" title={s.summary || s.first_prompt || s.session_id}>{title}</span>}
           {!isArchived && !!s.timed_tasks?.length && <Suspense fallback={null}><TimedTaskIndicator tasks={s.timed_tasks} hidden={isMenu} /></Suspense>}
           {sessionBusy && (
             <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
@@ -359,13 +380,13 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
             <span className="pill completed"><span className="sd" />{completionLabel}</span>
           )}
         </div>
-        {(showLocation || engine === "dsh") && s.cwd && (
+        {comfortable && (engine === "dsh" || s.pinned) && s.cwd && (
           <div className="scard-location" title={s.cwd}>
             <Icon name="folder" size={12} />
             <span>{basename(s.cwd)}</span>
           </div>
         )}
-        {s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
+        {comfortable && s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
         <div className="scard-actions">
           <button ref={isMenu ? menuAnchor : undefined} className="scard-act" aria-label="更多操作"
             aria-expanded={isMenu}
@@ -374,7 +395,11 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
           </button>
         </div>
         {isMenu && (
-          <Suspense fallback={null}><SessionCardMenu anchor={menuAnchor} onClose={closeMenu}>
+          <SessionCardMenu anchor={menuAnchor} onClose={closeMenu}>
+            {profilePresentation && <div className="card-menu-account">
+              <i className={`profile-tone tone-${profilePresentation.tone}`} aria-hidden="true" />
+              <span>{engine === "codex" ? "Codex" : "Claude"} 账号：{profilePresentation.fullLabel}</span>
+            </div>}
             {capabilities.rename && (
               <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
             )}
@@ -413,7 +438,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
                 <Icon name="trash" size={15} />{space === "work" ? "删除工作" : "删除会话"}
               </button>
             )}
-          </SessionCardMenu></Suspense>
+          </SessionCardMenu>
         )}
       </div>
     );
@@ -428,7 +453,6 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
     const isCodeDirectoryGroup = space === "code" && !label;
     const canAdd = isCodeDirectoryGroup && !!key;
     const showDirectoryPath = isCodeDirectoryGroup && !!key;
-    const showPinnedLocation = key === "__pinned__";
     const directoryExpanded = !!expandedDirectories[key];
     const visibleItems = isCodeDirectoryGroup
       ? visibleDirectorySessions(items, directoryExpanded, !!filter)
@@ -456,7 +480,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
           {showDirectoryPath && <span className="sgroup-path-tip" role="tooltip">{key}</span>}
         </div>
         {!isCollapsed && <div className="sgroup-items">
-          {visibleItems.map((session) => renderCard(session, showPinnedLocation))}
+          {visibleItems.map(renderCard)}
           {isCodeDirectoryGroup && !filter && items.length > 5 && (
             <button className="sgroup-more" onClick={(event) => {
               event.stopPropagation();
@@ -475,7 +499,7 @@ export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
   return (
     <>
       <div className={"scrim-side" + (open ? " show" : "")} onClick={onClose} />
-      <aside ref={sidebarRef} className={"sessions" + (open ? " show" : "")} inert={!open} aria-hidden={!open}>
+      <aside ref={sidebarRef} className={"sessions" + (open ? " show" : "")} data-layout={sessionLayout} inert={!open} aria-hidden={!open}>
         {/* Fade a sibling surface, never the native list scroller's ancestors. */}
         <div className="s-fade" aria-hidden="true" />
         {/* Keep the contents stable while the shell animates both surfaces. */}

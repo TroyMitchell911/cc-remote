@@ -30,7 +30,11 @@ export class ImeSubmitGuard {
   }
 
   shouldSubmitKey(event: SubmitKeyEvent): boolean {
-    return !this.composing && shouldSubmitTextKey(event);
+    return !this.isComposingInput(event) && shouldSubmitTextKey(event);
+  }
+
+  isComposingInput(event: Pick<SubmitKeyEvent, "isComposing" | "keyCode">): boolean {
+    return this.composing || event.isComposing === true || event.keyCode === 229;
   }
 
   /** Whether a button pointer-down should blur to commit the active IME first. */

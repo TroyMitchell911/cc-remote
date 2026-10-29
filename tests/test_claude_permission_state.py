@@ -1,5 +1,6 @@
 """Authoritative Claude permission state across reconnect and runtime creation."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -1367,7 +1368,7 @@ def test_claude_code_resume_without_override_never_reads_fresh_default(
         monkeypatch.setattr(
             machine_module, "save_session_id", lambda *_args: None)
         machine, _ = _mk_machine()
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1423,7 +1424,7 @@ def test_claude_code_resume_recovers_native_curated_model_before_history(
             native_controls,
         )
         machine, _ = _mk_machine()
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1465,7 +1466,7 @@ def test_claude_code_resume_prefers_native_model_to_saved_remote_choice(
         monkeypatch.setattr(
             machine_module, "save_session_id", lambda *_args: None)
         machine, _ = _mk_machine()
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1514,7 +1515,7 @@ def test_claude_work_resume_never_applies_code_fresh_default(
         store = machine._work.for_engine("claude")
         record = store.create_session()
         store.bind_session(record.work_id, session_id)
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1611,7 +1612,7 @@ def test_cold_claude_resume_retains_permissions_but_inherits_native_model_effort
         )
         monkeypatch.setattr(machine_module, "last_completed_assistant_controls",
                             lambda *_a, **_k: ClaudeControls(model="claude-sonnet-5", effort="low"))
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1669,7 +1670,7 @@ def test_cold_resume_keeps_pending_lower_window_out_of_launch(
             applied_auto_compact_mode="custom",
             applied_auto_compact_threshold_tokens=800_000,
         )
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -1707,7 +1708,7 @@ def test_cold_resume_without_control_record_uses_native_autocompact(
             machine_module, "save_session_id", lambda *_args: None)
 
         machine, _ = _mk_machine()
-        machine._watch_session = lambda _sid: None
+        machine._watch_session = AsyncMock(side_effect=lambda _sid: None)
         machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
         machine._load_history = lambda *_args: asyncio.sleep(0)
 

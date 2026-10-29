@@ -23,7 +23,6 @@ import type {
   CodexTerminalFence, AutoCompact, AutoCompactMode,
   BackgroundProcessItem, CodexContext,
 } from "./protocol";
-import type { SendMode } from "./composer-submit";
 import {
   compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
   MAX_BACKGROUND_PROCESS_ITEMS,
@@ -373,10 +372,6 @@ export interface SessionRuntime {
   statusError: string | null;
   resetCreditResult: RateLimitResetResult | null;
   notices: Notice[];
-  // Busy-send choice belongs to this session's composer. A choice made while
-  // reading one Codex task must not turn another session away from the default
-  // native steer behavior.
-  sendMode: SendMode;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
   // Rejected reliable submissions retain their complete browser payload until
@@ -400,7 +395,11 @@ export interface AppState {
   // connection / global UI
   connState: ConnState;
   wrapperOnline: boolean;
+  /** Transport phase stays independent of dismissible command feedback. */
+  wrapperConnection?: "offline" | "syncing";
   banner?: string;
+  /** Distinguish repeated commands with identical feedback from a stale dismissal. */
+  bannerRevision?: number;
   artifact: Artifact | null;
   retainedArtifacts?: Record<string, Artifact>;
   dirPicker: {
@@ -519,7 +518,7 @@ export function createRuntime(): SessionRuntime {
     goalId: null, goalDismissed: false, completion: null,
     statusReport: null, rateLimits: [], statusRequestId: null, statusError: null,
     resetCreditResult: null,
-    notices: [], sendMode: "steer",
+    notices: [],
     queue: [], pendingSend: null, failedDeferred: [],
     acceptancePending: null,
     acceptanceKind: null,
@@ -535,10 +534,9 @@ export type Action =
   | { type: "steer_sent"; sid: string; prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[]; ts: number }
   | { type: "conn"; connState: ConnState; detail?: string }
   | { type: "command_error"; detail: string }
-  | { type: "dismiss_banner"; banner: string }
+  | { type: "dismiss_banner"; banner: string; revision?: number }
   | { type: "enqueue"; sid?: string; query: PendingQuery }
   | { type: "dequeue_at"; sid: string; i: number }
-  | { type: "set_send_mode"; sid: string; mode: SendMode }
   | { type: "set_pending"; sid?: string; query: PendingQuery }
   | { type: "clear_pending"; sid: string }
   | { type: "remove_deferred"; sid: string; msgId: string }
@@ -2490,6 +2488,10 @@ export function reduce(state: AppState, action: Action): AppState {
   return reduceWithRetainedArtifacts(state, action, reduceCurrent);
 }
 
+function commandBanner(state: AppState, banner: string) {
+  return { banner, bannerRevision: (state.bannerRevision ?? 0) + 1 };
+}
+
 function reduceCurrent(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "reset":
@@ -2524,6 +2526,7 @@ function reduceCurrent(state: AppState, action: Action): AppState {
         // A reconnect may land on a restarted relay with no wrapper. Wait for
         // replay/snapshot proof before allowing background queue removal.
         wrapperOnline: action.connState === "connected" ? state.wrapperOnline : false,
+        wrapperConnection: action.connState === "connected" ? "syncing" : undefined,
         // Pagination waiters are frozen to one underlying socket generation.
         // Keep the authoritative live runtime, but reopen deep history from its
         // newest page after reconnect instead of accepting a delayed old page.
@@ -2536,9 +2539,10 @@ function reduceCurrent(state: AppState, action: Action): AppState {
       };
     }
     case "command_error":
-      return { ...state, banner: action.detail };
+      return { ...state, ...commandBanner(state, action.detail) };
     case "dismiss_banner":
       return state.banner === action.banner
+          && (action.revision === undefined || action.revision === (state.bannerRevision ?? 0))
         ? { ...state, banner: undefined }
         : state;
     case "query_sent":
@@ -2624,8 +2628,6 @@ function reduceCurrent(state: AppState, action: Action): AppState {
         state.runtimes, action.sid, { type: "dequeue_at", i: action.i });
       return runtimes === state.runtimes ? state : { ...state, runtimes };
     }
-    case "set_send_mode":
-      return patch(state, action.sid, (rt) => { rt.sendMode = action.mode; });
     case "set_pending": {
       const targetSid = action.sid ?? state.focusedSid;
       const unconfirmed = collectUnconfirmedQueries(
@@ -5285,6 +5287,7 @@ function reduceEvent(
           }])),
         wrapperOnline: false,
         banner: "machine offline — waiting for reconnect",
+        wrapperConnection: "offline",
         historyBrowse: null,
         retainedHistoryBrowse:
           state.historyBrowse ?? state.retainedHistoryBrowse,
@@ -5292,7 +5295,8 @@ function reduceEvent(
     case "wrapper_reconnected":
       // The event only proves a process connected to the relay. Wait for this
       // client's Hello replay/snapshot before draining any queued turns.
-      return { ...state, wrapperOnline: false, banner: "machine reconnected — syncing…" };
+      return { ...state, wrapperOnline: false, wrapperConnection: "syncing",
+        banner: "machine reconnected — syncing…" };
     case "diff_report":
       if (!state.artifact || state.artifact.file !== e.file
           || state.artifact.requestId !== e.request_id
@@ -6086,6 +6090,7 @@ function reduceEvent(
             }])),
           wrapperOnline: false,
           banner: "设备离线，正在等待重新连接…",
+          wrapperConnection: "offline",
           historyBrowse: null,
           retainedHistoryBrowse:
             state.historyBrowse ?? state.retainedHistoryBrowse,
@@ -6144,7 +6149,7 @@ function reduceEvent(
           ));
           clearAcceptance(rt);
         });
-        return { ...next, banner: presentCommandProblem(e) };
+        return { ...next, ...commandBanner(state, presentCommandProblem(e)) };
       }
       const sendRejection = e.code === "busy" || e.code === "not_running" || e.code === "bad_prompt";
       if (e.msg_id) {
@@ -6180,7 +6185,7 @@ function reduceEvent(
                 };
               }
             });
-            return { ...next, banner: problem };
+            return { ...next, ...commandBanner(state, problem) };
           }
           const next = patch(state, key, (rt) => {
             rt.queue = rt.queue.filter(
@@ -6211,12 +6216,12 @@ function reduceEvent(
           return {
             ...next,
             runtimes: boundFailedDeferred(next.runtimes),
-            banner: problem,
+            ...commandBanner(state, problem),
           };
         }
       }
       if (!e.msg_id) {
-        return { ...state, banner: presentCommandProblem(e) };
+        return { ...state, ...commandBanner(state, presentCommandProblem(e)) };
       }
       if (sendRejection || e.request_id) {
         // A rejected command never owns an engine terminal. Older wrappers

@@ -1,5 +1,6 @@
 """Zero-token regressions for Claude terminal ownership and takeover."""
 from __future__ import annotations
+from unittest.mock import AsyncMock
 
 import asyncio
 import json
@@ -1483,7 +1484,7 @@ def test_query_is_rejected_before_state_claim_when_claude_is_external(monkeypatc
         ctx = _mk_ctx("sid", "sid")
         ctx.sdk = _ClaudeRunSdk()
         machine.sessions["sid"] = ctx
-        monkeypatch.setattr(machine, "_watch_session", lambda _sid: None)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=lambda _sid: None))
 
         async def occupied(_sid):
             return True
@@ -2140,7 +2141,7 @@ def test_first_claude_session_id_capture_starts_owner_watch(monkeypatch):
         ctx.sdk = _ClaudeRunSdk()
         machine.sessions[ctx.key] = ctx
         watched = []
-        monkeypatch.setattr(machine, "_watch_session", watched.append)
+        monkeypatch.setattr(machine, "_watch_session", AsyncMock(side_effect=watched.append))
 
         await machine._capture_session_id(
             ctx, "11111111-1111-4111-8111-111111111111")

@@ -1366,7 +1366,7 @@ assert.match(historyAppSource,
   /historyViewRevision=\{historyView\.viewRevision\}/,
   "an atomic recovery replacement must retain the prior virtual-scroll scope");
 assert.match(historyAppSource,
-  /replaying=\{rt\.replaying \|\| historyView\.recovering\}/,
+  /phase=\{headerConnectionPhase\(state\.connState, state\.wrapperOnline,\s*rt\.replaying \|\| historyView\.recovering/,
   "the retained projection must remain visibly marked as synchronizing");
 assert.match(historyAppSource,
   /onEdit=\{historyView\.recovering\s*\? undefined/,
@@ -1571,23 +1571,6 @@ assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
 assert.doesNotMatch(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*\bwidth/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
-assert.doesNotMatch(layoutCss, /\.scard\.has-profile-ribbon\s*\{[^}]*padding-top/,
-  "profile stamps must not add a second row to every session card");
-assert.doesNotMatch(layoutCss,
-  /\.scard\.has-profile-ribbon \.scard-top\s*\{[^}]*padding-left/s,
-  "profile keycaps must not push session titles into a second column");
-assert.match(layoutCss,
-  /\.scard\.has-profile-ribbon\s*\{[^}]*border-color\s*:\s*color-mix\([^}]*background\s*:\s*color-mix\(/s,
-  "every profile keycap needs a quiet card edge to hang from");
-assert.match(layoutCss,
-  /:root\[data-engine="codex"\]\[data-theme="dark"\] \.scard\.has-profile-ribbon\s*\{[^}]*background\s*:\s*color-mix\([^}]*border-color\s*:\s*var\(--border-strong\)/s,
-  "dark profile cards need an opaque edge that survives the dark sidebar");
-assert.match(layoutCss,
-  /\.scard-profile-ribbon\s*\{[^}]*top\s*:\s*-6px[^}]*height\s*:\s*16px[^}]*max-width\s*:\s*64px[^}]*font-family\s*:\s*var\(--mono\)[^}]*font-size\s*:\s*8\.5px/s,
-  "profile keycaps must hang compactly from the card edge");
-assert.match(layoutCss,
-    /\.work-profile-owner\s*\{[^}]*max-width\s*:\s*72px[^}]*height\s*:\s*19px[^}]*font\s*:\s*var\(--font-weight-650\) 9px\/1 var\(--mono\)/s,
-  "a multi-account Work owner stays compact in the shared header");
 assert.match(layoutCss,
   /@media \(max-width:980px\)\{\s*\.artifact-panel\{[^}]*top:calc\(var\(--app-offset-top,0px\) \+ 10px\)[^}]*bottom:auto[^}]*height:calc\(var\(--app-height,100dvh\) - 20px\)[^}]*max-height:none/s,
   "mobile artifact previews must fill the visual viewport instead of shrink-wrapping iframe or Markdown content");
@@ -3653,8 +3636,6 @@ try {
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: 22, ts: 10, ...body,
   } as ServerEvent);
-  assert.equal(createRuntime().sendMode, "steer",
-    "Codex running input uses steer mode by default");
   const autoCompactSid = "claude-autocompact-context";
   const oldContextReport = event({
     type: "context_report",
@@ -3988,23 +3969,6 @@ try {
     "/repo/old",
     "an unowned reconnect list must not update scoped cwd",
   );
-  const sendModeA = "send-mode-a";
-  const sendModeB = "send-mode-b";
-  const isolatedSendModes = reduce({
-    ...initialState,
-    focusedSid: sendModeA,
-    runtimes: {
-      [sendModeA]: createRuntime(),
-      [sendModeB]: createRuntime(),
-    },
-  }, {
-    type: "set_send_mode",
-    sid: sendModeA,
-    mode: "queue",
-  });
-  assert.equal(isolatedSendModes.runtimes[sendModeA].sendMode, "queue");
-  assert.equal(isolatedSendModes.runtimes[sendModeB].sendMode, "steer",
-    "busy-send selection must not leak between sessions");
   const questionA = "question-session-a";
   const questionB = "question-session-b";
   let questionState = {
@@ -11030,9 +10994,9 @@ try {
     },
   ));
   assert.match(profileSidebarMarkup,
-    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+    /class="scard-profile-dot tone-0"[^>]*aria-label="Codex 账号：default · Main"/);
   assert.match(profileSidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+    /class="scard-profile-dot tone-1"[^>]*aria-label="Codex 账号：nyx · Stack"/);
   assert.match(profileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const workProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11060,9 +11024,9 @@ try {
   ));
   assert.match(workProfileSidebarMarkup, /aria-label="筛选 Codex 账号"/);
   assert.match(workProfileSidebarMarkup,
-    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+    /class="scard-profile-dot tone-0"[^>]*aria-label="Codex 账号：default · Main"/);
   assert.match(workProfileSidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+    /class="scard-profile-dot tone-1"[^>]*aria-label="Codex 账号：nyx · Stack"/);
   assert.match(workProfileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const singleProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11076,7 +11040,7 @@ try {
       }],
     },
   ));
-  assert.doesNotMatch(singleProfileSidebarMarkup, /profile-ribbon|profile-filter/,
+  assert.doesNotMatch(singleProfileSidebarMarkup, /scard-profile-dot|profile-filter/,
     "single-account sidebar output remains free of profile-only DOM");
   const singleProfileWorkSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
@@ -11094,7 +11058,7 @@ try {
   ));
   assert.doesNotMatch(
     singleProfileWorkSidebarMarkup,
-    /profile-ribbon|profile-filter/,
+    /scard-profile-dot|profile-filter/,
     "single-account Work keeps its historical sidebar DOM",
   );
   const btwDraftStore = new ComposerDraftStore();
@@ -11136,7 +11100,6 @@ try {
     catalog: {},
     draftKey: "btw-render-draft",
     draftStore: btwDraftStore,
-    sendMode: "steer",
     unconfirmedQueued: [],
     unconfirmedReplaceable: [],
     queueCapacity: {},
@@ -11148,7 +11111,6 @@ try {
     onSend: () => true,
     onSteer: () => true,
     onInterrupt: () => {},
-    onSetSendMode: () => {},
     onEnqueue: () => {},
     onSetPending: () => {},
     onRemoveQueued: () => {},
@@ -11166,7 +11128,8 @@ try {
   assert.match(btwPanelMarkup, /queued follow-up/);
   assert.match(btwPanelMarkup, /replacement follow-up/);
   assert.match(btwPanelMarkup, /retryable failed follow-up/);
-  assert.match(btwPanelMarkup, />引导</);
+  assert.doesNotMatch(btwPanelMarkup, /btw-runbar|class="seg"/);
+  assert.match(btwPanelMarkup, /Tab 排队/);
   assert.match(btwPanelMarkup, />排队</);
   assert.match(btwPanelMarkup, />替换</);
   assert.match(btwPanelMarkup, />未发送</);
@@ -18418,8 +18381,6 @@ assert.match(appSource, /sendSetModelTo\(sid, model\)/,
   "BTW model changes must never follow focusedSid");
 assert.match(appSource, /sendSetEffortTo\(sid, effort\)/,
   "BTW effort changes must never follow focusedSid");
-assert.match(appSource, /btwSendModeBySid/,
-  "BTW send mode must not reuse the main composer's global mode");
 assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
   "restored focus must replace the temporary new-session page");
 assert.match(appSource, /<HeaderMenu[\s\S]*notificationMode=\{notificationMode\}/,
@@ -18442,12 +18403,6 @@ assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
 assert.match(appSource,
   /focusedSession\?\.native_session_id[\s\S]{0,180}nativeProfileSessionId\(rt\.ccSessionId\)/,
   "the Work header must not expose a profile-namespaced routing id");
-assert.match(appSource,
-  /<span className=\{`work-profile-owner tone-\$\{focusedWorkProfile\.tone\}`\}/,
-  "multi-account Work must expose its immutable owner in the header");
-assert.doesNotMatch(appSource,
-  /<button className=\{`work-profile-owner/,
-  "an existing Work owner is informational and must not become switchable");
 assert.match(appSource,
   /workDashboardMachineId === machineId[\s\S]{0,180}workDashboards\[engine\]/,
   "Work dashboard data must not cross a device boundary");

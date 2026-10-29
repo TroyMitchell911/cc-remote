@@ -50,7 +50,7 @@ export function EngineSelector({ engine, onChange }: {
         }
       }}>
       <span className="engine-label"><EngineIcon engine={engine} />
-        {engine === "dsh" ? "DSH" : engine === "codex" ? "Codex" : "Claude"}</span>
+        <span className="engine-name">{engine === "dsh" ? "DSH" : engine === "codex" ? "Codex" : "Claude"}</span></span>
     </button>
     {menu !== null && <Suspense fallback={null}><EngineMenu engine={engine} anchor={button}
       keyboard={menu} altShortcuts={altShortcuts} onClose={close} onSelect={(next, keyboard) => {

@@ -29,6 +29,7 @@ import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { useMarkdownExtras } from "../use-markdown-extras";
 import { rehypeMessageBreaks } from "../markdown-breaks";
 import { remarkReplySections } from "../markdown-reply-sections";
+import { remarkEmphasizedLinks } from "../markdown-emphasized-links";
 import { messageImageGeometry } from "../media-geometry";
 
 // Keep the parser behind its own memo boundary. MessageBlock still receives
@@ -584,6 +585,7 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
   const extras = useMarkdownExtras(shown);
   const remarkPlugins = useMemo(() => [
     ...(math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS),
+    remarkEmphasizedLinks,
     ...(formatReplySections && done ? [remarkReplySections] : []),
     ...(extras.citation ? [extras.citation] : []),
   ], [done, formatReplySections, extras.citation, math.plugins?.remarkPlugins]);

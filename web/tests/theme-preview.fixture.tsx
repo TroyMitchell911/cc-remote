@@ -56,7 +56,6 @@ export function ThemePreview() {
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 980);
   const [active, setActive] = useState("preview");
   const [space, setSpace] = useState<"code" | "work">("code");
-  const [sendMode, setSendMode] = useState<"steer" | "queue">("steer");
   const [showNotice, setShowNotice] = useState(params.has("notices"));
   const drafts = useRef(new ComposerDraftStore());
   const runtime = useMemo(() => demoState(engine), [engine]);
@@ -84,6 +83,7 @@ export function ThemePreview() {
     codex_profile_id: index === 1 ? "nyx" : "default", claude_profile_id: index === 1 ? "nyx" : "default" })) as SessionInfo[];
   return <div className={`shell${sidebarOpen ? " sidebar-open" : ""}`}>
     <SessionsSidebar open={sidebarOpen} engine={engine} space={space} profileScopeKey={`preview:${engine}`}
+      sessionLayout={appearance.sessionLayout}
       machineId="theme-preview" codexProfiles={profiles} claudeProfiles={profiles}
       defaultCodexProfileId="default" defaultClaudeProfileId="default"
       sessions={sessions} activeSessionId={active} onSpaceChange={setSpace} onSelect={setActive}
@@ -111,7 +111,7 @@ export function ThemePreview() {
       <ChatView sid="preview" turns={runtime.turns} engine={engine} historyScopeKey={engine} />
       <Composer draftKey={engine} draftStore={drafts.current} state="idle"
         backgroundTasks={<BackgroundTaskControl processes={runtime.backgroundProcesses} />}
-        connState="connected" wrapperOnline sendMode={sendMode} setSendMode={setSendMode}
+        connState="connected" wrapperOnline
         queue={[]} pendingSend={null} failedDeferred={[]} unconfirmedQueued={[]} unconfirmedReplaceable={[]}
         queueCapacity={{}} replaceQueueCapacity={{}}
         model={engine === "codex" ? "gpt-6-astra" : String(engine) === "dsh" ? "DeepSeek-V41-Flash" : "claude-fable-5-1"} effort="max"

@@ -25,7 +25,7 @@ try {
   const { ChatView } = await harness.ssrLoadModule(
     "/src/components/ChatView.tsx");
   const { assistantContinuations: claudeContinuations } = await harness.ssrLoadModule("/src/assistant-continuations.ts");
-  const { mergeInitialHistory, mergeAuthoritativeTurnDetail } =
+  const { mergeInitialHistory, mergeAuthoritativeTurnDetail, restoreCachedTurnDetails } =
     await harness.ssrLoadModule("/src/history-merge.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: PROTOCOL_VERSION,
@@ -605,6 +605,104 @@ try {
   summarySend({ type: "state", state: "idle", ts: 45 });
   assert.equal(summaryMarkup().split("Claude 继续处理").length - 1, 2);
   assert.match(summaryMarkup(), /CI passed\.[\s\S]*Claude 继续处理[\s\S]*Next task passed\./);
+
+  // With no summary loaded before the background response, the completed live
+  // row still holds all process blocks inline. A later summary must weave those
+  // blocks before their exact final-answer anchor, even without an active owner.
+  const completedBlocks: Block[] = [{
+    kind: "text", message_id: "settled-original", channel: "final",
+    text: "Waiting for results.", done: true, liveOrder: 0,
+  }, {
+    kind: "text", message_id: "settled-thinking", channel: "thinking",
+    text: "Inspect the results.", done: true, background: true,
+    startedTs: 10_000, liveOrder: 1,
+  }, {
+    kind: "tool", message_id: "settled-command", tool_use_id: "settled-read",
+    tool: "Bash", category: "command", input: { command: "cat result.txt" },
+    result: { content: "passed", is_error: false },
+    done: true, background: true, liveOrder: 2,
+  }, {
+    kind: "text", message_id: "settled-final", channel: "final",
+    text: "The check passed.", done: true, background: true,
+    startedTs: 20_000, doneTs: 21_000, liveOrder: 3,
+  }];
+  const completedLive: Turn = {
+    id: "settled-background-parent", prompt: "Run the check", done: true,
+    blocks: completedBlocks,
+  };
+  const completedSummary: Turn = {
+    ...completedLive,
+    processDetailState: "present", detailEventCount: 3, detailLoaded: false,
+    blocks: completedBlocks.filter(block =>
+      block.kind === "text" && block.channel === "final")
+      .map(block => ({ ...block, liveOrder: undefined })),
+  };
+  const identity = (block: Block) => block.kind === "text" ? block.message_id
+    : block.kind === "tool" ? block.tool_use_id : block.item_id;
+  const continuations = (turn: Turn) => claudeContinuations(turn.blocks,
+    turn.blocks.filter(block => block.kind === "text" && block.channel === "final"),
+    "claude").continuations;
+  let completedMerged = completedLive;
+  for (let refresh = 0; refresh < 3; refresh += 1) {
+    completedMerged = mergeInitialHistory([completedSummary], [completedMerged], {
+      reconcileReplayOrphans: true, newestHistoryId: completedSummary.id,
+    })[0];
+    assert.deepEqual(completedMerged.blocks.map(identity), completedBlocks.map(identity),
+      "refreshing a settled row preserves witnessed process order around the summary's exact answer");
+    const replies = continuations(completedMerged);
+    assert.equal(replies.length, 1,
+      "a completed process must not become an empty second continuation after its answer");
+    assert.equal(replies[0].startedTs, 10_000);
+    assert.deepEqual(replies[0].answers.map(identity), ["settled-final"]);
+    assert.equal(completedMerged.done, true);
+  }
+  const completedMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "settled-background", engine: "claude", turns: [completedMerged],
+  }));
+  assert.equal(completedMarkup.split("Claude 继续处理").length - 1, 1);
+  assert.match(completedMarkup,
+    /Waiting for results\.[\s\S]*Claude 继续处理[\s\S]*已处理[\s\S]*The check passed\./);
+  const cachedCompleted = restoreCachedTurnDetails([completedSummary],
+    JSON.parse(JSON.stringify([completedMerged])), "idle");
+  const cachedMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "settled-background", engine: "claude", turns: cachedCompleted,
+  }));
+  assert.equal(cachedMarkup.split("Claude 继续处理").length - 1, 1,
+    "restoring the completed process from cache must keep it with its answer");
+  assert.match(cachedMarkup,
+    /Claude 继续处理[\s\S]*已处理[\s\S]*The check passed\./);
+
+  const secondReplyBlocks: Block[] = [{
+    kind: "text", message_id: "settled-next-thought", channel: "thinking",
+    text: "Inspect the next result.", done: true, background: true,
+    startedTs: 30_000, liveOrder: 4,
+  }, {
+    kind: "text", message_id: "settled-next-final", channel: "final",
+    text: "The next check passed.", done: true, background: true,
+    startedTs: 40_000, liveOrder: 5,
+  }];
+  const twiceCompleted = mergeInitialHistory([{
+    ...completedSummary,
+    blocks: [...completedSummary.blocks, { ...secondReplyBlocks[1], liveOrder: undefined }],
+  }], [{ ...completedMerged, blocks: [...completedMerged.blocks, ...secondReplyBlocks] }])[0];
+  assert.deepEqual(continuations(twiceCompleted).map((reply: { answers: Block[] }) =>
+    reply.answers.map(identity)), [["settled-final"], ["settled-next-final"]],
+  "two completed background responses retain two distinct answer/process groups");
+
+  for (const unprovenBlocks of [
+    completedBlocks.map(block => ({ ...block, liveOrder: undefined })),
+    completedBlocks.map(block => ({ ...block, liveOrder: 0 })),
+    completedBlocks.map((block, index) => ({ ...block, liveOrder: 3 - index })),
+  ]) {
+    const unproven = mergeInitialHistory([completedSummary], [{
+      ...completedLive, blocks: unprovenBlocks,
+    }])[0];
+    assert.deepEqual(unproven.blocks.slice(0, 2).map(identity),
+      completedSummary.blocks.map(identity),
+      "missing, duplicate or conflicting order cannot override the canonical answer sequence");
+    assert.deepEqual(new Set(unproven.blocks.map(identity)), new Set(completedBlocks.map(identity)),
+      "an unproven ordering never discards retained process or answer payloads");
+  }
 
   // The idle summary moves observed process into detailProjection and drops
   // the final's liveOrder. A later continuation must share one order with that

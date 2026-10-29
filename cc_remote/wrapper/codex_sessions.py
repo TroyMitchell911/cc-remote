@@ -18,6 +18,7 @@ import sqlite3
 import stat
 from typing import Any, Iterable, Optional
 
+from cc_remote.wrapper.rollout_io import rollout_first_line, rollout_open, rollout_size
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_rpc import codex_rpc
 
@@ -256,7 +257,7 @@ def codex_rollout_path(
     *,
     codex_home: str | os.PathLike[str] | None = None,
 ) -> Optional[str]:
-    """Public: the rollout .jsonl for a Codex thread (for history replay)."""
+    """Public: the native .jsonl or .jsonl.zst path for history replay."""
     return (
         _rollout_path(session_id)
         if codex_home is None
@@ -421,6 +422,119 @@ def codex_session_confirmed_missing(
     return codex_session_presence(session_id, codex_home=home) is False
 
 
+def codex_missing_sidebar_sessions(
+    session_ids: Iterable[str],
+    *,
+    unloaded_ids: Iterable[str] = (),
+    codex_home: str | os.PathLike[str] | None = None,
+) -> set[str]:
+    """Confirm deleted cold sidebar entries without changing native state.
+
+    Readable catalog absence plus a complete scan of both rollout roots proves
+    deletion. A stale catalog row is also eligible only when the fresh official
+    list says ``notLoaded`` and its exact, profile-local rollout path is gone.
+    Missing databases, permissions, symlinks and scan limits preserve rows.
+    This is a batch sidebar check, never a live-handle retirement predicate.
+    """
+    ids = set()
+    for sid in session_ids:
+        if isinstance(sid, str) and _SAFE_SESSION_ID.fullmatch(sid):
+            ids.add(sid)
+        if len(ids) >= 8192:
+            break
+    if not ids:
+        return set()
+    unloaded = set(unloaded_ids) & ids
+    home = _codex_home(codex_home)
+    roots = _session_roots(home)
+
+    def path_missing(path: object) -> bool:
+        if (not isinstance(path, str) or not os.path.isabs(path)
+                or len(os.fsencode(path)) > 16 * 1024):
+            return False
+        absolute = os.path.abspath(path)
+        # Do not follow an index copied from another account, or a symlink
+        # through which a missing file could really belong to another root.
+        if absolute != os.path.realpath(path):
+            return False
+        if not any(absolute.startswith(root + os.sep) for root in roots):
+            return False
+        # The native catalog may keep the original .jsonl path after Codex
+        # compresses an inactive rollout. Both representations must be absent.
+        variants = (path, path + ".zst") if path.endswith(".jsonl") else (path,)
+        for candidate in variants:
+            try:
+                os.lstat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            return False
+        return True
+
+    def candidates() -> dict[str, str | None]:
+        db_path = _state_db_path(home)
+        if db_path is None:
+            return {}
+        try:
+            uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as db:
+                db.execute("BEGIN")
+                columns = {row[1] for row in db.execute('PRAGMA table_info("threads")')}
+                if "id" not in columns:
+                    return {}
+                rollout_column = '"rollout_path"' if "rollout_path" in columns else "NULL"
+                found = {}
+                ordered = sorted(ids)
+                for start in range(0, len(ordered), 400):
+                    batch = ordered[start:start + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    found.update(db.execute(
+                        f'SELECT "id", {rollout_column} FROM threads '
+                        f'WHERE "id" IN ({placeholders})', batch,
+                    ))
+        except (OSError, sqlite3.Error):
+            return {}
+        return {
+            sid: found.get(sid) for sid in ids
+            if sid not in found or (sid in unloaded and path_missing(found[sid]))
+        }
+
+    before = candidates()
+    if not before:
+        return set()
+    remaining = set(before)
+    scanned = 0
+
+    def failed_scan(error: OSError) -> None:
+        raise error
+
+    try:
+        for root in roots:
+            try:
+                mode = os.lstat(root).st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                return set()
+            for directory, dirs, files in os.walk(root, onerror=failed_scan):
+                scanned += 1 + len(dirs) + len(files)
+                if scanned > 100_000:
+                    return set()
+                if any(os.path.islink(os.path.join(directory, name)) for name in dirs):
+                    return set()
+                for name in files:
+                    if name.endswith((".jsonl", ".jsonl.zst")):
+                        remaining.difference_update(sid for sid in tuple(remaining)
+                                                    if sid in name)
+                if not remaining:
+                    return set()
+    except OSError:
+        return set()
+    after = candidates()
+    return {sid for sid in remaining if sid in after and before[sid] == after[sid]}
+
+
 def codex_thread_archive_states(
     session_ids: Iterable[str],
     *,
@@ -504,6 +618,13 @@ def _catalog_rollout_fork_parent(
     ):
         return False, None
     expanded = os.path.expanduser(rollout_path)
+    if expanded.endswith(".jsonl"):
+        try:
+            os.lstat(expanded)
+        except FileNotFoundError:
+            expanded += ".zst"
+        except OSError:
+            return False, None
     if not os.path.isabs(expanded):
         return False, None
     expected_root = os.path.realpath(_session_roots(codex_home)[archived])
@@ -533,24 +654,14 @@ def _catalog_rollout_fork_parent(
             or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
         ):
             return False, None
-        chunks: list[bytes] = []
-        received = 0
-        newline = False
-        while received <= MAX_META_RECORD_BYTES:
-            chunk = os.read(
-                descriptor,
-                min(64 * 1024, MAX_META_RECORD_BYTES + 1 - received),
-            )
-            if not chunk:
-                break
-            marker = chunk.find(b"\n")
-            if marker >= 0:
-                chunks.append(chunk[:marker + 1])
-                received += marker + 1
-                newline = True
-                break
-            chunks.append(chunk)
-            received += len(chunk)
+        try:
+            with os.fdopen(os.dup(descriptor), "rb") as source:
+                raw = rollout_first_line(
+                    expanded, MAX_META_RECORD_BYTES + 1, source=source)
+        except OSError:
+            return False, None
+        received = len(raw)
+        newline = raw.endswith(b"\n")
         try:
             current = os.lstat(expanded)
         except OSError:
@@ -561,7 +672,6 @@ def _catalog_rollout_fork_parent(
             or received > MAX_META_RECORD_BYTES
         ):
             return False, None
-        raw = b"".join(chunks)
     finally:
         os.close(descriptor)
 
@@ -967,7 +1077,7 @@ def codex_session_settings(
     if not path:
         return {}
     try:
-        size = os.path.getsize(path)
+        size = rollout_size(path)
     except OSError:
         return {}
     out: dict = {}
@@ -977,7 +1087,7 @@ def codex_session_settings(
         # first partial JSONL record instead of rejecting the entire rollout.
         tail_bytes = max(1, int(max_bytes))
         start = max(0, size - tail_bytes)
-        with open(path, "rb") as f:
+        with rollout_open(path, "rb") as f:
             def read_chunk():
                 remaining = size - f.tell()
                 return f.readline(min(MAX_JSONL_RECORD_BYTES + 1, remaining)) \
@@ -1121,23 +1231,25 @@ def _rollout_path(
         # thread/archive moves the rollout out of ``sessions``. Archived rows
         # still need history, cwd lookup, and engine detection so unarchive never
         # falls through to the Claude SDK.
-        for source_root in _session_roots(codex_home):
-            matches = glob.iglob(
-                os.path.join(source_root, "**", f"*{safe_id}*.jsonl"),
-                recursive=True,
-            )
-            root = os.path.realpath(source_root)
-            for match in matches:
-                if scanned >= 1000:
-                    return None
-                scanned += 1
-                resolved = os.path.realpath(match)
-                if os.path.commonpath((root, resolved)) == root:
-                    # Filename substrings can match other threads (child vs
-                    # grandchild), in filesystem-dependent directory order.
-                    meta = _read_meta(match)
-                    if meta and meta.get("id") == session_id:
-                        return match
+        # A resumed native thread may have both forms briefly; prefer the live
+        # JSONL in either root over an older compressed snapshot.
+        for suffix in (".jsonl", ".jsonl.zst"):
+            for source_root in _session_roots(codex_home):
+                matches = glob.iglob(
+                    os.path.join(source_root, "**", f"*{safe_id}*{suffix}"),
+                    recursive=True,
+                )
+                root = os.path.realpath(source_root)
+                for match in matches:
+                    if scanned >= 1000:
+                        return None
+                    scanned += 1
+                    resolved = os.path.realpath(match)
+                    if os.path.commonpath((root, resolved)) == root:
+                        # Match the embedded exact id, never a filename alone.
+                        meta = _read_meta(match)
+                        if meta and meta.get("id") == session_id:
+                            return match
         return None
     except Exception:
         return None
@@ -1145,11 +1257,10 @@ def _rollout_path(
 
 def _read_meta(path: str) -> Optional[dict]:
     try:
-        with open(path) as f:
-            line = f.readline(MAX_META_RECORD_BYTES + 1)
-            if len(line.encode("utf-8", "surrogatepass")) > MAX_META_RECORD_BYTES:
-                return None
-            d = json.loads(line)
+        line = rollout_first_line(path, MAX_META_RECORD_BYTES + 1)
+        if len(line) > MAX_META_RECORD_BYTES:
+            return None
+        d = json.loads(line)
         if d.get("type") == "session_meta" and isinstance(d.get("payload"), dict):
             return d["payload"]
     except Exception:

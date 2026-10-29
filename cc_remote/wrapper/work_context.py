@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
+from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open, rollout_stat
 from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
 from cc_remote.wrapper.claude_compaction import compact_context_usage
 from cc_remote.wrapper.codex_sessions import codex_rollout_path
@@ -32,15 +32,15 @@ def _bounded_context_tail(path: str) -> list[bytes] | None:
     native conversation.
     """
     try:
-        with open(path, "rb") as history:
-            before = os.fstat(history.fileno())
+        with rollout_open(path, "rb") as history:
+            before = rollout_fstat(history)
             size = before.st_size
             start = max(0, size - _CONTEXT_TAIL_SCAN_BYTES)
             read_start = max(0, start - 1)
             history.seek(read_start)
             data = history.read(size - read_start)
-            after = os.fstat(history.fileno())
-        current = os.stat(path)
+            after = rollout_fstat(history)
+        current = rollout_stat(path)
     except OSError:
         return None
 
@@ -255,7 +255,7 @@ def recover_work_context_baseline(
     if not path:
         return None
     try:
-        with open(path, encoding="utf-8") as history:
+        with rollout_open(path, "r", encoding="utf-8") as history:
             for index, line in enumerate(_bounded_jsonl_lines(history)):
                 if index >= _BASELINE_HISTORY_RECORD_LIMIT:
                     break

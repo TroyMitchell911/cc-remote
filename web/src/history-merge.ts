@@ -1120,7 +1120,14 @@ function mergeTurn(
   const hasLoadedDetailPayload = blocks.some((block) =>
     !isFinalTextBlock(block)
     && (block as ProcessBlock).processKind !== "plan");
-  if (preserveCompleteLiveOrder) {
+  // A completed background reply is still one ordered response. A lightweight
+  // summary retains its final answer but omits the preceding tools/reasoning;
+  // appending that retained live detail after the answer invents another empty
+  // continuation. Keep the witnessed order after completion and cache refresh,
+  // under the same exact-identity/complete-order checks as an active live tail.
+  const detachedAnswer = history.blocks.some(block =>
+    isFinalTextBlock(block) && block.background === true);
+  if (preserveCompleteLiveOrder || detachedAnswer) {
     const historyIds = history.blocks.map(blockIdentity);
     const liveOrders = live.blocks.map((block) => block.liveOrder);
     const liveIds = new Set(live.blocks.map(blockIdentity));

@@ -4,7 +4,7 @@ import {
   type ThemeChoice, type ThemeEngine,
 } from "./themes";
 import { APPEARANCE_STORAGE_KEY, appearanceColors, appearanceVariables, readAppearancePreferences,
-  saveAppearanceChange, type AppearanceChange, type AppearanceLook } from "./appearance";
+  saveAppearanceChange, type AppearanceChange, type AppearanceLook, type SessionLayout } from "./appearance";
 
 function browserStorage(): Storage | undefined {
   try { return typeof window === "undefined" ? undefined : window.localStorage; }
@@ -17,6 +17,7 @@ export function useTheme(engine: ThemeEngine) {
     && typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   const preference = preferences[engine]!;
   const choice = preference.mode;
+  const sessionLayout = preference.sessionLayout ?? "compact";
   const mode = resolveThemeMode(choice, systemDark);
   const look = preference[mode];
   const colors = appearanceColors(engine, mode, look);
@@ -67,7 +68,8 @@ export function useTheme(engine: ThemeEngine) {
   }, [changeAppearance]);
   const updateLook = useCallback((patch: AppearanceLook) => changeAppearance({ target: mode, patch }), [changeAppearance, mode]);
   const replaceLook = useCallback((next: AppearanceLook) => changeAppearance({ target: mode, replace: next }), [changeAppearance, mode]);
-  return { choice, mode, look, colors, selectTheme, updateLook, replaceLook };
+  const selectSessionLayout = useCallback((next: SessionLayout) => changeAppearance({ sessionLayout: next }), [changeAppearance]);
+  return { choice, mode, look, colors, sessionLayout, selectTheme, updateLook, replaceLook, selectSessionLayout };
 }
 
 export type AppearanceController = ReturnType<typeof useTheme>;
