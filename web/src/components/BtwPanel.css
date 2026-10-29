@@ -27,8 +27,7 @@
 .btw-queued::-webkit-scrollbar{ display:none; }
 .btw-queued .qchip{ flex:none; max-width:min(280px,72vw); }
 .btw-queued .qx{ display:inline-flex; align-items:center; justify-content:center; }
-.btw-runbar{ display:flex; padding:0 0 8px; }
-.btw-runbar .seg{ margin-left:auto; }
+@media (max-width:640px){ .btw-queue-hint{ display:none; } }
 .btw-input-card{ border:1px solid var(--border-strong); border-radius:18px; background:var(--surface); padding:6px; box-shadow:var(--shadow-sm); }
 .btw-input-card:focus-within{ border-color:var(--accent); }
 .btw-composer .btw-pastes{ padding:0 0 10px; max-height:min(160px,22vh); overflow-y:auto; overscroll-behavior:contain; }

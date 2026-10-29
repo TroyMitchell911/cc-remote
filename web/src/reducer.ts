@@ -23,7 +23,6 @@ import type {
   CodexTerminalFence, AutoCompact, AutoCompactMode,
   BackgroundProcessItem, CodexContext,
 } from "./protocol";
-import type { SendMode } from "./composer-submit";
 import {
   compareSessionControl, sessionControlLocksInput, sessionControlTargetsSid,
   MAX_BACKGROUND_PROCESS_ITEMS,
@@ -373,10 +372,6 @@ export interface SessionRuntime {
   statusError: string | null;
   resetCreditResult: RateLimitResetResult | null;
   notices: Notice[];
-  // Busy-send choice belongs to this session's composer. A choice made while
-  // reading one Codex task must not turn another session away from the default
-  // native steer behavior.
-  sendMode: SendMode;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
   // Rejected reliable submissions retain their complete browser payload until
@@ -523,7 +518,7 @@ export function createRuntime(): SessionRuntime {
     goalId: null, goalDismissed: false, completion: null,
     statusReport: null, rateLimits: [], statusRequestId: null, statusError: null,
     resetCreditResult: null,
-    notices: [], sendMode: "steer",
+    notices: [],
     queue: [], pendingSend: null, failedDeferred: [],
     acceptancePending: null,
     acceptanceKind: null,
@@ -542,7 +537,6 @@ export type Action =
   | { type: "dismiss_banner"; banner: string; revision?: number }
   | { type: "enqueue"; sid?: string; query: PendingQuery }
   | { type: "dequeue_at"; sid: string; i: number }
-  | { type: "set_send_mode"; sid: string; mode: SendMode }
   | { type: "set_pending"; sid?: string; query: PendingQuery }
   | { type: "clear_pending"; sid: string }
   | { type: "remove_deferred"; sid: string; msgId: string }
@@ -2634,8 +2628,6 @@ function reduceCurrent(state: AppState, action: Action): AppState {
         state.runtimes, action.sid, { type: "dequeue_at", i: action.i });
       return runtimes === state.runtimes ? state : { ...state, runtimes };
     }
-    case "set_send_mode":
-      return patch(state, action.sid, (rt) => { rt.sendMode = action.mode; });
     case "set_pending": {
       const targetSid = action.sid ?? state.focusedSid;
       const unconfirmed = collectUnconfirmedQueries(

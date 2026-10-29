@@ -876,7 +876,16 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
     }
     // Preserve native motion that has not reached onScroll yet. Explicit
     // history/selection transactions instead own their exact viewport offset.
-    const nativeMotion = delta == null ? 0 : el.scrollTop - lastScrollTopRef.current;
+    const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    // Collapsing a tall process can make the old scrollTop exceed the new
+    // range. Browsers clamp it before observers run. That lost distance is
+    // layout movement, not a user scroll; applying the content delta to the
+    // already-clamped position would move the reading paragraph twice.
+    const clampedDistance = delta != null && delta < 0 && el.scrollTop >= maxScrollTop - 0.5
+      ? Math.max(0, lastScrollTopRef.current - maxScrollTop) : 0;
+    const nativeMotion = delta == null ? 0
+      : el.scrollTop + clampedDistance - lastScrollTopRef.current;
+    if (delta != null) delta += clampedDistance;
     if (delta == null) {
       if (!boundary || boundary.scope !== activeScrollScopeRef.current
           || userScrollIntentRef.current || touchYRef.current !== null

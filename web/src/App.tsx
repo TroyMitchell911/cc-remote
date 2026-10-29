@@ -116,7 +116,6 @@ import {
   canEnqueueQuery,
   collectUnconfirmedQueries,
 } from "./runtime-drain";
-import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import {
   FORK_FOCUS_REFRESH_MS,
@@ -511,9 +510,6 @@ export default function App() {
   const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
   const completionReceiptsRef = useRef(completionReceipts);
   completionReceiptsRef.current = completionReceipts;
-  const [btwSendModeBySid, setBtwSendModeBySid] = useState<
-    Record<string, SendMode>
-  >({});
   const [newChatPermissionCatalog, setNewChatPermissionCatalog] = useState<{
     machineId: string;
     cwd: string;
@@ -895,7 +891,6 @@ export default function App() {
     activeBtwByParentRef.current.clear();
     btwRequestParentsRef.current.clear();
     setBtwOpeningByParentSid({});
-    setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     questionDraftsRef.current.clear();
@@ -1337,8 +1332,6 @@ export default function App() {
   const replaceQueueCapacity = deferredQueueCapacity(state, focusedSid);
   const btwReplaceQueueCapacity = deferredQueueCapacity(
     state, activeBtwSid);
-  const activeBtwSendMode = activeBtwSid
-    ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
   const focusedGoalScopeKey = focusedSid
     ? goalUiScopeKey(machineId, space, focusedEngine, focusedSid) : null;
   const storedGoalPreference = focusedGoalScopeKey
@@ -3226,11 +3219,6 @@ export default function App() {
               }
             }
             if (removed.length > 0) {
-              setBtwSendModeBySid((current) => {
-                const next = { ...current };
-                for (const [, chat] of removed) delete next[chat.sid];
-                return next;
-              });
               setCompletionReceipts((current) => removed.reduce(
                 (next, [parentSid, chat]) => acknowledgeCompletion(
                   next, parentSid, { btwSid: chat.sid }),
@@ -3304,12 +3292,6 @@ export default function App() {
                 ));
               }
             }
-            setBtwSendModeBySid((current) => {
-              if (!(msg.btw_sid in current)) return current;
-              const next = { ...current };
-              delete next[msg.btw_sid];
-              return next;
-            });
             setCompletionReceipts((current) => acknowledgeCompletion(
               current, msg.parent_sid, { btwSid: msg.btw_sid }));
           } else if (msg.type === "error" && msg.request_id
@@ -3965,7 +3947,6 @@ export default function App() {
           historyPageScopesRef.current.clear();
           void historyPageCacheRef.current.clear();
           setBtwOpeningByParentSid({});
-          setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
           questionDraftsRef.current.clear();
           setCenteredBtwScopes([]);
@@ -4015,7 +3996,6 @@ export default function App() {
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
           setCompletionReceipts(discardBtwCompletionReceipts);
-          setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
           questionDraftsRef.current.clear();
           setCenteredBtwScopes([]);
@@ -4858,8 +4838,7 @@ export default function App() {
       currentRuntime?.queue.length || currentRuntime?.pendingSend
     );
     if (awaitingAcceptance || hasDeferred) {
-      const sendMode = currentRuntime?.sendMode ?? "steer";
-      const delivery = awaitingAcceptance && sendMode !== "queue"
+      const delivery = awaitingAcceptance
         ? "replace" : "queue";
       const unconfirmed = collectUnconfirmedQueries(
         currentState.runtimes,
@@ -5694,7 +5673,7 @@ export default function App() {
     if (steer && awaitingAcceptance) return false;
     const query = { prompt, images, files };
     if (!steer && (awaitingAcceptance || runtime?.queue.length || runtime?.pendingSend)) {
-      const delivery = awaitingAcceptance && activeBtwSendMode !== "queue"
+      const delivery = awaitingAcceptance
         ? "replace" : "queue";
       const currentState = stateRef.current;
       const unconfirmed = collectUnconfirmedQueries(
@@ -5740,13 +5719,6 @@ export default function App() {
     return wsRef.current?.sendSetAutoCompactTo(
       sid, selection.mode, selection.thresholdTokens) ?? false;
   };
-  const setBtwSendMode = (
-    sid: string, mode: SendMode,
-  ) => {
-    setBtwSendModeBySid((current) => (
-      current[sid] === mode ? current : { ...current, [sid]: mode }
-    ));
-  };
   const closeBtw = (btwSid = activeBtwSid) => {
     const parentSid = visibleParentSid;
     if (!parentSid || !btwSid) return;
@@ -5766,12 +5738,6 @@ export default function App() {
       (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine ?? focusedEngine),
       `btw:${btwSid}`,
     ));
-    setBtwSendModeBySid((current) => {
-      if (!(btwSid in current)) return current;
-      const next = { ...current };
-      delete next[btwSid];
-      return next;
-    });
     setCompletionReceipts((receipts) => acknowledgeCompletion(
       receipts, parentSid, { btwSid }));
     dispatch({ type: "clear_btw", parentSid, btwSid });
@@ -5827,7 +5793,6 @@ export default function App() {
       btwDraftsRef.current.clear();
       questionDraftsRef.current.clear();
       setCenteredBtwScopes([]);
-      setBtwSendModeBySid({});
       setCreateError(null);
       setForkingPointId(null);
       setForkWorktreeSession(null);
@@ -6429,10 +6394,6 @@ export default function App() {
           onRequestModels={requestFocusedModels}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
-          sendMode={rt.sendMode}
-          setSendMode={(m) => focusedSid && dispatch({
-            type: "set_send_mode", sid: focusedSid, mode: m,
-          })}
           queue={rt.queue}
           pendingSend={rt.pendingSend}
           failedDeferred={rt.failedDeferred}
@@ -6690,7 +6651,6 @@ export default function App() {
             onRequestModels={requestFocusedModels}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
             questionDrafts={questionDraftsRef.current}
-            sendMode={activeBtwSendMode}
             unconfirmedQueued={unconfirmedQueued}
             unconfirmedReplaceable={btwUnconfirmedReplaceable}
             queueCapacity={queueCapacity}
@@ -6706,9 +6666,6 @@ export default function App() {
               }}
             onInterrupt={() => {
               if (activeBtwSid) interruptBtw(activeBtwSid);
-            }}
-            onSetSendMode={(mode) => {
-              if (activeBtwSid) setBtwSendMode(activeBtwSid, mode);
             }}
             onEnqueue={(query) => {
               return activeBtwSid

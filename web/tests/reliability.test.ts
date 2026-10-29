@@ -3636,8 +3636,6 @@ try {
   const event = (body: Record<string, unknown>): ServerEvent => ({
     v: 22, ts: 10, ...body,
   } as ServerEvent);
-  assert.equal(createRuntime().sendMode, "steer",
-    "Codex running input uses steer mode by default");
   const autoCompactSid = "claude-autocompact-context";
   const oldContextReport = event({
     type: "context_report",
@@ -3971,23 +3969,6 @@ try {
     "/repo/old",
     "an unowned reconnect list must not update scoped cwd",
   );
-  const sendModeA = "send-mode-a";
-  const sendModeB = "send-mode-b";
-  const isolatedSendModes = reduce({
-    ...initialState,
-    focusedSid: sendModeA,
-    runtimes: {
-      [sendModeA]: createRuntime(),
-      [sendModeB]: createRuntime(),
-    },
-  }, {
-    type: "set_send_mode",
-    sid: sendModeA,
-    mode: "queue",
-  });
-  assert.equal(isolatedSendModes.runtimes[sendModeA].sendMode, "queue");
-  assert.equal(isolatedSendModes.runtimes[sendModeB].sendMode, "steer",
-    "busy-send selection must not leak between sessions");
   const questionA = "question-session-a";
   const questionB = "question-session-b";
   let questionState = {
@@ -11119,7 +11100,6 @@ try {
     catalog: {},
     draftKey: "btw-render-draft",
     draftStore: btwDraftStore,
-    sendMode: "steer",
     unconfirmedQueued: [],
     unconfirmedReplaceable: [],
     queueCapacity: {},
@@ -11131,7 +11111,6 @@ try {
     onSend: () => true,
     onSteer: () => true,
     onInterrupt: () => {},
-    onSetSendMode: () => {},
     onEnqueue: () => {},
     onSetPending: () => {},
     onRemoveQueued: () => {},
@@ -11149,7 +11128,8 @@ try {
   assert.match(btwPanelMarkup, /queued follow-up/);
   assert.match(btwPanelMarkup, /replacement follow-up/);
   assert.match(btwPanelMarkup, /retryable failed follow-up/);
-  assert.match(btwPanelMarkup, />引导</);
+  assert.doesNotMatch(btwPanelMarkup, /btw-runbar|class="seg"/);
+  assert.match(btwPanelMarkup, /Tab 排队/);
   assert.match(btwPanelMarkup, />排队</);
   assert.match(btwPanelMarkup, />替换</);
   assert.match(btwPanelMarkup, />未发送</);
@@ -18401,8 +18381,6 @@ assert.match(appSource, /sendSetModelTo\(sid, model\)/,
   "BTW model changes must never follow focusedSid");
 assert.match(appSource, /sendSetEffortTo\(sid, effort\)/,
   "BTW effort changes must never follow focusedSid");
-assert.match(appSource, /btwSendModeBySid/,
-  "BTW send mode must not reuse the main composer's global mode");
 assert.match(appSource, /if \(latest && latest\.session_id !== state\.focusedSid\) \{\s*dispatch\(\{ type: "exit_new_chat" \}\)/,
   "restored focus must replace the temporary new-session page");
 assert.match(appSource, /<HeaderMenu[\s\S]*notificationMode=\{notificationMode\}/,

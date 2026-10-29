@@ -371,6 +371,10 @@ body{
 .thread{ flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; overflow-anchor:none; -webkit-overflow-scrolling:touch; padding:0; position:relative; z-index:1;
   color-scheme:light; scrollbar-width:thin;
   scrollbar-color:color-mix(in srgb,var(--faint) 78%,transparent) transparent; }
+/* Keep the reading surface keyboard-scrollable without framing the entire
+   transcript when an input-source key activates :focus-visible after a click.
+   Interactive descendants retain their own keyboard focus indicators. */
+.thread:focus-visible{ outline:none; border-radius:0; }
 :root[data-theme="dark"] .thread{ color-scheme:dark;
   scrollbar-color:color-mix(in srgb,var(--faint) 90%,transparent) transparent; }
 .thread::-webkit-scrollbar{ width:10px; }
@@ -1590,7 +1594,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .auto-compact-sheet .auto-compact-options button{ min-height:38px; font-size:12px; }
 .auto-compact-sheet .auto-compact-meta{ font-size:11px; }
 
-/* Composer activity: send mode and independently running background tasks. */
+/* Composer activity: independently running background tasks. */
 .runbar{ display:none; align-items:center; gap:8px; padding:2px 2px 9px; }
 .runbar.show{ display:flex; }
 .stopbtn{ display:inline-flex; align-items:center; gap:7px; font-size:13px; font-weight:var(--font-weight-600);
@@ -1598,12 +1602,6 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   padding:7px 13px 7px 11px; border-radius:11px; transition:.14s; }
 .stopbtn:hover{ filter:brightness(.97); }
 .stopbtn svg{ width:13px; height:13px; }
-.seg{ display:flex; margin-left:auto; background:var(--surface); border:1px solid var(--border);
-  border-radius:11px; padding:3px; gap:2px; }
-.seg button{ display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:var(--font-weight-600);
-  color:var(--dim); padding:6px 11px; border-radius:8px; transition:.14s; }
-.seg button svg{ width:14px; height:14px; }
-.seg button.on{ background:var(--accent-weak); color:var(--accent-ink); }
 
 /* input row */
 .inrow{ display:flex; align-items:flex-end; gap:8px; background:var(--surface);

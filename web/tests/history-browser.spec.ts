@@ -170,6 +170,12 @@ test("turn regressions keyboard scrolling leaves the live tail and resumes at bo
   // synthetic focus() or scrollTop write hiding the original regression.
   await page.getByText("continue work", { exact: true }).click();
   await expect(viewport).toBeFocused();
+  // A non-text input-source key can switch the browser to keyboard focus
+  // styling after a prose click. The reading surface must not gain a full
+  // accent frame (only its bottom edge is visible in the app layout).
+  await page.keyboard.press("CapsLock");
+  await expect.poll(() => viewport.evaluate(node => node.matches(":focus-visible"))).toBe(true);
+  await expect(viewport).toHaveCSS("outline-style", "none");
   for (let repeat = 0; repeat < 16; repeat++) {
     await page.keyboard.down("ArrowUp");
     await page.waitForTimeout(40);
@@ -189,6 +195,106 @@ test("turn regressions keyboard scrolling leaves the live tail and resumes at bo
   await page.keyboard.press("Shift+Space");
   await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
   await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeGreaterThan(200);
+  // Suppressing the reading-surface frame must leave real controls visible
+  // to keyboard users.
+  const control = page.getByTestId("regression-live-toggle");
+  await control.focus();
+  await expect(control).toHaveCSS("outline-style", "solid");
+  await expect(control).toHaveCSS("outline-width", "2px");
+});
+
+for (const visible of ["thinking and answer", "only answer", "process header and answer"]) {
+  test(`turn regressions completion preserves the reading paragraph with ${visible} visible`, async ({ page, isMobile }, testInfo) => {
+    await page.goto(`/tests/history-browser.html?completion-reading=1${visible === "process header and answer" ? "&short-process=1" : ""}`);
+    const viewport = page.locator(".thread");
+    const paragraph = page.getByText("Answer paragraph 0. This is the explanation the user is reading.", { exact: true });
+    await expect(page.locator(".process-reasoning-body")).toBeVisible();
+    await waitForScrollIdle(page);
+    const offset = () => paragraph.evaluate(node => node.getBoundingClientRect().top
+      - node.closest(".thread")!.getBoundingClientRect().top);
+    const targetOffset = visible === "only answer" ? 0 : 180;
+    if (isMobile) {
+      await dispatchTouchPhase(page, "touchstart", 160);
+      await dispatchTouchPhase(page, "touchmove", 220);
+      await viewport.evaluate((node, delta) => { node.scrollTop += delta; }, await offset() - targetOffset);
+      await dispatchTouchPhase(page, "touchend", 220);
+    } else {
+      await viewport.hover();
+      await page.mouse.wheel(0, await offset() - targetOffset);
+    }
+    await waitForScrollIdle(page);
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    const before = await offset();
+    expect(Math.abs(before - targetOffset)).toBeLessThan(3);
+    // Incoming events must not transfer focus or manufacture a user gesture.
+    await page.getByTestId("append-answer").evaluate(node => (node as HTMLButtonElement).click());
+    await expect.poll(offset).toBeCloseTo(before, 0);
+    const frames = await paragraph.evaluate(node => new Promise<number[]>((resolve) => {
+      const viewport = node.closest(".thread")!;
+      const samples: number[] = [];
+      const sample = () => {
+        samples.push(node.getBoundingClientRect().top - viewport.getBoundingClientRect().top);
+        if (samples.length === 45) resolve(samples);
+        // Measure after each paint opportunity, including the collapse frame,
+        // so a jump to bottom followed by a correction cannot pass this test.
+        else requestAnimationFrame(() => setTimeout(sample, 0));
+      };
+      document.querySelector<HTMLButtonElement>('[data-testid="complete-answer"]')!.click();
+      requestAnimationFrame(() => setTimeout(sample, 0));
+    }));
+    await expect(page.locator(".process-reasoning-body")).toHaveCount(0);
+    await waitForScrollIdle(page);
+    const after = await offset();
+    const distance = await viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop);
+    await testInfo.attach("reading-position", { body: JSON.stringify({ before, after, distance, frames }), contentType: "application/json" });
+    expect(Math.max(...frames.map(value => Math.abs(value - before)))).toBeLessThan(3);
+    expect(Math.abs(after - before)).toBeLessThan(3);
+    await expect(page.locator(".scroll-bottom-btn")).toBeVisible();
+    // The retained paragraph is not a permanent scroll lock.
+    if (!isMobile) {
+      await viewport.hover();
+      await page.mouse.wheel(0, 100);
+      await waitForScrollIdle(page);
+      expect(await offset()).toBeLessThan(after - 80);
+    }
+    await page.locator(".scroll-bottom-btn").click();
+    await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+    await expect.poll(() => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+  });
+}
+
+test("turn regressions completion keeps a followed answer at the bottom", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?completion-reading=1");
+  const viewport = page.locator(".thread");
+  const distance = () => viewport.evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop);
+  await expect.poll(distance).toBeLessThan(3);
+  await page.getByTestId("append-answer").evaluate(node => (node as HTMLButtonElement).click());
+  await expect.poll(distance).toBeLessThan(3);
+  await page.getByTestId("complete-answer").evaluate(node => (node as HTMLButtonElement).click());
+  await expect(page.locator(".process-reasoning-body")).toHaveCount(0);
+  await waitForScrollIdle(page);
+  expect(await distance()).toBeLessThan(3);
+  await expect(page.locator(".scroll-bottom-btn")).toHaveCount(0);
+});
+
+test("turn regressions manual keyboard collapse retains the process header", async ({ page, isMobile }) => {
+  test.skip(isMobile, "Physical desktop keyboard activation");
+  await page.goto("/tests/history-browser.html?completion-reading=1&short-process=1");
+  const viewport = page.locator(".thread");
+  const header = page.locator(".turn-process-head");
+  await waitForScrollIdle(page);
+  const offset = () => header.evaluate(node => node.getBoundingClientRect().top
+    - node.closest(".thread")!.getBoundingClientRect().top);
+  await viewport.hover();
+  await page.mouse.wheel(0, await offset());
+  await waitForScrollIdle(page);
+  const before = await offset();
+  expect(Math.abs(before)).toBeLessThan(3);
+  await header.press("Enter");
+  await expect(header).toHaveAttribute("aria-expanded", "false");
+  await waitForScrollIdle(page);
+  expect(Math.abs(await offset() - before)).toBeLessThan(3);
+  await expect(page.locator("[data-process-auto-collapsed]")).toHaveCount(0);
 });
 
 test("turn regressions ArrowDown reaches bottom after a small wheel scroll", async ({ page, isMobile }) => {
@@ -1099,7 +1205,7 @@ for (const running of [false, true]) {
     )).toBe(true);
     if (running) {
       relay.emit({ type: "state", sid: "layout-parent", state: "running" });
-      await expect(input).toHaveAttribute("placeholder", /引导/);
+      await expect(input).toHaveAttribute("placeholder", /补充当前任务/);
     }
     const prompt = "/Users/Tester/workspace/unitree-go2这里有双目的，看看我们的大脑是否能接入？";
     await input.fill(prompt);
@@ -1124,7 +1230,7 @@ for (const side of [false, true]) {
     const surface = page.locator(side ? ".btw-panel" : ".composer");
     const input = surface.locator("textarea");
     await expect(input).toBeVisible();
-    await expect(surface.getByRole("button", { name: "引导", exact: true })).toBeVisible();
+    await expect(surface.getByRole("button", { name: "引导", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "打断并发送", exact: true })).toHaveCount(0);
     relay.emit({ type: "user_msg", sid, msg_id: "claude-root", prompt: "检查输入" });
     relay.emit({ type: "state", sid, state: "running", msg_id: "claude-root" });
@@ -1159,9 +1265,8 @@ for (const side of [false, true]) {
       await expect(page.locator(`.turn[data-turn-id="${String(command.msg_id)}"]`))
         .not.toContainText("原任务输出");
     }
-    await surface.getByRole("button", { name: "排队", exact: true }).click();
     await input.fill("完成后再检查磁盘");
-    await input.press("Enter");
+    await input.press("Tab");
     await expect.poll(() => relay.commands.filter(c => c.type === "query"
       && c.delivery === "queue" && c.sid === sid).length).toBe(1);
     expect(relay.commands.filter(c => c.type === "interrupt")).toHaveLength(0);
@@ -1979,12 +2084,10 @@ for (const [engine, delivery] of [
     await page.goto("/");
     const panel = page.locator(".btw-panel");
     await expect(panel.getByRole("textbox")).toBeEnabled();
-    await expect(panel.locator(".btw-runbar")).toBeVisible();
+    await expect(panel.locator(".btw-runbar")).toHaveCount(0);
     if (delivery === "query") {
       relay.emit({ type: "state", sid: "btw-layout-child", state: "idle" });
       await expect(panel.locator(".btw-runbar")).toHaveCount(0);
-    } else if (delivery === "queue") {
-      await panel.getByRole("button", { name: "排队", exact: true }).click();
     }
     await panel.getByRole("button", { name: "添加附件", exact: true }).click();
     const chooser = page.getByRole("dialog", { name: "添加附件", exact: true });
@@ -2007,8 +2110,9 @@ for (const [engine, delivery] of [
     expect(attachment!.y + attachment!.height).toBeLessThan(card!.y);
     await expect(panel.locator(".btw-input-card .attach")).toHaveCount(0);
     await expect(page.locator(".composer .attach-file, .composer .attach-image-preview")).toHaveCount(0);
-    // An attachment-only click sends payload; it must never stop the active turn.
-    await panel.getByRole("button", { name: "发送", exact: true }).click();
+    // An attachment-only click/Tab sends the payload, never an interrupt.
+    if (delivery === "queue") await panel.getByRole("textbox").press("Tab");
+    else await panel.getByRole("button", { name: "发送", exact: true }).click();
     await expect.poll(() => relay.commands.filter(c => c.type === "query" || c.type === "steer").length).toBe(1);
     const sent = relay.commands.find(c => c.type === "query" || c.type === "steer")!;
     expect(sent.sid).toBe("btw-layout-child");

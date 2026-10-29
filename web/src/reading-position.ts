@@ -1,10 +1,16 @@
 /** A reading block's content coordinate, independent of native scroll motion.
  * Keep this separate from follow-output and explicit history/detail anchors. */
-export interface ReadingPosition {
-  scope: string;
+interface ReadingBlock {
   node: HTMLElement;
   /** Block top in scroll-content coordinates. */
   top: number;
+}
+
+export interface ReadingPosition extends ReadingBlock {
+  scope: string;
+  /** Other visible blocks can survive an automatic process collapse. */
+  fallbacks: ReadingBlock[];
+  expandedProcesses: HTMLElement[];
 }
 
 // The outer media node survives pending -> ready. Anchoring its source <pre>
@@ -24,8 +30,24 @@ export function captureReadingPosition(viewport: HTMLElement, scope: string): Re
   if (!turn) return null;
   // Only inspect blocks in a visible turn. A whole-turn anchor cannot keep
   // a paragraph in place when text earlier in that same answer reflows.
-  const node = firstVisible(turn.querySelectorAll<HTMLElement>(READING_BLOCKS)) ?? turn;
-  return { scope, node, top: node.getBoundingClientRect().top - top + viewport.scrollTop };
+  const visible: ReadingBlock[] = [];
+  for (const node of turn.querySelectorAll<HTMLElement>(READING_BLOCKS)) {
+    const rect = node.getBoundingClientRect();
+    if (rect.height <= 0) continue;
+    if (rect.top >= bottom) break;
+    if (rect.bottom > top) visible.push({
+      node, top: rect.top - top + viewport.scrollTop,
+    });
+  }
+  const primary = visible[0]
+    ?? { node: turn, top: turn.getBoundingClientRect().top - top + viewport.scrollTop };
+  const answer = visible.find(block => block.node.closest(".assistant-answer-segment"));
+  return { scope, ...primary, fallbacks: visible.filter(block => block !== primary),
+    expandedProcesses: answer
+      ? [...turn.querySelectorAll<HTMLElement>(".turn-process.open")].filter(process =>
+          process.getBoundingClientRect().bottom - top + viewport.scrollTop <= answer.top)
+      : [],
+  };
 }
 
 /** Returns only layout displacement. Adding scrollTop cancels any wheel/key
@@ -33,12 +55,29 @@ export function captureReadingPosition(viewport: HTMLElement, scope: string): Re
 export function readingPositionDelta(
   viewport: HTMLElement, position: ReadingPosition,
 ): number | null {
-  const rect = position.node.getBoundingClientRect();
-  if (!viewport.contains(position.node) || !rect.height) return null;
-  const contentTop = rect.top
-    - viewport.getBoundingClientRect().top + viewport.scrollTop;
-  const delta = contentTop - position.top;
-  position.top = contentTop;
+  const viewportTop = viewport.getBoundingClientRect().top;
+  const retained = [position, ...position.fallbacks].flatMap(block => {
+    if (!viewport.contains(block.node)) return [];
+    const rect = block.node.getBoundingClientRect();
+    if (!rect.height) return [];
+    return [{ node: block.node, previousTop: block.top,
+      top: rect.top - viewportTop + viewport.scrollTop }];
+  });
+  const collapsed = position.expandedProcesses.some(process =>
+    viewport.contains(process) && process.dataset.processAutoCollapsed === "true");
+  position.expandedProcesses = position.expandedProcesses.filter(process =>
+    viewport.contains(process) && process.classList.contains("open"));
+  // Only automatic collapse transfers the anchor to the visible answer.
+  // Manual toggles/detail loading still retain the first visible block.
+  // A surviving process header cannot anchor the answer below a closed body.
+  const primary = (collapsed
+    ? retained.find(block => block.node.closest(".assistant-answer-segment")) : undefined)
+    ?? retained[0];
+  if (!primary) return null;
+  const delta = primary.top - primary.previousTop;
+  position.node = primary.node;
+  position.top = primary.top;
+  position.fallbacks = retained.filter(block => block !== primary).map(({ node, top }) => ({ node, top }));
   return delta;
 }
 

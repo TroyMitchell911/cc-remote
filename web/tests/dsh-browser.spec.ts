@@ -737,6 +737,19 @@ test("DSH references insert the native quoted file and session syntax", async ({
   await expect.poll(() => relay.commands.filter(c => c.type === "query" && c.prompt === "关联 @[相关会话](dsh-session:native-session)").length).toBe(1);
 });
 
+test("DSH Tab completes a file reference before queueing a running task", async ({ page }) => {
+  const relay = await openDsh(page, { features: true, running: true });
+  const input = page.locator(".composer textarea");
+  await input.fill("检查 @report");
+  await expect(page.getByRole("option", { name: "文件 report notes.md" })).toBeVisible();
+  await input.press("Tab");
+  await expect(input).toHaveValue('检查 @"report notes.md" ');
+  expect(relay.commands.some(c => c.type === "query" || c.type === "steer")).toBe(false);
+  await input.press("Tab");
+  await expect.poll(() => relay.commands.filter(c => c.type === "query"
+    && c.delivery === "queue" && c.prompt === '检查 @"report notes.md"').length).toBe(1);
+});
+
 test("DSH subagent controls, jobs, diagnostics and complete export share a compact panel", async ({ page }, info) => {
   const relay = await openDsh(page, { features: true });
   await openDshTools(page);

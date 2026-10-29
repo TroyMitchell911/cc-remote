@@ -31,7 +31,6 @@ export function QuotaLayoutFixture() {
     </div>
     <Composer draftKey="quota-layout" draftStore={drafts}
       state="idle" connState="connected" wrapperOnline
-      sendMode="steer" setSendMode={() => {}}
       queue={[]} pendingSend={null} failedDeferred={[]}
       unconfirmedQueued={[]} unconfirmedReplaceable={[]}
       queueCapacity={{}} replaceQueueCapacity={{}}

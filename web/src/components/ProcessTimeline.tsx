@@ -812,6 +812,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
   const processSettled = !processActive;
   const terminalOutcome = processSettled && done ? outcome : undefined;
   const [uncontrolledOpen, setUncontrolledOpen] = useState(!terminalComplete);
+  const [autoCollapsed, setAutoCollapsed] = useState(false);
   const open = openOverride ?? uncontrolledOpen;
   const [localDetailError, setLocalDetailError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -826,6 +827,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
     // content, never reopens the disclosure or overrides a manual choice.
     if (!terminalComplete || !uncontrolledOpen || openOverride != null
         || manuallyToggled.current) return;
+    setAutoCollapsed(true);
     setUncontrolledOpen(false);
     onOpenChange?.(false);
   }, [terminalComplete, uncontrolledOpen, openOverride, onOpenChange]);
@@ -909,6 +911,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
   };
   const toggle = () => {
     manuallyToggled.current = true;
+    setAutoCollapsed(false);
     const next = !open;
     if (next && needsAuthoritativeDetail && !detailLoading) requestDetail();
     setUncontrolledOpen(next);
@@ -939,7 +942,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
       event.currentTarget, event.pointerId, event.pointerType);
   };
   return (
-    <section data-process-detail-root
+    <section data-process-detail-root data-process-auto-collapsed={!open && autoCollapsed || undefined}
       className={`turn-process${open ? " open" : ""}`}>
       <div className="turn-process-controls">
         {showOuterDisclosure && <button type="button" className="turn-process-head"

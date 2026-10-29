@@ -16,6 +16,7 @@ import { MediaLayoutFixture } from "./fixtures/media-layout";
 import { ReadingNavigationFixture } from "./fixtures/reading-navigation";
 import { QuotaLayoutFixture } from "./fixtures/quota-layout";
 import { RewindFixture } from "./fixtures/rewind";
+import { CompletionReadingFixture } from "./fixtures/completion-reading";
 
 import "../src/index.css";
 import "../src/App.css";
@@ -1117,8 +1118,6 @@ function CodexLiveBurstFixture() {
             state={runtime.state}
             connState="connected"
             wrapperOnline
-            sendMode={runtime.sendMode}
-            setSendMode={() => {}}
             queue={runtime.queue}
             pendingSend={runtime.pendingSend}
             failedDeferred={runtime.failedDeferred}
@@ -3244,6 +3243,7 @@ function CodexFileCitationFixture() {
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
+    : rootParams.has("completion-reading") ? <CompletionReadingFixture />
     : rootParams.has("rewind") ? <RewindFixture />
     : rootParams.has("quota-layout") ? <QuotaLayoutFixture />
     : rootParams.has("reading-navigation") ? <ReadingNavigationFixture />

@@ -47,6 +47,7 @@ import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import { ImeSubmitGuard } from "../ime-submit";
 import {
   classifyBusySubmit,
+  shouldQueueOnTab,
   isComposerBusy,
   isInterruptSettling,
   isSettlingStopDisabled,
@@ -88,8 +89,6 @@ interface Props {
   state: State;
   connState: ConnState;
   wrapperOnline: boolean;
-  sendMode: SendMode;
-  setSendMode: (m: SendMode) => void;
   queue: PendingQuery[];
   pendingSend: PendingQuery | null;
   failedDeferred: PendingQuery[];
@@ -483,7 +482,7 @@ export function Composer(p: Props) {
   }, [dshResult, p.draftKey, updateDraft]);
 
   // Send prompt text to cc, honoring busy/queue/interrupt rules.
-  const submitPrompt = (prompt: string) => {
+  const submitPrompt = (prompt: string, mode: SendMode = "steer") => {
     if (importing) { flash("请等待附件导入完成"); return; }
     const composed = composePastePrompt(pastes, prompt);
     if (!composed.ok) {
@@ -498,7 +497,7 @@ export function Composer(p: Props) {
     };
     if (busy) {
       const action = classifyBusySubmit(
-        p.state, p.sendMode, p.engine ?? "claude",
+        p.state, mode, p.engine ?? "claude",
         !!expandedPrompt || hasAttachments);
       if (action === "noop") return;
       if (action === "steer") {
@@ -510,9 +509,9 @@ export function Composer(p: Props) {
         }
         return;
       }
-      const unconfirmed = p.sendMode === "queue"
+      const unconfirmed = mode === "queue"
         ? p.unconfirmedQueued : p.unconfirmedReplaceable;
-      const capacity = p.sendMode === "queue"
+      const capacity = mode === "queue"
         ? p.queueCapacity : p.replaceQueueCapacity;
       if (!canEnqueueQuery(unconfirmed, query, capacity)) {
         flash("排队已满（最多 32 条 / 64 MiB），请先等待发送");
@@ -705,7 +704,7 @@ export function Composer(p: Props) {
     focusTa(); growTa();
   };
 
-  const send = (value = taRef.current?.value ?? input) => {
+  const send = (value = taRef.current?.value ?? input, mode: SendMode = "steer") => {
     if (locked || importing) return;
     const route = routeComposerInput(value, p.engine, p.surface);
     if (route.kind === "blocked") { flash(route.message); return; }
@@ -713,6 +712,13 @@ export function Composer(p: Props) {
     const parsed = parseSlash(raw);
     const nativeSkill = parsed && p.engine === "dsh" && p.skills?.some(skill => skill.name === parsed.slash)
       && !p.dsh?.commands.some(command => command.name === parsed.slash);
+    // Control commands must never run immediately as a side effect of Tab.
+    // Native prompt/skill invocations still use the full queued-query path.
+    if (mode === "queue" && (route.kind === "client"
+        || (p.engine === "dsh" && parsed && !nativeSkill))) {
+      flash("此命令请按 Enter 执行");
+      return;
+    }
     if (p.engine === "dsh" && parsed && !nativeSkill && !clientSlashesFor("dsh").has(parsed.slash)) {
       if (p.dsh?.commands.length && !p.dsh.commands.some(command => command.name === parsed.slash)) {
         flash(`此 DSH 会话没有 /${parsed.slash} 命令`); return;
@@ -731,7 +737,7 @@ export function Composer(p: Props) {
     }
     if (route.kind === "empty") return;
     if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
-    submitPrompt(route.prompt);
+    submitPrompt(route.prompt, mode);
   };
 
   const requestButtonSend = () => {
@@ -749,9 +755,7 @@ export function Composer(p: Props) {
 
   const stopping = busy && !hasText && !hasAttachments;
   const interruptSettling = isInterruptSettling(p.state);
-  const sendIcon = !busy ? "send" : stopping ? "stop"
-    : p.sendMode === "steer" ? "send"
-      : "queue";
+  const sendIcon = stopping ? "stop" : "send";
   const sendClass = "sendbtn" + (stopping ? " interrupt" : "");
   const disabled = locked || importing || (!busy && !hasText && !hasAttachments)
     || isSettlingStopDisabled(p.state, hasText || hasAttachments);
@@ -828,8 +832,8 @@ export function Composer(p: Props) {
         : offline ? "机器离线 — 等待重连…"
         : p.archived ? "会话已归档 — 取消归档后可继续对话"
         : (controlUi?.placeholder
-          ?? (busy && (p.engine ?? "claude") === "codex"
-            ? "输入以引导当前任务，或选择排队…"
+          ?? (busy
+            ? "补充当前任务…"
             : placeholder))}
       disabled={locked}
       onChange={(e) => { onInput(e.target.value); setReferenceCaret(e.target.selectionStart); }}
@@ -843,17 +847,36 @@ export function Composer(p: Props) {
       }}
       onPaste={onPaste}
       onKeyDown={(e) => {
-        if (refs.open && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
+        if (imeSubmitRef.current.isComposingInput(e.nativeEvent)) return;
+        const plainTab = e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+        if (refs.open) {
           if (e.key === "Escape") { e.preventDefault(); refs.dismiss(); return; }
           if (refs.items.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
             e.preventDefault(); refs.setSelected((refs.selected + (e.key === "ArrowDown" ? 1 : -1) + refs.items.length) % refs.items.length); return;
           }
-          if (refs.items.length && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+          if (refs.items.length && (plainTab || (e.key === "Enter" && !e.shiftKey))) {
             e.preventDefault(); pickReference(refs.items[refs.selected] ?? refs.items[0]); return;
           }
         }
         if (e.key === "Escape" && suggestionOpen) {
           setInput(""); resetTaHeight(); return;
+        }
+        if (plainTab && suggestionOpen) {
+          e.preventDefault();
+          if (cmdMatches.length && cmdToken !== null) {
+            setInput("/" + cmdMatches[0].slash + " ");
+            growTa();
+          } else if (skillMatches.length && currentSkillToken !== null) {
+            pickSkill(skillMatches[0].name);
+          }
+          return;
+        }
+        if (e.key === "Tab" && refs.open) return;
+        if (shouldQueueOnTab(e, p.state,
+            !!e.currentTarget.value.trim() || hasAttachments || pastes.length > 0)) {
+          e.preventDefault();
+          send(e.currentTarget.value, "queue");
+          return;
         }
         if (!imeSubmitRef.current.shouldSubmitKey({
           key: e.key,
@@ -957,18 +980,9 @@ export function Composer(p: Props) {
           </div>
         )}
 
-        {(busy || p.backgroundTasks) && (
+        {p.backgroundTasks && (
           <div className="runbar show">
             {p.backgroundTasks}
-            {busy && <div className="seg">
-              <button className={p.sendMode === "steer" ? "on" : ""}
-                onClick={() => p.setSendMode("steer")}>
-                <Icon name="send" size={14} />引导
-              </button>
-              <button className={p.sendMode === "queue" ? "on" : ""} onClick={() => p.setSendMode("queue")}>
-                <Icon name="queue" size={14} />排队
-              </button>
-            </div>}
           </div>
         )}
 
@@ -1080,7 +1094,9 @@ export function Composer(p: Props) {
               : p.permissionProfilePending ? "环境切换中…" : modeLabel}</span>
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
           </button>}
-          <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
+          <span className="hint-kbds"><kbd>Enter</kbd> {p.state === "running" ? "补充" : "发送"}{
+            p.state === "running" && <> · <kbd>Tab</kbd> 排队</>
+          } · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
             (p.engine === "codex" || p.engine === "dsh") && <> · <kbd>$</kbd> Skills</>
           }</span>
           <div className="hint-right" ref={ctxWrapRef}>
