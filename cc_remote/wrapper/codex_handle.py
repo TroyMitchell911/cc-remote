@@ -35,6 +35,7 @@ from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
+from cc_remote.wrapper.rollout_io import rollout_open, rollout_size
 from cc_remote.log import logger
 from cc_remote.wrapper.token_usage import CodexUsageTracker
 from cc_remote.wrapper.btw_history import CodexBtwCompletions
@@ -1239,10 +1240,10 @@ def _newer_private_core_for_oversized_resume(
     if not rollout_path:
         return None
     try:
-        rollout_size = os.path.getsize(rollout_path)
+        history_size = rollout_size(rollout_path)
     except OSError:
         return None
-    if rollout_size < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
+    if history_size < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
         return None
 
     managed_version = _codex_version(managed_bin)
@@ -1260,7 +1261,7 @@ def _newer_private_core_for_oversized_resume(
     if best_path is not None:
         log.info(
             "oversized Codex resume uses newer official private core",
-            rollout_bytes=rollout_size,
+            rollout_bytes=history_size,
             managed_version=".".join(map(str, managed_version)),
             private_version=".".join(map(str, best_version)),
         )
@@ -1294,10 +1295,10 @@ def _oversized_desktop_openai_resume_requires_http(
     if not rollout_path:
         return False
     try:
-        if os.path.getsize(
+        if rollout_size(
                 rollout_path) < _OVERSIZED_RESUME_PRIVATE_CORE_MIN_BYTES:
             return False
-        with open(rollout_path, "rb") as stream:
+        with rollout_open(rollout_path, "rb") as stream:
             first_line = stream.readline(_ROLLOUT_SESSION_META_MAX_BYTES + 1)
     except OSError:
         return False

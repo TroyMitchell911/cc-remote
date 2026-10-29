@@ -23,6 +23,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open
 from cc_remote.wrapper.codex_delegation import codex_message_target
 from cc_remote.wrapper.claude_rewind_history import rewind_anchor_row
 
@@ -207,8 +208,8 @@ class HistorySourceFingerprint:
     @classmethod
     def capture(cls, path: str | os.PathLike[str]) -> "HistorySourceFingerprint":
         resolved = os.path.realpath(os.fspath(path))
-        with open(resolved, "rb") as source:
-            stat = os.fstat(source.fileno())
+        with rollout_open(resolved, "rb") as source:
+            stat = rollout_fstat(source)
             head = source.read(_FINGERPRINT_SAMPLE_BYTES)
             tail = head
             digest = hashlib.sha256()
@@ -281,8 +282,8 @@ def history_source_extends(
         return False
     sample_size = min(previous.size, _FINGERPRINT_SAMPLE_BYTES)
     try:
-        with open(current.path, "rb") as source:
-            stat = os.fstat(source.fileno())
+        with rollout_open(current.path, "rb") as source:
+            stat = rollout_fstat(source)
             if (
                 int(stat.st_dev) != current.device
                 or int(stat.st_ino) != current.inode
@@ -2250,8 +2251,8 @@ class HistoryIndexStore:
             return None
         old_size = int(row["source_size"])
         try:
-            with open(source.path, "rb") as current:
-                stat = os.fstat(current.fileno())
+            with rollout_open(source.path, "rb") as current:
+                stat = rollout_fstat(current)
                 if (int(stat.st_dev) != source.device
                         or int(stat.st_ino) != source.inode
                         or int(stat.st_size) < source.size):

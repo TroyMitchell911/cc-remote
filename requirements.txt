@@ -10,3 +10,4 @@ pywebpush==2.3.0
 # cryptography 49 no longer publishes an Intel macOS wheel.
 cryptography==48.0.0
 tomli==2.3.0 ; python_version < "3.11"
+backports.zstd==1.8.0 ; python_version < "3.14"

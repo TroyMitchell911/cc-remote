@@ -25,6 +25,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
+from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open, rollout_stat
 from cc_remote.protocol import CodexTerminalFence
 
 
@@ -97,9 +98,9 @@ def _real_path(path: str | os.PathLike[str]) -> str:
 
 def _capture_witness(path: str | os.PathLike[str]) -> _SourceWitness:
     real = _real_path(path)
-    before = os.stat(real)
-    with open(real, "rb") as stream:
-        opened = os.fstat(stream.fileno())
+    before = rollout_stat(real)
+    with rollout_open(real, "rb") as stream:
+        opened = rollout_fstat(stream)
         if (
             opened.st_dev != before.st_dev
             or opened.st_ino != before.st_ino
@@ -110,8 +111,8 @@ def _capture_witness(path: str | os.PathLike[str]) -> _SourceWitness:
         start = max(0, size - _WITNESS_BYTES)
         stream.seek(start)
         boundary = stream.read(size - start)
-        finished = os.fstat(stream.fileno())
-    after = os.stat(real)
+        finished = rollout_fstat(stream)
+    after = rollout_stat(real)
     if (
         finished.st_dev != opened.st_dev
         or finished.st_ino != opened.st_ino
@@ -139,7 +140,7 @@ def _witness_matches(
 ) -> bool:
     try:
         real = _real_path(path)
-        before = os.stat(real)
+        before = rollout_stat(real)
         if (
             real != witness.path
             or int(before.st_dev) != witness.device
@@ -150,8 +151,8 @@ def _witness_matches(
             or witness.size - witness.window_start > _WITNESS_BYTES
         ):
             return False
-        with open(real, "rb") as stream:
-            opened = os.fstat(stream.fileno())
+        with rollout_open(real, "rb") as stream:
+            opened = rollout_fstat(stream)
             if (
                 int(opened.st_dev) != witness.device
                 or int(opened.st_ino) != witness.inode
@@ -160,8 +161,8 @@ def _witness_matches(
                 return False
             stream.seek(witness.window_start)
             boundary = stream.read(witness.size - witness.window_start)
-            finished = os.fstat(stream.fileno())
-        after = os.stat(real)
+            finished = rollout_fstat(stream)
+        after = rollout_stat(real)
         return (
             int(finished.st_dev) == witness.device
             and int(finished.st_ino) == witness.inode
@@ -182,7 +183,7 @@ def _source_identity_matches(
     path: str,
 ) -> bool:
     try:
-        current = os.stat(path)
+        current = rollout_stat(path)
     except OSError:
         return False
     identity_path, device, inode, boundary_size = identity

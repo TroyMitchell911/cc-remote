@@ -3177,7 +3177,7 @@ def test_large_head_process_metadata_reads_only_appends(monkeypatch, tmp_path):
             reads.append(len(data))
             return data
 
-    monkeypatch.setattr(codex_stream_module, "open", lambda *args, **kwargs:
+    monkeypatch.setattr(codex_stream_module, "rollout_open", lambda *args, **kwargs:
                         CountedFile(original_open(*args, **kwargs)), raising=False)
 
     async def run():

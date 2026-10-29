@@ -358,6 +358,9 @@ from cc_remote.wrapper.codex_sessions import (
     codex_thread_archive_states, codex_thread_catalog_row,
     codex_thread_parent_maps, codex_thread_rollout_record,
 )
+from cc_remote.wrapper.rollout_io import (
+    is_compressed_rollout, rollout_open, rollout_size, rollout_stat,
+)
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
     clamp_effort,
@@ -12928,7 +12931,7 @@ class WrapperMachine:
         if not w:
             return
         try:
-            st = os.stat(w["path"])
+            st = rollout_stat(w["path"])
         except OSError:
             w["file_available"] = False
             return
@@ -12999,8 +13002,13 @@ class WrapperMachine:
                 path = self._claude_transcript_path(profile, native_sid)
         if not path:
             return
+        # Compressed rollouts are cold native history. Sidebar rotation must
+        # not materialize every old conversation just to watch for live growth.
+        # Native resume creates a plain JSONL, eligible on the next refresh.
+        if sidebar and engine == "codex" and is_compressed_rollout(path):
+            return
         try:
-            st = os.stat(path)
+            st = rollout_stat(path)
         except OSError:
             return
         if len(self._watch) >= self.WATCH_MAX:
@@ -13655,8 +13663,10 @@ class WrapperMachine:
     ]:
         """Return the latest bounded lifecycle state and exact last marker."""
         try:
+            if is_compressed_rollout(path):
+                size = rollout_size(path)
             start = max(0, size - cls.CODEX_TAIL_READ_MAX)
-            with open(path, "rb") as stream:
+            with rollout_open(path, "rb") as stream:
                 stream.seek(start)
                 data = stream.read(cls.CODEX_TAIL_READ_MAX)
         except OSError:
@@ -13692,7 +13702,7 @@ class WrapperMachine:
 
     @classmethod
     def _read_watch_growth(cls, path: str, offset: int, available: int) -> bytes:
-        with open(path, "rb") as stream:
+        with rollout_open(path, "rb") as stream:
             stream.seek(offset)
             return stream.read(min(max(0, available), cls.WATCH_READ_MAX))
 
@@ -13860,7 +13870,13 @@ class WrapperMachine:
         data = b""
         visible_user_growth = False
         try:
-            st = await asyncio.to_thread(os.stat, w["path"])
+            # Native resume can replace a compressed cold source with live
+            # JSONL. Follow the native representation, never the decoded cache.
+            if is_compressed_rollout(w["path"]) or not os.path.exists(w["path"]):
+                current_path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
+                if current_path:
+                    w["path"] = current_path
+            st = await asyncio.to_thread(rollout_stat, w["path"])
         except OSError:
             return
 

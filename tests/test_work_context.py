@@ -193,7 +193,7 @@ def test_claude_context_usage_rejects_concurrent_truncation(
         return TruncatingReader(stream) if mode == "rb" else stream
 
     monkeypatch.setattr(
-        work_context_module, "open", truncating_open, raising=False)
+        work_context_module, "rollout_open", truncating_open, raising=False)
     monkeypatch.setattr(
         work_context_module, "transcript_path", lambda _sid: str(transcript))
 
@@ -397,7 +397,7 @@ def test_codex_context_usage_ignores_concurrent_append(
         stream = real_open(path, mode, *args, **kwargs)
         return AppendingReader(stream) if mode == "rb" else stream
 
-    monkeypatch.setattr(work_context_module, "open", growing_open, raising=False)
+    monkeypatch.setattr(work_context_module, "rollout_open", growing_open, raising=False)
     monkeypatch.setattr(
         work_context_module, "codex_rollout_path",
         lambda *_args, **_kwargs: str(rollout))
@@ -452,7 +452,7 @@ def test_codex_context_usage_rejects_concurrent_path_replacement(
         stream = real_open(path, mode, *args, **kwargs)
         return ReplacingReader(stream) if mode == "rb" else stream
 
-    monkeypatch.setattr(work_context_module, "open", replacing_open, raising=False)
+    monkeypatch.setattr(work_context_module, "rollout_open", replacing_open, raising=False)
     monkeypatch.setattr(
         work_context_module, "codex_rollout_path",
         lambda *_args, **_kwargs: str(rollout))

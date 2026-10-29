@@ -11,7 +11,6 @@ import asyncio
 import difflib
 import hashlib
 import json
-import os
 import re
 import shlex
 from dataclasses import dataclass, field, replace
@@ -21,6 +20,7 @@ from typing import Callable
 
 from pydantic import ValidationError
 
+from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open, rollout_size
 from cc_remote.wrapper.codex_delegation import (
     normalize_codex_delegation_item, parse_codex_delegation,
 )
@@ -579,8 +579,8 @@ def _reverse_jsonl_records(
     of a multi-gigabyte rollout into RSS. Individual pathological records and
     the cross-chunk carry remain bounded.
     """
-    with open(path, "rb") as source:
-        source_size = os.fstat(source.fileno()).st_size
+    with rollout_open(path, "rb") as source:
+        source_size = rollout_fstat(source).st_size
         size = source_size
         if end_offset is not None:
             size = min(source_size, max(0, int(end_offset)))
@@ -636,7 +636,7 @@ def _next_jsonl_offset(path: str, offset: int, end_offset: int) -> int:
     """Move a byte budget boundary to the next complete JSONL record."""
     if offset <= 0:
         return 0
-    with open(path, "rb") as source:
+    with rollout_open(path, "rb") as source:
         source.seek(offset - 1)
         if source.read(1) == b"\n":
             return offset
@@ -663,7 +663,7 @@ def _previous_jsonl_record_offset(path: str, offset: int) -> int:
     """
     if offset <= 0:
         return 0
-    with open(path, "rb") as source:
+    with rollout_open(path, "rb") as source:
         position = offset - 1  # exclude the newline immediately before offset
         while position > 0:
             start = max(0, position - _REVERSE_HISTORY_CHUNK_BYTES)
@@ -710,7 +710,7 @@ def _legacy_user_item_before(
         record_bytes = offset - previous
         if record_bytes > _MAX_HISTORY_REVERSE_RECORD_BYTES + 2:
             return previous, None
-        with open(path, "rb") as source:
+        with rollout_open(path, "rb") as source:
             source.seek(previous)
             raw = source.read(record_bytes).rstrip(b"\r\n")
     except OSError:
@@ -734,6 +734,11 @@ def _legacy_user_item_before(
 
 def _fallback_history_id(path: str, kind: str, offset: int, raw_ts: str,
                          identity: str) -> str:
+    # Compression changes storage, not message/cursor identity. Legacy records
+    # without native item ids must keep the same IDs after cold compression or
+    # resume; decoded offsets already use the original JSONL byte coordinates.
+    if path.endswith(".jsonl.zst"):
+        path = path[:-4]
     seed = "\0".join((path, kind, identity, str(offset), raw_ts))
     return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
@@ -1078,7 +1083,7 @@ def _history_goal_prompt_before_boundary(
         return None
     start = max(0, boundary_offset - max_scan_bytes)
     try:
-        with open(path, "rb") as source:
+        with rollout_open(path, "rb") as source:
             source.seek(start)
             data = source.read(boundary_offset - start)
             source.seek(boundary_offset)
@@ -1162,8 +1167,8 @@ def _history_goal_prompt_after_boundary(
         _history_goal_objective_before_offset(path, boundary_offset)
     )
     try:
-        size = os.path.getsize(path)
-        source = open(path, "rb")
+        size = rollout_size(path)
+        source = rollout_open(path, "rb")
     except (OSError, TypeError, ValueError):
         return (None, False)
     end_offset = min(size, boundary_offset + max_scan_bytes)
@@ -1240,7 +1245,7 @@ def _history_goal_objective_before_offset(
         return (False, None)
     start = max(0, offset - max_scan_bytes)
     try:
-        with open(path, "rb") as source:
+        with rollout_open(path, "rb") as source:
             source.seek(start)
             data = source.read(offset - start)
     except OSError:
@@ -1485,7 +1490,7 @@ def codex_history_native_witness(
         turn_id for turn_id in required_turn_ids
         if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id)
     }
-    source_size = os.path.getsize(path)
+    source_size = rollout_size(path)
     turn_ids: list[str] = []
     seen: set[str] = set()
     retained: set[str] = set()
@@ -1689,7 +1694,7 @@ def codex_history_process_append(
     segment = previous.append_segment
     if segment is None or start_offset <= 0 or end_offset <= start_offset:
         return None
-    with open(path, "rb") as source:
+    with rollout_open(path, "rb") as source:
         source.seek(start_offset - 1)
         if source.read(1) != b"\n":
             return None
@@ -1749,7 +1754,7 @@ def codex_history_file_changes(
     sources: dict[str, list[dict]] = {}
     incomplete: set[str] = set()
     remaining = 16 * 1024 * 1024
-    with open(path, "rb") as source:
+    with rollout_open(path, "rb") as source:
         for turn_id, offsets in offsets_by_turn.items():
             events = sources[turn_id] = []
             for offset in sorted(set(offsets)):
@@ -1814,7 +1819,7 @@ def codex_history_window_info(
     must be omitted. ``forced_boundary_offset`` lets the caller recover the
     omitted user boundary without parsing or retaining that entire turn.
     """
-    size = os.path.getsize(path)
+    size = rollout_size(path)
     if size <= 0 or not isinstance(limit, int) or limit <= 0:
         return CodexHistoryWindow(0, size, False)
     byte_budget = max(1024 * 1024, int(max_bytes))
@@ -1956,12 +1961,12 @@ def codex_history_boundary_process_start(
     ):
         return None
     try:
-        size = os.path.getsize(path)
+        size = rollout_size(path)
         end_offset = min(
             size,
             boundary_offset + max(1024 * 1024, max_scan_bytes),
         )
-        source = open(path, "rb")
+        source = rollout_open(path, "rb")
     except (OSError, TypeError, ValueError):
         return None
 
@@ -2032,13 +2037,13 @@ def codex_history_boundary_user(
             or user_index < 0):
         return None
     try:
-        size = os.path.getsize(path)
+        size = rollout_size(path)
         end_offset = min(
             size,
             boundary_offset + max(
                 1024 * 1024, int(max_scan_bytes)),
         )
-        source = open(path, "rb")
+        source = rollout_open(path, "rb")
     except (OSError, TypeError, ValueError):
         return None
 
@@ -2170,7 +2175,7 @@ def codex_history_turn_user(
                 and not isinstance(boundary_offset, bool) and boundary_offset >= 0):
             # The caller binds this coordinate to a verified source snapshot.
             # Still require the exact native task marker before using it.
-            with open(path, "rb") as source:
+            with rollout_open(path, "rb") as source:
                 source.seek(boundary_offset)
                 boundary = source.readline(_MAX_HISTORY_REVERSE_RECORD_BYTES + 1)
             if _history_turn_cursor(boundary) == turn_id:
@@ -2254,8 +2259,8 @@ def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
         raise ValueError("logical_turns must be a positive integer")
     groups: list[int] = []
     try:
-        size = os.path.getsize(path)
-        source = open(path, "rb")
+        size = rollout_size(path)
+        source = rollout_open(path, "rb")
     except (OSError, TypeError, ValueError):
         return logical_turns
     with source:
@@ -4132,7 +4137,7 @@ def codex_next_user_boundary_ts(
     Legacy response_item/user must be paired with its immediately next replay.
     """
     try:
-        with open(path, "rb") as stream:
+        with rollout_open(path, "rb") as stream:
             stream.seek(offset)
             for index in range(2):
                 limit = _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1
@@ -4644,7 +4649,7 @@ def codex_translate_history(
         pending_compactions.clear()
 
     try:
-        f = open(path, "rb")
+        f = rollout_open(path, "rb")
     except Exception:
         return [], None
     with f:
@@ -5751,8 +5756,8 @@ def _codex_history_record_window(
         return None
     try:
         needle = identity.encode("ascii")
-        with open(path, "rb") as source:
-            file_size = os.fstat(source.fileno()).st_size
+        with rollout_open(path, "rb") as source:
+            file_size = rollout_fstat(source).st_size
             left = 0
             right = file_size
             checked_records: set[int] = set()
@@ -5972,7 +5977,7 @@ def codex_history_image_views(
     awaiting_next_anchor: list[dict[str, object]] = []
     source_complete = False
     try:
-        source = open(path, "rb")
+        source = rollout_open(path, "rb")
     except OSError:
         return ()
     with source:
