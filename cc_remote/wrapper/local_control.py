@@ -8,7 +8,7 @@ start model work; the socket is private to the Wrapper's user.
 One JSON line in, one JSON line out::
 
     {"op": "release_claude_session", "config_dir": "/home/me/.claude", "session_id": "<uuid>"}
-    {"status": "released" | "busy" | "not_resident"}
+    {"status": "released" | "busy" | "not_resident" | "unknown"}
 """
 from __future__ import annotations
 
@@ -96,6 +96,8 @@ class LocalControl:
             raise ValueError("Unknown control request")
         status = await self.machine.release_claude_session(
             _config_dir(request["config_dir"]), _session_id(request["session_id"]))
+        if status == "unknown":
+            return {"status": status, "error": "Native process exit could not be confirmed; do not take over the session"}
         return {"status": status}
 
     async def _client(self, reader, writer):

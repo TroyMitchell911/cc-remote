@@ -2058,6 +2058,7 @@ class WrapperMachine:
         "dismiss_goal", "get_claude_plan", "dismiss_claude_plan", "acknowledge_completion",
     })
     BTW_DESTROYED_MESSAGE = "当前临时对话已经销毁，请创建新的临时对话"
+    CLAUDE_RELEASE_UNCONFIRMED_MESSAGE = "无法确认原 Claude 进程是否已退出，暂时无法恢复此会话"
     BTW_DESTROYED_ALLOWED_COMMANDS = frozenset({
         "sync_btw", "close_btw", "open_btw", "get_queued_query",
         "cancel_queued_query", "get_file_preview", "get_preview_asset",
@@ -2342,8 +2343,9 @@ class WrapperMachine:
         self.sessions: dict[str, SessionContext] = {}
         self.focused_sid: Optional[str] = None  # pool key of the viewed session
         # Sessions handed to another local process (see release_claude_session):
-        # pool key -> (subprocess exited, cwd), so the viewer's next prompt resumes it.
-        self._released_claude_sessions: dict[str, tuple[asyncio.Future, str]] = {}
+        # pool key -> (confirmed subprocess exit, cwd). False retains an
+        # uncertain close: neither a retry nor a cold resume may assume exit.
+        self._released_claude_sessions: dict[str, tuple[asyncio.Future[bool], str]] = {}
         # Side chats are resident, owner-scoped state rather than one-shot UI
         # events. Serialize their catalog mutations with reconnect snapshots so
         # Hello can never publish a half-open or already-closed fork.
@@ -18865,6 +18867,10 @@ class WrapperMachine:
         ctx = self._ctx_for(sid)
         if ctx is None and sid in self._released_claude_sessions:
             ctx = await self._resume_released_claude_session(sid)
+            release = self._released_claude_sessions.get(sid)
+            if ctx is None and release is not None and release[0].done() and not release[0].result():
+                return await self._reject_query(ctx, cmd, Error(
+                    code=ERR_BUSY, message=self.CLAUDE_RELEASE_UNCONFIRMED_MESSAGE))
             if ctx is not None and (ctx.write_state != "writable"
                                     or getattr(ctx.sdk, "is_claude_broker", False)):
                 return await self._reject_query(ctx, cmd, Error(
@@ -28798,8 +28804,14 @@ class WrapperMachine:
             await self._refresh_claude_broker_handle(ctx)
         newly_spawned = ctx is None
         if ctx is None and sid in self._released_claude_sessions:
-            exited, _cwd = self._released_claude_sessions.pop(sid)
-            await exited
+            exited, _cwd = self._released_claude_sessions[sid]
+            if not await asyncio.shield(exited):
+                error = Error(
+                    code=ERR_BUSY, message=self.CLAUDE_RELEASE_UNCONFIRMED_MESSAGE,
+                    sid=sid, request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None))
+                await self.transport.send(error)
+                return error
             ctx = self.sessions.get(sid)
             newly_spawned = ctx is None
         if ctx is None:
@@ -28825,6 +28837,7 @@ class WrapperMachine:
                 )
                 await self._emit_to_sid(sid, error)
                 return error
+        self._released_claude_sessions.pop(sid, None)
         if ctx.engine == "codex":
             await self._resolve_codex_session_effort(ctx)
             if not newly_spawned and ctx.state == "idle":
@@ -36970,7 +36983,10 @@ class WrapperMachine:
                        if self._session_can_evict(key, ctx)), None)
         if victim is None:
             return False
-        await self._detach_idle_session(victim)
+        try:
+            await self._detach_idle_session(victim)
+        except Exception:
+            log.exception("idle session detach failed during eviction", key=victim)
         log.info("evicted idle session for cap", key=victim)
         return True
 
@@ -36978,10 +36994,7 @@ class WrapperMachine:
         """Leave the pool first, so no command can reach the departing subprocess."""
         ctx = self.sessions.pop(key)
         self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
-        try:
-            await ctx.sdk.disconnect()
-        except Exception:
-            log.exception("idle session detach failed", key=key)
+        await ctx.sdk.disconnect()
 
     async def release_claude_session(self, config_dir: str, native_sid: str) -> str:
         """Let another local process resume an idle Claude Code session.
@@ -36989,7 +37002,8 @@ class WrapperMachine:
         The session leaves the pool like a capacity eviction, even while a
         browser views it; that browser's next prompt resumes it. Returns
         ``released``, ``busy`` (working, or not an ordinary Code session) or
-        ``not_resident``.
+        ``not_resident``. A failed or cancelled close stays ``unknown`` until
+        ownership is recovered; dropping the SDK client does not prove exit.
         """
         target = Path(config_dir).resolve()
         profile = next((p for p in self._claude_profiles
@@ -36997,6 +37011,12 @@ class WrapperMachine:
         if profile is None:
             raise ValueError("Claude account is not configured on this Wrapper")
         key = self._claude_wire_sid(profile, native_sid)
+        if (release := self._released_claude_sessions.get(key)) is not None:
+            exited, _cwd = release
+            if not exited.done():
+                return "busy"
+            if not exited.result():
+                return "unknown"
         ctx = self.sessions.get(key)
         if ctx is None or ctx.engine != "claude":
             return "not_resident"
@@ -37006,25 +37026,37 @@ class WrapperMachine:
         self._released_claude_sessions[key] = (exited, ctx.cwd)
         try:
             await self._detach_idle_session(key)
+        except Exception:
+            log.exception("local session release could not confirm native exit", key=key)
+            return "unknown"
+        else:
+            exited.set_result(True)
         finally:
-            exited.set_result(None)
+            # Also covers cancellation by the socket deadline or shutdown.
+            # Viewer waits use shield so they cannot cancel this shared result.
+            if not exited.done():
+                exited.set_result(False)
         log.info("released idle session for a local process", key=key)
         return "released"
 
     async def _resume_released_claude_session(self, sid: str) -> Optional[SessionContext]:
         """Resume a released session for its viewer, as a message delivery would."""
-        exited, cwd = self._released_claude_sessions.pop(sid)
-        await exited
+        exited, cwd = self._released_claude_sessions[sid]
+        if not await asyncio.shield(exited):
+            return None
         if (ctx := self.sessions.get(sid)) is not None:
             return ctx
         profile, native = self._claude_target(sid)
         try:
-            return await self._spawn(resume_id=native, cwd=cwd, engine="claude",
-                                     raise_on_failure=True,
-                                     **self._claude_spawn_profile_kwargs(profile))
+            ctx = await self._spawn(resume_id=native, cwd=cwd, engine="claude",
+                                    raise_on_failure=True,
+                                    **self._claude_spawn_profile_kwargs(profile))
         except Exception:
             log.warning("released session could not be resumed", key=sid)
             return None
+        if ctx is not None:
+            self._released_claude_sessions.pop(sid, None)
+        return ctx
 
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
@@ -37096,6 +37128,16 @@ class WrapperMachine:
                 await self._emit_to_sid(sid, error)
             else:
                 await self._emit_focused(error)
+
+        if engine == "claude" and wire_resume_id in self._released_claude_sessions:
+            # Every cold-resume entry point must respect an unconfirmed close,
+            # including local message delivery, not just browser query/switch.
+            exited, _cwd = self._released_claude_sessions[wire_resume_id]
+            if not await asyncio.shield(exited):
+                await reject(
+                    ERR_BUSY, self.CLAUDE_RELEASE_UNCONFIRMED_MESSAGE,
+                    route="sid", sid=wire_resume_id)
+                return None
 
         if (
             engine == "claude"
@@ -38183,6 +38225,8 @@ class WrapperMachine:
         )
         self.sessions[key] = ctx
         ctx.key = key
+        if engine == "claude":
+            self._released_claude_sessions.pop(key, None)
         if service_attached and not ctx.session_id:
             old_key = ctx.sdk.client.description["metadata"].get("key")
             if isinstance(old_key, str) and old_key.startswith("tmp-"):

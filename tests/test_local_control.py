@@ -4,13 +4,14 @@ import json
 import os
 import stat
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
 
 from cc_remote.protocol import Query, SwitchSession
 from cc_remote.wrapper.local_control import LocalControl
+from cc_remote.wrapper.sdk import SdkHandle
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 NATIVE = str(uuid4())
@@ -35,7 +36,7 @@ async def test_release_detaches_an_idle_session_even_while_it_is_viewed():
     assert ctx.key not in machine.sessions
     ctx.sdk.disconnect.assert_awaited_once()
     exited, cwd = machine._released_claude_sessions[ctx.key]
-    assert exited.done() and cwd == ctx.cwd
+    assert exited.done() and exited.result() is True and cwd == ctx.cwd
     await machine._command_scheduler.close()
 
 
@@ -85,6 +86,115 @@ async def test_release_reports_a_session_that_is_not_resident_and_rejects_unknow
         await machine.release_claude_session(str(tmp_path / "other-account"), NATIVE)
     assert machine.sessions[ctx.key] is ctx
     await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_disconnect_does_not_authorize_handoff_or_retry():
+    machine, _, profile, ctx = released_machine()
+    # A failed service close can discard its client while leaving the native
+    # worker alive. A second disconnect may then be a no-op, not proof of exit.
+    ctx.sdk.disconnect.side_effect = [RuntimeError("close failed"), None]
+    control = LocalControl(machine)
+    release = {"op": "release_claude_session", "config_dir": str(profile.config_dir), "session_id": NATIVE}
+    try:
+        for _ in range(2):
+            reply = await control.handle(release)
+            assert reply["status"] == "unknown"
+        ctx.sdk.disconnect.assert_awaited_once()
+        exited, _ = machine._released_claude_sessions[ctx.key]
+        assert exited.done() and exited.result() is False
+    finally:
+        await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_release_is_busy_until_native_disconnect_finishes():
+    machine, _, profile, ctx = released_machine()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def disconnect():
+        entered.set()
+        await finish.wait()
+
+    ctx.sdk.disconnect.side_effect = disconnect
+    releasing = asyncio.create_task(machine.release_claude_session(str(profile.config_dir), NATIVE))
+    try:
+        await entered.wait()
+        assert await machine.release_claude_session(str(profile.config_dir), NATIVE) == "busy"
+        finish.set()
+        assert await releasing == "released"
+        assert await machine.release_claude_session(str(profile.config_dir), NATIVE) == "not_resident"
+        ctx.sdk.disconnect.assert_awaited_once()
+    finally:
+        finish.set()
+        await releasing
+        await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["query", "switch", "spawn"])
+async def test_unknown_release_never_starts_a_second_writer(action, monkeypatch):
+    machine, transport, profile, ctx = released_machine()
+    ctx.sdk.disconnect.side_effect = RuntimeError("close failed")
+    assert await machine.release_claude_session(str(profile.config_dir), NATIVE) == "unknown"
+    monkeypatch.setattr(machine, "_claude_catalog_session_info", lambda *_: None)
+    preflight = Mock(side_effect=AssertionError("must not start another writer"))
+    monkeypatch.setattr(SdkHandle, "preflight", preflight)
+    try:
+        for _ in range(2):
+            if action == "query":
+                await machine._handle_query(Query(sid=ctx.key, prompt="continue", msg_id="retry"))
+            elif action == "switch":
+                await machine._handle_switch_session(SwitchSession(session_id=ctx.key))
+            else:
+                assert await machine._spawn(resume_id=NATIVE, engine="claude",
+                                            **machine._claude_spawn_profile_kwargs(profile)) is None
+        preflight.assert_not_called()
+        assert ctx.key not in machine.sessions
+        assert ctx.key in machine._released_claude_sessions
+        assert len([frame for frame in transport.sent if getattr(frame, "type", None) == "error"]) == 2
+    finally:
+        await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["query", "switch"])
+async def test_cancelling_a_viewer_wait_does_not_cancel_the_release(action, monkeypatch):
+    machine, _, profile, ctx = released_machine()
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def disconnect():
+        entered.set()
+        await finish.wait()
+
+    ctx.sdk.disconnect.side_effect = disconnect
+    monkeypatch.setattr(machine, "_claude_catalog_session_info", lambda *_: None)
+    releasing = asyncio.create_task(machine.release_claude_session(str(profile.config_dir), NATIVE))
+    waiter = None
+    try:
+        await entered.wait()
+        exited, _ = machine._released_claude_sessions[ctx.key]
+        command = (machine._handle_query(Query(sid=ctx.key, prompt="continue", msg_id="cancelled"))
+                   if action == "query" else
+                   machine._handle_switch_session(SwitchSession(session_id=ctx.key)))
+        waiter = asyncio.create_task(command)
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert ctx.key in machine._released_claude_sessions
+        assert not exited.done()
+        finish.set()
+        assert await releasing == "released"
+        assert exited.result() is True
+    finally:
+        if waiter is not None:
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        finish.set()
+        await releasing
+        await machine._command_scheduler.close()
 
 
 def resumable(machine, ctx, monkeypatch, *, write_state="writable"):
@@ -143,7 +253,7 @@ async def test_switching_back_to_a_released_session_waits_for_its_old_subprocess
     switching = asyncio.create_task(machine._handle_switch_session(SwitchSession(session_id=ctx.key)))
     await asyncio.sleep(0.05)
     assert not switching.done() and spawned == []
-    exited.set_result(None)
+    exited.set_result(True)
     await switching
     assert len(spawned) == 1 and machine.focused_sid == ctx.key and machine.sessions[ctx.key] is replacement
     assert machine._released_claude_sessions == {}
@@ -178,6 +288,34 @@ async def test_private_socket_releases_by_account_directory_and_rejects_anything
         await control.close()
         await machine._command_scheduler.close()
     assert not control.socket.exists()
+
+
+@pytest.mark.asyncio
+async def test_socket_timeout_keeps_release_unknown_on_retry(monkeypatch):
+    from cc_remote.wrapper import local_control
+
+    machine, _, profile, ctx = released_machine()
+    entered = asyncio.Event()
+
+    async def disconnect():
+        entered.set()
+        await asyncio.Event().wait()
+
+    ctx.sdk.disconnect.side_effect = disconnect
+    monkeypatch.setattr(local_control, "REQUEST_TIMEOUT", 0.05)
+    control = LocalControl(machine)
+    await control.start()
+    release = {"op": "release_claude_session", "config_dir": str(profile.config_dir), "session_id": NATIVE}
+    try:
+        reply = await asyncio.wait_for(request(control.socket, release), timeout=2)
+        assert entered.is_set() and reply["status"] == "unknown"
+        assert (await request(control.socket, release))["status"] == "unknown"
+        exited, _ = machine._released_claude_sessions[ctx.key]
+        assert exited.done() and exited.result() is False
+        ctx.sdk.disconnect.assert_awaited_once()
+    finally:
+        await control.close()
+        await machine._command_scheduler.close()
 
 
 @pytest.mark.asyncio

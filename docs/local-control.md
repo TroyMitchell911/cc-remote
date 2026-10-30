@@ -27,8 +27,16 @@ One JSON line in, one JSON line out:
   subprocess has exited when the reply is sent.
 - `{"status": "busy"}`: a turn, queued input, user question, background task,
   scheduled command or control change holds it, or it is a side chat or Work
-  session. Nothing changed.
+  session. A release already in progress also returns `busy`; that earlier
+  request must finish before another process can claim the session.
 - `{"status": "not_resident"}`: the Wrapper holds no subprocess for it.
+- `{"status": "unknown", "error": …}`: disconnect failed, timed out or was
+  cancelled, so native process exit could not be confirmed. Do not take over.
+  The current Wrapper retains this uncertainty: repeat release requests stay
+  `unknown`, and browser queries, session switches and other cold-resume paths
+  cannot start another writer. Inspect the original process/service and recover
+  ownership before attempting takeover; losing a client connection is not proof
+  that its native worker exited.
 - `{"status": "rejected", "error": …}`: malformed request or unknown account.
 
 A request never carries a prompt and cannot start model work.
