@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ImgHTMLAttributes } from "react";
 import {
   constrainImageTransform, panImageTransform, pinchImageTransform, zoomImageTransform,
+  IMAGE_WHEEL_ZOOM_RATE, MAX_IMAGE_SCALE,
   type ImagePoint, type ImageTransform,
 } from "../image-gesture";
 
@@ -18,12 +19,26 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     const image = imageRef.current;
     if (!stage || !image) return;
     let transform: ImageTransform = { scale: 1, x: 0, y: 0 };
+    let interacted = false;
     let frame: number | null = null;
     const pointers = new Map<number, ImagePoint>();
-    const sizes = () => ({
-      image: { width: image.clientWidth, height: image.clientHeight },
-      viewport: { width: stage.clientWidth, height: stage.clientHeight },
-    });
+    const sizes = () => {
+      // CSS keeps a contained base image so shrinking can still reveal the
+      // whole picture. Open tall files at readable width, with room to zoom
+      // further even when that width is more than 4x the contained size.
+      // Preserve fractional CSS pixels: rounding the narrow contained width
+      // would magnify that error when a very long image fills the panel.
+      const style = getComputedStyle(image);
+      const width = parseFloat(style.width) || 0, height = parseFloat(style.height) || 0;
+      const widthScale = width > 0
+        ? Math.max(1, Math.min(image.naturalWidth, stage.clientWidth) / width) : 1;
+      return {
+        image: { width, height },
+        viewport: { width: stage.clientWidth, height: stage.clientHeight },
+        widthScale,
+        maxScale: widthScale * MAX_IMAGE_SCALE,
+      };
+    };
     const localPoint = (event: { clientX: number; clientY: number }) => {
       const rect = stage.getBoundingClientRect();
       return { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -52,15 +67,16 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     };
     const move = (event: PointerEvent) => {
       if (!pointers.has(event.pointerId)) return;
+      interacted = true;
       pointers.set(event.pointerId, localPoint(event));
       const points = [...pointers.values()];
-      const { image, viewport } = start.sizes;
+      const { image, viewport, maxScale } = start.sizes;
       if (points.length >= 2 && start.points.length >= 2) {
         update(pinchImageTransform(start.transform, start.points[0], start.points[1],
-          points[0], points[1], image, viewport));
+          points[0], points[1], image, viewport, maxScale));
       } else if (points.length === 1 && start.points.length === 1) {
         update(panImageTransform(start.transform, points[0].x - start.points[0].x,
-          points[0].y - start.points[0].y, image, viewport));
+          points[0].y - start.points[0].y, image, viewport, maxScale));
       }
     };
     const finish = (event: PointerEvent) => {
@@ -73,15 +89,16 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
       // Safari can also emit wheel events during a native gesture. One input
       // stream owns the transform, so the same pinch is never applied twice.
       if (pointers.size || nativeGesture) return;
-      const { image, viewport } = sizes();
+      interacted = true;
+      const { image, viewport, maxScale } = sizes();
       const delta = (value: number, page: number) => value * (
         event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16
           : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? page : 1);
       update(event.ctrlKey
-        ? zoomImageTransform(transform, Math.exp(-delta(event.deltaY, viewport.height) * 0.002),
-          localPoint(event), image, viewport)
+        ? zoomImageTransform(transform, Math.exp(-delta(event.deltaY, viewport.height) * IMAGE_WHEEL_ZOOM_RATE),
+          localPoint(event), image, viewport, maxScale)
         : panImageTransform(transform, -delta(event.deltaX, viewport.width),
-          -delta(event.deltaY, viewport.height), image, viewport));
+          -delta(event.deltaY, viewport.height), image, viewport, maxScale));
     };
     const gestureStart = (raw: Event) => {
       raw.preventDefault();
@@ -94,22 +111,32 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
       raw.preventDefault();
       const event = raw as SafariGesture;
       if (!nativeGesture || pointers.size || !Number.isFinite(event.scale) || event.scale <= 0) return;
-      const { image, viewport } = sizes();
-      update(zoomImageTransform(nativeGesture.transform, event.scale / nativeGesture.scale,
-        localPoint(event), image, viewport));
+      interacted = true;
+      const { image, viewport, maxScale } = sizes();
+      // Trackpad gestures need more travel gain; touch pointers retain 1:1
+      // finger tracking and continue to own overlapping iOS gesture events.
+      update(zoomImageTransform(nativeGesture.transform, (event.scale / nativeGesture.scale) ** 2,
+        localPoint(event), image, viewport, maxScale));
     };
     const gestureEnd = (event: Event) => {
       event.preventDefault();
       nativeGesture = null;
     };
-    const resize = new ResizeObserver(() => {
-      const { image, viewport } = sizes();
-      update(constrainImageTransform(transform, image, viewport));
+    const fit = () => {
+      const { image, viewport, widthScale, maxScale } = sizes();
+      if (!image.width || !image.height || !viewport.width || !viewport.height) return;
+      update(interacted ? constrainImageTransform(transform, image, viewport, maxScale) : {
+        scale: widthScale, x: 0,
+        y: Math.max(0, (image.height * widthScale - viewport.height) / 2),
+      });
       start = baseline();
       nativeGesture = null;
-    });
+    };
+    const resize = new ResizeObserver(fit);
     resize.observe(stage);
     resize.observe(image);
+    image.addEventListener("load", fit);
+    fit();
     stage.addEventListener("pointerdown", down);
     stage.addEventListener("pointermove", move);
     stage.addEventListener("pointerup", finish);
@@ -122,6 +149,7 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     return () => {
       if (frame !== null) cancelAnimationFrame(frame);
       resize.disconnect();
+      image.removeEventListener("load", fit);
       stage.removeEventListener("pointerdown", down);
       stage.removeEventListener("pointermove", move);
       stage.removeEventListener("pointerup", finish);

@@ -4,6 +4,7 @@ export interface ImageTransform { scale: number; x: number; y: number }
 
 export const MIN_IMAGE_SCALE = 1;
 export const MAX_IMAGE_SCALE = 4;
+export const IMAGE_WHEEL_ZOOM_RATE = 0.01;
 
 /** A deliberate horizontal drag at fitted size turns the page. Zoomed images
  * reserve the same gesture for panning; short/vertical drags stay on the image. */
@@ -24,8 +25,9 @@ export function constrainImageTransform(
   transform: ImageTransform,
   image: ImageSize,
   viewport: ImageSize,
+  maxScale = MAX_IMAGE_SCALE,
 ): ImageTransform {
-  const scale = clamp(transform.scale, MIN_IMAGE_SCALE, MAX_IMAGE_SCALE);
+  const scale = clamp(transform.scale, MIN_IMAGE_SCALE, maxScale);
   if (scale <= MIN_IMAGE_SCALE) return { scale: MIN_IMAGE_SCALE, x: 0, y: 0 };
   const maxX = Math.max(0, (image.width * scale - viewport.width) / 2);
   const maxY = Math.max(0, (image.height * scale - viewport.height) / 2);
@@ -42,12 +44,13 @@ export function panImageTransform(
   deltaY: number,
   image: ImageSize,
   viewport: ImageSize,
+  maxScale = MAX_IMAGE_SCALE,
 ): ImageTransform {
   return constrainImageTransform({
     scale: start.scale,
     x: start.x + deltaX,
     y: start.y + deltaY,
-  }, image, viewport);
+  }, image, viewport, maxScale);
 }
 
 export function zoomImageTransform(
@@ -56,14 +59,15 @@ export function zoomImageTransform(
   focalPoint: ImagePoint,
   image: ImageSize,
   viewport: ImageSize,
+  maxScale = MAX_IMAGE_SCALE,
 ): ImageTransform {
   if (start.scale <= 0 || !Number.isFinite(scaleFactor)) {
-    return constrainImageTransform(start, image, viewport);
+    return constrainImageTransform(start, image, viewport, maxScale);
   }
   const scale = clamp(
     start.scale * scaleFactor,
     MIN_IMAGE_SCALE,
-    MAX_IMAGE_SCALE,
+    maxScale,
   );
   const center = { x: viewport.width / 2, y: viewport.height / 2 };
   const contentPoint = {
@@ -74,7 +78,7 @@ export function zoomImageTransform(
     scale,
     x: focalPoint.x - center.x - scale * contentPoint.x,
     y: focalPoint.y - center.y - scale * contentPoint.y,
-  }, image, viewport);
+  }, image, viewport, maxScale);
 }
 
 export function pinchImageTransform(
@@ -85,13 +89,14 @@ export function pinchImageTransform(
   currentSecond: ImagePoint,
   image: ImageSize,
   viewport: ImageSize,
+  maxScale = MAX_IMAGE_SCALE,
 ): ImageTransform {
   const startDistance = Math.hypot(
     startSecond.x - startFirst.x,
     startSecond.y - startFirst.y,
   );
   if (startDistance <= 0) {
-    return constrainImageTransform(start, image, viewport);
+    return constrainImageTransform(start, image, viewport, maxScale);
   }
   const currentDistance = Math.hypot(
     currentSecond.x - currentFirst.x,
@@ -100,7 +105,7 @@ export function pinchImageTransform(
   const scale = clamp(
     start.scale * currentDistance / startDistance,
     MIN_IMAGE_SCALE,
-    MAX_IMAGE_SCALE,
+    maxScale,
   );
   const startMidpoint = {
     x: (startFirst.x + startSecond.x) / 2,
@@ -119,5 +124,5 @@ export function pinchImageTransform(
     scale,
     x: currentMidpoint.x - center.x - scale * contentPoint.x,
     y: currentMidpoint.y - center.y - scale * contentPoint.y,
-  }, image, viewport);
+  }, image, viewport, maxScale);
 }
