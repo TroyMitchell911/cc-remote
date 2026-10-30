@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ImgHTMLAttributes } from "react";
+import { useLayoutEffect, useRef, type ImgHTMLAttributes } from "react";
 import {
   constrainImageTransform, panImageTransform, pinchImageTransform, zoomImageTransform,
   IMAGE_WHEEL_ZOOM_RATE, MAX_IMAGE_SCALE,
@@ -14,11 +14,12 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const stage = stageRef.current;
     const image = imageRef.current;
     if (!stage || !image) return;
     let transform: ImageTransform = { scale: 1, x: 0, y: 0 };
+    let ready = false;
     let interacted = false;
     let frame: number | null = null;
     const pointers = new Map<number, ImagePoint>();
@@ -46,6 +47,7 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     const paint = () => {
       frame = null;
       image.style.transform = `translate(${transform.x}px,${transform.y}px) scale(${transform.scale})`;
+      image.style.visibility = ready ? "visible" : "hidden";
       stage.dataset.zoomed = String(transform.scale > 1);
     };
     const update = (next: ImageTransform) => {
@@ -58,7 +60,7 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     paint();
 
     const down = (event: PointerEvent) => {
-      if (event.pointerType === "mouse" && event.button !== 0) return;
+      if (!ready || (event.pointerType === "mouse" && event.button !== 0)) return;
       event.preventDefault();
       nativeGesture = null;
       pointers.set(event.pointerId, localPoint(event));
@@ -88,7 +90,7 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
       event.preventDefault();
       // Safari can also emit wheel events during a native gesture. One input
       // stream owns the transform, so the same pinch is never applied twice.
-      if (pointers.size || nativeGesture) return;
+      if (!ready || pointers.size || nativeGesture) return;
       interacted = true;
       const { image, viewport, maxScale } = sizes();
       const delta = (value: number, page: number) => value * (
@@ -103,7 +105,7 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
     const gestureStart = (raw: Event) => {
       raw.preventDefault();
       const event = raw as SafariGesture;
-      if (!pointers.size && Number.isFinite(event.scale) && event.scale > 0) {
+      if (ready && !pointers.size && Number.isFinite(event.scale) && event.scale > 0) {
         nativeGesture = { transform, scale: event.scale };
       }
     };
@@ -123,12 +125,19 @@ export function ZoomableImage({ src, alt, onLoad, onError }: Pick<
       nativeGesture = null;
     };
     const fit = () => {
-      const { image, viewport, widthScale, maxScale } = sizes();
-      if (!image.width || !image.height || !viewport.width || !viewport.height) return;
-      update(interacted ? constrainImageTransform(transform, image, viewport, maxScale) : {
+      if (!image.complete || !image.naturalWidth || !image.naturalHeight) return;
+      const { image: imageSize, viewport, widthScale, maxScale } = sizes();
+      if (!imageSize.width || !imageSize.height || !viewport.width || !viewport.height) return;
+      transform = interacted ? constrainImageTransform(transform, imageSize, viewport, maxScale) : {
         scale: widthScale, x: 0,
-        y: Math.max(0, (image.height * widthScale - viewport.height) / 2),
-      });
+        y: Math.max(0, (imageSize.height * widthScale - viewport.height) / 2),
+      };
+      // Apply load/resize geometry before the browser paints. Queuing this in
+      // RAF exposes the contained base image (or a previous file's transform)
+      // for a frame before it expands to readable width.
+      ready = true;
+      if (frame !== null) cancelAnimationFrame(frame);
+      paint();
       start = baseline();
       nativeGesture = null;
     };
