@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v5.3.6
+
+Make file previews easier to read and avoid accidental path tooltips. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
+
+- Show file path tooltips after 500 ms of hover; preserve immediate keyboard focus and file opening.
+- Open tall images at panel width from the top, without briefly flashing a smaller image first.
+- Increase trackpad pinch response while preserving touch zoom and protection against duplicate Safari gestures.
+
+See the bilingual [release notes](docs/releases/v5.3.6.md).
+
 ## v5.3.5
 
 Enable pinch zoom in centered and docked image file previews on trackpads and touchscreens. Wire protocol v85 and Claude Agent SDK 0.2.174 are unchanged.
