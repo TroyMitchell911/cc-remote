@@ -7,7 +7,8 @@ import { Icon } from "../icons";
 export function LocalFileLink({ location, children, onOpen, id }: {
   location: string; children: ReactNode; onOpen: () => void; id?: string;
 }) {
-  const pop = useLinkPopover();
+  // Let a passing pointer leave before the path covers the conversation.
+  const pop = useLinkPopover(500);
   const path = useRef<HTMLSpanElement>(null);
   return <>
     <span ref={pop.anchor} className="message-link-anchor">

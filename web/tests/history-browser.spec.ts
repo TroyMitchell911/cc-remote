@@ -6904,7 +6904,7 @@ test("local Markdown file link reveals its complete path without native title", 
   await expect(page.getByRole("tooltip")).toBeVisible();
 });
 
-test("local Markdown file links replace the previous tooltip immediately and wrap without altering the path", async ({ page }, testInfo) => {
+test("local Markdown file links retire the previous tooltip before showing the next path", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 720, height: 480 });
   await page.route("**/api/link-preview", route => route.fulfill({ json: {} }));
   await page.goto("/tests/history-browser.html?local-file-link=1");
@@ -6912,7 +6912,7 @@ test("local Markdown file links replace the previous tooltip immediately and wra
   const fullPath = "/workspace/project/packages/frontend/src/components/conversation/MessageBlock.tsx:455";
   for (const index of [0, 1, 0, 1]) {
     await links.nth(index).hover();
-    expect(await page.getByRole("tooltip").count()).toBe(1);
+    expect(await page.getByRole("tooltip").count()).toBe(0);
     await expect(page.getByRole("tooltip")).toContainText(index ? fullPath : "/tmp/qwen3-tts-v017-release-test:42");
   }
   const tip = page.getByRole("tooltip");

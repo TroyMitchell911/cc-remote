@@ -2877,7 +2877,7 @@ function ArtifactPreviewFixture({ kind }: {
     | "markdown-svg" | "markdown-source" | "markdown-html" | "markdown-github-html";
 }) {
   const [openedFile, setOpenedFile] = useState("");
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(() => new URLSearchParams(location.search).has("image-centered"));
   const [replacement, setReplacement] = useState(false);
   const gestureFixture = new URLSearchParams(location.search).has("image-gestures");
   const svgData = (window as unknown as { svgFixture?: string }).svgFixture
